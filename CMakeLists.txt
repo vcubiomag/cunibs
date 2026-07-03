@@ -88,5 +88,3 @@ install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/solver/py.typed
   DESTINATION cunibs/solver
 )
-
-# Build AMGx, with LTO, hardware LTO. Build binaries for 70;75;80;86;89;90;100;120
