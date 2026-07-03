@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "GPU FEM solver for the TMS E-field"
 readme = "README.md"
 authors = [
-    { name = "Sriman Achanta", email = "68172138+srimanachanta@users.noreply.github.com" }
+    { name = "Sriman Achanta" }
 ]
 requires-python = ">=3.12"
 dependencies = [
