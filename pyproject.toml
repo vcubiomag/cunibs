@@ -7,15 +7,22 @@ authors = [
     { name = "Sriman Achanta", email = "68172138+srimanachanta@users.noreply.github.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "cuda-toolkit[cudart,cublas,cusparse,cusolver,nvtx,curand]>=13.2"
+]
 
 [build-system]
-requires = ["scikit-build-core>=0.12"]
+requires = [
+    "scikit-build-core>=0.12",
+    "nanobind>=2.13.0",
+    "cuda-toolkit[nvcc,cudart,cccl,cublas,cusparse,cusolver,nvtx,curand]==13.2.*"
+]
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
+wheel.exclude = ["**.cpp", "**.cu", "**.hpp"]
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,hpp,cpp}" }, { file = "CMakeLists.txt" }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,cu,hpp,cpp}" }, { file = "CMakeLists.txt" }]
