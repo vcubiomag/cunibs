@@ -68,11 +68,15 @@ target_link_libraries(_solver_ext PRIVATE CUDA::cudart AMGX::amgxsh)
 
 set_target_properties(_solver_ext amgxsh PROPERTIES
   INSTALL_RPATH "$ORIGIN;$ORIGIN/../../nvidia/cu13/lib"
-  INSTALL_RPATH_USE_LINK_PATH OFF
 )
 
-install(TARGETS _solver_ext LIBRARY DESTINATION cunibs/solver)
-install(TARGETS amgxsh LIBRARY DESTINATION cunibs/solver)
+get_target_property(_amgxsh_soversion amgxsh SOVERSION)
+set_target_properties(amgxsh PROPERTIES VERSION ${_amgxsh_soversion})
+
+install(TARGETS _solver_ext amgxsh
+  LIBRARY DESTINATION cunibs/solver
+  NAMELINK_SKIP
+)
 
 nanobind_add_stub(
   _solver_ext_stub
