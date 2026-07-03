@@ -13,28 +13,18 @@ isotropic conductivity models and NVIDIA GPUs.
 
 Under the magneto-quasistatic approximation, the electric field is
 
-$$
-\mathbf{E} = -\nabla v - \frac{\partial \mathbf{A}}{\partial t},
-$$
+$$\mathbf{E} = -\nabla v - \frac{\partial \mathbf{A}}{\partial t}$$
 
 where $v$ is the electric scalar potential and $\mathbf{A}$ is the magnetic
 vector potential. For piecewise constant isotropic conductivity $\sigma$, the
 potential satisfies
 
-$$
-\nabla \cdot \left(\sigma \nabla v\right)
-=
--\nabla \cdot \left(\sigma \frac{\partial \mathbf{A}}{\partial t}\right).
-$$
+$$\nabla \cdot \left(\sigma \nabla v\right) = -\nabla \cdot \left(\sigma \frac{\partial \mathbf{A}}{\partial t}\right)$$
 
 cuNIBS discretizes this equation with linear basis functions on tetrahedra. For
 tetrahedron $e$, the element matrix is
 
-$$
-K_{ij}^{(e)}
-=
-V_e \sigma_e \nabla \lambda_i \cdot \nabla \lambda_j.
-$$
+$$K_{ij}^{(e)} = V_e \sigma_e \nabla \lambda_i \cdot \nabla \lambda_j$$
 
 The right-hand side uses the mean nodal value of
 $\partial\mathbf{A}/\partial t$ in each tetrahedron. One potential degree of
@@ -44,14 +34,7 @@ an aggregation AMG preconditioner.
 
 The coil field is evaluated from magnetic dipoles:
 
-$$
-\mathbf{A}(\mathbf{r})
-=
-\frac{\mu_0}{4\pi}
-\sum_j
-\frac{\mathbf{m}_j \times (\mathbf{r} - \mathbf{s}_j)}
-{\lVert \mathbf{r} - \mathbf{s}_j \rVert^3}.
-$$
+$$\mathbf{A}(\mathbf{r}) = \frac{\mu_0}{4\pi} \sum_j \frac{\mathbf{m}_j \times (\mathbf{r} - \mathbf{s}_j)}{\lVert \mathbf{r} - \mathbf{s}_j \rVert^3}$$
 
 The implementation uses float64 for stiffness assembly and the scalar
 potential. Placement-dependent field kernels use float32. Electric-field
