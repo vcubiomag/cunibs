@@ -57,7 +57,7 @@ execute_process(
   OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT)
 find_package(nanobind CONFIG REQUIRED)
 
-nanobind_add_module(_solver_ext LTO
+nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/bindings.cpp
   src/cunibs/solver/solver.cpp
   src/cunibs/solver/dadt.cu
