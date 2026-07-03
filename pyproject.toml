@@ -34,3 +34,7 @@ dev = [
 
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,cu,hpp,cpp}" }, { file = "CMakeLists.txt" }]
+
+[tool.ruff]
+line-length = 96
+target-version = "py312"
