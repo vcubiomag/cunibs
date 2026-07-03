@@ -27,7 +27,7 @@ foreach(_lib ${_CUDA_SHIM_LIBS})
   endif()
 endforeach()
 
-find_package(CUDAToolkit 13.0 REQUIRED)
+find_package(CUDAToolkit 13.2 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
