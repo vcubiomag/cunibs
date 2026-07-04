@@ -52,3 +52,4 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,cu,hpp,cpp}" 
 [tool.ruff]
 line-length = 96
 target-version = "py312"
+exclude = ["external"]
