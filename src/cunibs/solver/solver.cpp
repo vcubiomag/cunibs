@@ -1,5 +1,6 @@
 #include "solver.hpp"
 
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -14,10 +15,23 @@ void check(AMGX_RC rc, const char* what) {
     }
 }
 
+extern "C" void amgx_print_filter(const char* msg, int length) {
+    std::string s(msg, static_cast<size_t>(length));
+    if (s.rfind("AMGX version", 0) == 0 ||
+        s.rfind("Built on", 0) == 0 ||
+        s.rfind("Compiled with CUDA Runtime", 0) == 0) {
+        return;
+    }
+    std::fwrite(msg, 1, static_cast<size_t>(length), stderr);
+}
+
 // AMGx initialization is process-global. Keep it alive until process exit.
 void initialize_amgx_once() {
     static std::once_flag flag;
-    std::call_once(flag, [] { check(AMGX_initialize(), "initialize"); });
+    std::call_once(flag, [] {
+        AMGX_register_print_callback(amgx_print_filter);
+        check(AMGX_initialize(), "initialize");
+    });
 }
 
 constexpr AMGX_Mode kMode = AMGX_mode_dDDI;
