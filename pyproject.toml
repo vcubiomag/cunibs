@@ -32,7 +32,7 @@ Repository = "https://github.com/vcubiomag/cunibs"
 requires = [
     "scikit-build-core>=0.12",
     "nanobind>=2.13.0",
-    "cuda-toolkit[nvcc,cudart,cccl,cublas,cusparse,cusolver,nvtx,curand]==13.2.*"
+    "cuda-toolkit[nvcc,cudart,cccl,cublas,cusparse,cusolver,nvtx]==13.2.*"
 ]
 build-backend = "scikit_build_core.build"
 
