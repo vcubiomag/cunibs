@@ -1,5 +1,7 @@
 # cuNIBS
 
+[![pypi](https://img.shields.io/pypi/v/cunibs)](https://pypi.python.org/pypi/cunibs)
+
 cuNIBS computes the electric field induced by transcranial magnetic stimulation
 (TMS) in a tetrahedral head model. It uses first-order finite elements, magnetic
 dipole coil models, CUDA kernels, and an AMGx-preconditioned linear solve. Mesh
