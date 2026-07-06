@@ -17,7 +17,6 @@ public:
 
 private:
     AMGX_config_handle cfg_ = nullptr;
-    AMGX_resources_handle rsc_ = nullptr;
     AMGX_matrix_handle A_ = nullptr;
     AMGX_vector_handle b_ = nullptr;
     AMGX_vector_handle x_ = nullptr;
