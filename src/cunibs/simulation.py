@@ -142,19 +142,19 @@ class FieldResult:
     barycenters_mm: ArrayT
     _summaries: dict[str, metrics.FieldMetrics] = field(default_factory=dict, repr=False)
 
-    def _mask(self, region: str) -> ArrayT:
+    def _mask(self, region: metrics.Region) -> ArrayT:
         return metrics.region_mask(self.tet_tags, region)
 
-    def peak_magnE(self, region: str = "gray_matter") -> float:
+    def peak_magnE(self, region: metrics.Region = "gray_matter") -> float:
         return metrics.peak_magnitude(self.magnE, self._mask(region))
 
-    def peak_location_mm(self, region: str = "gray_matter") -> npt.NDArray[np.float64]:
+    def peak_location_mm(self, region: metrics.Region = "gray_matter") -> npt.NDArray[np.float64]:
         return metrics.peak_location_mm(self.magnE, self.barycenters_mm, self._mask(region))
 
-    def focality(self, frac: float = 0.5, region: str = "gray_matter") -> float:
+    def focality(self, frac: float = 0.5, region: metrics.Region = "gray_matter") -> float:
         return metrics.focality(self.magnE, self.vols, self._mask(region), frac)
 
-    def summary(self, region: str = "gray_matter") -> metrics.FieldMetrics:
+    def summary(self, region: metrics.Region = "gray_matter") -> metrics.FieldMetrics:
         """Return cached metrics for a tissue region."""
         if region not in self._summaries:
             self._summaries[region] = metrics.compute_metrics(

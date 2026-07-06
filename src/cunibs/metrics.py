@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TypeAlias, TypedDict
+from typing import Literal, TypeAlias, TypedDict
 
 import cupy as cp
 import numpy as np
@@ -11,6 +11,7 @@ import numpy.typing as npt
 from cunibs.fem.assembly import GM_TAG
 
 ArrayT: TypeAlias = cp.ndarray | np.ndarray
+Region: TypeAlias = Literal["gray_matter", "all"]
 
 DEFAULT_PERCENTILES = (50.0, 95.0, 99.0, 99.9)
 DEFAULT_FOCALITY_FRAC = 0.5
@@ -19,7 +20,7 @@ DEFAULT_FOCALITY_FRAC = 0.5
 class FieldMetrics(TypedDict):
     """TMS metrics for one tissue region."""
 
-    region: str
+    region: Region
     peak_magnE: float
     peak_location_mm: npt.NDArray[np.float64]
     center_of_gravity_mm: npt.NDArray[np.float64]
@@ -28,7 +29,7 @@ class FieldMetrics(TypedDict):
     distribution: dict[str, float]
 
 
-def region_mask(tet_tags: ArrayT, region: str) -> ArrayT:
+def region_mask(tet_tags: ArrayT, region: Region) -> ArrayT:
     """Boolean per-tet mask for ``region`` (``"gray_matter"`` or ``"all"``)."""
     xp = cp.get_array_module(tet_tags)
     if region == "all":
@@ -112,7 +113,7 @@ def compute_metrics(
     barycenters_mm: ArrayT,
     tet_tags: ArrayT,
     *,
-    region: str = "gray_matter",
+    region: Region = "gray_matter",
     focality_fracs: tuple[float, ...] = (DEFAULT_FOCALITY_FRAC,),
     percentiles: tuple[float, ...] = DEFAULT_PERCENTILES,
 ) -> FieldMetrics:
