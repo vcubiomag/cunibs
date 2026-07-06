@@ -12,6 +12,7 @@ namespace nb = nanobind;
 
 // Contiguity is required because these arrays are passed to CUDA and AMGx as raw pointers.
 using f64_cuda = nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
+using f64_cuda_2d = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 using i32_cuda = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 
 using f32_cuda_1d = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
@@ -76,4 +77,18 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("v"), nb::arg("tet_nodes"), nb::arg("g"), nb::arg("dadt_elm"), nb::arg("e_out"),
         nb::arg("magn_out"), nb::arg("stream"),
         "Element-centric E/magnE reconstruction; writes into caller-allocated e_out/magn_out.");
+
+    m.def(
+        "place_transforms",
+        [](f64_cuda_2d centers, f64_cuda_2d handles, f64_cuda dists, f64_cuda_2d a, f64_cuda_2d b,
+           f64_cuda_2d c, f64_cuda_2d tnorm, f64_cuda_2d out, uintptr_t stream) {
+            int n_pl = static_cast<int>(centers.shape(0));
+            int n_tri = static_cast<int>(a.shape(0));
+            launch_place(centers.data(), handles.data(), dists.data(), a.data(), b.data(), c.data(),
+                         tnorm.data(), out.data(), n_pl, n_tri,
+                         reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("centers"), nb::arg("handles"), nb::arg("dists"), nb::arg("a"), nb::arg("b"),
+        nb::arg("c"), nb::arg("tnorm"), nb::arg("out"), nb::arg("stream"),
+        "Batched closest-point scalp projection + coil frame; writes (P,16) row-major 4x4 out.");
 }

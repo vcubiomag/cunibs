@@ -47,14 +47,16 @@ class GroundedSolver:
     amgx: AMGXSolver
 
 
-def prepare_grounded_solver(a: csp.csr_matrix, ground_node: int) -> GroundedSolver:
+def prepare_grounded_solver(
+    a: csp.csr_matrix, ground_node: int, config: str = AMGX_CONFIG
+) -> GroundedSolver:
     """Remove the ground DOF and build the AMGx hierarchy."""
     n = a.shape[0]
     idx = cp.arange(n - 1, dtype=cp.int32)
     idx[ground_node:] += 1
     a_red = a[idx][:, idx].tocsr()
     a_red.sum_duplicates()
-    amgx = AMGXSolver(AMGX_CONFIG)
+    amgx = AMGXSolver(config)
     amgx.setup(
         a_red.indptr.astype(cp.int32),
         a_red.indices.astype(cp.int32),

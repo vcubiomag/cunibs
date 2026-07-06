@@ -189,11 +189,58 @@ from cunibs import FieldResult
 loaded = FieldResult.load("placement.h5")
 ```
 
+## Coil-placement optimization (ADM)
+
+`cunibs.adm` implements the Auxiliary Dipole Method for fast coil-placement
+optimization. A few one-time adjoint solves, reusing the forward AMG hierarchy,
+sample a reciprocity field on a regular grid. The target E-field of any placement
+is then a trilinear interpolation plus a dipole sum, with no further FEM solve.
+This evaluates candidate placements orders of magnitude faster than a forward
+solve per candidate, and matches a forward solve at the optimum to a relative
+error of 4e-4.
+
+```python
+from cunibs import Subject, Target, adm
+from cunibs.coil import Coil, MAGSTIM_D70
+import numpy as np
+
+subject = Subject.from_mesh("subject.msh")
+coil = Coil.load(MAGSTIM_D70)
+
+# Omit `direction` to maximize |E| (three adjoint solves), or pass one to
+# maximize a directional component.
+target = Target(position_mm=[-45.0, -5.0, 25.0], region="gray_matter")
+
+# Candidate scalp positions to search (each is projected onto the scalp).
+centers = np.array([[x, y, 80.0] for x in range(-30, 31, 5) for y in range(-30, 31, 5)])
+
+result = adm.optimize(subject.context, coil, target, centers)
+
+print(result.best_objective)     # peak |E| at the target (V/m)
+print(result.best_center_mm)     # optimal scalp position
+print(result.best_angle_rad)     # optimal in-plane rotation
+```
+
+The in-plane rotation is optimized in closed form: the target E-field is a rigid
+rotation of the coil, so each component is band-limited in the angle. It is
+sampled at `n_samples` angles, trigonometrically interpolated, and `|E(θ)|²` is
+maximized analytically.
+
+For repeated queries against a fixed target, such as uncertainty quantification
+over a distribution of placements, build the reciprocity field once and reuse it:
+
+```python
+recip = adm.build_reciprocity(subject.context, coil, target, centers)
+E = adm.evaluate(recip, coil, placements, didt=1.0e6)   # (P, D) target E-vectors
+```
+
 ## Reproducibility
 
 The solver configuration uses deterministic AMGx execution and a fixed
 right-hand-side reduction order. Floating-point results can still vary across
 GPU architectures, CUDA versions, compiler versions, and dependency versions.
+The ADM adjoint solves use a tighter tolerance (`1e-9`) than the forward solve
+because their near-point-source right-hand side is more sensitive.
 
 ## Citation
 
@@ -216,6 +263,10 @@ mesh, coil model, and placement parameters used in the analysis.
   [Three-dimensional head model simulation of transcranial magnetic
   stimulation](https://doi.org/10.1109/TBME.2004.827925). *IEEE Transactions
   on Biomedical Engineering*, 51(9), 1586-1598.
+- Gomez, L. J., Dannhauer, M., and Peterchev, A. V. (2021). [Fast computational
+  optimization of TMS coil placement for individualized electric field
+  targeting](https://doi.org/10.1016/j.neuroimage.2020.117696). *NeuroImage*,
+  228, 117696. (Auxiliary Dipole Method.)
 - Opitz, A., Paulus, W., Will, S., Antunes, A., and Thielscher, A. (2015).
   [Determinants of the electric field during transcranial direct current
   stimulation](https://doi.org/10.1016/j.neuroimage.2015.01.033).

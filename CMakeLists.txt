@@ -68,6 +68,7 @@ nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/dadt.cu
   src/cunibs/solver/rhs.cu
   src/cunibs/solver/reconstruct.cu
+  src/cunibs/solver/place.cu
 )
 target_link_libraries(_solver_ext PRIVATE CUDA::cudart AMGX::amgxsh)
 
