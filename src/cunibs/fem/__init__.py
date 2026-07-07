@@ -14,6 +14,7 @@ from cunibs.fem.placement import (
     MU0_OVER_4PI,
     coil_dadt_at_nodes,
     compute_coil_transform,
+    compute_coil_transforms,
 )
 from cunibs.fem.solve import (
     AMGX_CONFIG,
@@ -44,6 +45,7 @@ __all__ = [
     "gradient_operator",
     "coil_dadt_at_nodes",
     "compute_coil_transform",
+    "compute_coil_transforms",
     "GroundedSolver",
     "PlacementResult",
     "SolverContext",

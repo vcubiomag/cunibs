@@ -16,7 +16,6 @@ import cupy as cp
 import numpy.typing as npt
 
 from cunibs.adm.grid import Grid, build_grid
-from cunibs.adm.place import compute_coil_transforms
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 from cunibs.coil import Coil
 from cunibs.fem.assembly import (
@@ -25,7 +24,7 @@ from cunibs.fem.assembly import (
     conductivity_per_tet,
     gradient_operator,
 )
-from cunibs.fem.placement import MU0_OVER_4PI
+from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.fem.solve import (
     AMGX_CONFIG,
     GroundedSolver,

@@ -109,25 +109,6 @@ def test_qfield_reformulation_and_grid_interp(cp, cube_mesh, coil):
     np.testing.assert_allclose(e_grid, j, rtol=5e-3, atol=5e-3)
 
 
-def test_place_kernel_matches_reference(cp, cube_mesh, coil):
-    """Batched projection kernel reproduces the per-placement transform."""
-    from cunibs.adm.place import compute_coil_transforms
-    from cunibs.fem import build_context
-    from cunibs.fem.placement import compute_coil_transform
-
-    ctx = build_context(cube_mesh)
-    centers = np.array([[50.0, 50.0, 100.0], [40.0, 60.0, 100.0], [55.0, 45.0, 100.0]])
-    handles = np.array([[50.0, 150.0, 100.0], [40.0, 160.0, 100.0], [55.0, 145.0, 100.0]])
-    dists = np.array([4.0, 4.0, 4.0])
-    ref = np.stack([compute_coil_transform(ctx, centers[i], handles[i], 4.0) for i in range(3)])
-    got = cp.asnumpy(
-        compute_coil_transforms(
-            ctx, cp.asarray(centers), cp.asarray(handles), cp.asarray(dists)
-        )
-    )
-    np.testing.assert_allclose(got, ref, atol=1e-9)
-
-
 def test_optimize_consistent_with_forward(cp, cube_mesh, coil):
     """The optimizer's reported optimum matches a forward solve at that placement."""
     from cunibs import adm

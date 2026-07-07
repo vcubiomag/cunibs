@@ -15,10 +15,11 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs.adm.evaluate import _interp_reduce
-from cunibs.adm.place import compute_coil_transforms, place_coil_dipoles_batch
+from cunibs.adm.place import place_coil_dipoles_batch
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.adm.target import Target
 from cunibs.coil import Coil
+from cunibs.fem.placement import compute_coil_transforms
 from cunibs.fem.solve import SolverContext
 
 
