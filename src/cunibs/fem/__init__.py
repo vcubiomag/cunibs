@@ -17,11 +17,15 @@ from cunibs.fem.placement import (
 )
 from cunibs.fem.solve import (
     AMGX_CONFIG,
+    UQ_AMGX_CONFIG,
     GroundedSolver,
     PlacementResult,
     SolverContext,
     build_context,
+    ground_node_of,
+    grounded_index,
     prepare_grounded_solver,
+    reduce_matrix,
     solve_grounded,
     solve_placement,
 )
@@ -33,6 +37,7 @@ __all__ = [
     "TISSUE_CONDUCTIVITY",
     "MU0_OVER_4PI",
     "AMGX_CONFIG",
+    "UQ_AMGX_CONFIG",
     "assemble_stiffness",
     "build_node2corner",
     "conductivity_per_tet",
@@ -43,6 +48,9 @@ __all__ = [
     "PlacementResult",
     "SolverContext",
     "build_context",
+    "ground_node_of",
+    "grounded_index",
+    "reduce_matrix",
     "prepare_grounded_solver",
     "solve_grounded",
     "solve_placement",

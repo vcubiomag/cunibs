@@ -33,6 +33,15 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"),
             "Upload the reduced CSR (device pointers) and build the AMG hierarchy once.")
         .def(
+            "update_coefficients",
+            [](AMGXSolver& self, f64_cuda values) {
+                self.update_coefficients(static_cast<int>(values.shape(0)), values.data());
+            },
+            nb::arg("values"),
+            "Replace matrix values (device pointer) keeping the sparsity pattern; no re-analysis.")
+        .def("resetup", &AMGXSolver::resetup,
+             "Rebuild the numeric AMG hierarchy for the current values (reuses structure per config).")
+        .def(
             "solve",
             [](AMGXSolver& self, f64_cuda b, f64_cuda x) {
                 int n = static_cast<int>(b.shape(0));

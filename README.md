@@ -9,7 +9,8 @@ state and the AMG hierarchy remain on the GPU and are reused across coil
 placements.
 
 The package is intended for computational research. It currently supports
-isotropic conductivity models and NVIDIA GPUs.
+isotropic conductivity models, conductivity uncertainty quantification, and
+NVIDIA GPUs.
 
 ## Numerical method
 
@@ -187,6 +188,72 @@ result.save("placement.h5")
 from cunibs import FieldResult
 
 loaded = FieldResult.load("placement.h5")
+```
+
+## Conductivity uncertainty quantification
+
+`ConductivityUQConfig` runs a Monte Carlo analysis over tissue conductivities for
+one coil placement or a sequence of placements. Each sampled conductivity vector
+is solved with the same finite-element model, and `ConductivityUQResult` reports
+per-tetrahedron moments of the electric-field magnitude.
+
+For tissue tag $t$, the default model treats the conductivity as an independent
+random variable with nominal value $\sigma_{0,t}$ and coefficient of variation
+$c_t$. The default distribution is lognormal:
+
+$$\sigma_t^{(k)} = \sigma_{0,t}\exp\left(s_t z_k - \frac{s_t^2}{2}\right), \qquad
+s_t = \sqrt{\log(1 + c_t^2)}, \qquad z_k \sim \mathcal{N}(0,1)$$
+
+This parameterization keeps conductivities positive and preserves the nominal
+mean, $\mathbb{E}[\sigma_t] = \sigma_{0,t}$. The result stores the sampled
+conductivities and the Monte Carlo estimates
+
+$$\bar{E}_e = \frac{1}{N}\sum_{k=1}^{N} |E_e^{(k)}|, \qquad
+s_e = \sqrt{\frac{1}{N-1}\sum_{k=1}^{N}(|E_e^{(k)}|-\bar{E}_e)^2}, \qquad
+\mathrm{CoV}_e = \frac{s_e}{\bar{E}_e}$$
+
+where $e$ indexes tetrahedra. The finite-element matrix and right-hand side are
+linear in the tissue conductivities, so cuNIBS precomputes per-tissue stiffness
+and right-hand-side components once and reuses the matrix sparsity pattern across
+samples.
+
+```python
+from cunibs import ConductivityUQConfig, Placement, Subject
+from cunibs.coil import Coil, MAGSTIM_D70
+
+subject = Subject.from_mesh("subject.msh")
+coil = Coil.load(MAGSTIM_D70)
+
+placement = Placement(
+    center_mm=[0.0, 20.0, 80.0],
+    handle_mm=[0.0, 70.0, 80.0],
+    distance_mm=4.0,
+)
+
+config = ConductivityUQConfig(
+    n_samples=500,
+    tissue_cov={2: 0.15, 3: 0.05, 7: 0.35, 8: 0.35},
+    seed=1,
+)
+
+uq_result = subject.simulate(coil, placement, didt=1.0e6, conductivity_uq=config)
+
+print(uq_result.peak_mean_magnE())
+print(uq_result.peak_cov())
+```
+
+`mean_magnE`, `std_magnE`, and `cov_magnE` use the same tetrahedron ordering as
+`FieldResult.magnE`. `peak_mean_magnE` and `peak_cov` accept the same region
+names as the deterministic metric API.
+
+Save a conductivity-UQ result to HDF5:
+
+```python
+uq_result.save("conductivity_uq.h5")
+
+from cunibs import ConductivityUQResult
+
+loaded = ConductivityUQResult.load("conductivity_uq.h5")
 ```
 
 ## Coil-placement optimization (ADM)

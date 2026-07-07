@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence, TypeAlias, overload
+from typing import TYPE_CHECKING, Sequence, TypeAlias, overload
 
 import cupy as cp
 import h5py
@@ -15,6 +15,9 @@ from cunibs import metrics
 from cunibs.coil import Coil
 from cunibs.fem import SolverContext, build_context, solve_placement
 from cunibs.mesh import HeadMesh, load_mesh
+
+if TYPE_CHECKING:
+    from cunibs.uq import ConductivityUQConfig, ConductivityUQPrecompute, ConductivityUQResult
 
 _FORMAT_VERSION = 1
 
@@ -58,6 +61,7 @@ class Subject:
         self._mesh = mesh
         self._ctx: SolverContext | None = None
         self._barycenters_mm: cp.ndarray | None = None
+        self._conductivity_uq_pre: dict[tuple[int, ...], "ConductivityUQPrecompute"] = {}
 
     @classmethod
     def from_mesh(cls, mesh_file: str | Path) -> "Subject":
@@ -73,27 +77,86 @@ class Subject:
             self._ctx = build_context(self._mesh)
         return self._ctx
 
+    def _conductivity_uq_precompute(
+        self, config: "ConductivityUQConfig"
+    ) -> "ConductivityUQPrecompute":
+        """Build (and cache) the per-tissue stiffness components for a UQ configuration.
+
+        Cached by the set of perturbed tissues so repeated UQ runs on the same subject reuse the
+        components and the nominal-σ AMG hierarchy.
+        """
+        from cunibs.uq import build_conductivity_uq_precompute
+
+        ctx = self.context
+        if config.perturbed_tags is not None:
+            tags = tuple(sorted(int(t) for t in config.perturbed_tags))
+        else:
+            tags = tuple(int(t) for t in cp.asnumpy(cp.unique(ctx.tet_tags)))
+        if tags not in self._conductivity_uq_pre:
+            self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
+        return self._conductivity_uq_pre[tags]
+
     @overload
     def simulate(
-        self, coil: Coil, placements: Placement, didt: float = ...
+        self,
+        coil: Coil,
+        placements: Placement,
+        didt: float = ...,
+        conductivity_uq: None = ...,
     ) -> "FieldResult": ...
     @overload
     def simulate(
-        self, coil: Coil, placements: Sequence[Placement], didt: float = ...
+        self,
+        coil: Coil,
+        placements: Sequence[Placement],
+        didt: float = ...,
+        conductivity_uq: None = ...,
     ) -> list["FieldResult"]: ...
+    @overload
+    def simulate(
+        self,
+        coil: Coil,
+        placements: Placement,
+        didt: float = ...,
+        conductivity_uq: "ConductivityUQConfig" = ...,
+    ) -> "ConductivityUQResult": ...
+    @overload
+    def simulate(
+        self,
+        coil: Coil,
+        placements: Sequence[Placement],
+        didt: float = ...,
+        conductivity_uq: "ConductivityUQConfig" = ...,
+    ) -> list["ConductivityUQResult"]: ...
 
     def simulate(
         self,
         coil: Coil,
         placements: Placement | Sequence[Placement],
         didt: float = 1e6,
-    ) -> "FieldResult | list[FieldResult]":
-        """Solve one placement or a sequence of placements."""
+        conductivity_uq: "ConductivityUQConfig | None" = None,
+    ) -> "FieldResult | list[FieldResult] | ConductivityUQResult | list[ConductivityUQResult]":
+        """Solve one placement or a sequence of placements.
+
+        With ``conductivity_uq`` set, run a conductivity Monte Carlo per placement and return
+        :class:`~cunibs.uq.ConductivityUQResult` moments instead of a deterministic
+        :class:`FieldResult`.
+        """
         single = isinstance(placements, Placement)
         sites = [placements] if single else list(placements)
         ctx = self.context
         if self._barycenters_mm is None:
             self._barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
+
+        if conductivity_uq is not None:
+            from cunibs.uq import run_conductivity_uq
+
+            pre = self._conductivity_uq_precompute(conductivity_uq)
+            uq_results = [
+                run_conductivity_uq(ctx, pre, coil, site, conductivity_uq, didt)
+                for site in sites
+            ]
+            return uq_results[0] if single else uq_results
 
         results: list[FieldResult] = []
         for site in sites:
@@ -148,7 +211,9 @@ class FieldResult:
     def peak_magnE(self, region: metrics.Region = "gray_matter") -> float:
         return metrics.peak_magnitude(self.magnE, self._mask(region))
 
-    def peak_location_mm(self, region: metrics.Region = "gray_matter") -> npt.NDArray[np.float64]:
+    def peak_location_mm(
+        self, region: metrics.Region = "gray_matter"
+    ) -> npt.NDArray[np.float64]:
         return metrics.peak_location_mm(self.magnE, self.barycenters_mm, self._mask(region))
 
     def focality(self, frac: float = 0.5, region: metrics.Region = "gray_matter") -> float:

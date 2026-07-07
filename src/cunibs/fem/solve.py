@@ -33,6 +33,29 @@ AMGX_CONFIG = (
     "amg:cycle=V, amg:coarse_solver=DENSE_LU_SOLVER, amg:min_coarse_rows=32, amg:max_levels=50"
 )
 
+# Reuse the aggregation graph across resetups when only the matrix values change (e.g. a
+# conductivity Monte Carlo). resetup then rebuilds only the Galerkin operators and smoothers.
+UQ_AMGX_CONFIG = AMGX_CONFIG + ", structure_reuse_levels=-1"
+
+
+def ground_node_of(nodes_mm: cp.ndarray) -> int:
+    """The grounded DOF: the lowest node in z (shared by forward and adjoint systems)."""
+    return int(cp.argmin(nodes_mm[:, 2]))
+
+
+def grounded_index(n: int, ground_node: int) -> cp.ndarray:
+    """Row/column index that drops ``ground_node`` from an ``n``-DOF system."""
+    idx = cp.arange(n - 1, dtype=cp.int32)
+    idx[ground_node:] += 1
+    return idx
+
+
+def reduce_matrix(a: csp.csr_matrix, idx: cp.ndarray) -> csp.csr_matrix:
+    """Remove the grounded DOF and canonicalise the reduced CSR."""
+    a_red = a[idx][:, idx].tocsr()
+    a_red.sum_duplicates()
+    return a_red
+
 
 @dataclass
 class GroundedSolver:
@@ -52,10 +75,8 @@ def prepare_grounded_solver(
 ) -> GroundedSolver:
     """Remove the ground DOF and build the AMGx hierarchy."""
     n = a.shape[0]
-    idx = cp.arange(n - 1, dtype=cp.int32)
-    idx[ground_node:] += 1
-    a_red = a[idx][:, idx].tocsr()
-    a_red.sum_duplicates()
+    idx = grounded_index(n, ground_node)
+    a_red = reduce_matrix(a, idx)
     amgx = AMGXSolver(config)
     amgx.setup(
         a_red.indptr.astype(cp.int32),
@@ -165,7 +186,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     g, vols = gradient_operator(nodes_mm * 1e-3, tet_nodes)
     cond = conductivity_per_tet(tet_tags)
     stiffness = assemble_stiffness(g, vols, cond, mesh.n_nodes, tet_nodes)
-    ground_node = int(cp.argmin(nodes_mm[:, 2]))
+    ground_node = ground_node_of(nodes_mm)
     solver = prepare_grounded_solver(stiffness, ground_node)
     del stiffness
 

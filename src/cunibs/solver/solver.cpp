@@ -74,9 +74,19 @@ AMGXSolver::~AMGXSolver() {
 
 void AMGXSolver::setup(int n, int nnz, const int* row_ptr, const int* col_idx,
                        const double* values) {
+    n_ = n;
     check(AMGX_matrix_upload_all(A_, n, nnz, 1, 1, row_ptr, col_idx, values, nullptr),
           "matrix_upload_all");
     check(AMGX_solver_setup(solver_, A_), "solver_setup");
+}
+
+void AMGXSolver::update_coefficients(int nnz, const double* values) {
+    check(AMGX_matrix_replace_coefficients(A_, n_, nnz, values, nullptr),
+          "matrix_replace_coefficients");
+}
+
+void AMGXSolver::resetup() {
+    check(AMGX_solver_resetup(solver_, A_), "solver_resetup");
 }
 
 void AMGXSolver::solve(int n, const double* b, double* x) {
