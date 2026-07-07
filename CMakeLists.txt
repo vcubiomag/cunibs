@@ -51,7 +51,7 @@ set(AMGX_ENABLE_COMPLEX OFF CACHE BOOL "" FORCE)
 set(AMGX_ENABLE_MIXED_PRECISION OFF CACHE BOOL "" FORCE)
 set(AMGX_MINIMAL_SOLVERS ON CACHE BOOL "" FORCE)
 
-add_subdirectory(external/AMGX) 
+add_subdirectory(external/AMGX)
 
 target_compile_options(amgx_libs PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-deprecated-declarations>
