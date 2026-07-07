@@ -10,6 +10,8 @@ import numpy.typing as npt
 
 _ELEM_TYPE_TRIANGLE = 2
 _ELEM_TYPE_TET = 4
+_NODE_DTYPE = np.dtype([("id", "<i4"), ("xyz", "<f8", (3,))])
+_ELEMENT_BYTES = {1: 16, 2: 24, 3: 28, 4: 28, 5: 44}
 
 SKIN_SURFACE_TAG = 1005
 
@@ -37,6 +39,9 @@ SURFACE_KEY_TO_LABEL: dict[int, str] = {
     1010: "muscle",
     1099: "internal_air",
 }
+
+_VOLUME_KEYS = np.fromiter(VOLUME_KEY_TO_LABEL, dtype=np.int32)
+_SURFACE_KEYS = np.fromiter(SURFACE_KEY_TO_LABEL, dtype=np.int32)
 
 
 def parse_msh_binary(
@@ -68,10 +73,10 @@ def parse_msh_binary(
 
         assert f.readline().decode().strip() == "$Nodes"
         num_nodes = int(f.readline().decode().strip())
-        node_u8 = np.frombuffer(f.read(num_nodes * 28), dtype=np.uint8).reshape(num_nodes, 28)
-        nodes_xyz = np.frombuffer(
-            np.ascontiguousarray(node_u8[:, 4:]).tobytes(), dtype="<f8"
-        ).reshape(num_nodes, 3)
+        node_records = np.frombuffer(
+            f.read(num_nodes * _NODE_DTYPE.itemsize), dtype=_NODE_DTYPE
+        )
+        nodes_xyz = node_records["xyz"]
         assert f.readline().decode().strip() == "$EndNodes"
 
         assert f.readline().decode().strip() == "$Elements"
@@ -88,14 +93,14 @@ def parse_msh_binary(
             assert num_tags == 2
             if elem_type == _ELEM_TYPE_TRIANGLE:
                 block = np.frombuffer(f.read(count * 24), dtype="<i4").reshape(count, 6)
-                tri_tags_list.append(block[:, 1].copy())
-                tri_nodes_list.append(block[:, 3:].copy())
+                tri_tags_list.append(block[:, 1])
+                tri_nodes_list.append(block[:, 3:])
             elif elem_type == _ELEM_TYPE_TET:
                 block = np.frombuffer(f.read(count * 28), dtype="<i4").reshape(count, 7)
-                tet_tags_raw = block[:, 1].copy()
-                tet_nodes_raw = block[:, 3:].copy()
+                tet_tags_raw = block[:, 1]
+                tet_nodes_raw = block[:, 3:]
             else:
-                bytes_per = {1: 16, 2: 24, 3: 28, 4: 28, 5: 44}.get(elem_type, 0)
+                bytes_per = _ELEMENT_BYTES.get(elem_type, 0)
                 if bytes_per:
                     f.read(count * bytes_per)
             consumed += count
@@ -104,13 +109,18 @@ def parse_msh_binary(
 
     assert tet_nodes_raw is not None and tet_tags_raw is not None
 
-    valid_tet = np.isin(tet_tags_raw, list(VOLUME_KEY_TO_LABEL.keys()))
-    tet_tags = tet_tags_raw[valid_tet].astype(np.int32)
+    valid_tet = np.isin(tet_tags_raw, _VOLUME_KEYS)
+    tet_tags = tet_tags_raw[valid_tet]
     tet_nodes_filt = tet_nodes_raw[valid_tet]
 
-    unique_ids, inverse = np.unique(tet_nodes_filt.ravel(), return_inverse=True)
-    nodes_out = nodes_xyz[unique_ids - 1]
-    tet_nodes_out = inverse.reshape(-1, 4).astype(np.int32)
+    used_nodes = np.zeros(num_nodes + 1, dtype=bool)
+    used_nodes[tet_nodes_filt.ravel()] = True
+    unique_ids = np.flatnonzero(used_nodes)
+    node_index = np.full(num_nodes + 1, -1, dtype=np.int32)
+    node_index[unique_ids] = np.arange(unique_ids.size, dtype=np.int32)
+
+    nodes_out = np.ascontiguousarray(nodes_xyz[unique_ids - 1])
+    tet_nodes_out = node_index[tet_nodes_filt]
 
     if tri_nodes_list:
         tri_nodes_raw = np.concatenate(tri_nodes_list, axis=0)
@@ -119,13 +129,12 @@ def parse_msh_binary(
         tri_nodes_raw = np.empty((0, 3), dtype=np.int32)
         tri_tags_raw_all = np.empty((0,), dtype=np.int32)
 
-    valid_surf = np.isin(tri_tags_raw_all, list(SURFACE_KEY_TO_LABEL.keys()))
-    surf_tags = tri_tags_raw_all[valid_surf].astype(np.int32)
+    valid_surf = np.isin(tri_tags_raw_all, _SURFACE_KEYS)
+    surf_tags = tri_tags_raw_all[valid_surf]
     surf_nodes_filt = tri_nodes_raw[valid_surf]
 
-    surf_tris_out = (
-        np.searchsorted(unique_ids, surf_nodes_filt.ravel()).reshape(-1, 3).astype(np.int32)
-    )
+    surf_tris_out = node_index[surf_nodes_filt]
+    assert np.all(surf_tris_out >= 0)
 
     return nodes_out, tet_nodes_out, tet_tags, surf_tris_out, surf_tags
 
