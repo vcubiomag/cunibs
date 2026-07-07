@@ -18,7 +18,7 @@ def test_region_mask():
     )
     assert metrics.region_mask(TAGS, "all").all()
     with pytest.raises(ValueError):
-        metrics.region_mask(TAGS, "bone")
+        metrics.region_mask(TAGS, "bone")  # ty:ignore[invalid-argument-type]
 
 
 def test_peak_excludes_other_regions():
