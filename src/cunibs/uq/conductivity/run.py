@@ -9,7 +9,12 @@ from cunibs.fem.assembly import conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.fem.solve import SolverContext
 from cunibs.simulation import Placement
-from cunibs.solver import dadt_node_to_element, reconstruct_e, rhs_assemble
+from cunibs.solver import (
+    accumulate_moments,
+    dadt_node_to_element,
+    reconstruct_e,
+    rhs_assemble,
+)
 from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
 from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductivities
 from cunibs.uq.conductivity.result import ConductivityUQResult
@@ -125,9 +130,7 @@ def run_conductivity_uq(
 
         v[pre.idx] = x_red
         reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
-        m64 = magn.astype(cp.float64)
-        sum_e += m64
-        sumsq_e += m64 * m64
+        accumulate_moments(magn, sum_e, sumsq_e, stream)
 
     n = config.n_samples
     mean = sum_e / n

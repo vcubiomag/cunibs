@@ -19,7 +19,6 @@ from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 from cunibs.coil import Coil
 from cunibs.fem.assembly import (
-    GRADIENT_TILE_TETS,
     assemble_stiffness,
     conductivity_per_tet,
     gradient_operator,
@@ -32,7 +31,7 @@ from cunibs.fem.solve import (
     prepare_grounded_solver,
     solve_grounded,
 )
-from cunibs.solver import dadt_nbody
+from cunibs.solver import dadt_nbody, element_weight, node_scatter3
 
 # The adjoint RHS is a near-point source (Green's-function-like, singular at the target). At the
 # forward tolerance (1e-6) its residual leaves ~1% pointwise error in the functional, well above the
@@ -59,18 +58,6 @@ def build_adjoint_solver(
     return solver
 
 
-def _element_gradient(values: cp.ndarray, tet_nodes: cp.ndarray, g: cp.ndarray) -> cp.ndarray:
-    """Per-element ``Σ_i values[node_i]·g[e,i]`` in float64 (``g`` may be float32)."""
-    n_tet = int(tet_nodes.shape[0])
-    out = cp.empty((n_tet, 3), dtype=cp.float64)
-    for lo in range(0, n_tet, GRADIENT_TILE_TETS):
-        hi = min(lo + GRADIENT_TILE_TETS, n_tet)
-        vt = values[tet_nodes[lo:hi]]  # (t,4) float64
-        gt = g[lo:hi].astype(cp.float64)  # (t,4,3)
-        out[lo:hi] = cp.einsum("ti,tik->tk", vt, gt)
-    return out
-
-
 def _adjoint_rhs(
     ctx: SolverContext, elem_idx: cp.ndarray, weights: cp.ndarray, direction: cp.ndarray
 ) -> cp.ndarray:
@@ -92,17 +79,23 @@ def _node_weights(
     direction: cp.ndarray,
 ) -> cp.ndarray:
     """Nodal reciprocity weights ``W_n`` for one adjoint solution ``λ``."""
-    grad = _element_gradient(lam, ctx.tet_nodes, ctx.g)  # (n_tet,3), = G_e λ
+    stream = cp.cuda.get_current_stream().ptr
     # w_e = vol_e·σ_e·(G_e λ);  ctx.neg_vc = -vol_e·σ_e.
-    w_e = (-ctx.neg_vc.astype(cp.float64))[:, None] * grad
+    w_e = cp.empty((int(ctx.tet_nodes.shape[0]), 3), dtype=cp.float64)
+    element_weight(
+        cp.ascontiguousarray(lam, dtype=cp.float64),
+        ctx.tet_nodes,
+        ctx.g,
+        ctx.neg_vc,
+        w_e,
+        stream,
+    )
     # Fold the direct -ê·dA/dt_{ROI} term into the ROI element weights.
     w_e[elem_idx] -= weights[:, None] * direction[None, :]
 
-    node_w = cp.zeros((ctx.n_nodes, 3), dtype=cp.float64)
-    rows = ctx.tet_nodes.ravel()
-    for comp in range(3):
-        cp.add.at(node_w[:, comp], rows, cp.repeat(w_e[:, comp], 4))
-    node_w *= 0.25
+    # W_n = ¼ Σ_{e∋n} w_e, the transpose of the node2corner reduction.
+    node_w = cp.empty((ctx.n_nodes, 3), dtype=cp.float64)
+    node_scatter3(w_e, ctx.node2corner_ptr, ctx.node2corner_idx, node_w, stream)
     return node_w
 
 

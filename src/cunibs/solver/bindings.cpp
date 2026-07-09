@@ -199,6 +199,38 @@ NB_MODULE(_solver_ext, m) {
         "Element-centric E/magnE reconstruction; writes into caller-allocated e_out/magn_out.");
 
     m.def(
+        "element_weight",
+        [](f64_cuda values, i32_cuda_2d tet_nodes, f32_cuda_3d g, f32_cuda_1d neg_vc,
+           f64_cuda_2d w_e, uintptr_t stream) {
+            int n_tet = static_cast<int>(tet_nodes.shape(0));
+            launch_element_weight(values.data(), tet_nodes.data(), g.data(), neg_vc.data(),
+                                  w_e.data(), n_tet, reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("values"), nb::arg("tet_nodes"), nb::arg("g"), nb::arg("neg_vc"), nb::arg("w_e"),
+        nb::arg("stream"),
+        "Per-element reciprocity weight w_e = vol*sigma*(G_e values); into caller-allocated w_e.");
+
+    m.def(
+        "node_scatter3",
+        [](f64_cuda_2d w_e, i32_cuda ptr, i32_cuda idx, f64_cuda_2d node_w, uintptr_t stream) {
+            int n_nodes = static_cast<int>(ptr.shape(0)) - 1;
+            launch_node_scatter3(w_e.data(), ptr.data(), idx.data(), node_w.data(), n_nodes,
+                                 reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("w_e"), nb::arg("ptr"), nb::arg("idx"), nb::arg("node_w"), nb::arg("stream"),
+        "Node-centric 3-vector corner gather with 1/4 weight; into caller-allocated node_w.");
+
+    m.def(
+        "accumulate_moments",
+        [](f32_cuda_1d magn, f64_cuda sum_e, f64_cuda sumsq_e, uintptr_t stream) {
+            int n = static_cast<int>(magn.shape(0));
+            launch_accumulate_moments(magn.data(), sum_e.data(), sumsq_e.data(), n,
+                                      reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("magn"), nb::arg("sum_e"), nb::arg("sumsq_e"), nb::arg("stream"),
+        "Fused streaming |E| moments: sum_e += magn; sumsq_e += magn^2 (in place).");
+
+    m.def(
         "place_transforms",
         [](f64_cuda_2d centers, f64_cuda_2d handles, f64_cuda dists, f64_cuda_2d a, f64_cuda_2d b,
            f64_cuda_2d c, f64_cuda_2d tnorm, f64_cuda_2d out, uintptr_t stream) {
