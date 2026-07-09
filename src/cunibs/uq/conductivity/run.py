@@ -80,10 +80,11 @@ def run_conductivity_uq(
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
     b_base, b_tissue = _placement_rhs(ctx, pre, dadt_elm)
 
+    # The double AMGx solver stays frozen at nominal σ as the mixed-solve fallback.
     solver = pre.solver
-    # Freeze the preconditioner at nominal σ (the ensemble centre) for the whole run.
-    solver.update_coefficients(pre.nominal_data)
-    solver.resetup()
+    pcg = pre.pcg
+    float_precond = pre.float_preconditioner
+    nominal_f32 = cp.ascontiguousarray(pre.nominal_data.astype(cp.float32))
     policy = config.preconditioner_refresh
     periodic = policy if isinstance(policy, int) and not isinstance(policy, bool) else 0
 
@@ -99,22 +100,28 @@ def run_conductivity_uq(
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
     for k in range(config.n_samples):
-        solver.update_coefficients(cp.ascontiguousarray(pre.combine(sigmas[k])))
+        sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
+        pcg.update_values(sample_data)
         if policy == "always" or (periodic and k > 0 and k % periodic == 0):
-            solver.resetup()
+            float_precond.setup(pre.indptr, pre.indices, sample_data.astype(cp.float32))
 
         b_red[:] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        try:
-            solver.solve(b_red, x_red)
-        except RuntimeError:
+        _, rel = pcg.solve_mixed(float_precond, b_red, x_red, pre.tolerance, pre.max_iters)
+        if rel > pre.tolerance:
             if policy == "never":
-                raise
+                raise RuntimeError(
+                    f"UQ mixed solve did not converge (rel={rel:.2e}) with a frozen "
+                    "preconditioner; use preconditioner_refresh='adaptive'."
+                )
             # Rare extreme draw: match the preconditioner to this sample, solve, then restore
             # the nominal-frozen hierarchy for the remaining (i.i.d.) samples.
+            solver.update_coefficients(sample_data)
             solver.resetup()
             solver.solve(b_red, x_red)
             solver.update_coefficients(pre.nominal_data)
             solver.resetup()
+            if policy == "always" or periodic:
+                float_precond.setup(pre.indptr, pre.indices, nominal_f32)
 
         v[pre.idx] = x_red
         reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)

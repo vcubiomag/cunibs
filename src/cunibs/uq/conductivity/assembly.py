@@ -19,13 +19,15 @@ from cunibs.fem.assembly import (
     gradient_operator,
 )
 from cunibs.fem.solve import (
+    AMGX_PRECONDITIONER_CONFIG,
     UQ_AMGX_CONFIG,
     SolverContext,
+    _amgx_config_value,
     ground_node_of,
     grounded_index,
     reduce_matrix,
 )
-from cunibs.solver import AMGXSolver
+from cunibs.solver import AMGXFloatSolver, AMGXSolver, PcgAmgSolver
 
 
 @dataclass
@@ -39,7 +41,11 @@ class ConductivityUQPrecompute:
     indices: cp.ndarray
     base_data: cp.ndarray  # (nnz,) f64 — non-perturbed tissues at nominal σ
     tissue_data: cp.ndarray  # (n_perturbed, nnz) f64 — per-tissue unit-σ contribution
-    solver: AMGXSolver  # set up at nominal σ with structure_reuse enabled
+    solver: AMGXSolver  # nominal σ, structure_reuse; mixed-solve fallback
+    float_preconditioner: AMGXFloatSolver  # fp32 AMG V-cycle frozen at nominal σ
+    pcg: PcgAmgSolver  # fp64 outer PCG; matrix values swapped per sample
+    tolerance: float
+    max_iters: int
     nominal_sigma: cp.ndarray  # (n_perturbed,) f64
     nominal_data: (
         cp.ndarray
@@ -103,18 +109,32 @@ def build_conductivity_uq_precompute(
         raise RuntimeError(f"UQ stiffness decomposition mismatch (rel={rel:.2e})")
 
     nominal_data = cp.ascontiguousarray(recon)
+    row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
+    col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
     solver = AMGXSolver(UQ_AMGX_CONFIG)
-    solver.setup(k_ref.indptr.astype(cp.int32), k_ref.indices.astype(cp.int32), nominal_data)
+    solver.setup(row_ptr, col_idx, nominal_data)
+
+    float_preconditioner = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
+    float_preconditioner.setup(
+        row_ptr, col_idx, cp.ascontiguousarray(nominal_data.astype(cp.float32))
+    )
+    pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data)
+    tolerance = float(_amgx_config_value(UQ_AMGX_CONFIG, "tolerance", "1e-6"))
+    max_iters = int(_amgx_config_value(UQ_AMGX_CONFIG, "max_iters", "2000"))
 
     return ConductivityUQPrecompute(
         perturbed_tags=perturbed_tags,
         idx=idx,
         n_nodes=ctx.n_nodes,
-        indptr=k_ref.indptr,
-        indices=k_ref.indices,
+        indptr=row_ptr,
+        indices=col_idx,
         base_data=base_data,
         tissue_data=tissue_data,
         solver=solver,
+        float_preconditioner=float_preconditioner,
+        pcg=pcg,
+        tolerance=tolerance,
+        max_iters=max_iters,
         nominal_sigma=nominal_sigma,
         nominal_data=nominal_data,
     )
