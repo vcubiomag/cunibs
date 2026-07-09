@@ -48,7 +48,7 @@ UQ_AMGX_CONFIG = AMGX_CONFIG + ", structure_reuse_levels=-1"
 
 AMGX_PRECONDITIONER_CONFIG = (
     "config_version=2, determinism_flag=1, solver=AMG, max_iters=1, "
-    "monitor_residual=0, algorithm=AGGREGATION, selector=SIZE_2, "
+    "monitor_residual=0, algorithm=AGGREGATION, selector=SIZE_4, "
     "smoother=JACOBI_L1, presweeps=1, postsweeps=1, cycle=V, "
     "coarse_solver=DENSE_LU_SOLVER, min_coarse_rows=32, max_levels=50"
 )
