@@ -45,13 +45,16 @@ set(AMGX_BUILD_STATIC OFF CACHE BOOL "" FORCE)
 set(AMGX_BUILD_SHARED ON  CACHE BOOL "" FORCE)
 set(AMGX_INSTALL OFF CACHE BOOL "" FORCE)
 set(CMAKE_NO_MPI ON CACHE BOOL "" FORCE)
-set(AMGX_BUILD_DEVICE_MODE AMGX_mode_dDDI CACHE STRING "" FORCE)
-set(AMGX_BUILD_HOST_MODE AMGX_mode_hDDI CACHE STRING "" FORCE)
 set(AMGX_ENABLE_COMPLEX OFF CACHE BOOL "" FORCE)
-set(AMGX_ENABLE_MIXED_PRECISION OFF CACHE BOOL "" FORCE)
+set(AMGX_ENABLE_MIXED_PRECISION ON CACHE BOOL "" FORCE)
 set(AMGX_MINIMAL_SOLVERS ON CACHE BOOL "" FORCE)
 
 add_subdirectory(external/AMGX)
+
+target_compile_definitions(amgx_libs PUBLIC
+  AMGX_build_device_dDDI_dFFI
+  AMGX_build_host_hDDI_hFFI
+)
 
 target_compile_options(amgx_libs PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-deprecated-declarations>
@@ -65,12 +68,17 @@ find_package(nanobind CONFIG REQUIRED)
 nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/bindings.cpp
   src/cunibs/solver/solver.cpp
+  src/cunibs/solver/cast.cu
   src/cunibs/solver/dadt.cu
+  src/cunibs/solver/dadt_element.cu
   src/cunibs/solver/rhs.cu
   src/cunibs/solver/reconstruct.cu
   src/cunibs/solver/place.cu
 )
-target_link_libraries(_solver_ext PRIVATE CUDA::cudart AMGX::amgxsh)
+target_link_libraries(
+  _solver_ext
+  PRIVATE CUDA::cudart CUDA::cublas CUDA::cusparse AMGX::amgxsh
+)
 
 set_target_properties(_solver_ext amgxsh PROPERTIES
   INSTALL_RPATH "$ORIGIN;$ORIGIN/../../nvidia/cu13/lib"

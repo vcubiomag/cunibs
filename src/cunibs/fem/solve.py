@@ -18,7 +18,16 @@ from cunibs.fem.assembly import (
 )
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.mesh import HeadMesh
-from cunibs.solver import AMGXSolver, reconstruct_e, rhs_assemble
+from cunibs.solver import (
+    AMGXFloatSolver,
+    AMGXSolver,
+    PcgAmgSolver,
+    dadt_node_to_element,
+    reconstruct_e,
+    rhs_assemble,
+    rhs_assemble_weighted,
+    weighted_gradient,
+)
 
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
@@ -36,6 +45,22 @@ AMGX_CONFIG = (
 # Reuse the aggregation graph across resetups when only the matrix values change (e.g. a
 # conductivity Monte Carlo). resetup then rebuilds only the Galerkin operators and smoothers.
 UQ_AMGX_CONFIG = AMGX_CONFIG + ", structure_reuse_levels=-1"
+
+AMGX_PRECONDITIONER_CONFIG = (
+    "config_version=2, determinism_flag=1, solver=AMG, max_iters=1, "
+    "monitor_residual=0, algorithm=AGGREGATION, selector=SIZE_2, "
+    "smoother=JACOBI_L1, presweeps=1, postsweeps=1, cycle=V, "
+    "coarse_solver=DENSE_LU_SOLVER, min_coarse_rows=32, max_levels=50"
+)
+
+
+def _amgx_config_value(config: str, key: str, default: str) -> str:
+    prefix = f"{key}="
+    for part in config.split(","):
+        item = part.strip()
+        if item.startswith(prefix):
+            return item[len(prefix) :]
+    return default
 
 
 def ground_node_of(nodes_mm: cp.ndarray) -> int:
@@ -68,6 +93,12 @@ class GroundedSolver:
     n: int
     idx: cp.ndarray
     amgx: AMGXSolver
+    float_preconditioner: AMGXFloatSolver
+    pcg: PcgAmgSolver
+    tolerance: float
+    max_iters: int
+    last_iterations: int = 0
+    last_relative_residual: float = 0.0
 
 
 def prepare_grounded_solver(
@@ -78,19 +109,41 @@ def prepare_grounded_solver(
     idx = grounded_index(n, ground_node)
     a_red = reduce_matrix(a, idx)
     amgx = AMGXSolver(config)
+    row_ptr = cp.ascontiguousarray(a_red.indptr.astype(cp.int32))
+    col_idx = cp.ascontiguousarray(a_red.indices.astype(cp.int32))
+    values = cp.ascontiguousarray(a_red.data.astype(cp.float64))
     amgx.setup(
-        a_red.indptr.astype(cp.int32),
-        a_red.indices.astype(cp.int32),
-        a_red.data.astype(cp.float64),
+        row_ptr,
+        col_idx,
+        values,
     )
-    return GroundedSolver(n, idx, amgx)
+    float_preconditioner = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
+    float_preconditioner.setup(
+        row_ptr, col_idx, cp.ascontiguousarray(values.astype(cp.float32))
+    )
+    pcg = PcgAmgSolver(row_ptr, col_idx, values)
+    tolerance = float(_amgx_config_value(config, "tolerance", "1e-6"))
+    max_iters = int(_amgx_config_value(config, "max_iters", "2000"))
+    return GroundedSolver(n, idx, amgx, float_preconditioner, pcg, tolerance, max_iters)
 
 
 def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
     """Solve one RHS on the prepared hierarchy."""
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
     x_red = cp.empty(int(solver.idx.shape[0]), dtype=cp.float64)
-    solver.amgx.solve(b_red, x_red)
+    iters, rel = solver.pcg.solve_mixed(
+        solver.float_preconditioner,
+        b_red,
+        x_red,
+        solver.tolerance,
+        solver.max_iters,
+    )
+    solver.last_iterations = int(iters)
+    solver.last_relative_residual = float(rel)
+    if solver.last_relative_residual > solver.tolerance:
+        solver.amgx.solve(b_red, x_red)
+        solver.last_iterations = solver.amgx.iterations()
+        solver.last_relative_residual = 0.0
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x_red
     return v
@@ -98,10 +151,13 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
     """Average nodal dA/dt over each tetrahedron."""
-    dadt_elm = dadt_nodes[tet_nodes[:, 0]]
-    for vertex in range(1, 4):
-        dadt_elm += dadt_nodes[tet_nodes[:, vertex]]
-    dadt_elm *= 0.25
+    dadt_elm = cp.empty((int(tet_nodes.shape[0]), 3), dtype=cp.float32)
+    dadt_node_to_element(
+        cp.ascontiguousarray(dadt_nodes),
+        tet_nodes,
+        dadt_elm,
+        cp.cuda.get_current_stream().ptr,
+    )
     return dadt_elm
 
 
@@ -125,6 +181,31 @@ def _assemble_rhs_kernel(
         cp.cuda.get_current_stream().ptr,
     )
     return b
+
+
+def _assemble_rhs_weighted_kernel(
+    dadt_elm: cp.ndarray,
+    wg: cp.ndarray,
+    node2corner_ptr: cp.ndarray,
+    node2corner_idx: cp.ndarray,
+    n_nodes: int,
+) -> cp.ndarray:
+    b = cp.empty(n_nodes, dtype=cp.float32)
+    rhs_assemble_weighted(
+        cp.ascontiguousarray(dadt_elm),
+        wg,
+        node2corner_ptr,
+        node2corner_idx,
+        b,
+        cp.cuda.get_current_stream().ptr,
+    )
+    return b
+
+
+def _weighted_gradient_kernel(g: cp.ndarray, neg_vc: cp.ndarray) -> cp.ndarray:
+    wg = cp.empty_like(g)
+    weighted_gradient(g, neg_vc, wg, cp.cuda.get_current_stream().ptr)
+    return wg
 
 
 def _reconstruct_e_kernel(
@@ -162,6 +243,7 @@ class SolverContext:
     tet_tags: cp.ndarray
     n_nodes: int
     g: cp.ndarray
+    wg: cp.ndarray
     vols: cp.ndarray
     neg_vc: cp.ndarray
     solver: GroundedSolver
@@ -193,6 +275,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     g = cp.ascontiguousarray(g.astype(RESIDENT_G_DTYPE))
     # Negating after multiplication preserves the previous IEEE rounding order.
     neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
+    wg = _weighted_gradient_kernel(g, neg_vc)
     vols = cp.ascontiguousarray(vols.astype(cp.float32))
     del cond
     ptr, idx = build_node2corner(tet_nodes, mesh.n_nodes)
@@ -202,13 +285,14 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     skin_b = cp.ascontiguousarray(nodes_mm[skin_tris[:, 1]])
     skin_c = cp.ascontiguousarray(nodes_mm[skin_tris[:, 2]])
     skin_tri_normals = cp.asarray(mesh.skin_triangle_normals)
-    return SolverContext(
+    ctx = SolverContext(
         mesh,
         nodes_mm,
         tet_nodes,
         tet_tags,
         mesh.n_nodes,
         g,
+        wg,
         vols,
         neg_vc,
         solver,
@@ -219,6 +303,8 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         skin_c,
         skin_tri_normals,
     )
+    cp.get_default_memory_pool().free_all_blocks()
+    return ctx
 
 
 class PlacementResult(TypedDict):
@@ -245,10 +331,9 @@ def solve_placement(
     dadt_nodes = coil_dadt_at_nodes(dip_pos_m, dip_moment, transform, didt, ctx.nodes_mm)
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
 
-    b = _assemble_rhs_kernel(
+    b = _assemble_rhs_weighted_kernel(
         dadt_elm,
-        ctx.g,
-        ctx.neg_vc,
+        ctx.wg,
         ctx.node2corner_ptr,
         ctx.node2corner_idx,
         ctx.n_nodes,

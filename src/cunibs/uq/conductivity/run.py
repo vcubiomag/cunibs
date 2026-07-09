@@ -9,7 +9,7 @@ from cunibs.fem.assembly import conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.fem.solve import SolverContext
 from cunibs.simulation import Placement
-from cunibs.solver import reconstruct_e, rhs_assemble
+from cunibs.solver import dadt_node_to_element, reconstruct_e, rhs_assemble
 from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
 from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductivities
 from cunibs.uq.conductivity.result import ConductivityUQResult
@@ -17,11 +17,14 @@ from cunibs.uq.conductivity.result import ConductivityUQResult
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
     """Average nodal dA/dt over each tetrahedron (σ-independent, computed once)."""
-    dadt_elm = dadt_nodes[tet_nodes[:, 0]]
-    for vertex in range(1, 4):
-        dadt_elm += dadt_nodes[tet_nodes[:, vertex]]
-    dadt_elm *= 0.25
-    return cp.ascontiguousarray(dadt_elm)
+    dadt_elm = cp.empty((int(tet_nodes.shape[0]), 3), dtype=cp.float32)
+    dadt_node_to_element(
+        cp.ascontiguousarray(dadt_nodes),
+        tet_nodes,
+        dadt_elm,
+        cp.cuda.get_current_stream().ptr,
+    )
+    return dadt_elm
 
 
 def _placement_rhs(
