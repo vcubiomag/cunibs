@@ -16,6 +16,34 @@ from cunibs.simulation import ArrayT, Placement
 _FORMAT_VERSION = 1
 
 
+def _to_numpy_array(value: ArrayT | npt.ArrayLike) -> npt.NDArray:
+    return cp.asnumpy(value) if isinstance(value, cp.ndarray) else np.asarray(value)
+
+
+@dataclass
+class ConductivityUQSummary:
+    """Compact CPU-side conductivity-UQ metrics for one placement."""
+
+    mean_summary: metrics.FieldMetrics
+    peak_cov_value: float
+    n_samples: int
+    perturbed_tags: tuple[int, ...]
+    sigma_samples: npt.NDArray[np.float64]
+    placement: Placement
+    coil_name: str
+    didt: float
+
+    def peak_mean_magnE(self, region: metrics.Region = "gray_matter") -> float:
+        if region != self.mean_summary["region"]:
+            raise ValueError("Only the default gray_matter summary is retained.")
+        return self.mean_summary["peak_magnE"]
+
+    def peak_cov(self, region: metrics.Region = "gray_matter") -> float:
+        if region != self.mean_summary["region"]:
+            raise ValueError("Only the default gray_matter summary is retained.")
+        return self.peak_cov_value
+
+
 @dataclass
 class ConductivityUQResult:
     """Per-tetrahedron moments of ``|E|`` over the conductivity ensemble.
@@ -48,18 +76,37 @@ class ConductivityUQResult:
         """Largest local coefficient of variation in a region."""
         return metrics.peak_magnitude(self.cov_magnE, self._mask(region))
 
-    def to_numpy(self) -> "ConductivityUQResult":
-        """Copy device arrays to NumPy."""
-        return ConductivityUQResult(
-            mean_magnE=cp.asnumpy(self.mean_magnE),
-            std_magnE=cp.asnumpy(self.std_magnE),
-            cov_magnE=cp.asnumpy(self.cov_magnE),
+    def summary(self, region: metrics.Region = "gray_matter") -> ConductivityUQSummary:
+        mask = self._mask(region)
+        return ConductivityUQSummary(
+            mean_summary=metrics.compute_metrics(
+                self.mean_magnE,
+                self.vols,
+                self.barycenters_mm,
+                self.tet_tags,
+                region=region,
+            ),
+            peak_cov_value=metrics.peak_magnitude(self.cov_magnE, mask),
             n_samples=self.n_samples,
             perturbed_tags=self.perturbed_tags,
             sigma_samples=np.asarray(self.sigma_samples),
-            vols=cp.asnumpy(self.vols),
-            tet_tags=cp.asnumpy(self.tet_tags),
-            barycenters_mm=cp.asnumpy(self.barycenters_mm),
+            placement=self.placement,
+            coil_name=self.coil_name,
+            didt=self.didt,
+        )
+
+    def to_numpy(self) -> "ConductivityUQResult":
+        """Copy device arrays to NumPy."""
+        return ConductivityUQResult(
+            mean_magnE=_to_numpy_array(self.mean_magnE),
+            std_magnE=_to_numpy_array(self.std_magnE),
+            cov_magnE=_to_numpy_array(self.cov_magnE),
+            n_samples=self.n_samples,
+            perturbed_tags=self.perturbed_tags,
+            sigma_samples=np.asarray(self.sigma_samples),
+            vols=_to_numpy_array(self.vols),
+            tet_tags=_to_numpy_array(self.tet_tags),
+            barycenters_mm=_to_numpy_array(self.barycenters_mm),
             placement=self.placement,
             coil_name=self.coil_name,
             didt=self.didt,
@@ -77,7 +124,7 @@ class ConductivityUQResult:
                 "barycenters_mm",
             ):
                 h5f.create_dataset(
-                    name, data=cp.asnumpy(getattr(self, name)), compression="gzip"
+                    name, data=_to_numpy_array(getattr(self, name)), compression="gzip"
                 )
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
             h5f.attrs["format_version"] = _FORMAT_VERSION

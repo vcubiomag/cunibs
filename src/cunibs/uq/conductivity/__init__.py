@@ -9,12 +9,13 @@ from cunibs.uq.conductivity.config import (
     ConductivityUQConfig,
     sample_conductivities,
 )
-from cunibs.uq.conductivity.result import ConductivityUQResult
+from cunibs.uq.conductivity.result import ConductivityUQResult, ConductivityUQSummary
 from cunibs.uq.conductivity.run import run_conductivity_uq
 
 __all__ = [
     "ConductivityUQConfig",
     "ConductivityUQResult",
+    "ConductivityUQSummary",
     "ConductivityUQPrecompute",
     "build_conductivity_uq_precompute",
     "sample_conductivities",

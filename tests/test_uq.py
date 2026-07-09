@@ -90,11 +90,11 @@ def test_uq_degenerate_matches_forward(cp, cube_mesh):
 
     subj = Subject(cube_mesh)
     coil, pl = _coil(), _placement()
-    det = subj.simulate(coil, pl)
+    det = subj.simulate(coil, pl, retain_fields=True, device="gpu")
     cfg = ConductivityUQConfig(
         n_samples=8, tissue_cov={2: 0.0}, seed=1, preconditioner_refresh="never"
     )
-    r = subj.simulate(coil, pl, conductivity_uq=cfg)
+    r = subj.simulate(coil, pl, conductivity_uq=cfg, retain_fields=True, device="gpu")
     np.testing.assert_allclose(cp.asnumpy(r.mean_magnE), cp.asnumpy(det.magnE), atol=1e-6)
     assert float(cp.asarray(r.std_magnE).max()) == 0.0
 
@@ -108,6 +108,8 @@ def test_uq_homogeneous_has_no_sensitivity(cp, cube_mesh):
         _coil(),
         _placement(),
         conductivity_uq=ConductivityUQConfig(n_samples=32, tissue_cov={2: 0.3}, seed=0),
+        retain_fields=True,
+        device="gpu",
     )
     assert float(cp.asarray(r.cov_magnE).max()) < 1e-5
 
@@ -123,6 +125,8 @@ def test_uq_two_tissue_has_variance(cp, two_tissue_cube):
         conductivity_uq=ConductivityUQConfig(
             n_samples=200, tissue_cov={2: 0.2, 3: 0.3}, seed=0
         ),
+        retain_fields=True,
+        device="gpu",
     )
     cov = cp.asarray(r.cov_magnE)
     assert float(cov.max()) > 1e-3
@@ -144,6 +148,8 @@ def test_uq_refresh_modes_agree(cp, two_tissue_cube):
             seed=7,
             preconditioner_refresh="always",
         ),
+        retain_fields=True,
+        device="gpu",
     )
     rn = subj.simulate(
         coil,
@@ -154,6 +160,8 @@ def test_uq_refresh_modes_agree(cp, two_tissue_cube):
             seed=7,
             preconditioner_refresh="never",
         ),
+        retain_fields=True,
+        device="gpu",
     )
     peak = float(cp.asarray(ra.mean_magnE).max())
     diff = float(cp.abs(cp.asarray(ra.mean_magnE) - cp.asarray(rn.mean_magnE)).max())
@@ -167,10 +175,51 @@ def test_uq_deterministic_seed(cp, two_tissue_cube):
     subj = Subject(two_tissue_cube)
     coil, pl = _coil(), _placement()
     cfg = ConductivityUQConfig(n_samples=32, tissue_cov={2: 0.2, 3: 0.3}, seed=5)
-    r1 = subj.simulate(coil, pl, conductivity_uq=cfg)
-    r2 = subj.simulate(coil, pl, conductivity_uq=cfg)
+    r1 = subj.simulate(coil, pl, conductivity_uq=cfg, retain_fields=True, device="gpu")
+    r2 = subj.simulate(coil, pl, conductivity_uq=cfg, retain_fields=True, device="gpu")
     assert bool(cp.all(cp.asarray(r1.mean_magnE) == cp.asarray(r2.mean_magnE)))
     assert bool(cp.all(cp.asarray(r1.std_magnE) == cp.asarray(r2.std_magnE)))
+
+
+def test_uq_default_sequence_returns_summaries(two_tissue_cube):
+    from cunibs import ConductivityUQConfig, Placement, Subject
+
+    subj = Subject(two_tissue_cube)
+    placements = [
+        _placement(),
+        Placement([50, 50, 100], [100, 50, 100], 4.0),
+    ]
+    r = subj.simulate(
+        _coil(),
+        placements,
+        conductivity_uq=ConductivityUQConfig(n_samples=8, seed=3),
+    )
+    assert isinstance(r, list) and len(r) == 2
+    for item in r:
+        assert item.peak_mean_magnE() > 0.0
+        assert item.peak_cov() >= 0.0
+
+
+def test_uq_retain_fields_cpu_sequence_results_are_host_backed(cp, two_tissue_cube):
+    from cunibs import ConductivityUQConfig, Placement, Subject
+
+    subj = Subject(two_tissue_cube)
+    placements = [
+        _placement(),
+        Placement([50, 50, 100], [100, 50, 100], 4.0),
+    ]
+    r = subj.simulate(
+        _coil(),
+        placements,
+        conductivity_uq=ConductivityUQConfig(n_samples=8, seed=3),
+        retain_fields=True,
+    )
+    assert isinstance(r, list) and len(r) == 2
+    for item in r:
+        assert isinstance(item.mean_magnE, np.ndarray)
+        assert isinstance(item.vols, np.ndarray)
+        assert not isinstance(item.mean_magnE, cp.ndarray)
+    assert r[0].vols is r[1].vols
 
 
 def test_uq_result_save_load(cp, tmp_path, two_tissue_cube):
@@ -182,6 +231,8 @@ def test_uq_result_save_load(cp, tmp_path, two_tissue_cube):
         _coil(),
         _placement(),
         conductivity_uq=ConductivityUQConfig(n_samples=16, seed=3),
+        retain_fields=True,
+        device="gpu",
     ).to_numpy()
     path = tmp_path / "uq.h5"
     r.save(path)

@@ -135,7 +135,7 @@ result = subject.simulate(coil, placement, didt=1.0e6)
 print(result.peak_magnE())
 print(result.peak_location_mm())
 print(result.focality(frac=0.5))
-print(result.summary())
+print(result.summary)
 ```
 
 `center_mm` specifies the scalp target. `handle_mm` specifies a point in the
@@ -155,9 +155,21 @@ results = subject.simulate(coil, placements, didt=1.0e6)
 ```
 
 The first call builds the GPU solver state. Later calls on the same `Subject`
-reuse it.
+reuse it. By default, `simulate` returns compact CPU-side summaries and does not
+retain full-volume field arrays.
 
 ## Results
+
+`FieldSummary` contains the placement metadata, the coil-to-head transform, and
+the gray-matter metric summary. Retain raw fields explicitly when per-tetrahedron
+arrays are needed:
+
+```python
+field = subject.simulate(coil, placement, didt=1.0e6, retain_fields=True)
+gpu_field = subject.simulate(
+    coil, placement, didt=1.0e6, retain_fields=True, device="gpu"
+)
+```
 
 `FieldResult` contains:
 
@@ -173,7 +185,8 @@ reuse it.
 
 The metric API reports the peak field, peak location, stimulated volume,
 field-weighted centre of gravity, and volume-weighted distribution statistics.
-Metrics can be computed over gray matter or the complete volume:
+Metrics can be computed over gray matter or the complete volume when fields are
+retained:
 
 ```python
 gray_matter = result.summary("gray_matter")
@@ -183,7 +196,7 @@ whole_model = result.summary("all")
 Save a result and its metric inputs to HDF5:
 
 ```python
-result.save("placement.h5")
+field.save("placement.h5")
 
 from cunibs import FieldResult
 
@@ -242,14 +255,27 @@ print(uq_result.peak_mean_magnE())
 print(uq_result.peak_cov())
 ```
 
+By default, conductivity UQ returns compact CPU-side metrics. Retain the
+per-tetrahedron moment arrays explicitly:
+
+```python
+uq_fields = subject.simulate(
+    coil,
+    placement,
+    didt=1.0e6,
+    conductivity_uq=config,
+    retain_fields=True,
+)
+```
+
 `mean_magnE`, `std_magnE`, and `cov_magnE` use the same tetrahedron ordering as
-`FieldResult.magnE`. `peak_mean_magnE` and `peak_cov` accept the same region
-names as the deterministic metric API.
+`FieldResult.magnE` when fields are retained. `peak_mean_magnE` and `peak_cov`
+accept the same region names as the deterministic metric API.
 
 Save a conductivity-UQ result to HDF5:
 
 ```python
-uq_result.save("conductivity_uq.h5")
+uq_fields.save("conductivity_uq.h5")
 
 from cunibs import ConductivityUQResult
 

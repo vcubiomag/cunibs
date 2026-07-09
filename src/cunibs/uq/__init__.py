@@ -6,6 +6,7 @@ from cunibs.uq.conductivity import (
     ConductivityUQConfig,
     ConductivityUQPrecompute,
     ConductivityUQResult,
+    ConductivityUQSummary,
     build_conductivity_uq_precompute,
     run_conductivity_uq,
     sample_conductivities,
@@ -14,6 +15,7 @@ from cunibs.uq.conductivity import (
 __all__ = [
     "ConductivityUQConfig",
     "ConductivityUQResult",
+    "ConductivityUQSummary",
     "ConductivityUQPrecompute",
     "build_conductivity_uq_precompute",
     "sample_conductivities",
