@@ -2,10 +2,18 @@ cmake_minimum_required(VERSION 3.21)
 
 find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 
-execute_process(
-  COMMAND "${Python_EXECUTABLE}" -c "import nvidia.cu13 as m, os; print(os.path.join(m.__path__[0], 'bin', 'nvcc'))"
-  OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE CMAKE_CUDA_COMPILER
-)
+option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the Python CUDA toolkit" OFF)
+
+if(NOT CUNIBS_USE_SYSTEM_CUDA)
+  execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import nvidia.cu13 as m, os; print(os.path.join(m.__path__[0], 'bin', 'nvcc'))"
+    RESULT_VARIABLE _CUDA_COMPILER_RESULT
+    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE CMAKE_CUDA_COMPILER
+  )
+  if(NOT _CUDA_COMPILER_RESULT EQUAL 0)
+    message(FATAL_ERROR "Could not locate nvcc from the Python CUDA toolkit")
+  endif()
+endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
@@ -13,21 +21,23 @@ endif()
 
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX CUDA)
 
-get_filename_component(_CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
-set(_CUDA_LIB_DIR "${_CUDA_BIN_DIR}/../lib")
-set(_CUDA_SHIM_LIBS cudart cublas cusparse cusolver)
-foreach(_lib ${_CUDA_SHIM_LIBS})
-  if(EXISTS "${_CUDA_LIB_DIR}" AND NOT EXISTS "${_CUDA_LIB_DIR}/lib${_lib}.so")
-    file(GLOB _versioned "${_CUDA_LIB_DIR}/lib${_lib}.so.[0-9]*")
-    list(LENGTH _versioned _count)
-    if(_count GREATER 0)
-      list(GET _versioned 0 _first)
-      file(CREATE_LINK "${_first}" "${_CUDA_LIB_DIR}/lib${_lib}.so" SYMBOLIC)
+if(NOT CUNIBS_USE_SYSTEM_CUDA)
+  get_filename_component(_CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+  set(_CUDA_LIB_DIR "${_CUDA_BIN_DIR}/../lib")
+  set(_CUDA_SHIM_LIBS cudart cublas cusparse cusolver)
+  foreach(_lib ${_CUDA_SHIM_LIBS})
+    if(EXISTS "${_CUDA_LIB_DIR}" AND NOT EXISTS "${_CUDA_LIB_DIR}/lib${_lib}.so")
+      file(GLOB _versioned "${_CUDA_LIB_DIR}/lib${_lib}.so.[0-9]*")
+      list(LENGTH _versioned _count)
+      if(_count GREATER 0)
+        list(GET _versioned 0 _first)
+        file(CREATE_LINK "${_first}" "${_CUDA_LIB_DIR}/lib${_lib}.so" SYMBOLIC)
+      endif()
     endif()
-  endif()
-endforeach()
+  endforeach()
+endif()
 
-find_package(CUDAToolkit 13.2 REQUIRED)
+find_package(CUDAToolkit 12.0 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,9 +92,12 @@ target_link_libraries(
   PRIVATE CUDA::cudart CUDA::cublas CUDA::cusparse AMGX::amgxsh
 )
 
-set_target_properties(_solver_ext amgxsh PROPERTIES
-  INSTALL_RPATH "$ORIGIN;$ORIGIN/../../nvidia/cu13/lib"
-)
+if(CUNIBS_USE_SYSTEM_CUDA)
+  set(_CUNIBS_INSTALL_RPATH "$ORIGIN")
+else()
+  set(_CUNIBS_INSTALL_RPATH "$ORIGIN;$ORIGIN/../../nvidia/cu13/lib")
+endif()
+set_target_properties(_solver_ext amgxsh PROPERTIES INSTALL_RPATH "${_CUNIBS_INSTALL_RPATH}")
 
 get_target_property(_amgxsh_soversion amgxsh SOVERSION)
 set_target_properties(amgxsh PROPERTIES VERSION ${_amgxsh_soversion})
