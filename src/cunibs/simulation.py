@@ -93,6 +93,28 @@ class Subject:
     def from_mesh(cls, mesh_file: str | Path) -> "Subject":
         return cls(load_mesh(mesh_file))
 
+    def free(self) -> None:
+        """Release cached GPU state (solver context, AMG hierarchies, UQ precompute).
+
+        Dropping the cached solver objects triggers their teardown, so a loop over many subjects
+        can reclaim device memory between subjects instead of accumulating it. The subject stays
+        usable afterwards; cached state is rebuilt lazily on the next call. Also available via the
+        context manager: ``with Subject.from_mesh(path) as subject: ...``.
+        """
+        self._conductivity_uq_pre.clear()
+        self._ctx = None
+        self._barycenters_mm = None
+        self._host_vols = None
+        self._host_tet_tags = None
+        self._host_barycenters_mm = None
+        cp.get_default_memory_pool().free_all_blocks()
+
+    def __enter__(self) -> "Subject":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.free()
+
     @property
     def mesh(self) -> HeadMesh:
         return self._mesh
