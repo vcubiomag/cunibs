@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Sequence, TypeAlias, overload
+from typing import TYPE_CHECKING, Literal, Mapping, Sequence, TypeAlias, overload
 
 import cupy as cp
 import h5py
@@ -17,6 +17,7 @@ from cunibs.fem import SolverContext, build_context, solve_placement
 from cunibs.mesh import HeadMesh, load_mesh
 
 if TYPE_CHECKING:
+    from cunibs.adm.target import ResolvedTarget
     from cunibs.uq import (
         ConductivityUQConfig,
         ConductivityUQPrecompute,
@@ -228,6 +229,7 @@ class Subject:
         conductivity_uq: "ConductivityUQConfig" = ...,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
     ) -> "ConductivityUQSummary": ...
     @overload
     def simulate(
@@ -238,6 +240,7 @@ class Subject:
         conductivity_uq: "ConductivityUQConfig" = ...,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
     ) -> list["ConductivityUQSummary"]: ...
     @overload
     def simulate(
@@ -248,6 +251,7 @@ class Subject:
         conductivity_uq: "ConductivityUQConfig" = ...,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
     ) -> "ConductivityUQResult": ...
     @overload
     def simulate(
@@ -258,6 +262,7 @@ class Subject:
         conductivity_uq: "ConductivityUQConfig" = ...,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
     ) -> list["ConductivityUQResult"]: ...
 
     def simulate(
@@ -269,6 +274,7 @@ class Subject:
         *,
         retain_fields: bool = False,
         device: Device = "cpu",
+        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
     ) -> (
         "FieldSummary | list[FieldSummary] | FieldResult | list[FieldResult] | "
         "ConductivityUQSummary | list[ConductivityUQSummary] | "
@@ -287,6 +293,12 @@ class Subject:
         ``device`` selects where retained fields live (``"gpu"`` keeps them on the device,
         ``"cpu"`` copies them to host). It has no effect when ``retain_fields=False``, since no
         field arrays are kept in that case.
+
+        ``record_rois`` (conductivity UQ only) is a ``{name: ResolvedTarget}`` mapping of ROIs from
+        :meth:`roi` / ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over
+        every ROI is recorded (``result.roi_samples[name]``), along with the per-draw gray-matter
+        peak, focality, and peak location — the distributional data that a metric of the mean field
+        cannot provide. These small per-draw arrays are returned even with ``retain_fields=False``.
         """
         if device not in ("cpu", "gpu"):
             raise ValueError("device must be 'cpu' or 'gpu'.")
@@ -306,11 +318,13 @@ class Subject:
             temp_pool = cp.cuda.MemoryPool()
             for site in sites:
                 if retain_fields and device == "gpu":
-                    result = run_conductivity_uq(ctx, pre, coil, site, conductivity_uq, didt)
+                    result = run_conductivity_uq(
+                        ctx, pre, coil, site, conductivity_uq, didt, record_rois
+                    )
                 else:
                     with cp.cuda.using_allocator(temp_pool.malloc):
                         result = run_conductivity_uq(
-                            ctx, pre, coil, site, conductivity_uq, didt
+                            ctx, pre, coil, site, conductivity_uq, didt, record_rois
                         )
                         if not retain_fields:
                             uq_results.append(result.summary())
@@ -337,6 +351,10 @@ class Subject:
                         placement=result.placement,
                         coil_name=result.coil_name,
                         didt=result.didt,
+                        roi_samples=result.roi_samples,
+                        peak_samples=result.peak_samples,
+                        focality_samples=result.focality_samples,
+                        peak_location_samples=result.peak_location_samples,
                     )
                 )
                 del result

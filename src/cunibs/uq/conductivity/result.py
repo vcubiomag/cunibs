@@ -20,9 +20,50 @@ def _to_numpy_array(value: ArrayT | npt.ArrayLike) -> npt.NDArray:
     return cp.asnumpy(value) if isinstance(value, cp.ndarray) else np.asarray(value)
 
 
+def _tissue_sensitivity(result, output: str) -> dict[int, float]:
+    """First-order variance share of each perturbed tissue from a log-linear regression.
+
+    Regresses ``log`` of the chosen per-draw scalar on the ``log`` conductivity draws. Because the
+    ensemble is i.i.d., the inputs are independent, so ``beta_j^2·Var(log σ_j)/Var(log y)`` is tag
+    ``j``'s first-order (Sobol) share of the output variance under a local log-linear response. It
+    is not a Saltelli Sobol estimate and captures only the linear-in-log part of the sensitivity.
+    """
+    if output == "peak":
+        y = result.peak_samples
+    elif output == "focality":
+        y = result.focality_samples
+    elif result.roi_samples is not None and output in result.roi_samples:
+        y = result.roi_samples[output]
+    else:
+        y = None
+    if y is None:
+        available = ["peak", "focality", *(result.roi_samples or {})]
+        raise ValueError(
+            f"No per-draw samples for output {output!r} (available: {available}); "
+            "run simulate(..., record_rois={...}) with that ROI name."
+        )
+    x = np.log(np.asarray(result.sigma_samples, dtype=np.float64))
+    logy = np.log(np.asarray(y, dtype=np.float64))
+    xc = x - x.mean(0)
+    yc = logy - logy.mean()
+    var_y = float(yc.var())
+    if var_y == 0.0:
+        return {int(t): 0.0 for t in result.perturbed_tags}
+    beta, *_ = np.linalg.lstsq(xc, yc, rcond=None)
+    contrib = beta**2 * xc.var(0) / var_y
+    return {int(t): float(c) for t, c in zip(result.perturbed_tags, contrib)}
+
+
 @dataclass
 class ConductivityUQSummary:
-    """Compact CPU-side conductivity-UQ metrics for one placement."""
+    """Compact CPU-side conductivity-UQ metrics for one placement.
+
+    ``mean_summary`` holds metrics computed on the *mean* field. For a nonlinear metric (peak,
+    focality) that is **not** the mean of the metric over the ensemble: ``peak_cov`` is the CoV of
+    the mean field, not the CoV of the per-draw peak. To characterise the distribution of a scalar
+    metric, run with ``record_rois=...`` and use the per-draw arrays (``peak_samples``,
+    ``focality_samples``, ``roi_samples[name]``).
+    """
 
     mean_summary: metrics.FieldMetrics
     peak_cov_value: float
@@ -32,6 +73,17 @@ class ConductivityUQSummary:
     placement: Placement
     coil_name: str
     didt: float
+    # per-draw samples, present only when the run was given record_rois=
+    roi_samples: dict[str, npt.NDArray[np.float64]] | None = (
+        None  # name -> (n_samples,) ROI mean |E|
+    )
+    peak_samples: npt.NDArray[np.float64] | None = None  # (n_samples,) gray-matter peak |E|
+    focality_samples: npt.NDArray[np.float64] | None = (
+        None  # (n_samples,) stimulated volume (m^3)
+    )
+    peak_location_samples: npt.NDArray[np.float64] | None = (
+        None  # (n_samples, 3) peak location (mm)
+    )
 
     def peak_mean_magnE(self, region: metrics.Region = "gray_matter") -> float:
         if region != self.mean_summary["region"]:
@@ -39,9 +91,19 @@ class ConductivityUQSummary:
         return self.mean_summary["peak_magnE"]
 
     def peak_cov(self, region: metrics.Region = "gray_matter") -> float:
+        """CoV of the *mean* field (not the CoV of the per-draw peak; see class docstring)."""
         if region != self.mean_summary["region"]:
             raise ValueError("Only the default gray_matter summary is retained.")
         return self.peak_cov_value
+
+    def tissue_sensitivity(self, output: str = "peak") -> dict[int, float]:
+        """First-order share of each perturbed tissue in a per-draw output's variance.
+
+        ``output`` is ``"peak"``, ``"focality"``, or a recorded ROI name; requires the run to have
+        recorded per-draw samples (``record_rois={...}``). A linear-in-log first-order index, not a
+        Saltelli Sobol estimate -- see :func:`_tissue_sensitivity`.
+        """
+        return _tissue_sensitivity(self, output)
 
 
 @dataclass
@@ -64,6 +126,17 @@ class ConductivityUQResult:
     placement: Placement
     coil_name: str
     didt: float
+    # per-draw samples, present only when the run was given record_rois=
+    roi_samples: dict[str, npt.NDArray[np.float64]] | None = (
+        None  # name -> (n_samples,) ROI mean |E|
+    )
+    peak_samples: npt.NDArray[np.float64] | None = None  # (n_samples,) gray-matter peak |E|
+    focality_samples: npt.NDArray[np.float64] | None = (
+        None  # (n_samples,) stimulated volume (m^3)
+    )
+    peak_location_samples: npt.NDArray[np.float64] | None = (
+        None  # (n_samples, 3) peak location (mm)
+    )
 
     def _mask(self, region: metrics.Region) -> ArrayT:
         return metrics.region_mask(self.tet_tags, region)
@@ -93,7 +166,20 @@ class ConductivityUQResult:
             placement=self.placement,
             coil_name=self.coil_name,
             didt=self.didt,
+            roi_samples=self.roi_samples,
+            peak_samples=self.peak_samples,
+            focality_samples=self.focality_samples,
+            peak_location_samples=self.peak_location_samples,
         )
+
+    def tissue_sensitivity(self, output: str = "peak") -> dict[int, float]:
+        """First-order share of each perturbed tissue in a per-draw output's variance.
+
+        ``output`` is ``"peak"``, ``"focality"``, or a recorded ROI name; requires the run to have
+        recorded per-draw samples (``record_rois={...}``). A linear-in-log first-order index, not a
+        Saltelli Sobol estimate -- see :func:`_tissue_sensitivity`.
+        """
+        return _tissue_sensitivity(self, output)
 
     def to_numpy(self) -> "ConductivityUQResult":
         """Copy device arrays to NumPy."""
@@ -110,6 +196,10 @@ class ConductivityUQResult:
             placement=self.placement,
             coil_name=self.coil_name,
             didt=self.didt,
+            roi_samples=self.roi_samples,
+            peak_samples=self.peak_samples,
+            focality_samples=self.focality_samples,
+            peak_location_samples=self.peak_location_samples,
         )
 
     def save(self, path: str | Path) -> None:
@@ -127,6 +217,14 @@ class ConductivityUQResult:
                     name, data=_to_numpy_array(getattr(self, name)), compression="gzip"
                 )
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
+            if self.roi_samples is not None:
+                grp = h5f.create_group("roi_samples")
+                for roi_name, arr in self.roi_samples.items():
+                    grp.create_dataset(roi_name, data=np.asarray(arr))
+            for name in ("peak_samples", "focality_samples", "peak_location_samples"):
+                value = getattr(self, name)
+                if value is not None:
+                    h5f.create_dataset(name, data=np.asarray(value))
             h5f.attrs["format_version"] = _FORMAT_VERSION
             h5f.attrs["n_samples"] = self.n_samples
             h5f.attrs["perturbed_tags"] = np.asarray(self.perturbed_tags, dtype=np.int32)
@@ -157,6 +255,15 @@ class ConductivityUQResult:
                 handle_mm=h5f.attrs["placement_handle_mm"],
                 distance_mm=float(h5f.attrs["placement_distance_mm"]),
             )
+            roi_samples = (
+                {k: np.asarray(v) for k, v in h5f["roi_samples"].items()}
+                if "roi_samples" in h5f
+                else None
+            )
+            per_draw = {
+                name: np.asarray(h5f[name]) if name in h5f else None
+                for name in ("peak_samples", "focality_samples", "peak_location_samples")
+            }
             return cls(
                 mean_magnE=data["mean_magnE"],
                 std_magnE=data["std_magnE"],
@@ -170,4 +277,6 @@ class ConductivityUQResult:
                 placement=placement,
                 coil_name=str(h5f.attrs["coil_name"]),
                 didt=float(h5f.attrs["didt"]),
+                roi_samples=roi_samples,
+                **per_draw,
             )

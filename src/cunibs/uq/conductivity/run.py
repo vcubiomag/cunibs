@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Mapping
+
 import cupy as cp
 
 from cunibs.coil import Coil
-from cunibs.fem.assembly import conductivity_per_tet
+from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.fem.solve import SolverContext
 from cunibs.simulation import Placement
@@ -18,6 +20,9 @@ from cunibs.solver import (
 from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
 from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductivities
 from cunibs.uq.conductivity.result import ConductivityUQResult
+
+if TYPE_CHECKING:
+    from cunibs.adm.target import ResolvedTarget
 
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
@@ -64,6 +69,8 @@ def run_conductivity_uq(
     placement: Placement,
     config: ConductivityUQConfig,
     didt: float = 1e6,
+    record_rois: Mapping[str, "ResolvedTarget"] | None = None,
+    focality_frac: float = 0.5,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
 
@@ -72,6 +79,14 @@ def run_conductivity_uq(
     GEMVs), then solves against a preconditioner frozen at the nominal (ensemble-centre) σ — the
     cheapest robust choice, since i.i.d. samples give a fixed central preconditioner no drift to
     chase. ``preconditioner_refresh`` only controls the rare recovery/robustness behaviour.
+
+    When ``record_rois`` (a ``{name: ResolvedTarget}`` mapping; ``{}`` is allowed and records the
+    whole-field metrics only) is given, each draw's per-tet field is reduced in-place — no host
+    sync in the loop — into the per-sample arrays returned on the result: the volume-weighted mean
+    ``|E|`` over each named ROI (``roi_samples``), plus the gray-matter peak ``|E|``
+    (``peak_samples``), the stimulated volume ``|E| >= focality_frac * peak`` (``focality_samples``),
+    and the peak location (``peak_location_samples``). These are the distributional quantities that a
+    metric of the mean field (``ConductivityUQResult.summary``) cannot provide.
     """
     sigmas = sample_conductivities(config, pre.perturbed_tags)  # (N, P) f64
     sig_f32 = sigmas.astype(cp.float32)
@@ -104,6 +119,23 @@ def run_conductivity_uq(
     sum_e = cp.zeros(n_tet, dtype=cp.float64)
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
+    recording = record_rois is not None
+    if recording:
+        gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
+        vols_gm = ctx.vols[gm_idx].astype(cp.float64)
+        bary_gm = cp.asarray(ctx.mesh.tet_barycenters_mm)[gm_idx]
+        roi_names = list(record_rois)
+        probe_idx = [
+            cp.ascontiguousarray(record_rois[n].elem_idx.astype(cp.int64)) for n in roi_names
+        ]
+        probe_w = [
+            cp.ascontiguousarray(record_rois[n].weights.astype(cp.float64)) for n in roi_names
+        ]
+        roi_s = cp.empty((config.n_samples, len(roi_names)), dtype=cp.float64)
+        peak_s = cp.empty(config.n_samples, dtype=cp.float64)
+        foc_s = cp.empty(config.n_samples, dtype=cp.float64)
+        peakloc_s = cp.empty((config.n_samples, 3), dtype=cp.float64)
+
     for k in range(config.n_samples):
         sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
         pcg.update_values(sample_data)
@@ -132,6 +164,15 @@ def run_conductivity_uq(
         reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
         accumulate_moments(magn, sum_e, sumsq_e, stream)
 
+        if recording:
+            magn_gm = magn[gm_idx]
+            peak = magn_gm.max()
+            peak_s[k] = peak
+            foc_s[k] = vols_gm[magn_gm >= focality_frac * peak].sum()
+            peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
+            for j, (idx, w) in enumerate(zip(probe_idx, probe_w)):
+                roi_s[k, j] = (magn[idx].astype(cp.float64) * w).sum()
+
     n = config.n_samples
     mean = sum_e / n
     var = (sumsq_e - sum_e * sum_e / n) / max(n - 1, 1)
@@ -151,4 +192,10 @@ def run_conductivity_uq(
         placement=placement,
         coil_name=coil.name,
         didt=didt,
+        roi_samples=(
+            {n: cp.asnumpy(roi_s[:, j]) for j, n in enumerate(roi_names)} if recording else None
+        ),
+        peak_samples=cp.asnumpy(peak_s) if recording else None,
+        focality_samples=cp.asnumpy(foc_s) if recording else None,
+        peak_location_samples=cp.asnumpy(peakloc_s) if recording else None,
     )
