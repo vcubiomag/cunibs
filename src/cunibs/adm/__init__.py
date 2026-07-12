@@ -8,10 +8,12 @@ dipole sum.
 from cunibs.adm.evaluate import evaluate
 from cunibs.adm.optimize import OptimizeResult, optimize
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
-from cunibs.adm.target import Target
+from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 
 __all__ = [
     "Target",
+    "ResolvedTarget",
+    "resolve_target",
     "optimize",
     "OptimizeResult",
     "build_reciprocity",

@@ -4,6 +4,7 @@ import struct
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import Literal, TypeAlias
 
 import numpy as np
 import numpy.typing as npt
@@ -15,7 +16,19 @@ _ELEMENT_BYTES = {1: 16, 2: 24, 3: 28, 4: 28, 5: 44}
 
 SKIN_SURFACE_TAG = 1005
 
-VOLUME_KEY_TO_LABEL: dict[int, str] = {
+TissueLabel: TypeAlias = Literal[
+    "white_matter",
+    "gray_matter",
+    "csf",
+    "scalp",
+    "eye_balls",
+    "cortical_bone",
+    "cancellous_bone",
+    "blood",
+    "muscle",
+]
+
+VOLUME_KEY_TO_LABEL: dict[int, TissueLabel] = {
     1: "white_matter",
     2: "gray_matter",
     3: "csf",
@@ -27,7 +40,7 @@ VOLUME_KEY_TO_LABEL: dict[int, str] = {
     10: "muscle",
 }
 
-SURFACE_KEY_TO_LABEL: dict[int, str] = {
+SURFACE_KEY_TO_LABEL: dict[int, TissueLabel | Literal["internal_air"]] = {
     1001: "white_matter",
     1002: "gray_matter",
     1003: "csf",

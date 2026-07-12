@@ -103,6 +103,39 @@ class Subject:
             self._ctx = build_context(self._mesh)
         return self._ctx
 
+    def roi(
+        self,
+        point_mm: npt.ArrayLike,
+        radius_mm: float = 0.0,
+        region: metrics.Region = "gray_matter",
+    ) -> "ResolvedTarget":
+        """Volume-weighted ROI of ``region`` elements around ``point_mm`` (nearest one if radius 0).
+
+        Returns a :class:`~cunibs.adm.target.ResolvedTarget` usable as a ``record_rois`` probe or an
+        ``adm`` target.
+        """
+        from cunibs.adm.target import Target, resolve_target
+
+        return resolve_target(
+            self.context, Target(point_mm, region=region, radius_mm=radius_mm)
+        )
+
+    def depth_probes(
+        self,
+        cortical_point_mm: npt.ArrayLike,
+        inward_dir: npt.ArrayLike,
+        depths_mm: Sequence[float],
+        radius_mm: float = 0.0,
+        region: metrics.Region = "all",
+    ) -> list["ResolvedTarget"]:
+        """ROIs at increasing depth along ``inward_dir`` from a cortical point."""
+        p = _as_point(cortical_point_mm)
+        d = _as_point(inward_dir)
+        d = d / np.linalg.norm(d)
+        return [
+            self.roi(p + depth * d, radius_mm=radius_mm, region=region) for depth in depths_mm
+        ]
+
     def _conductivity_uq_precompute(
         self, config: "ConductivityUQConfig"
     ) -> "ConductivityUQPrecompute":
@@ -139,7 +172,7 @@ class Subject:
 
     def _field_summary(
         self,
-        out: dict[str, ArrayT],
+        out: Mapping[str, ArrayT],
         site: Placement,
         coil: Coil,
         didt: float,
@@ -167,6 +200,7 @@ class Subject:
         placements: Placement,
         didt: float = ...,
         conductivity_uq: None = ...,
+        *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
     ) -> "FieldSummary": ...
@@ -177,6 +211,7 @@ class Subject:
         placements: Sequence[Placement],
         didt: float = ...,
         conductivity_uq: None = ...,
+        *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
     ) -> list["FieldSummary"]: ...
@@ -187,8 +222,9 @@ class Subject:
         placements: Placement,
         didt: float = ...,
         conductivity_uq: None = ...,
+        *,
         retain_fields: Literal[True] = ...,
-        device: Literal["cpu"] = ...,
+        device: Device = ...,
     ) -> "FieldResult": ...
     @overload
     def simulate(
@@ -197,28 +233,9 @@ class Subject:
         placements: Sequence[Placement],
         didt: float = ...,
         conductivity_uq: None = ...,
+        *,
         retain_fields: Literal[True] = ...,
-        device: Literal["cpu"] = ...,
-    ) -> list["FieldResult"]: ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Placement,
-        didt: float = ...,
-        conductivity_uq: None = ...,
-        retain_fields: Literal[True] = ...,
-        device: Literal["gpu"] = ...,
-    ) -> "FieldResult": ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Sequence[Placement],
-        didt: float = ...,
-        conductivity_uq: None = ...,
-        retain_fields: Literal[True] = ...,
-        device: Literal["gpu"] = ...,
+        device: Device = ...,
     ) -> list["FieldResult"]: ...
     @overload
     def simulate(
@@ -227,6 +244,7 @@ class Subject:
         placements: Placement,
         didt: float = ...,
         conductivity_uq: "ConductivityUQConfig" = ...,
+        *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
         record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
@@ -238,6 +256,7 @@ class Subject:
         placements: Sequence[Placement],
         didt: float = ...,
         conductivity_uq: "ConductivityUQConfig" = ...,
+        *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
         record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
@@ -249,6 +268,7 @@ class Subject:
         placements: Placement,
         didt: float = ...,
         conductivity_uq: "ConductivityUQConfig" = ...,
+        *,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
         record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
@@ -260,6 +280,7 @@ class Subject:
         placements: Sequence[Placement],
         didt: float = ...,
         conductivity_uq: "ConductivityUQConfig" = ...,
+        *,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
         record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
@@ -276,9 +297,11 @@ class Subject:
         device: Device = "cpu",
         record_rois: "Mapping[str, ResolvedTarget] | None" = None,
     ) -> (
-        "FieldSummary | list[FieldSummary] | FieldResult | list[FieldResult] | "
-        "ConductivityUQSummary | list[ConductivityUQSummary] | "
-        "ConductivityUQResult | list[ConductivityUQResult]"
+        FieldSummary
+        | FieldResult
+        | ConductivityUQSummary
+        | ConductivityUQResult
+        | Sequence[FieldSummary | FieldResult | ConductivityUQSummary | ConductivityUQResult]
     ):
         """Solve one placement or a sequence of placements.
 
@@ -309,7 +332,6 @@ class Subject:
         if conductivity_uq is not None:
             from cunibs.uq import (
                 ConductivityUQResult,
-                ConductivityUQSummary,
                 run_conductivity_uq,
             )
 

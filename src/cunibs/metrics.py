@@ -8,10 +8,12 @@ import cupy as cp
 import numpy as np
 import numpy.typing as npt
 
-from cunibs.fem.assembly import GM_TAG
+from cunibs.mesh import VOLUME_KEY_TO_LABEL, TissueLabel
 
 ArrayT: TypeAlias = cp.ndarray | np.ndarray
-Region: TypeAlias = Literal["gray_matter", "all"]
+Region: TypeAlias = TissueLabel | Literal["all"]
+
+_LABEL_TO_TAG: dict[str, int] = {label: tag for tag, label in VOLUME_KEY_TO_LABEL.items()}
 
 DEFAULT_PERCENTILES = (50.0, 95.0, 99.0, 99.9)
 DEFAULT_FOCALITY_FRAC = 0.5
@@ -30,13 +32,16 @@ class FieldMetrics(TypedDict):
 
 
 def region_mask(tet_tags: ArrayT, region: Region) -> ArrayT:
-    """Boolean per-tet mask for ``region`` (``"gray_matter"`` or ``"all"``)."""
+    """Boolean per-tet mask for ``region`` (``"all"`` or any volume tissue label)."""
     xp = cp.get_array_module(tet_tags)
     if region == "all":
         return xp.ones(tet_tags.shape[0], dtype=bool)
-    if region == "gray_matter":
-        return tet_tags == GM_TAG
-    raise ValueError(f"Unknown region {region!r}; use 'gray_matter' or 'all'.")
+    tag = _LABEL_TO_TAG.get(region)
+    if tag is None:
+        raise ValueError(
+            f"Unknown region {region!r}; use 'all' or a tissue label: {sorted(_LABEL_TO_TAG)}."
+        )
+    return tet_tags == tag
 
 
 def _weighted_quantiles(values: ArrayT, weights: ArrayT, qs: ArrayT) -> ArrayT:
