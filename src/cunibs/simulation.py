@@ -38,10 +38,6 @@ def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return p
 
 
-def _to_numpy_array(value: ArrayT | npt.ArrayLike) -> npt.NDArray:
-    return cp.asnumpy(value) if isinstance(value, cp.ndarray) else np.asarray(value)
-
-
 def _copy_metrics(m: metrics.FieldMetrics) -> metrics.FieldMetrics:
     return {
         "region": m["region"],
@@ -559,16 +555,16 @@ class FieldResult:
     def to_numpy(self) -> "FieldResult":
         """Copy all arrays to NumPy."""
         return FieldResult(
-            E=_to_numpy_array(self.E),
-            magnE=_to_numpy_array(self.magnE),
-            v=_to_numpy_array(self.v),
+            E=cp.asnumpy(self.E),
+            magnE=cp.asnumpy(self.magnE),
+            v=cp.asnumpy(self.v),
             transform=np.asarray(self.transform),
             placement=self.placement,
             coil_name=self.coil_name,
             didt=self.didt,
-            vols=_to_numpy_array(self.vols),
-            tet_tags=_to_numpy_array(self.tet_tags),
-            barycenters_mm=_to_numpy_array(self.barycenters_mm),
+            vols=cp.asnumpy(self.vols),
+            tet_tags=cp.asnumpy(self.tet_tags),
+            barycenters_mm=cp.asnumpy(self.barycenters_mm),
         )
 
     def save(self, path: str | Path) -> None:
@@ -576,7 +572,7 @@ class FieldResult:
         with h5py.File(Path(path), "w") as h5f:
             for name in ("E", "magnE", "v", "vols", "tet_tags", "barycenters_mm"):
                 h5f.create_dataset(
-                    name, data=_to_numpy_array(getattr(self, name)), compression="gzip"
+                    name, data=cp.asnumpy(getattr(self, name)), compression="gzip"
                 )
             h5f.create_dataset("transform", data=np.asarray(self.transform))
             h5f.attrs["format_version"] = _FORMAT_VERSION

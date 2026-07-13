@@ -16,10 +16,6 @@ from cunibs.simulation import ArrayT, Placement
 _FORMAT_VERSION = 1
 
 
-def _to_numpy_array(value: ArrayT | npt.ArrayLike) -> npt.NDArray:
-    return cp.asnumpy(value) if isinstance(value, cp.ndarray) else np.asarray(value)
-
-
 def _tissue_sensitivity(result, output: str) -> dict[int, float]:
     """First-order variance share of each perturbed tissue from a log-linear regression.
 
@@ -184,15 +180,15 @@ class ConductivityUQResult:
     def to_numpy(self) -> "ConductivityUQResult":
         """Copy device arrays to NumPy."""
         return ConductivityUQResult(
-            mean_magnE=_to_numpy_array(self.mean_magnE),
-            std_magnE=_to_numpy_array(self.std_magnE),
-            cov_magnE=_to_numpy_array(self.cov_magnE),
+            mean_magnE=cp.asnumpy(self.mean_magnE),
+            std_magnE=cp.asnumpy(self.std_magnE),
+            cov_magnE=cp.asnumpy(self.cov_magnE),
             n_samples=self.n_samples,
             perturbed_tags=self.perturbed_tags,
             sigma_samples=np.asarray(self.sigma_samples),
-            vols=_to_numpy_array(self.vols),
-            tet_tags=_to_numpy_array(self.tet_tags),
-            barycenters_mm=_to_numpy_array(self.barycenters_mm),
+            vols=cp.asnumpy(self.vols),
+            tet_tags=cp.asnumpy(self.tet_tags),
+            barycenters_mm=cp.asnumpy(self.barycenters_mm),
             placement=self.placement,
             coil_name=self.coil_name,
             didt=self.didt,
@@ -214,7 +210,7 @@ class ConductivityUQResult:
                 "barycenters_mm",
             ):
                 h5f.create_dataset(
-                    name, data=_to_numpy_array(getattr(self, name)), compression="gzip"
+                    name, data=cp.asnumpy(getattr(self, name)), compression="gzip"
                 )
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
             if self.roi_samples is not None:
