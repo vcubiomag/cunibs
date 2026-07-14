@@ -32,7 +32,7 @@ def grid_for_placements(
     ctx: SolverContext,
     coil: Coil,
     placements: Sequence[Placement],
-    spacing_mm: float = 2.0,
+    spacing_mm: float = 3.0,
     margin_mm: float = 8.0,
 ) -> Grid:
     """Build a Q-sampling grid covering every coil dipole across ``placements``."""

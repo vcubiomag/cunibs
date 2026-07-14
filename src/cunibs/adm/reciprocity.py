@@ -217,7 +217,7 @@ def build_reciprocity(
     coverage_centers_mm: npt.ArrayLike,
     *,
     distance_mm: float = 4.0,
-    spacing_mm: float = 2.0,
+    spacing_mm: float = 3.0,
     margin_mm: float = 8.0,
     adjoint_solver: GroundedSolver | None = None,
 ) -> ReciprocityField:

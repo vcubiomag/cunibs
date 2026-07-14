@@ -135,7 +135,7 @@ def optimize(
     n_samples: int = 9,
     distance_mm: float = 4.0,
     didt: float = 1e6,
-    spacing_mm: float = 2.0,
+    spacing_mm: float = 3.0,
 ) -> OptimizeResult:
     """Build the reciprocity field for ``target`` and search ``centers_mm`` × rotations for the best
     coil placement, with no per-placement FEM solve."""
