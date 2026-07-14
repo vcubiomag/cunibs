@@ -74,7 +74,8 @@ public:
     PcgResult solve(AMGXSolver& preconditioner, const double* b, double* x, double tolerance,
                     int max_iters);
     PcgResult solve_mixed(AMGXFloatSolver& preconditioner, const double* b, double* x,
-                          double tolerance, int max_iters, cudaStream_t stream);
+                          double tolerance, int max_iters, cudaStream_t stream,
+                          const double* x0 = nullptr);
 
 private:
     int n_ = 0;
@@ -116,3 +117,8 @@ void launch_float_to_double(const float* in, double* out, int n, cudaStream_t st
 void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double* neg_alpha,
                      cudaStream_t stream);
 void launch_cg_beta(const double* rz_next, double* rz, double* beta, cudaStream_t stream);
+void launch_cg_update_xr(const double* alpha, const double* neg_alpha, const double* p,
+                         const double* ap, double* x, double* r, float* rf, int n,
+                         cudaStream_t stream);
+void launch_cg_update_p(const double* beta, const double* z, double* p, int n,
+                        cudaStream_t stream);

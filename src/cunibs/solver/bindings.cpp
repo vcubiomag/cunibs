@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 
 #include <cstdint>
@@ -108,14 +109,14 @@ NB_MODULE(_solver_ext, m) {
         .def(
             "solve_mixed",
             [](PcgAmgSolver& self, AMGXFloatSolver& preconditioner, f64_cuda b, f64_cuda x,
-               double tolerance, int max_iters, uintptr_t stream) {
-                PcgResult result =
-                    self.solve_mixed(preconditioner, b.data(), x.data(), tolerance, max_iters,
-                                     reinterpret_cast<cudaStream_t>(stream));
+               double tolerance, int max_iters, uintptr_t stream, std::optional<f64_cuda> x0) {
+                PcgResult result = self.solve_mixed(
+                    preconditioner, b.data(), x.data(), tolerance, max_iters,
+                    reinterpret_cast<cudaStream_t>(stream), x0.has_value() ? x0->data() : nullptr);
                 return nb::make_tuple(result.iterations, result.relative_residual);
             },
             nb::arg("preconditioner"), nb::arg("b"), nb::arg("x"), nb::arg("tolerance"),
-            nb::arg("max_iters"), nb::arg("stream"));
+            nb::arg("max_iters"), nb::arg("stream"), nb::arg("x0") = nb::none());
 
     m.def(
         "pcg_amg_solve",

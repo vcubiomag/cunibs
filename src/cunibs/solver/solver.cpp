@@ -333,7 +333,7 @@ PcgResult PcgAmgSolver::solve(AMGXSolver& preconditioner, const double* b, doubl
 
 PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const double* b,
                                     double* x, double tolerance, int max_iters,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream, const double* x0) {
     // Default-on (CUNIBS_GRAPH=0 forces the direct path). The solve runs on an internal
     // capture-capable stream because the caller's is usually the un-capturable legacy default stream;
     // the AMGx fork routes its kernels onto that stream so the preconditioner apply is capturable too.
@@ -348,9 +348,6 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
     check_cublas(cublasSetStream(blas_, s), "set_stream(blas)");
     check_cusparse(cusparseSetStream(sparse_, s), "set_stream(sparse)");
     check(AMGX_set_thread_stream(reinterpret_cast<void*>(s)), "set_thread_stream");
-    // solve() may leave the shared handle in host-pointer mode; select device mode so reductions
-    // land in scalars_ without round-tripping to the host.
-    check_cublas(cublasSetPointerMode(blas_, CUBLAS_POINTER_MODE_DEVICE), "set_pointer_mode(device)");
     double* const d_rz = scalars_ + 0;
     double* const d_rz_next = scalars_ + 1;
     double* const d_pap = scalars_ + 2;
@@ -358,19 +355,45 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
     double* const d_neg_alpha = scalars_ + 4;
     double* const d_norm = scalars_ + 5;
     double* const d_beta = scalars_ + 6;
-    double* const d_one = scalars_ + 7;
+    const double one = 1.0;
+    const double zero = 0.0;
 
-    check_cuda(cudaMemsetAsync(x, 0, static_cast<size_t>(n_) * sizeof(double), s), "memset(x)");
+    // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
+    // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
+    // small initial residual. With x0 == 0 this is the old path exactly (r0 = b, so ‖b‖ was the
+    // reference either way). Setup uses host-pointer mode since it runs outside the captured loop.
+    check_cublas(cublasSetPointerMode(blas_, CUBLAS_POINTER_MODE_HOST), "set_pointer_mode(host)");
+    if (x0 != nullptr) {
+        check_cublas(cublasDcopy(blas_, n_, x0, 1, x, 1), "copy(x0,x)");
+    } else {
+        check_cuda(cudaMemsetAsync(x, 0, static_cast<size_t>(n_) * sizeof(double), s), "memset(x)");
+    }
     check_cublas(cublasDcopy(blas_, n_, b, 1, r_, 1), "copy(b,r)");
-
-    check_cublas(cublasDnrm2(blas_, n_, r_, 1, d_norm), "nrm2(r0)");
-    check_cuda(cudaMemcpyAsync(h_norm_, d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
-               "copy(norm0)");
-    check_cuda(cudaStreamSynchronize(s), "sync(norm0)");
-    const double norm0 = *h_norm_;
-    if (norm0 == 0.0) {
+    double norm_ref = 0.0;
+    check_cublas(cublasDnrm2(blas_, n_, b, 1, &norm_ref), "nrm2(b)");
+    if (norm_ref == 0.0) {
+        if (use_graph) { check(AMGX_set_thread_stream(nullptr), "reset_thread_stream"); }
         return {0, 0.0};
     }
+    if (x0 != nullptr) {
+        // r0 = b - A x0. Retarget the p-vector descriptor at x to reuse the cached SpMV plan/buffer,
+        // then restore it to p_ before the captured loop reads it.
+        check_cusparse(cusparseDnVecSetValues(p_vec_, x), "spmv:set_x0");
+        check_cusparse(cusparseSpMV(sparse_, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, mat_, p_vec_,
+                                    &zero, ap_vec_, CUDA_R_64F, CUSPARSE_SPMV_CSR_ALG1, spmv_buffer_),
+                       "spmv(Ax0)");
+        check_cusparse(cusparseDnVecSetValues(p_vec_, p_), "spmv:restore_p");
+        const double neg_one = -1.0;
+        check_cublas(cublasDaxpy(blas_, n_, &neg_one, ap_, 1, r_, 1), "axpy(r0)");
+        double norm_r0 = 0.0;
+        check_cublas(cublasDnrm2(blas_, n_, r_, 1, &norm_r0), "nrm2(r0)");
+        if (norm_r0 / norm_ref <= tolerance) {
+            if (use_graph) { check(AMGX_set_thread_stream(nullptr), "reset_thread_stream"); }
+            return {0, norm_r0 / norm_ref};
+        }
+    }
+    // The captured loop needs device-pointer mode so its reductions land in scalars_.
+    check_cublas(cublasSetPointerMode(blas_, CUBLAS_POINTER_MODE_DEVICE), "set_pointer_mode(device)");
 
     launch_double_to_float(r_, rf_, n_, s);
     check_cuda(cudaStreamSynchronize(s), "sync(precond_in0)");
@@ -379,8 +402,6 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
     check_cublas(cublasDcopy(blas_, n_, z_, 1, p_, 1), "copy(z,p)");
     check_cublas(cublasDdot(blas_, n_, r_, 1, z_, 1, d_rz), "dot(r,z)");
 
-    const double one = 1.0;
-    const double zero = 0.0;
     // Identical every iteration (fixed buffers updated in place), so it is captured once and
     // replayed; the residual readback is inside the body but the host convergence test stays outside.
     auto run_body = [&]() {
@@ -389,18 +410,16 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
                        "spmv");
         check_cublas(cublasDdot(blas_, n_, p_, 1, ap_, 1, d_pap), "dot(p,ap)");
         launch_cg_alpha(d_rz, d_pap, d_alpha, d_neg_alpha, s);
-        check_cublas(cublasDaxpy(blas_, n_, d_alpha, p_, 1, x, 1), "axpy(x)");
-        check_cublas(cublasDaxpy(blas_, n_, d_neg_alpha, ap_, 1, r_, 1), "axpy(r)");
+        // x += α p; r -= α ap; rf = (float)r
+        launch_cg_update_xr(d_alpha, d_neg_alpha, p_, ap_, x, r_, rf_, n_, s);
         check_cublas(cublasDnrm2(blas_, n_, r_, 1, d_norm), "nrm2(r)");
         check_cuda(cudaMemcpyAsync(h_norm_, d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
                    "copy(norm)");
-        launch_double_to_float(r_, rf_, n_, s);
         preconditioner.apply(n_, rf_, zf_);
         launch_float_to_double(zf_, z_, n_, s);
         check_cublas(cublasDdot(blas_, n_, r_, 1, z_, 1, d_rz_next), "dot(r,z)");
         launch_cg_beta(d_rz_next, d_rz, d_beta, s);  // beta = rz_next/rz; rz <- rz_next
-        check_cublas(cublasDscal(blas_, n_, d_beta, p_, 1), "scal(p)");
-        check_cublas(cublasDaxpy(blas_, n_, d_one, z_, 1, p_, 1), "axpy(p)");
+        launch_cg_update_p(d_beta, z_, p_, n_, s);  // p = β p + z
     };
 
     // The graph body writes to the caller's x, which changes per call, so recapture each solve.
@@ -434,7 +453,7 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
             }
         }
         check_cuda(cudaStreamSynchronize(s), "sync(iter)");
-        rel = *h_norm_ / norm0;
+        rel = *h_norm_ / norm_ref;
         if (rel <= tolerance) {
             result_iters = it;
             break;
