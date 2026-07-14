@@ -41,7 +41,6 @@ class ConductivityUQPrecompute:
     indices: cp.ndarray
     base_data: cp.ndarray  # (nnz,) f64 — non-perturbed tissues at nominal σ
     tissue_data: cp.ndarray  # (n_perturbed, nnz) f64 — per-tissue unit-σ contribution
-    solver: AMGXSolver  # nominal σ, structure_reuse; mixed-solve fallback
     float_preconditioner: AMGXFloatSolver  # fp32 AMG V-cycle frozen at nominal σ
     pcg: PcgAmgSolver  # fp64 outer PCG; matrix values swapped per sample
     tolerance: float
@@ -50,10 +49,24 @@ class ConductivityUQPrecompute:
     nominal_data: (
         cp.ndarray
     )  # (nnz,) f64 — reduced values at nominal σ (frozen-preconditioner point)
+    # nominal σ, structure_reuse; the mixed-solve fallback, built lazily on the rare extreme draw.
+    solver: AMGXSolver | None = None
 
     def combine(self, sigma: cp.ndarray) -> cp.ndarray:
         """Assemble the reduced matrix values for one conductivity sample."""
         return self.base_data + sigma @ self.tissue_data
+
+    def ensure_solver(self) -> AMGXSolver:
+        """Build the fp64 fallback AMGx solver (set up at nominal σ) on first non-convergent draw.
+
+        Frozen-preconditioner UQ almost never falls back, so the full double hierarchy is dead
+        weight for most ensembles; deferring it lets more subjects share one GPU.
+        """
+        if self.solver is None:
+            solver = AMGXSolver(UQ_AMGX_CONFIG)
+            solver.setup(self.indptr, self.indices, self.nominal_data)
+            self.solver = solver
+        return self.solver
 
 
 def _reduced_data_for(
@@ -111,8 +124,6 @@ def build_conductivity_uq_precompute(
     nominal_data = cp.ascontiguousarray(recon)
     row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
     col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
-    solver = AMGXSolver(UQ_AMGX_CONFIG)
-    solver.setup(row_ptr, col_idx, nominal_data)
 
     float_preconditioner = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
     float_preconditioner.setup(
@@ -130,7 +141,6 @@ def build_conductivity_uq_precompute(
         indices=col_idx,
         base_data=base_data,
         tissue_data=tissue_data,
-        solver=solver,
         float_preconditioner=float_preconditioner,
         pcg=pcg,
         tolerance=tolerance,

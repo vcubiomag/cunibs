@@ -28,7 +28,7 @@ public:
     void update_coefficients(int nnz, const double* values);
     void resetup();
 
-    void solve(int n, const double* b, double* x);
+    void solve(int n, const double* b, double* x, cudaStream_t stream);
     void apply(int n, const double* b, double* x);
     int iterations() const;
 
@@ -70,11 +70,11 @@ public:
     PcgAmgSolver(const PcgAmgSolver&) = delete;
     PcgAmgSolver& operator=(const PcgAmgSolver&) = delete;
 
-    void update_values(const double* values);
+    void update_values(const double* values, cudaStream_t stream);
     PcgResult solve(AMGXSolver& preconditioner, const double* b, double* x, double tolerance,
                     int max_iters);
     PcgResult solve_mixed(AMGXFloatSolver& preconditioner, const double* b, double* x,
-                          double tolerance, int max_iters);
+                          double tolerance, int max_iters, cudaStream_t stream);
 
 private:
     int n_ = 0;
@@ -89,11 +89,22 @@ private:
     float* rf_ = nullptr;
     float* zf_ = nullptr;
     void* spmv_buffer_ = nullptr;
+    // CG scalars kept on-device (device-pointer-mode cuBLAS): [rz, rz_next, pap, alpha, neg_alpha,
+    // norm, beta, one]. Only the residual norm is copied back, into pinned host memory, once/iter.
+    double* scalars_ = nullptr;
+    double* h_norm_ = nullptr;
     cublasHandle_t blas_ = nullptr;
     cusparseHandle_t sparse_ = nullptr;
     cusparseSpMatDescr_t mat_ = nullptr;
     cusparseDnVecDescr_t p_vec_ = nullptr;
     cusparseDnVecDescr_t ap_vec_ = nullptr;
+    // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
+    // un-capturable legacy default stream; b/x are handed off via join_event_. Recaptured per solve
+    // because the graph body references the caller's output pointer x.
+    cudaStream_t solve_stream_ = nullptr;
+    cudaEvent_t join_event_ = nullptr;
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
 };
 
 PcgResult pcg_amg_solve(int n, int nnz, const int* row_ptr, const int* col_idx,
@@ -102,3 +113,6 @@ PcgResult pcg_amg_solve(int n, int nnz, const int* row_ptr, const int* col_idx,
 
 void launch_double_to_float(const double* in, float* out, int n, cudaStream_t stream);
 void launch_float_to_double(const float* in, double* out, int n, cudaStream_t stream);
+void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double* neg_alpha,
+                     cudaStream_t stream);
+void launch_cg_beta(const double* rz_next, double* rz, double* beta, cudaStream_t stream);

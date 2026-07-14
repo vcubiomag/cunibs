@@ -100,8 +100,8 @@ def run_conductivity_uq(
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
     b_base, b_tissue = _placement_rhs(ctx, pre, dadt_elm)
 
-    # The double AMGx solver stays frozen at nominal σ as the mixed-solve fallback.
-    solver = pre.solver
+    # The double AMGx solver stays frozen at nominal σ as the mixed-solve fallback; built lazily on
+    # the first extreme draw (``pre.ensure_solver()``), so most ensembles never allocate it.
     pcg = pre.pcg
     float_precond = pre.float_preconditioner
     nominal_f32 = cp.ascontiguousarray(pre.nominal_data.astype(cp.float32))
@@ -138,12 +138,14 @@ def run_conductivity_uq(
 
     for k in range(config.n_samples):
         sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
-        pcg.update_values(sample_data)
+        pcg.update_values(sample_data, stream)
         if policy == "always" or (periodic and k > 0 and k % periodic == 0):
             float_precond.setup(pre.indptr, pre.indices, sample_data.astype(cp.float32))
 
         b_red[:] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        _, rel = pcg.solve_mixed(float_precond, b_red, x_red, pre.tolerance, pre.max_iters)
+        _, rel = pcg.solve_mixed(
+            float_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream
+        )
         if rel > pre.tolerance:
             if policy == "never":
                 raise RuntimeError(
@@ -152,9 +154,10 @@ def run_conductivity_uq(
                 )
             # Rare extreme draw: match the preconditioner to this sample, solve, then restore
             # the nominal-frozen hierarchy for the remaining (i.i.d.) samples.
+            solver = pre.ensure_solver()
             solver.update_coefficients(sample_data)
             solver.resetup()
-            solver.solve(b_red, x_red)
+            solver.solve(b_red, x_red, stream)
             solver.update_coefficients(pre.nominal_data)
             solver.resetup()
             if policy == "always" or periodic:

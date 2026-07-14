@@ -92,31 +92,44 @@ class GroundedSolver:
 
     n: int
     idx: cp.ndarray
-    amgx: AMGXSolver
     float_preconditioner: AMGXFloatSolver
     pcg: PcgAmgSolver
     tolerance: float
     max_iters: int
+    # Retained to build the fp64 fallback lazily (see ``ensure_amgx``).
+    config: str
+    row_ptr: cp.ndarray
+    col_idx: cp.ndarray
+    values: cp.ndarray
+    amgx: AMGXSolver | None = None
     last_iterations: int = 0
     last_relative_residual: float = 0.0
+
+    def ensure_amgx(self) -> AMGXSolver:
+        """Build the fp64 AMGx fallback solver on first use.
+
+        The fallback only runs when the mixed-precision PCG misses tolerance, so building its full
+        double AMG hierarchy eagerly holds a second (rarely used) hierarchy on the device for every
+        subject's lifetime. Deferring it raises how many subjects fit on one GPU. The reduced CSR is
+        already resident, so this only pays the one-time AMGx setup, not a reassembly.
+        """
+        if self.amgx is None:
+            amgx = AMGXSolver(self.config)
+            amgx.setup(self.row_ptr, self.col_idx, self.values)
+            self.amgx = amgx
+        return self.amgx
 
 
 def prepare_grounded_solver(
     a: csp.csr_matrix, ground_node: int, config: str = AMGX_CONFIG
 ) -> GroundedSolver:
-    """Remove the ground DOF and build the AMGx hierarchy."""
+    """Remove the ground DOF and build the mixed-precision solver (fp64 fallback built lazily)."""
     n = a.shape[0]
     idx = grounded_index(n, ground_node)
     a_red = reduce_matrix(a, idx)
-    amgx = AMGXSolver(config)
     row_ptr = cp.ascontiguousarray(a_red.indptr.astype(cp.int32))
     col_idx = cp.ascontiguousarray(a_red.indices.astype(cp.int32))
     values = cp.ascontiguousarray(a_red.data.astype(cp.float64))
-    amgx.setup(
-        row_ptr,
-        col_idx,
-        values,
-    )
     float_preconditioner = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
     float_preconditioner.setup(
         row_ptr, col_idx, cp.ascontiguousarray(values.astype(cp.float32))
@@ -124,7 +137,18 @@ def prepare_grounded_solver(
     pcg = PcgAmgSolver(row_ptr, col_idx, values)
     tolerance = float(_amgx_config_value(config, "tolerance", "1e-6"))
     max_iters = int(_amgx_config_value(config, "max_iters", "2000"))
-    return GroundedSolver(n, idx, amgx, float_preconditioner, pcg, tolerance, max_iters)
+    return GroundedSolver(
+        n=n,
+        idx=idx,
+        float_preconditioner=float_preconditioner,
+        pcg=pcg,
+        tolerance=tolerance,
+        max_iters=max_iters,
+        config=config,
+        row_ptr=row_ptr,
+        col_idx=col_idx,
+        values=values,
+    )
 
 
 def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
@@ -137,12 +161,14 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
         x_red,
         solver.tolerance,
         solver.max_iters,
+        cp.cuda.get_current_stream().ptr,
     )
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(rel)
     if solver.last_relative_residual > solver.tolerance:
-        solver.amgx.solve(b_red, x_red)
-        solver.last_iterations = solver.amgx.iterations()
+        amgx = solver.ensure_amgx()
+        amgx.solve(b_red, x_red, cp.cuda.get_current_stream().ptr)
+        solver.last_iterations = amgx.iterations()
         solver.last_relative_residual = 0.0
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x_red

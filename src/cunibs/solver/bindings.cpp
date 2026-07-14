@@ -46,11 +46,11 @@ NB_MODULE(_solver_ext, m) {
              "Return the iteration count from the most recent solve.")
         .def(
             "solve",
-            [](AMGXSolver& self, f64_cuda b, f64_cuda x) {
+            [](AMGXSolver& self, f64_cuda b, f64_cuda x, uintptr_t stream) {
                 int n = static_cast<int>(b.shape(0));
-                self.solve(n, b.data(), x.data());
+                self.solve(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
             },
-            nb::arg("b"), nb::arg("x"),
+            nb::arg("b"), nb::arg("x"), nb::arg("stream"),
             "Solve A x = b on device; x (length n) is overwritten with the solution.")
         .def(
             "apply",
@@ -91,8 +91,10 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"))
         .def(
             "update_values",
-            [](PcgAmgSolver& self, f64_cuda values) { self.update_values(values.data()); },
-            nb::arg("values"))
+            [](PcgAmgSolver& self, f64_cuda values, uintptr_t stream) {
+                self.update_values(values.data(), reinterpret_cast<cudaStream_t>(stream));
+            },
+            nb::arg("values"), nb::arg("stream"))
         .def(
             "solve",
             [](PcgAmgSolver& self, AMGXSolver& preconditioner, f64_cuda b, f64_cuda x,
@@ -106,13 +108,14 @@ NB_MODULE(_solver_ext, m) {
         .def(
             "solve_mixed",
             [](PcgAmgSolver& self, AMGXFloatSolver& preconditioner, f64_cuda b, f64_cuda x,
-               double tolerance, int max_iters) {
+               double tolerance, int max_iters, uintptr_t stream) {
                 PcgResult result =
-                    self.solve_mixed(preconditioner, b.data(), x.data(), tolerance, max_iters);
+                    self.solve_mixed(preconditioner, b.data(), x.data(), tolerance, max_iters,
+                                     reinterpret_cast<cudaStream_t>(stream));
                 return nb::make_tuple(result.iterations, result.relative_residual);
             },
             nb::arg("preconditioner"), nb::arg("b"), nb::arg("x"), nb::arg("tolerance"),
-            nb::arg("max_iters"));
+            nb::arg("max_iters"), nb::arg("stream"));
 
     m.def(
         "pcg_amg_solve",
