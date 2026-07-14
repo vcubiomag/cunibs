@@ -172,8 +172,9 @@ NB_MODULE(_solver_ext, m) {
         [](f32_cuda_2d dadt_elm, f32_cuda_3d wg, i32_cuda ptr, i32_cuda idx, f32_cuda_1d b,
            uintptr_t stream) {
             int n_nodes = static_cast<int>(b.shape(0));
+            int n_tet = static_cast<int>(dadt_elm.shape(0));
             launch_rhs_weighted(dadt_elm.data(), wg.data(), ptr.data(), idx.data(), b.data(),
-                                n_nodes, reinterpret_cast<cudaStream_t>(stream));
+                                n_nodes, n_tet, reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("dadt_elm"), nb::arg("wg"), nb::arg("ptr"), nb::arg("idx"), nb::arg("b"),
         nb::arg("stream"),

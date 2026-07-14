@@ -11,7 +11,7 @@ void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, cons
                 const int* idx, float* b, int n_nodes, cudaStream_t stream);
 
 void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr, const int* idx,
-                         float* b, int n_nodes, cudaStream_t stream);
+                         float* b, int n_nodes, int n_tet, cudaStream_t stream);
 
 void launch_weighted_gradient(const float* g, const float* neg_vc, float* wg, int n_tet,
                               cudaStream_t stream);
