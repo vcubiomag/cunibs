@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Mapping
 
 import cupy as cp
+import cupyx.scipy.sparse as csp
 
 from cunibs.coil import Coil
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
@@ -119,6 +120,41 @@ def run_conductivity_uq(
     sum_e = cp.zeros(n_tet, dtype=cp.float64)
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
+    # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
+    # initial guess for every draw, which are i.i.d. around nominal. solve_mixed measures convergence
+    # against ‖b‖ (not the warm ‖r0‖), so warm-started draws still reach the 1e-6-of-field criterion.
+    # pcg is cached on `pre` and reused across placements, so its values may hold a previous
+    # placement's last draw — reset the matrix to nominal before seeding (the frozen preconditioner
+    # affects only iteration count, not the solution, so it needs no reset).
+    x_nominal = cp.empty(n_red, dtype=cp.float64)
+    pcg.update_values(cp.ascontiguousarray(pre.nominal_data), stream)
+    b_nom = cp.ascontiguousarray(
+        (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx]
+    )
+    pcg.solve_mixed(float_precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
+
+    # Subspace recycling: only P conductivities are perturbed, so x(σ)−x_nominal spans an ≈P-dim
+    # subspace. Build an A-orthonormal basis W from the first RECYCLE_BUILD draws, then Galerkin-
+    # project each later draw's initial guess onto it: x0 = x_nominal + W·E⁻¹·Wᵀr0, with
+    # r0 = b(σ)−A(σ)x_nominal and E = Wᵀ·A_nominal·W (frozen). Only a better x0 into the same solve.
+    RECYCLE_BUILD = 16
+    recycle = config.n_samples >= 2 * RECYCLE_BUILD
+    if recycle:
+        n_build = RECYCLE_BUILD
+        d_basis = cp.empty((n_red, n_build), dtype=cp.float64)
+        x0_buf = cp.empty(n_red, dtype=cp.float64)
+        recycle_w = None  # (n_red, k)
+        einv_nom = None  # (k, k)
+        # r0 = b − A(σ)x_nominal is linear in σ: precompute A_base·x_nom and each A_t·x_nom once.
+        a_base = csp.csr_matrix((pre.base_data, pre.indices, pre.indptr), shape=(n_red, n_red))
+        ax_base = a_base @ x_nominal
+        ax_tissue = cp.empty((len(pre.perturbed_tags), n_red), dtype=cp.float64)
+        for t in range(len(pre.perturbed_tags)):
+            a_t = csp.csr_matrix(
+                (pre.tissue_data[t], pre.indices, pre.indptr), shape=(n_red, n_red)
+            )
+            ax_tissue[t] = a_t @ x_nominal
+
     recording = record_rois is not None
     if recording:
         gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
@@ -143,8 +179,13 @@ def run_conductivity_uq(
             float_precond.setup(pre.indptr, pre.indices, sample_data.astype(cp.float32))
 
         b_red[:] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
+        x0 = x_nominal
+        if recycle and recycle_w is not None:
+            r0 = b_red - (ax_base + sigmas[k] @ ax_tissue)
+            x0_buf[:] = x_nominal + recycle_w @ (einv_nom @ (recycle_w.T @ r0))
+            x0 = x0_buf
         _, rel = pcg.solve_mixed(
-            float_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream
+            float_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
         )
         if rel > pre.tolerance:
             if policy == "never":
@@ -162,6 +203,18 @@ def run_conductivity_uq(
             solver.resetup()
             if policy == "always" or periodic:
                 float_precond.setup(pre.indptr, pre.indices, nominal_f32)
+
+        if recycle and recycle_w is None:
+            d_basis[:, k] = x_red - x_nominal
+            if k == n_build - 1:
+                # A-orthonormal basis for the perturbation subspace; drop near-dependent directions.
+                q, s, _ = cp.linalg.svd(d_basis, full_matrices=False)
+                keep = int((s > 1e-8 * float(s[0])).sum())
+                recycle_w = cp.ascontiguousarray(q[:, :keep])
+                a_nom = csp.csr_matrix(
+                    (pre.nominal_data, pre.indices, pre.indptr), shape=(n_red, n_red)
+                )
+                einv_nom = cp.linalg.inv(recycle_w.T @ (a_nom @ recycle_w))
 
         v[pre.idx] = x_red
         reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
