@@ -76,13 +76,22 @@ def _reduced_data_for(
     cond: cp.ndarray,
     idx: cp.ndarray,
     template: "cp.ndarray | None",
+    sel: "cp.ndarray | None" = None,
 ) -> cp.ndarray:
     """Assemble a stiffness with conductivity ``cond``, ground it, and align to the pattern.
 
     ``template`` is a zero-valued CSR on the reference pattern; adding it forces the reference
-    ordering so every component's ``.data`` is index-aligned with ``base_data``/AMGx.
+    ordering so every component's ``.data`` is index-aligned with ``base_data``/AMGx. ``sel``
+    restricts the assembly to a subset of tets so each component touches only its own tets; the
+    subset pattern is ⊆ the reference, so the template still aligns it. ``g64``/``vols``/``tet_nodes``
+    are subset by ``sel`` while ``cond`` is passed already subset.
     """
-    k = reduce_matrix(assemble_stiffness(g64, vols, cond, ctx.n_nodes, ctx.tet_nodes), idx)
+    tet_nodes = ctx.tet_nodes
+    if sel is not None:
+        g64 = g64[sel]
+        vols = vols[sel]
+        tet_nodes = tet_nodes[sel]
+    k = reduce_matrix(assemble_stiffness(g64, vols, cond, ctx.n_nodes, tet_nodes), idx)
     if template is None:
         return k
     return (template + k).data
@@ -104,12 +113,17 @@ def build_conductivity_uq_precompute(
     perturbed = cp.asarray(perturbed_tags)
     tissue_data = cp.empty((len(perturbed_tags), k_ref.data.shape[0]), dtype=cp.float64)
     for i, tag in enumerate(perturbed_tags):
-        indicator = (ctx.tet_tags == tag).astype(cp.float64)
-        tissue_data[i] = _reduced_data_for(ctx, g64, vols, indicator, idx, template=zero_ref)
+        sel = cp.where(ctx.tet_tags == tag)[0]
+        ones = cp.ones(sel.shape[0], dtype=cp.float64)  # unit-σ component for this tissue
+        tissue_data[i] = _reduced_data_for(
+            ctx, g64, vols, ones, idx, template=zero_ref, sel=sel
+        )
 
-    base_cond = cond_nom.copy()
-    base_cond[cp.isin(ctx.tet_tags, perturbed)] = 0.0
-    base_data = _reduced_data_for(ctx, g64, vols, base_cond, idx, template=zero_ref)
+    base_sel = cp.where(~cp.isin(ctx.tet_tags, perturbed))[0]
+    base_cond = conductivity_per_tet(ctx.tet_tags[base_sel])
+    base_data = _reduced_data_for(
+        ctx, g64, vols, base_cond, idx, template=zero_ref, sel=base_sel
+    )
 
     nominal_sigma = cp.asarray(
         [TISSUE_CONDUCTIVITY[t] for t in perturbed_tags], dtype=cp.float64
