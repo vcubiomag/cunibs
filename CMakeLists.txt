@@ -87,6 +87,9 @@ nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/moments.cu
   src/cunibs/solver/place.cu
 )
+
+set_source_files_properties(src/cunibs/solver/dadt.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
 target_link_libraries(
   _solver_ext
   PRIVATE CUDA::cudart CUDA::cublas CUDA::cusparse AMGX::amgxsh
