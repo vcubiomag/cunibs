@@ -372,34 +372,6 @@ recip = adm.build_reciprocity(subject.context, coil, target, centers)
 E = adm.evaluate(recip, coil, placements, didt=1.0e6)   # (P, D) target E-vectors
 ```
 
-## Performance and scaling
-
-A single solve at roughly one million degrees of freedom is latency-bound, not
-throughput-bound: the AMG V-cycles and the outer PCG iterations are a chain of
-small dependent kernels, so a large datacenter GPU is not meaningfully faster per
-solve than a laptop GPU — and it sits underutilized, with idle SMs between kernel
-launches. Scale a population study by running independent solves concurrently.
-
-- Across GPUs, run one process per GPU (`CUDA_VISIBLE_DEVICES`). This always
-  scales linearly.
-- Within one GPU, the underutilization is an opportunity, but only with CUDA MPS.
-  Without MPS, separate processes time-slice a single GPU context and serialize —
-  throughput dropped by roughly 6x in our runs. With
-  [MPS](https://docs.nvidia.com/deploy/mps/) enabled, kernels from co-located
-  processes run concurrently and fill the idle capacity, so packing several
-  subjects onto one large GPU recovers much of that lost throughput. Enable MPS
-  before co-locating; do not co-locate without it.
-- The per-solve launch loop is CPU-bound on kernel dispatch, so starving a process
-  of cores throttles the GPU. Give each process several CPU cores.
-- Release device memory between subjects with the context manager or
-  `subject.free()` (see [Batch over subjects](#batch-over-subjects)).
-
-The forward mixed-precision PCG solves to a relative tolerance of `1e-6`; the ADM
-adjoint solves use a tighter `1e-9`. For conductivity UQ the AMG preconditioner is
-frozen at the nominal conductivity for the whole ensemble; `preconditioner_refresh`
-(default `"adaptive"`) governs only the rare draw that fails to converge, where the
-hierarchy is rebuilt for that sample and then restored.
-
 ## Reproducibility
 
 The solver configuration uses deterministic AMGx execution and a fixed
