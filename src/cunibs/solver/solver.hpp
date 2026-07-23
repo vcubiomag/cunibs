@@ -52,9 +52,14 @@ public:
     void setup(int n, int nnz, const int* row_ptr, const int* col_idx, const float* values);
     void apply(int n, const float* b, float* x);
     int iterations() const;
+    // Bumped on every setup(): a captured CUDA graph embeds pointers into this solver's hierarchy
+    // buffers, so PcgAmgSolver keys its cached graph on (solver address, generation) and recaptures
+    // after any re-setup.
+    int generation() const { return generation_; }
 
 private:
     int n_ = 0;
+    int generation_ = 0;
     AMGX_config_handle cfg_ = nullptr;
     AMGX_matrix_handle A_ = nullptr;
     AMGX_vector_handle b_ = nullptr;
@@ -87,12 +92,15 @@ private:
     double* z_ = nullptr;
     double* p_ = nullptr;
     double* ap_ = nullptr;
+    double* x_int_ = nullptr;
     float* rf_ = nullptr;
     float* zf_ = nullptr;
     void* spmv_buffer_ = nullptr;
     // CG scalars kept on-device (device-pointer-mode cuBLAS): [rz, rz_next, pap, alpha, neg_alpha,
     // norm, beta, one]. Only the residual norm is copied back, into pinned host memory, once/iter.
     double* scalars_ = nullptr;
+    // Per-block partial sums for the fused deterministic reductions (‖r‖², r·z).
+    double* partials_ = nullptr;
     double* h_norm_ = nullptr;
     cublasHandle_t blas_ = nullptr;
     cusparseHandle_t sparse_ = nullptr;
@@ -100,12 +108,15 @@ private:
     cusparseDnVecDescr_t p_vec_ = nullptr;
     cusparseDnVecDescr_t ap_vec_ = nullptr;
     // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
-    // un-capturable legacy default stream; b/x are handed off via join_event_. Recaptured per solve
-    // because the graph body references the caller's output pointer x.
+    // un-capturable legacy default stream; b/x are handed off via join_event_. The iteration body
+    // only touches solver-owned buffers (x_int_, not the caller's x), so the captured graph is
+    // reused across solves as long as the preconditioner identity/generation is unchanged.
     cudaStream_t solve_stream_ = nullptr;
     cudaEvent_t join_event_ = nullptr;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
+    const AMGXFloatSolver* captured_precond_ = nullptr;
+    int captured_precond_gen_ = 0;
 };
 
 PcgResult pcg_amg_solve(int n, int nnz, const int* row_ptr, const int* col_idx,
@@ -122,3 +133,12 @@ void launch_cg_update_xr(const double* alpha, const double* neg_alpha, const dou
                          cudaStream_t stream);
 void launch_cg_update_p(const double* beta, const double* z, double* p, int n,
                         cudaStream_t stream);
+void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
+                      const double* x, double* y, cudaStream_t stream);
+int cg_partials_size(int n);
+void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, const double* p,
+                              const double* ap, double* x, double* r, float* rf,
+                              double* partials, double* norm_sq, int n, cudaStream_t stream);
+void launch_cg_cast_dot_beta(const float* zf, double* z, const double* r, double* partials,
+                             double* rz, double* rz_next, double* beta, int n,
+                             cudaStream_t stream);
