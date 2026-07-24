@@ -58,6 +58,35 @@ def test_retain_fields_gpu_returns_cupy_arrays(cube_mesh):
     assert isinstance(res.magnE, cp.ndarray)
 
 
+def test_depth_probes_walk_inward(cube_mesh):
+    import cupy as cp
+
+    subj = Subject(cube_mesh)
+    point = [50.0, 50.0, 100.0]
+    depths = [0.0, 20.0, 40.0]
+    # The 6-tet cube resolves every depth to the same element at radius 0, so use a radius
+    # wide enough that the ROI membership actually changes with depth.
+    probes = subj.depth_probes(point, [0.0, 0.0, -1.0], depths, radius_mm=40.0)
+    assert len(probes) == len(depths)
+
+    # Each probe is the ROI at the point that far inward along the direction.
+    for depth, probe in zip(depths, probes):
+        expected = subj.roi([50.0, 50.0, 100.0 - depth], radius_mm=40.0, region="all")
+        np.testing.assert_array_equal(cp.asnumpy(probe.elem_idx), cp.asnumpy(expected.elem_idx))
+        np.testing.assert_allclose(
+            cp.asnumpy(probe.barycenter_mm), cp.asnumpy(expected.barycenter_mm)
+        )
+
+    # inward_dir is normalized, so its magnitude must not shift the probe spacing.
+    scaled = subj.depth_probes(point, [0.0, 0.0, -7.5], depths, radius_mm=40.0)
+    for probe, other in zip(probes, scaled):
+        np.testing.assert_array_equal(cp.asnumpy(probe.elem_idx), cp.asnumpy(other.elem_idx))
+
+    z = [float(p.barycenter_mm[2]) for p in probes]
+    assert z[0] >= z[1] >= z[2] and z[2] < z[0]
+    assert all(abs(float(p.weights.sum()) - 1.0) < 1e-12 for p in probes)
+
+
 def test_result_to_numpy_and_serialize(tmp_path, cube_mesh):
     import cupy as cp
 
