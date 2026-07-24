@@ -2,13 +2,16 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include <cstdint>
 #include <new>
+#include <stdexcept>
 #include <string>
 
 #include "kernels.hpp"
 #include "solver.hpp"
+#include "vcycle.hpp"
 
 namespace nb = nanobind;
 
@@ -62,7 +65,11 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("b"), nb::arg("x"),
             "Run the configured solver once without enforcing convergence.");
 
-    nb::class_<AMGXFloatSolver>(m, "AMGXFloatSolver")
+    // Abstract fp32-preconditioner interface: solve_mixed accepts any implementation
+    // (the AMGx apply or the native V-cycle rebuilt from the exported hierarchy).
+    nb::class_<FloatPrecond>(m, "FloatPrecond");
+
+    nb::class_<AMGXFloatSolver, FloatPrecond>(m, "AMGXFloatSolver")
         .def(nb::init<const std::string&>(), nb::arg("config"))
         .def(
             "setup",
@@ -79,7 +86,63 @@ NB_MODULE(_solver_ext, m) {
                 self.apply(n, b.data(), x.data());
             },
             nb::arg("b"), nb::arg("x"))
-        .def("iterations", &AMGXFloatSolver::iterations);
+        .def("iterations", &AMGXFloatSolver::iterations)
+        .def("generation", &AMGXFloatSolver::generation)
+        .def("amg_num_levels", &AMGXFloatSolver::amg_num_levels,
+             "Number of levels in the AMG hierarchy built by the last setup().")
+        .def(
+            "amg_level_dims",
+            [](const AMGXFloatSolver& self, int level) {
+                int n_rows = 0, n_nz = 0, n_coarse = 0;
+                self.amg_level_dims(level, &n_rows, &n_nz, &n_coarse);
+                return nb::make_tuple(n_rows, n_nz, n_coarse);
+            },
+            nb::arg("level"), "Return (n_rows, n_nz, n_coarse) for one AMG level.")
+        .def(
+            "download_aggregates",
+            [](const AMGXFloatSolver& self, int level, i32_cuda out) {
+                self.download_aggregates(level, out.data());
+            },
+            nb::arg("level"), nb::arg("out"),
+            "Copy the level's fine-row -> aggregate map into a device int32 array.");
+
+    nb::class_<NativeVCycle, FloatPrecond>(m, "NativeVCycle")
+        .def(nb::init<>())
+        .def(
+            "add_level",
+            [](NativeVCycle& self, i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values,
+               f32_cuda_1d dinv, i32_cuda r_row_ptr, i32_cuda r_col_idx, i32_cuda aggregates) {
+                int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
+                int nnz = static_cast<int>(values.shape(0));
+                int n_coarse = static_cast<int>(r_row_ptr.shape(0)) - 1;
+                self.add_level(n_rows, nnz, n_coarse, row_ptr.data(), col_idx.data(),
+                               values.data(), dinv.data(), r_row_ptr.data(), r_col_idx.data(),
+                               aggregates.data());
+            },
+            nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"), nb::arg("dinv"),
+            nb::arg("r_row_ptr"), nb::arg("r_col_idx"), nb::arg("aggregates"),
+            "Append one non-coarsest level (fp32 CSR, omega/guard(d), restriction CSR, "
+            "fine->aggregate map); device arrays are copied into solver-owned buffers.")
+        .def(
+            "set_coarse",
+            [](NativeVCycle& self, f32_cuda_2d ainv) {
+                if (ainv.shape(0) != ainv.shape(1)) {
+                    throw std::invalid_argument("coarse inverse must be square");
+                }
+                self.set_coarse(static_cast<int>(ainv.shape(0)), ainv.data());
+            },
+            nb::arg("ainv"), "Set the dense (row-major) inverse of the coarsest matrix.")
+        .def("finalize", &NativeVCycle::finalize,
+             "Validate level chain consistency; required before apply.")
+        .def(
+            "apply",
+            [](NativeVCycle& self, f32_cuda_1d b, f32_cuda_1d x, uintptr_t stream) {
+                int n = static_cast<int>(b.shape(0));
+                self.apply(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
+            },
+            nb::arg("b"), nb::arg("x"), nb::arg("stream"),
+            "One zero-initial-guess V-cycle: x = M^{-1} b (fp32, deterministic).")
+        .def("generation", &NativeVCycle::generation);
 
     nb::class_<PcgAmgSolver>(m, "PcgAmgSolver")
         .def(
@@ -108,7 +171,7 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("max_iters"))
         .def(
             "solve_mixed",
-            [](PcgAmgSolver& self, AMGXFloatSolver& preconditioner, f64_cuda b, f64_cuda x,
+            [](PcgAmgSolver& self, FloatPrecond& preconditioner, f64_cuda b, f64_cuda x,
                double tolerance, int max_iters, uintptr_t stream, std::optional<f64_cuda> x0) {
                 PcgResult result = self.solve_mixed(
                     preconditioner, b.data(), x.data(), tolerance, max_iters,
@@ -116,7 +179,25 @@ NB_MODULE(_solver_ext, m) {
                 return nb::make_tuple(result.iterations, result.relative_residual);
             },
             nb::arg("preconditioner"), nb::arg("b"), nb::arg("x"), nb::arg("tolerance"),
-            nb::arg("max_iters"), nb::arg("stream"), nb::arg("x0") = nb::none());
+            nb::arg("max_iters"), nb::arg("stream"), nb::arg("x0") = nb::none())
+        .def(
+            "solve_mixed_block",
+            [](PcgAmgSolver& self, FloatPrecond& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
+               double tolerance, int max_iters, uintptr_t stream,
+               std::optional<f64_cuda_2d> X0) {
+                int k = static_cast<int>(B.shape(1));
+                PcgBlockResult result = self.solve_mixed_block(
+                    preconditioner, B.data(), X.data(), k, tolerance, max_iters,
+                    reinterpret_cast<cudaStream_t>(stream),
+                    X0.has_value() ? X0->data() : nullptr);
+                nb::list rels;
+                for (double r : result.relative_residual) rels.append(r);
+                return nb::make_tuple(result.iterations, rels);
+            },
+            nb::arg("preconditioner"), nb::arg("B"), nb::arg("X"), nb::arg("tolerance"),
+            nb::arg("max_iters"), nb::arg("stream"), nb::arg("X0") = nb::none(),
+            "Lockstep k-RHS mixed-precision PCG over row-major (n, k) operands; returns "
+            "(iterations, per-column relative residuals). k in {2, 4, 8}.");
 
     m.def(
         "pcg_amg_solve",
@@ -180,6 +261,57 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("dadt_elm"), nb::arg("wg"), nb::arg("ptr"), nb::arg("idx"), nb::arg("b"),
         nb::arg("stream"),
         "Deterministic node-centric RHS assembly with preweighted gradients.");
+
+    m.def(
+        "rhs_assemble_weighted_block",
+        [](std::vector<f32_cuda_2d> dadt_elm, f32_cuda_3d wg, i32_cuda ptr, i32_cuda idx,
+           f32_cuda_2d b_block, uintptr_t stream) {
+            const int k = static_cast<int>(dadt_elm.size());
+            if (k < 1 || k > kMaxStageBlock ||
+                static_cast<int>(b_block.shape(1)) != k) {
+                throw std::invalid_argument("rhs_assemble_weighted_block: bad list sizes");
+            }
+            const float* in_ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) in_ptrs[c] = dadt_elm[c].data();
+            int n_nodes = static_cast<int>(b_block.shape(0));
+            int n_tet = static_cast<int>(dadt_elm[0].shape(0));
+            launch_rhs_weighted_block(in_ptrs, wg.data(), ptr.data(), idx.data(),
+                                      b_block.data(), n_nodes, n_tet, k,
+                                      reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("dadt_elm"), nb::arg("wg"), nb::arg("ptr"), nb::arg("idx"), nb::arg("b_block"),
+        nb::arg("stream"),
+        "Block RHS assembly for <=8 placements: wg/node2corner read once; writes "
+        "row-major (n_nodes, k) float32.");
+
+    m.def(
+        "reconstruct_e_block",
+        [](f64_cuda_2d v_block, i32_cuda_2d tet_nodes, f32_cuda_3d g,
+           std::vector<f32_cuda_2d> dadt_elm, std::vector<f32_cuda_2d> e_out,
+           std::vector<f32_cuda_1d> magn_out, uintptr_t stream) {
+            const int k = static_cast<int>(dadt_elm.size());
+            if (k < 1 || k > kMaxStageBlock || e_out.size() != dadt_elm.size() ||
+                magn_out.size() != dadt_elm.size() ||
+                static_cast<int>(v_block.shape(1)) != k) {
+                throw std::invalid_argument("reconstruct_e_block: bad list sizes");
+            }
+            const float* de_ptrs[kMaxStageBlock];
+            float* e_ptrs[kMaxStageBlock];
+            float* m_ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                de_ptrs[c] = dadt_elm[c].data();
+                e_ptrs[c] = e_out[c].data();
+                m_ptrs[c] = magn_out[c].data();
+            }
+            int n_tet = static_cast<int>(tet_nodes.shape(0));
+            launch_reconstruct_block(v_block.data(), tet_nodes.data(), g.data(), de_ptrs,
+                                     e_ptrs, m_ptrs, n_tet, k,
+                                     reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("v_block"), nb::arg("tet_nodes"), nb::arg("g"), nb::arg("dadt_elm"),
+        nb::arg("e_out"), nb::arg("magn_out"), nb::arg("stream"),
+        "Block E/magnE reconstruction for <=8 placements: tet_nodes/g read once; "
+        "v_block is row-major (n_nodes, k) float64.");
 
     m.def(
         "weighted_gradient",

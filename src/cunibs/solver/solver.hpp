@@ -1,14 +1,22 @@
 #pragma once
 #include <string>
+#include <vector>
 
 #include <amgx_c.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cusparse.h>
 
+#include "vcycle.hpp"
+
 struct PcgResult {
     int iterations = 0;
     double relative_residual = 0.0;
+};
+
+struct PcgBlockResult {
+    int iterations = 0;                     // lockstep iterations run
+    std::vector<double> relative_residual;  // per-column final relative residual
 };
 
 class AMGXSolver {
@@ -41,21 +49,33 @@ private:
     AMGX_solver_handle solver_ = nullptr;
 };
 
-class AMGXFloatSolver {
+class AMGXFloatSolver : public FloatPrecond {
 public:
     explicit AMGXFloatSolver(const std::string& config);
-    ~AMGXFloatSolver();
+    ~AMGXFloatSolver() override;
 
     AMGXFloatSolver(const AMGXFloatSolver&) = delete;
     AMGXFloatSolver& operator=(const AMGXFloatSolver&) = delete;
 
     void setup(int n, int nnz, const int* row_ptr, const int* col_idx, const float* values);
     void apply(int n, const float* b, float* x);
+    // AMGx runs on its per-thread stream (bound by the caller before the solve), so the
+    // stream argument of the FloatPrecond interface is not needed here.
+    void apply(int n, const float* b, float* x, cudaStream_t) override { apply(n, b, x); }
+    // AMGx vectors are single-column, so the block apply loops k single-vector applies
+    // through contiguous staging columns: correct but with no matrix-read amortization
+    // (A/B probing only; production block solves use NativeVCycle).
+    void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream) override;
     int iterations() const;
     // Bumped on every setup(): a captured CUDA graph embeds pointers into this solver's hierarchy
     // buffers, so PcgAmgSolver keys its cached graph on (solver address, generation) and recaptures
     // after any re-setup.
-    int generation() const { return generation_; }
+    int generation() const override { return generation_; }
+
+    // cuNIBS fork extension: aggregation-hierarchy export for the native V-cycle rebuild.
+    int amg_num_levels() const;
+    void amg_level_dims(int level, int* n_rows, int* n_nz, int* n_coarse) const;
+    void download_aggregates(int level, int* aggregates) const;
 
 private:
     int n_ = 0;
@@ -65,6 +85,10 @@ private:
     AMGX_vector_handle b_ = nullptr;
     AMGX_vector_handle x_ = nullptr;
     AMGX_solver_handle solver_ = nullptr;
+    // Staging columns for apply_block (lazily grown, never shrunk).
+    float* col_in_ = nullptr;
+    float* col_out_ = nullptr;
+    int col_capacity_ = 0;
 };
 
 class PcgAmgSolver {
@@ -78,11 +102,19 @@ public:
     void update_values(const double* values, cudaStream_t stream);
     PcgResult solve(AMGXSolver& preconditioner, const double* b, double* x, double tolerance,
                     int max_iters);
-    PcgResult solve_mixed(AMGXFloatSolver& preconditioner, const double* b, double* x,
+    PcgResult solve_mixed(FloatPrecond& preconditioner, const double* b, double* x,
                           double tolerance, int max_iters, cudaStream_t stream,
                           const double* x0 = nullptr);
+    // Block solve: k independent CG chains in lockstep over row-major (n, k) operands,
+    // sharing every stiffness-matrix read (block SpMV + block V-cycle). Stops when the
+    // worst column reaches tolerance; per-column residuals are reported so callers can
+    // fall back per column. k in {2, 4, 8}.
+    PcgBlockResult solve_mixed_block(FloatPrecond& preconditioner, const double* B, double* X,
+                                     int k, double tolerance, int max_iters,
+                                     cudaStream_t stream, const double* X0 = nullptr);
 
 private:
+    void ensure_block_buffers(int k);
     int n_ = 0;
     int nnz_ = 0;
     int* row_ptr_ = nullptr;
@@ -115,8 +147,26 @@ private:
     cudaEvent_t join_event_ = nullptr;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
-    const AMGXFloatSolver* captured_precond_ = nullptr;
+    const FloatPrecond* captured_precond_ = nullptr;
     int captured_precond_gen_ = 0;
+    // Block-solve state: (n, k) row-major work buffers (lazily sized to the largest k
+    // seen) and a separate cached graph keyed additionally on k.
+    int block_k_ = 0;
+    double* R_blk_ = nullptr;
+    double* P_blk_ = nullptr;
+    double* AP_blk_ = nullptr;
+    double* X_int_blk_ = nullptr;
+    float* RF_blk_ = nullptr;
+    float* ZF_blk_ = nullptr;
+    // Layout: [rz | rz_next | pap | alpha | neg_alpha | norm | beta], each k wide.
+    double* scalars_blk_ = nullptr;
+    double* partials_blk_ = nullptr;
+    double* h_norms_blk_ = nullptr;  // pinned, k residual norms + k reference norms
+    cudaGraph_t block_graph_ = nullptr;
+    cudaGraphExec_t block_graph_exec_ = nullptr;
+    const FloatPrecond* block_captured_precond_ = nullptr;
+    int block_captured_gen_ = 0;
+    int block_captured_k_ = 0;
 };
 
 PcgResult pcg_amg_solve(int n, int nnz, const int* row_ptr, const int* col_idx,
@@ -131,7 +181,7 @@ void launch_cg_beta(const double* rz_next, double* rz, double* beta, cudaStream_
 void launch_cg_update_xr(const double* alpha, const double* neg_alpha, const double* p,
                          const double* ap, double* x, double* r, float* rf, int n,
                          cudaStream_t stream);
-void launch_cg_update_p(const double* beta, const double* z, double* p, int n,
+void launch_cg_update_p(const double* beta, const float* zf, double* p, int n,
                         cudaStream_t stream);
 void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
                       const double* x, double* y, cudaStream_t stream);
@@ -139,6 +189,38 @@ int cg_partials_size(int n);
 void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, const double* p,
                               const double* ap, double* x, double* r, float* rf,
                               double* partials, double* norm_sq, int n, cudaStream_t stream);
-void launch_cg_cast_dot_beta(const float* zf, double* z, const double* r, double* partials,
+void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials,
                              double* rz, double* rz_next, double* beta, int n,
                              cudaStream_t stream);
+
+// Block CG launchers (block_cg.cu); all dense operands row-major (n, k), k in {2, 4, 8}.
+int bcg_partials_blocks(int n);
+void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
+                             const double* vals, const double* x, double* y,
+                             cudaStream_t stream);
+void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,
+                    double* out, cudaStream_t stream);
+void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
+                      cudaStream_t stream);
+void launch_bcg_alpha(int k, const double* rz, const double* pap, double* alpha,
+                      double* neg_alpha, cudaStream_t stream);
+void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* neg_alpha,
+                               const double* p, const double* ap, double* x, double* r,
+                               float* rf, double* partials, double* norms,
+                               cudaStream_t stream);
+void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
+                              double* partials, double* rz, double* rz_next, double* beta,
+                              cudaStream_t stream);
+void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
+                              double* partials, double* rz, cudaStream_t stream);
+void launch_bcg_update_p(int n, int k, const double* beta, const float* zf, double* p,
+                         cudaStream_t stream);
+void launch_bcg_d2f(long n_total, const double* in, float* out, cudaStream_t stream);
+void launch_bcg_f2d(long n_total, const float* in, double* out, cudaStream_t stream);
+void launch_bcg_residual(long n_total, const double* b, const double* ap, double* r,
+                         cudaStream_t stream);
+// Column staging for AMGXFloatSolver::apply_block (defined in block_cg.cu).
+void launch_strided_gather(int n, int k, int c, const float* in, float* out,
+                           cudaStream_t stream);
+void launch_strided_scatter(int n, int k, int c, const float* in, float* out,
+                            cudaStream_t stream);

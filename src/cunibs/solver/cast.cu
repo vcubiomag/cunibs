@@ -46,11 +46,13 @@ __global__ void cg_update_xr_kernel(const double* __restrict__ alpha,
 }
 
 // Fuses p = β p + z (cublas scal(p) + axpy(z→p)): one read/write of p instead of two.
-__global__ void cg_update_p_kernel(const double* __restrict__ beta, const double* __restrict__ z,
+// z is consumed as the raw fp32 preconditioner output (exact float→double cast on the
+// fly), so no fp64 z vector is ever materialized.
+__global__ void cg_update_p_kernel(const double* __restrict__ beta, const float* __restrict__ zf,
                                    double* __restrict__ p, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    p[i] = (*beta) * p[i] + z[i];
+    p[i] = (*beta) * p[i] + static_cast<double>(zf[i]);
 }
 
 // Deterministic two-stage reductions: stage 1 kernels emit one partial per block (fixed-order
@@ -107,17 +109,14 @@ __global__ void cg_reduce_norm_kernel(const double* __restrict__ partials, int n
     if (threadIdx.x == 0) *norm_sq = total;
 }
 
-// float→double cast of z + r·z partials: replaces float_to_double + cublasDdot (drops a full
-// re-read of r and z).
-__global__ void cg_cast_dot_kernel(const float* __restrict__ zf, double* __restrict__ z,
-                                   const double* __restrict__ r, double* __restrict__ partials,
-                                   int n) {
+// r·z partials with z cast from fp32 on the fly: replaces float_to_double + cublasDdot
+// (drops a full re-read of r plus the fp64 z write/read entirely).
+__global__ void cg_cast_dot_kernel(const float* __restrict__ zf, const double* __restrict__ r,
+                                   double* __restrict__ partials, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     double prod = 0.0;
     if (i < n) {
-        const double zi = static_cast<double>(zf[i]);
-        z[i] = zi;
-        prod = r[i] * zi;
+        prod = r[i] * static_cast<double>(zf[i]);
     }
     block_reduce_partial(prod, partials);
 }
@@ -188,10 +187,10 @@ void launch_cg_update_xr(const double* alpha, const double* neg_alpha, const dou
     cg_update_xr_kernel<<<blocks, kBlock, 0, stream>>>(alpha, neg_alpha, p, ap, x, r, rf, n);
 }
 
-void launch_cg_update_p(const double* beta, const double* z, double* p, int n,
+void launch_cg_update_p(const double* beta, const float* zf, double* p, int n,
                         cudaStream_t stream) {
     const int blocks = (n + kBlock - 1) / kBlock;
-    cg_update_p_kernel<<<blocks, kBlock, 0, stream>>>(beta, z, p, n);
+    cg_update_p_kernel<<<blocks, kBlock, 0, stream>>>(beta, zf, p, n);
 }
 
 void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
@@ -211,10 +210,10 @@ void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, cons
     cg_reduce_norm_kernel<<<1, kBlock, 0, stream>>>(partials, blocks, norm_sq);
 }
 
-void launch_cg_cast_dot_beta(const float* zf, double* z, const double* r, double* partials,
+void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials,
                              double* rz, double* rz_next, double* beta, int n,
                              cudaStream_t stream) {
     const int blocks = (n + kBlock - 1) / kBlock;
-    cg_cast_dot_kernel<<<blocks, kBlock, 0, stream>>>(zf, z, r, partials, n);
+    cg_cast_dot_kernel<<<blocks, kBlock, 0, stream>>>(zf, r, partials, n);
     cg_reduce_beta_kernel<<<1, kBlock, 0, stream>>>(partials, blocks, rz, rz_next, beta);
 }

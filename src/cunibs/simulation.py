@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Mapping, Sequence, TypeAlias, overload
@@ -13,7 +15,13 @@ import numpy.typing as npt
 
 from cunibs import metrics
 from cunibs.coil import Coil
-from cunibs.fem import SolverContext, build_context, solve_placement
+from cunibs.fem import (
+    MAX_BLOCK,
+    BlockWarmStart,
+    SolverContext,
+    build_context,
+    solve_placements_block,
+)
 from cunibs.mesh import HeadMesh, load_mesh
 
 if TYPE_CHECKING:
@@ -405,73 +413,56 @@ class Subject:
         dip_pos_m = cp.asarray(coil.positions_m)
         dip_moment = cp.asarray(coil.moments)
         temp_pool = cp.cuda.MemoryPool()
-        for site in sites:
-            if retain_fields and device == "gpu":
-                out = solve_placement(
-                    ctx,
-                    dip_pos_m,
-                    dip_moment,
-                    site.center_mm,
-                    site.handle_mm,
-                    site.distance_mm,
-                    didt,
-                )
-            else:
-                with cp.cuda.using_allocator(temp_pool.malloc):
-                    out = solve_placement(
-                        ctx,
-                        dip_pos_m,
-                        dip_moment,
-                        site.center_mm,
-                        site.handle_mm,
-                        site.distance_mm,
-                        didt,
-                    )
-                    if not retain_fields:
-                        barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
-                        results.append(
-                            self._field_summary(out, site, coil, didt, barycenters_mm)
-                        )
-                        del out
-                        continue
-            if not retain_fields:
-                continue
+        # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
+        # one lockstep block CG that reads the matrix/hierarchy once for the whole
+        # chunk. CUNIBS_BLOCK_K=1 restores the serial per-placement path exactly.
+        chunk_k = max(1, min(MAX_BLOCK, int(os.environ.get("CUNIBS_BLOCK_K", MAX_BLOCK))))
+        warm = BlockWarmStart()
+        with ExitStack() as scratch:
+            # Retained device fields have to outlive the pool, so those solves allocate
+            # normally; everything else is scratch and gets bulk-freed below.
+            if not (retain_fields and device == "gpu"):
+                scratch.enter_context(cp.cuda.using_allocator(temp_pool.malloc))
 
-            if device == "gpu":
-                if self._barycenters_mm is None:
-                    self._barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
-                results.append(
+            for start in range(0, len(sites), chunk_k):
+                chunk = sites[start : start + chunk_k]
+                site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
+                outs = solve_placements_block(ctx, dip_pos_m, dip_moment, site_args, didt, warm)
+                if not retain_fields:
+                    # Pool-owned, so re-uploaded per chunk instead of cached on self.
+                    barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
+                    results.extend(
+                        self._field_summary(out, site, coil, didt, barycenters_mm)
+                        for site, out in zip(chunk, outs)
+                    )
+                    del outs
+                    continue
+
+                if device == "gpu":
+                    if self._barycenters_mm is None:
+                        self._barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
+                    to_out = cp.asarray
+                    vols, tet_tags = ctx.vols, ctx.tet_tags
+                    barycenters_mm = self._barycenters_mm
+                else:
+                    to_out = cp.asnumpy
+                    vols, tet_tags, barycenters_mm = self._host_metric_inputs(ctx)
+                results.extend(
                     FieldResult(
-                        E=out["E"],
-                        magnE=out["magnE"],
-                        v=out["v"],
-                        transform=out["transform"],
+                        E=to_out(out["E"]),
+                        magnE=to_out(out["magnE"]),
+                        v=to_out(out["v"]),
+                        transform=np.asarray(out["transform"]),
                         placement=site,
                         coil_name=coil.name,
                         didt=didt,
-                        vols=ctx.vols,
-                        tet_tags=ctx.tet_tags,
-                        barycenters_mm=self._barycenters_mm,
+                        vols=vols,
+                        tet_tags=tet_tags,
+                        barycenters_mm=barycenters_mm,
                     )
+                    for site, out in zip(chunk, outs)
                 )
-                continue
-
-            vols, tet_tags, barycenters_mm = self._host_metric_inputs(ctx)
-            results.append(
-                FieldResult(
-                    E=cp.asnumpy(out["E"]),
-                    magnE=cp.asnumpy(out["magnE"]),
-                    v=cp.asnumpy(out["v"]),
-                    transform=np.asarray(out["transform"]),
-                    placement=site,
-                    coil_name=coil.name,
-                    didt=didt,
-                    vols=vols,
-                    tet_tags=tet_tags,
-                    barycenters_mm=barycenters_mm,
-                )
-            )
-            del out
+                del outs
         temp_pool.free_all_blocks()
         return results[0] if single else results
 

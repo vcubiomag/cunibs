@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -16,16 +17,23 @@ from cunibs.fem.assembly import (
     conductivity_per_tet,
     gradient_operator,
 )
-from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
+from cunibs.fem.placement import (
+    coil_dadt_at_nodes,
+    compute_coil_transform,
+    compute_coil_transforms,
+)
 from cunibs.mesh import HeadMesh
 from cunibs.solver import (
     AMGXFloatSolver,
     AMGXSolver,
+    NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
     reconstruct_e,
+    reconstruct_e_block,
     rhs_assemble,
     rhs_assemble_weighted,
+    rhs_assemble_weighted_block,
     weighted_gradient,
 )
 
@@ -63,6 +71,78 @@ def _amgx_config_value(config: str, key: str, default: str) -> str:
     return default
 
 
+def _l1_dinv(a: csp.csr_matrix, omega: float = 0.9) -> cp.ndarray:
+    """AMGx JACOBI_L1 smoother scaling: omega / d, d_i = sign(a_ii) * sum_j |a_ij|.
+
+    Matches the fork's compute_d_kernel (diagonal included in the L1 norm, sign flipped
+    for negative diagonals) with the default relaxation_factor 0.9 folded in. The
+    zero-guard never triggers for the SPD reduced stiffness but is kept for parity.
+    """
+    abs_a = csp.csr_matrix((cp.abs(a.data), a.indices, a.indptr), shape=a.shape)
+    d = abs_a.dot(cp.ones(a.shape[1], dtype=cp.float32))
+    d = cp.where(a.diagonal() < 0, -d, d)
+    d = cp.where(d != 0, d, cp.float32(1.0))
+    return cp.ascontiguousarray((cp.float32(omega) / d).astype(cp.float32))
+
+
+def build_native_vcycle(
+    float_preconditioner: AMGXFloatSolver,
+    row_ptr: cp.ndarray,
+    col_idx: cp.ndarray,
+    values_f32: cp.ndarray,
+) -> NativeVCycle:
+    """Rebuild the AMGx preconditioner's V-cycle operators for the native apply.
+
+    AMGx contributes only the per-level aggregate maps (the hard part of setup); the
+    Galerkin products, l1-Jacobi diagonals, restriction ordering and the dense coarse
+    inverse are recomputed here. Unsmoothed aggregation makes P a boolean map, so
+    A_{l+1} = P^T A_l P and the restriction row order is the stable sort by aggregate,
+    matching the fork's computeRestrictionOperator.
+    """
+    n_levels = int(float_preconditioner.amg_num_levels())
+    n = int(row_ptr.shape[0]) - 1
+    a = csp.csr_matrix((values_f32, col_idx, row_ptr), shape=(n, n))
+    vc = NativeVCycle()
+    for level in range(n_levels - 1):
+        n_rows, _, n_coarse = float_preconditioner.amg_level_dims(level)
+        if n_rows != a.shape[0]:
+            raise RuntimeError(
+                f"native V-cycle: level {level} has {n_rows} rows in AMGx but "
+                f"{a.shape[0]} in the recomputed Galerkin chain"
+            )
+        agg = cp.empty(n_rows, dtype=cp.int32)
+        float_preconditioner.download_aggregates(level, agg)
+        order = cp.ascontiguousarray(cp.argsort(agg, kind="stable").astype(cp.int32))
+        counts = cp.bincount(agg, minlength=n_coarse)
+        r_ptr = cp.zeros(n_coarse + 1, dtype=cp.int64)
+        cp.cumsum(counts, out=r_ptr[1:])
+        r_ptr = cp.ascontiguousarray(r_ptr.astype(cp.int32))
+        vc.add_level(
+            cp.ascontiguousarray(a.indptr.astype(cp.int32)),
+            cp.ascontiguousarray(a.indices.astype(cp.int32)),
+            cp.ascontiguousarray(a.data.astype(cp.float32)),
+            _l1_dinv(a),
+            r_ptr,
+            order,
+            agg,
+        )
+        p = csp.csr_matrix(
+            (
+                cp.ones(n_rows, dtype=cp.float32),
+                agg,
+                cp.arange(n_rows + 1, dtype=cp.int32),
+            ),
+            shape=(n_rows, n_coarse),
+        )
+        a = (p.T.tocsr() @ a @ p).tocsr()
+        a.sum_duplicates()
+        a.sort_indices()
+    ainv = cp.linalg.inv(a.todense().astype(cp.float32))
+    vc.set_coarse(cp.ascontiguousarray(ainv.astype(cp.float32)))
+    vc.finalize()
+    return vc
+
+
 def ground_node_of(nodes_mm: cp.ndarray) -> int:
     """The grounded DOF: the lowest node in z (shared by forward and adjoint systems)."""
     return int(cp.argmin(nodes_mm[:, 2]))
@@ -92,7 +172,9 @@ class GroundedSolver:
 
     n: int
     idx: cp.ndarray
-    float_preconditioner: AMGXFloatSolver
+    # The fp32 apply inside solve_mixed: the native V-cycle rebuilt from the exported
+    # AMGx hierarchy (the AMGx float solver itself is dropped right after the export).
+    precond: NativeVCycle
     pcg: PcgAmgSolver
     tolerance: float
     max_iters: int
@@ -130,17 +212,21 @@ def prepare_grounded_solver(
     row_ptr = cp.ascontiguousarray(a_red.indptr.astype(cp.int32))
     col_idx = cp.ascontiguousarray(a_red.indices.astype(cp.int32))
     values = cp.ascontiguousarray(a_red.data.astype(cp.float64))
-    float_preconditioner = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
-    float_preconditioner.setup(
-        row_ptr, col_idx, cp.ascontiguousarray(values.astype(cp.float32))
-    )
+    values_f32 = cp.ascontiguousarray(values.astype(cp.float32))
+    # AMGx only builds the aggregation hierarchy; the export-derived native V-cycle owns
+    # device copies of everything it needs, so the AMGx float solver is dropped at
+    # return, releasing its matrix + hierarchy (~160 MB per subject).
+    amgx_precond = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
+    amgx_precond.setup(row_ptr, col_idx, values_f32)
+    precond = build_native_vcycle(amgx_precond, row_ptr, col_idx, values_f32)
+    del amgx_precond
     pcg = PcgAmgSolver(row_ptr, col_idx, values)
     tolerance = float(_amgx_config_value(config, "tolerance", "1e-6"))
     max_iters = int(_amgx_config_value(config, "max_iters", "2000"))
     return GroundedSolver(
         n=n,
         idx=idx,
-        float_preconditioner=float_preconditioner,
+        precond=precond,
         pcg=pcg,
         tolerance=tolerance,
         max_iters=max_iters,
@@ -156,7 +242,7 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
     x_red = cp.empty(int(solver.idx.shape[0]), dtype=cp.float64)
     iters, rel = solver.pcg.solve_mixed(
-        solver.float_preconditioner,
+        solver.precond,
         b_red,
         x_red,
         solver.tolerance,
@@ -173,6 +259,90 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x_red
     return v
+
+
+# Compiled block widths of the k-RHS solve kernels; smaller batches pad up by
+# replicating the last column (the padded column costs bandwidth but no extra
+# matrix reads, which is the point of the block path).
+BLOCK_SIZES = (2, 4, 8)
+MAX_BLOCK = BLOCK_SIZES[-1]
+
+
+@dataclass
+class BlockWarmStart:
+    """Carry the previous chunk's solutions to warm-start the next chunk.
+
+    One instance per batched simulate call; solve_placements_block updates it in place.
+    """
+
+    centers: np.ndarray | None = None  # (k_prev, 3) placement centers
+    x_red: cp.ndarray | None = None  # (n_red, k_prev) f64 reduced solutions
+
+
+def _warm_x0(
+    carry: BlockWarmStart | None, centers: np.ndarray, n_red: int, k: int, k_pad: int
+) -> cp.ndarray | None:
+    """Build the (n_red, k_pad) initial guess from the nearest prior placements.
+
+    Warm and cold starts converge to the same ||r||/||b|| <= tol criterion (the
+    reference norm is ||b||, not the warm residual), so fields stay within the solver
+    tolerance either way; a warm start only changes the iteration count.
+    """
+    if carry is None or carry.centers is None:
+        return None
+    assert carry.x_red is not None
+    nearest = np.linalg.norm(centers[:, None, :] - carry.centers[None, :, :], axis=2).argmin(
+        axis=1
+    )
+    x0 = cp.empty((n_red, k_pad), dtype=cp.float64)
+    for c in range(k):
+        x0[:, c] = carry.x_red[:, int(nearest[c])]
+    for c in range(k, k_pad):
+        x0[:, c] = x0[:, k - 1]
+    return cp.ascontiguousarray(x0)
+
+
+def _solve_grounded_block_mat(
+    solver: GroundedSolver, B: cp.ndarray, k: int, x0: cp.ndarray | None = None
+) -> cp.ndarray:
+    """Block-solve a padded (n_red, k_pad) RHS matrix; returns X with fallbacks applied.
+
+    Each of the k chains is numerically independent (per-column reductions), they just
+    share every stiffness/hierarchy matrix read. Columns whose lockstep residual misses
+    tolerance are re-solved individually by the fp64 AMGx fallback.
+    """
+    X = cp.empty_like(B)
+    iters, rels = solver.pcg.solve_mixed_block(
+        solver.precond,
+        B,
+        X,
+        solver.tolerance,
+        solver.max_iters,
+        cp.cuda.get_current_stream().ptr,
+        x0,
+    )
+    solver.last_iterations = int(iters)
+    solver.last_relative_residual = float(max(rels[:k]))
+    for c in range(k):
+        if rels[c] > solver.tolerance:
+            amgx = solver.ensure_amgx()
+            b_red = cp.ascontiguousarray(B[:, c])
+            x_red = cp.empty(int(B.shape[0]), dtype=cp.float64)
+            amgx.solve(b_red, x_red, cp.cuda.get_current_stream().ptr)
+            X[:, c] = x_red
+    return X
+
+
+def _pad_block(B: cp.ndarray, k: int) -> cp.ndarray:
+    """Pad the (n_red, k) RHS matrix to a compiled block width by replicating a column."""
+    k_pad = next(s for s in BLOCK_SIZES if s >= k)
+    if k_pad == k:
+        return cp.ascontiguousarray(B)
+    padded = cp.empty((int(B.shape[0]), k_pad), dtype=B.dtype)
+    padded[:, :k] = B
+    for c in range(k, k_pad):
+        padded[:, c] = B[:, k - 1]
+    return padded
 
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
@@ -376,3 +546,93 @@ def solve_placement(
         "magnE": magn_e,
         "v": v,
     }
+
+
+def solve_placements_block(
+    ctx: SolverContext,
+    dip_pos_m: npt.ArrayLike,
+    dip_moment: npt.ArrayLike,
+    sites: Sequence[tuple[npt.ArrayLike, npt.ArrayLike, float]],
+    didt: float,
+    warm: BlockWarmStart | None = None,
+) -> list[PlacementResult]:
+    """Solve up to MAX_BLOCK placements with block kernels end to end.
+
+    ``sites`` are (center_mm, pos_ydir_mm, distance_mm) triples. All stages that read
+    large placement-independent arrays (scalp projection, tet connectivity, weighted
+    gradients, node2corner, g) run once per chunk instead of once per placement; the
+    linear solve shares every stiffness/hierarchy read across the k columns.
+    """
+    k = len(sites)
+    solver = ctx.solver
+    if k == 1:
+        center_mm, pos_ydir_mm, distance_mm = sites[0]
+        return [
+            solve_placement(
+                ctx, dip_pos_m, dip_moment, center_mm, pos_ydir_mm, distance_mm, didt
+            )
+        ]
+    if k > MAX_BLOCK:
+        raise ValueError(f"solve_placements_block: k={k} exceeds MAX_BLOCK={MAX_BLOCK}")
+    stream = cp.cuda.get_current_stream().ptr
+    n_tet = int(ctx.tet_nodes.shape[0])
+
+    transforms = cp.asnumpy(
+        compute_coil_transforms(
+            ctx,
+            np.asarray([s[0] for s in sites], dtype=np.float64).reshape(k, 3),
+            np.asarray([s[1] for s in sites], dtype=np.float64).reshape(k, 3),
+            np.asarray([s[2] for s in sites], dtype=np.float64),
+        )
+    )
+
+    # dA/dt node->element stays per placement: a k-wide version gathers from k separate
+    # 8.4 MB nodal arrays at once, which overflows L2 and measured 3x SLOWER than k
+    # serial passes (the shared tet_nodes read it would amortize is the smaller cost).
+    dadt_elms = []
+    for i in range(k):
+        dadt_nodes = coil_dadt_at_nodes(
+            dip_pos_m, dip_moment, transforms[i], didt, ctx.nodes_mm
+        )
+        dadt_elms.append(_dadt_node_to_elm(dadt_nodes, ctx.tet_nodes))
+        del dadt_nodes
+
+    b_block = cp.empty((ctx.n_nodes, k), dtype=cp.float32)
+    rhs_assemble_weighted_block(
+        dadt_elms,
+        ctx.wg,
+        ctx.node2corner_ptr,
+        ctx.node2corner_idx,
+        b_block,
+        stream,
+    )
+
+    B = cp.ascontiguousarray(b_block[solver.idx, :].astype(cp.float64))
+    B_pad = _pad_block(B, k)
+    centers = np.asarray([np.asarray(s[0], dtype=np.float64).reshape(3) for s in sites])
+    x0 = _warm_x0(warm, centers, int(B.shape[0]), k, int(B_pad.shape[1]))
+    X = _solve_grounded_block_mat(solver, B_pad, k, x0)
+    if warm is not None:
+        warm.centers = centers
+        warm.x_red = X[:, :k]
+
+    v_block = cp.zeros((solver.n, k), dtype=cp.float64)
+    v_block[solver.idx, :] = X[:, :k]
+    v_block = cp.ascontiguousarray(v_block)
+
+    es = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
+    magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(k)]
+    reconstruct_e_block(v_block, ctx.tet_nodes, ctx.g, dadt_elms, es, magns, stream)
+
+    results: list[PlacementResult] = []
+    for i in range(k):
+        results.append(
+            {
+                "transform": transforms[i],
+                "dadt_elm": dadt_elms[i],
+                "E": es[i],
+                "magnE": magns[i],
+                "v": cp.ascontiguousarray(v_block[:, i]),
+            }
+        )
+    return results

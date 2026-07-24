@@ -10,9 +10,11 @@ import cupyx.scipy.sparse as csp
 from cunibs.coil import Coil
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-from cunibs.fem.solve import SolverContext
+from cunibs.fem.solve import SolverContext, build_native_vcycle
 from cunibs.simulation import Placement
 from cunibs.solver import (
+    AMGXFloatSolver,
+    NativeVCycle,
     accumulate_moments,
     dadt_node_to_element,
     reconstruct_e,
@@ -109,6 +111,16 @@ def run_conductivity_uq(
     policy = config.preconditioner_refresh
     periodic = policy if isinstance(policy, int) and not isinstance(policy, bool) else 0
 
+    # Frozen-preconditioner policies keep one hierarchy for the whole ensemble, so the
+    # apply can run on the native V-cycle.
+    precond: AMGXFloatSolver | NativeVCycle = float_precond
+    if policy in ("adaptive", "never"):
+        if pre.native_vcycle is None:
+            pre.native_vcycle = build_native_vcycle(
+                float_precond, pre.indptr, pre.indices, nominal_f32
+            )
+        precond = pre.native_vcycle
+
     n_tet = int(ctx.tet_nodes.shape[0])
     n_red = int(pre.idx.shape[0])
     stream = cp.cuda.get_current_stream().ptr
@@ -131,7 +143,7 @@ def run_conductivity_uq(
     b_nom = cp.ascontiguousarray(
         (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx]
     )
-    pcg.solve_mixed(float_precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
+    pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
 
     # Subspace recycling: only P conductivities are perturbed, so x(σ)−x_nominal spans an ≈P-dim
     # subspace. Build an A-orthonormal basis W from the first RECYCLE_BUILD draws, then Galerkin-
@@ -185,7 +197,7 @@ def run_conductivity_uq(
             x0_buf[:] = x_nominal + recycle_w @ (einv_nom @ (recycle_w.T @ r0))
             x0 = x0_buf
         _, rel = pcg.solve_mixed(
-            float_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
+            precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
         )
         if rel > pre.tolerance:
             if policy == "never":

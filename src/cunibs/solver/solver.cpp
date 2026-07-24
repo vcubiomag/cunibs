@@ -11,6 +11,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -158,6 +160,8 @@ AMGXFloatSolver::AMGXFloatSolver(const std::string& config) {
 }
 
 AMGXFloatSolver::~AMGXFloatSolver() {
+    cudaFree(col_out_);
+    cudaFree(col_in_);
     if (solver_) AMGX_solver_destroy(solver_);
     if (x_) AMGX_vector_destroy(x_);
     if (b_) AMGX_vector_destroy(b_);
@@ -181,11 +185,45 @@ void AMGXFloatSolver::apply(int n, const float* b, float* x) {
     check(AMGX_vector_download(x_, x), "vector_download(float x)");
 }
 
+void AMGXFloatSolver::apply_block(int n, int k, const float* B, float* X,
+                                  cudaStream_t stream) {
+    if (col_capacity_ < n) {
+        cudaFree(col_out_);
+        cudaFree(col_in_);
+        check_cuda(cudaMalloc(&col_in_, static_cast<size_t>(n) * sizeof(float)),
+                   "malloc(precond col_in)");
+        check_cuda(cudaMalloc(&col_out_, static_cast<size_t>(n) * sizeof(float)),
+                   "malloc(precond col_out)");
+        col_capacity_ = n;
+    }
+    for (int c = 0; c < k; ++c) {
+        launch_strided_gather(n, k, c, B, col_in_, stream);
+        apply(n, col_in_, col_out_);
+        launch_strided_scatter(n, k, c, col_out_, X, stream);
+    }
+}
+
 int AMGXFloatSolver::iterations() const {
     int iters = -1;
     check(AMGX_solver_get_iterations_number(solver_, &iters),
           "solver_get_iterations_number(float)");
     return iters;
+}
+
+int AMGXFloatSolver::amg_num_levels() const {
+    int n_levels = 0;
+    check(AMGX_solver_get_amg_num_levels(solver_, &n_levels), "solver_get_amg_num_levels");
+    return n_levels;
+}
+
+void AMGXFloatSolver::amg_level_dims(int level, int* n_rows, int* n_nz, int* n_coarse) const {
+    check(AMGX_solver_get_amg_level_dims(solver_, level, n_rows, n_nz, n_coarse),
+          "solver_get_amg_level_dims");
+}
+
+void AMGXFloatSolver::download_aggregates(int level, int* aggregates) const {
+    check(AMGX_solver_download_amg_aggregates(solver_, level, aggregates),
+          "solver_download_amg_aggregates");
 }
 
 PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_idx,
@@ -260,6 +298,17 @@ PcgAmgSolver::~PcgAmgSolver() {
     // path). Reset it to the default before destroying solve_stream_ so a later AMGx op on this
     // thread (e.g. another solver's setup thrust calls) does not dereference a destroyed stream.
     AMGX_set_thread_stream(nullptr);
+    if (block_graph_exec_) cudaGraphExecDestroy(block_graph_exec_);
+    if (block_graph_) cudaGraphDestroy(block_graph_);
+    if (h_norms_blk_) cudaFreeHost(h_norms_blk_);
+    cudaFree(partials_blk_);
+    cudaFree(scalars_blk_);
+    cudaFree(ZF_blk_);
+    cudaFree(RF_blk_);
+    cudaFree(X_int_blk_);
+    cudaFree(AP_blk_);
+    cudaFree(P_blk_);
+    cudaFree(R_blk_);
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (graph_) cudaGraphDestroy(graph_);
     if (join_event_) cudaEventDestroy(join_event_);
@@ -346,7 +395,175 @@ PcgResult PcgAmgSolver::solve(AMGXSolver& preconditioner, const double* b, doubl
     return {max_iters, norm / norm0};
 }
 
-PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const double* b,
+void PcgAmgSolver::ensure_block_buffers(int k) {
+    if (block_k_ >= k) return;
+    cudaFree(R_blk_);
+    cudaFree(P_blk_);
+    cudaFree(AP_blk_);
+    cudaFree(X_int_blk_);
+    cudaFree(RF_blk_);
+    cudaFree(ZF_blk_);
+    cudaFree(scalars_blk_);
+    cudaFree(partials_blk_);
+    if (h_norms_blk_) cudaFreeHost(h_norms_blk_);
+    const size_t nk = static_cast<size_t>(n_) * k;
+    check_cuda(cudaMalloc(&R_blk_, nk * sizeof(double)), "malloc(R_blk)");
+    check_cuda(cudaMalloc(&P_blk_, nk * sizeof(double)), "malloc(P_blk)");
+    check_cuda(cudaMalloc(&AP_blk_, nk * sizeof(double)), "malloc(AP_blk)");
+    check_cuda(cudaMalloc(&X_int_blk_, nk * sizeof(double)), "malloc(X_int_blk)");
+    check_cuda(cudaMalloc(&RF_blk_, nk * sizeof(float)), "malloc(RF_blk)");
+    check_cuda(cudaMalloc(&ZF_blk_, nk * sizeof(float)), "malloc(ZF_blk)");
+    check_cuda(cudaMalloc(&scalars_blk_, static_cast<size_t>(7) * k * sizeof(double)),
+               "malloc(scalars_blk)");
+    check_cuda(cudaMalloc(&partials_blk_,
+                          static_cast<size_t>(k) * bcg_partials_blocks(n_) * sizeof(double)),
+               "malloc(partials_blk)");
+    check_cuda(cudaMallocHost(&h_norms_blk_, static_cast<size_t>(2) * k * sizeof(double)),
+               "mallocHost(norms_blk)");
+    block_k_ = k;
+}
+
+PcgBlockResult PcgAmgSolver::solve_mixed_block(FloatPrecond& preconditioner, const double* B,
+                                               double* X, int k, double tolerance,
+                                               int max_iters, cudaStream_t stream,
+                                               const double* X0) {
+    ensure_block_buffers(k);
+    const char* graph_env = getenv("CUNIBS_GRAPH");
+    const bool use_graph = (graph_env == nullptr) || (graph_env[0] != '0');
+    const char* check_env = getenv("CUNIBS_CHECK_EVERY");
+    const int check_every = (check_env != nullptr && atoi(check_env) > 1) ? atoi(check_env) : 1;
+    cudaStream_t s = use_graph ? solve_stream_ : stream;
+    if (use_graph) {
+        check_cuda(cudaEventRecord(join_event_, stream), "block:record_in");
+        check_cuda(cudaStreamWaitEvent(s, join_event_, 0), "block:wait_in");
+    }
+    check(AMGX_set_thread_stream(reinterpret_cast<void*>(s)), "set_thread_stream(block)");
+
+    const size_t nk = static_cast<size_t>(n_) * k;
+    double* const d_rz = scalars_blk_ + 0 * k;
+    double* const d_rz_next = scalars_blk_ + 1 * k;
+    double* const d_pap = scalars_blk_ + 2 * k;
+    double* const d_alpha = scalars_blk_ + 3 * k;
+    double* const d_neg_alpha = scalars_blk_ + 4 * k;
+    double* const d_norm = scalars_blk_ + 5 * k;
+    double* const d_beta = scalars_blk_ + 6 * k;
+    double* const h_norm = h_norms_blk_;
+    double* const h_ref = h_norms_blk_ + k;
+
+    // Reference norms ‖b_c‖ (convergence is measured against b, matching solve_mixed).
+    launch_bcg_norm2(n_, k, B, partials_blk_, d_norm, s);
+    check_cuda(cudaMemcpyAsync(h_ref, d_norm, static_cast<size_t>(k) * sizeof(double),
+                               cudaMemcpyDeviceToHost, s),
+               "block:copy(ref_norms)");
+    check_cuda(cudaStreamSynchronize(s), "block:sync(ref_norms)");
+    std::vector<double> norm_ref(k);
+    for (int c = 0; c < k; ++c) {
+        norm_ref[c] = std::sqrt(h_ref[c]);
+        if (norm_ref[c] == 0.0) {
+            throw std::invalid_argument("solve_mixed_block: zero RHS column");
+        }
+    }
+
+    if (X0 != nullptr) {
+        check_cuda(cudaMemcpyAsync(X_int_blk_, X0, nk * sizeof(double),
+                                   cudaMemcpyDeviceToDevice, s),
+                   "block:copy(X0)");
+        launch_bcsrmv_f64_block(n_, k, row_ptr_, col_idx_, values_, X_int_blk_, AP_blk_, s);
+        launch_bcg_residual(static_cast<long>(nk), B, AP_blk_, R_blk_, s);
+    } else {
+        check_cuda(cudaMemsetAsync(X_int_blk_, 0, nk * sizeof(double), s), "block:memset(X)");
+        check_cuda(cudaMemcpyAsync(R_blk_, B, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
+                   "block:copy(B,R)");
+    }
+
+    launch_bcg_d2f(static_cast<long>(nk), R_blk_, RF_blk_, s);
+    check_cuda(cudaStreamSynchronize(s), "block:sync(precond_in0)");
+    preconditioner.apply_block(n_, k, RF_blk_, ZF_blk_, s);
+    launch_bcg_cast_dot_init(n_, k, ZF_blk_, R_blk_, partials_blk_, d_rz, s);
+    launch_bcg_f2d(static_cast<long>(nk), ZF_blk_, P_blk_, s);
+
+    auto run_body = [&]() {
+        launch_bcsrmv_f64_block(n_, k, row_ptr_, col_idx_, values_, P_blk_, AP_blk_, s);
+        launch_bcg_dot(n_, k, P_blk_, AP_blk_, partials_blk_, d_pap, s);
+        launch_bcg_alpha(k, d_rz, d_pap, d_alpha, d_neg_alpha, s);
+        launch_bcg_update_xr_norm(n_, k, d_alpha, d_neg_alpha, P_blk_, AP_blk_, X_int_blk_,
+                                  R_blk_, RF_blk_, partials_blk_, d_norm, s);
+        check_cuda(cudaMemcpyAsync(h_norm, d_norm, static_cast<size_t>(k) * sizeof(double),
+                                   cudaMemcpyDeviceToHost, s),
+                   "block:copy(norms)");
+        preconditioner.apply_block(n_, k, RF_blk_, ZF_blk_, s);
+        launch_bcg_cast_dot_beta(n_, k, ZF_blk_, R_blk_, partials_blk_, d_rz, d_rz_next,
+                                 d_beta, s);
+        launch_bcg_update_p(n_, k, d_beta, ZF_blk_, P_blk_, s);
+    };
+
+    if (block_graph_exec_ != nullptr &&
+        (block_captured_precond_ != &preconditioner ||
+         block_captured_gen_ != preconditioner.generation() || block_captured_k_ != k)) {
+        cudaGraphExecDestroy(block_graph_exec_);
+        block_graph_exec_ = nullptr;
+        if (block_graph_) {
+            cudaGraphDestroy(block_graph_);
+            block_graph_ = nullptr;
+        }
+    }
+
+    std::vector<double> rel(k, 0.0);
+    bool have_graph = use_graph && block_graph_exec_ != nullptr;
+    bool capture_failed = !use_graph;
+    int it = 1;
+    int result_iters = max_iters;
+    for (; it <= max_iters; ++it) {
+        if (have_graph) {
+            check_cuda(cudaGraphLaunch(block_graph_exec_, s), "block:graph_launch");
+        } else if (it == 1 || capture_failed) {
+            run_body();  // iter 1 warms pools/lazy block buffers so capture sees no allocs
+        } else {
+            cudaError_t cerr = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+            run_body();
+            cudaError_t eerr = cudaStreamEndCapture(s, &block_graph_);
+            if (cerr == cudaSuccess && eerr == cudaSuccess && block_graph_ != nullptr &&
+                cudaGraphInstantiate(&block_graph_exec_, block_graph_, 0) == cudaSuccess) {
+                have_graph = true;
+                block_captured_precond_ = &preconditioner;
+                block_captured_gen_ = preconditioner.generation();
+                block_captured_k_ = k;
+                check_cuda(cudaGraphLaunch(block_graph_exec_, s), "block:graph_launch_first");
+            } else {
+                if (block_graph_) {
+                    cudaGraphDestroy(block_graph_);
+                    block_graph_ = nullptr;
+                }
+                capture_failed = true;
+                run_body();
+            }
+        }
+        if (it % check_every == 0 || it == max_iters) {
+            check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
+            double worst = 0.0;
+            for (int c = 0; c < k; ++c) {
+                rel[c] = std::sqrt(h_norm[c]) / norm_ref[c];
+                if (rel[c] > worst) worst = rel[c];
+            }
+            if (worst <= tolerance) {
+                result_iters = it;
+                break;
+            }
+        }
+    }
+    check_cuda(cudaMemcpyAsync(X, X_int_blk_, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
+               "block:copy(X_out)");
+    check_cuda(cudaStreamSynchronize(s), "block:sync(X_out)");
+    if (use_graph) {
+        check(AMGX_set_thread_stream(nullptr), "reset_thread_stream(block)");
+    }
+    PcgBlockResult result;
+    result.iterations = result_iters;
+    result.relative_residual = std::move(rel);
+    return result;
+}
+
+PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* b,
                                     double* x, double tolerance, int max_iters,
                                     cudaStream_t stream, const double* x0) {
     // Default-on (CUNIBS_GRAPH=0 forces the direct path). The solve runs on an internal
@@ -417,10 +634,11 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
 
     launch_double_to_float(r_, rf_, n_, s);
     check_cuda(cudaStreamSynchronize(s), "sync(precond_in0)");
-    preconditioner.apply(n_, rf_, zf_);
-    launch_float_to_double(zf_, z_, n_, s);
-    check_cublas(cublasDcopy(blas_, n_, z_, 1, p_, 1), "copy(z,p)");
-    check_cublas(cublasDdot(blas_, n_, r_, 1, z_, 1, d_rz), "dot(r,z)");
+    preconditioner.apply(n_, rf_, zf_, s);
+    // p0 = z0 = (double)zf directly; the fp64 z vector is never materialized (the loop
+    // consumes zf on the fly in cast_dot_beta and update_p).
+    launch_float_to_double(zf_, p_, n_, s);
+    check_cublas(cublasDdot(blas_, n_, r_, 1, p_, 1, d_rz), "dot(r,z)");
 
     // Identical every iteration (fixed buffers updated in place), so it is captured once and
     // replayed; the residual readback is inside the body but the host convergence test stays outside.
@@ -453,10 +671,10 @@ PcgResult PcgAmgSolver::solve_mixed(AMGXFloatSolver& preconditioner, const doubl
                                  d_norm, n_, s);
         check_cuda(cudaMemcpyAsync(h_norm_, d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
                    "copy(norm)");
-        preconditioner.apply(n_, rf_, zf_);
-        // z = (double)zf; rz_next = r·z; beta = rz_next/rz; rz <- rz_next
-        launch_cg_cast_dot_beta(zf_, z_, r_, partials_, d_rz, d_rz_next, d_beta, n_, s);
-        launch_cg_update_p(d_beta, z_, p_, n_, s);  // p = β p + z
+        preconditioner.apply(n_, rf_, zf_, s);
+        // rz_next = r·(double)zf; beta = rz_next/rz; rz <- rz_next (no fp64 z vector)
+        launch_cg_cast_dot_beta(zf_, r_, partials_, d_rz, d_rz_next, d_beta, n_, s);
+        launch_cg_update_p(d_beta, zf_, p_, n_, s);  // p = β p + (double)zf
     };
 
     // The body references only solver-owned buffers plus the preconditioner's hierarchy, so a graph

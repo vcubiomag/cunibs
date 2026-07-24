@@ -32,3 +32,19 @@ void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e
 void launch_place(const double* centers, const double* handles, const double* dists,
                   const double* a, const double* b, const double* c, const double* tnorm,
                   double* out, int n_pl, int n_tri, cudaStream_t stream);
+
+// Block (k <= 8 placements per chunk) variants of the per-placement stages: the shared
+// mesh arrays (tet_nodes, wg, node2corner, g) are read ONCE per chunk instead of once
+// per placement. Per-placement arrays stay separate contiguous buffers, passed as
+// pointer packs so the public per-placement result layout is unchanged.
+constexpr int kMaxStageBlock = 8;
+
+// b_block is row-major (n_nodes, k) float32 — the layout the block solver consumes.
+void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, const int* ptr,
+                               const int* idx, float* b_block, int n_nodes, int n_tet, int k,
+                               cudaStream_t stream);
+
+// v_block is row-major (n_nodes, k) float64.
+void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const float* g,
+                              const float* const* dadt_elm, float* const* e_out,
+                              float* const* magn_out, int n_tet, int k, cudaStream_t stream);

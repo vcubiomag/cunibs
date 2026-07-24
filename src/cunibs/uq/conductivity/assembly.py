@@ -27,7 +27,7 @@ from cunibs.fem.solve import (
     grounded_index,
     reduce_matrix,
 )
-from cunibs.solver import AMGXFloatSolver, AMGXSolver, PcgAmgSolver
+from cunibs.solver import AMGXFloatSolver, AMGXSolver, NativeVCycle, PcgAmgSolver
 
 
 @dataclass
@@ -51,6 +51,9 @@ class ConductivityUQPrecompute:
     )  # (nnz,) f64 — reduced values at nominal σ (frozen-preconditioner point)
     # nominal σ, structure_reuse; the mixed-solve fallback, built lazily on the rare extreme draw.
     solver: AMGXSolver | None = None
+    # Native V-cycle rebuilt from the frozen nominal hierarchy, built lazily on the first
+    # frozen-preconditioner UQ run and reused across placements (see run_conductivity_uq).
+    native_vcycle: NativeVCycle | None = None
 
     def combine(self, sigma: cp.ndarray) -> cp.ndarray:
         """Assemble the reduced matrix values for one conductivity sample."""

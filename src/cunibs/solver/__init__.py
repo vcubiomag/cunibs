@@ -1,6 +1,7 @@
 from cunibs.solver._solver_ext import (
     AMGXSolver,
     AMGXFloatSolver,
+    NativeVCycle,
     PcgAmgSolver,
     accumulate_moments,
     dadt_node_to_element,
@@ -10,14 +11,17 @@ from cunibs.solver._solver_ext import (
     pcg_amg_solve,
     place_transforms,
     reconstruct_e,
+    reconstruct_e_block,
     rhs_assemble,
     rhs_assemble_weighted,
+    rhs_assemble_weighted_block,
     weighted_gradient,
 )
 
 __all__ = [
     "AMGXSolver",
     "AMGXFloatSolver",
+    "NativeVCycle",
     "PcgAmgSolver",
     "accumulate_moments",
     "dadt_nbody",
@@ -27,7 +31,9 @@ __all__ = [
     "pcg_amg_solve",
     "rhs_assemble",
     "rhs_assemble_weighted",
+    "rhs_assemble_weighted_block",
     "reconstruct_e",
+    "reconstruct_e_block",
     "weighted_gradient",
     "place_transforms",
 ]

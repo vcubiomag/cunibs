@@ -18,7 +18,9 @@ from cunibs.fem.placement import (
 )
 from cunibs.fem.solve import (
     AMGX_CONFIG,
+    MAX_BLOCK,
     UQ_AMGX_CONFIG,
+    BlockWarmStart,
     GroundedSolver,
     PlacementResult,
     SolverContext,
@@ -29,6 +31,7 @@ from cunibs.fem.solve import (
     reduce_matrix,
     solve_grounded,
     solve_placement,
+    solve_placements_block,
 )
 
 __all__ = [
@@ -53,7 +56,10 @@ __all__ = [
     "ground_node_of",
     "grounded_index",
     "reduce_matrix",
+    "MAX_BLOCK",
+    "BlockWarmStart",
     "prepare_grounded_solver",
     "solve_grounded",
     "solve_placement",
+    "solve_placements_block",
 ]
