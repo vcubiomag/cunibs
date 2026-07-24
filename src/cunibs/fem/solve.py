@@ -31,7 +31,6 @@ from cunibs.solver import (
     dadt_node_to_element,
     reconstruct_e,
     reconstruct_e_block,
-    rhs_assemble,
     rhs_assemble_weighted,
     rhs_assemble_weighted_block,
     weighted_gradient,
@@ -355,28 +354,6 @@ def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarr
         cp.cuda.get_current_stream().ptr,
     )
     return dadt_elm
-
-
-def _assemble_rhs_kernel(
-    dadt_elm: cp.ndarray,
-    g: cp.ndarray,
-    neg_vc: cp.ndarray,
-    node2corner_ptr: cp.ndarray,
-    node2corner_idx: cp.ndarray,
-    n_nodes: int,
-) -> cp.ndarray:
-    """Assemble the float32 RHS in a fixed reduction order."""
-    b = cp.empty(n_nodes, dtype=cp.float32)
-    rhs_assemble(
-        cp.ascontiguousarray(dadt_elm),
-        g,
-        neg_vc,
-        node2corner_ptr,
-        node2corner_idx,
-        b,
-        cp.cuda.get_current_stream().ptr,
-    )
-    return b
 
 
 def _assemble_rhs_weighted_kernel(

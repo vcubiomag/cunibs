@@ -241,18 +241,6 @@ __global__ void bcg_residual_kernel(long n_total, const double* __restrict__ b,
     if (i < n_total) r[i] = b[i] - ap[i];
 }
 
-__global__ void strided_gather_kernel(int n, int k, int c, const float* __restrict__ in,
-                                      float* __restrict__ out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = in[static_cast<long>(i) * k + c];
-}
-
-__global__ void strided_scatter_kernel(int n, int k, int c, const float* __restrict__ in,
-                                       float* __restrict__ out) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[static_cast<long>(i) * k + c] = in[i];
-}
-
 template <typename F>
 void dispatch_k(int k, F&& f) {
     switch (k) {
@@ -361,16 +349,4 @@ void launch_bcg_residual(long n_total, const double* b, const double* ap, double
                          cudaStream_t stream) {
     const long blocks = (n_total + kBlock - 1) / kBlock;
     bcg_residual_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, b, ap, r);
-}
-
-void launch_strided_gather(int n, int k, int c, const float* in, float* out,
-                           cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    strided_gather_kernel<<<blocks, kBlock, 0, stream>>>(n, k, c, in, out);
-}
-
-void launch_strided_scatter(int n, int k, int c, const float* in, float* out,
-                            cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    strided_scatter_kernel<<<blocks, kBlock, 0, stream>>>(n, k, c, in, out);
 }

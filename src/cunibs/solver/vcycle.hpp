@@ -11,9 +11,6 @@ class FloatPrecond {
 public:
     virtual ~FloatPrecond() = default;
     virtual void apply(int n, const float* b, float* x, cudaStream_t stream) = 0;
-    // Block variant: B and X are row-major (n, k). Must be graph-capturable after a
-    // first (warm-up) call.
-    virtual void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream) = 0;
     virtual int generation() const = 0;
 };
 
@@ -45,7 +42,10 @@ public:
     void finalize();
 
     void apply(int n, const float* b, float* x, cudaStream_t stream) override;
-    void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream) override;
+    // Block variant: B and X are row-major (n, k). Must be graph-capturable after a
+    // first (warm-up) call. Native-only: PcgAmgSolver::solve_mixed_block takes a
+    // NativeVCycle directly, so this is not part of the FloatPrecond interface.
+    void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
     int generation() const override { return generation_; }
 
 private:

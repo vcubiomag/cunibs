@@ -137,13 +137,6 @@ void AMGXSolver::solve(int n, const double* b, double* x, cudaStream_t stream) {
     check(AMGX_vector_download(x_, x), "vector_download(x)");
 }
 
-void AMGXSolver::apply(int n, const double* b, double* x) {
-    check(AMGX_vector_upload(b_, n, 1, b), "vector_upload(b)");
-    check(AMGX_vector_set_zero(x_, n, 1), "vector_set_zero(x)");
-    check(AMGX_solver_solve_with_0_initial_guess(solver_, b_, x_), "solver_apply");
-    check(AMGX_vector_download(x_, x), "vector_download(x)");
-}
-
 int AMGXSolver::iterations() const {
     int iters = -1;
     check(AMGX_solver_get_iterations_number(solver_, &iters), "solver_get_iterations_number");
@@ -160,8 +153,6 @@ AMGXFloatSolver::AMGXFloatSolver(const std::string& config) {
 }
 
 AMGXFloatSolver::~AMGXFloatSolver() {
-    cudaFree(col_out_);
-    cudaFree(col_in_);
     if (solver_) AMGX_solver_destroy(solver_);
     if (x_) AMGX_vector_destroy(x_);
     if (b_) AMGX_vector_destroy(b_);
@@ -183,31 +174,6 @@ void AMGXFloatSolver::apply(int n, const float* b, float* x) {
     check(AMGX_vector_set_zero(x_, n, 1), "vector_set_zero(float x)");
     check(AMGX_solver_solve_with_0_initial_guess(solver_, b_, x_), "solver_apply(float)");
     check(AMGX_vector_download(x_, x), "vector_download(float x)");
-}
-
-void AMGXFloatSolver::apply_block(int n, int k, const float* B, float* X,
-                                  cudaStream_t stream) {
-    if (col_capacity_ < n) {
-        cudaFree(col_out_);
-        cudaFree(col_in_);
-        check_cuda(cudaMalloc(&col_in_, static_cast<size_t>(n) * sizeof(float)),
-                   "malloc(precond col_in)");
-        check_cuda(cudaMalloc(&col_out_, static_cast<size_t>(n) * sizeof(float)),
-                   "malloc(precond col_out)");
-        col_capacity_ = n;
-    }
-    for (int c = 0; c < k; ++c) {
-        launch_strided_gather(n, k, c, B, col_in_, stream);
-        apply(n, col_in_, col_out_);
-        launch_strided_scatter(n, k, c, col_out_, X, stream);
-    }
-}
-
-int AMGXFloatSolver::iterations() const {
-    int iters = -1;
-    check(AMGX_solver_get_iterations_number(solver_, &iters),
-          "solver_get_iterations_number(float)");
-    return iters;
 }
 
 int AMGXFloatSolver::amg_num_levels() const {
@@ -239,7 +205,6 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
         check_cuda(cudaMalloc(&values_, static_cast<size_t>(nnz_) * sizeof(double)),
                    "malloc(values)");
         check_cuda(cudaMalloc(&r_, static_cast<size_t>(n_) * sizeof(double)), "malloc(r)");
-        check_cuda(cudaMalloc(&z_, static_cast<size_t>(n_) * sizeof(double)), "malloc(z)");
         check_cuda(cudaMalloc(&p_, static_cast<size_t>(n_) * sizeof(double)), "malloc(p)");
         check_cuda(cudaMalloc(&ap_, static_cast<size_t>(n_) * sizeof(double)), "malloc(ap)");
         check_cuda(cudaMalloc(&x_int_, static_cast<size_t>(n_) * sizeof(double)), "malloc(x_int)");
@@ -323,7 +288,6 @@ PcgAmgSolver::~PcgAmgSolver() {
     if (x_int_) cudaFree(x_int_);
     if (ap_) cudaFree(ap_);
     if (p_) cudaFree(p_);
-    if (z_) cudaFree(z_);
     if (r_) cudaFree(r_);
     if (zf_) cudaFree(zf_);
     if (rf_) cudaFree(rf_);
@@ -338,61 +302,6 @@ void PcgAmgSolver::update_values(const double* values, cudaStream_t stream) {
     check_cuda(cudaMemcpyAsync(values_, values, static_cast<size_t>(nnz_) * sizeof(double),
                                cudaMemcpyDeviceToDevice, stream),
                "copy(values)");
-}
-
-PcgResult PcgAmgSolver::solve(AMGXSolver& preconditioner, const double* b, double* x,
-                              double tolerance, int max_iters) {
-    // solve_mixed leaves the shared cuBLAS handle in device-pointer mode; these reductions use host
-    // pointers, so restore host mode.
-    check_cublas(cublasSetPointerMode(blas_, CUBLAS_POINTER_MODE_HOST), "set_pointer_mode(host)");
-    check_cuda(cudaMemset(x, 0, static_cast<size_t>(n_) * sizeof(double)), "memset(x)");
-    check_cublas(cublasDcopy(blas_, n_, b, 1, r_, 1), "copy(b,r)");
-
-    double norm0 = 0.0;
-    check_cublas(cublasDnrm2(blas_, n_, r_, 1, &norm0), "nrm2(r0)");
-    if (norm0 == 0.0) {
-        return {0, 0.0};
-    }
-
-    preconditioner.apply(n_, r_, z_);
-    check_cublas(cublasDcopy(blas_, n_, z_, 1, p_, 1), "copy(z,p)");
-
-    double rz = 0.0;
-    check_cublas(cublasDdot(blas_, n_, r_, 1, z_, 1, &rz), "dot(r,z)");
-
-    const double one = 1.0;
-    const double zero = 0.0;
-    for (int it = 1; it <= max_iters; ++it) {
-        check_cusparse(cusparseSpMV(sparse_, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, mat_, p_vec_,
-                                    &zero, ap_vec_, CUDA_R_64F, CUSPARSE_SPMV_CSR_ALG1,
-                                    spmv_buffer_),
-                       "spmv");
-        double pap = 0.0;
-        check_cublas(cublasDdot(blas_, n_, p_, 1, ap_, 1, &pap), "dot(p,ap)");
-        const double alpha = rz / pap;
-        check_cublas(cublasDaxpy(blas_, n_, &alpha, p_, 1, x, 1), "axpy(x)");
-        const double neg_alpha = -alpha;
-        check_cublas(cublasDaxpy(blas_, n_, &neg_alpha, ap_, 1, r_, 1), "axpy(r)");
-
-        double norm = 0.0;
-        check_cublas(cublasDnrm2(blas_, n_, r_, 1, &norm), "nrm2(r)");
-        const double rel = norm / norm0;
-        if (rel <= tolerance) {
-            return {it, rel};
-        }
-
-        preconditioner.apply(n_, r_, z_);
-        double rz_next = 0.0;
-        check_cublas(cublasDdot(blas_, n_, r_, 1, z_, 1, &rz_next), "dot(r,z)");
-        const double beta = rz_next / rz;
-        check_cublas(cublasDscal(blas_, n_, &beta, p_, 1), "scal(p)");
-        check_cublas(cublasDaxpy(blas_, n_, &one, z_, 1, p_, 1), "axpy(p)");
-        rz = rz_next;
-    }
-
-    double norm = 0.0;
-    check_cublas(cublasDnrm2(blas_, n_, r_, 1, &norm), "nrm2(r_final)");
-    return {max_iters, norm / norm0};
 }
 
 void PcgAmgSolver::ensure_block_buffers(int k) {
@@ -423,7 +332,7 @@ void PcgAmgSolver::ensure_block_buffers(int k) {
     block_k_ = k;
 }
 
-PcgBlockResult PcgAmgSolver::solve_mixed_block(FloatPrecond& preconditioner, const double* B,
+PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, const double* B,
                                                double* X, int k, double tolerance,
                                                int max_iters, cudaStream_t stream,
                                                const double* X0) {
@@ -736,11 +645,4 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
         check(AMGX_set_thread_stream(nullptr), "reset_thread_stream");
     }
     return {result_iters, rel};
-}
-
-PcgResult pcg_amg_solve(int n, int nnz, const int* row_ptr, const int* col_idx,
-                        const double* values, AMGXSolver& preconditioner, const double* b,
-                        double* x, double tolerance, int max_iters) {
-    PcgAmgSolver solver(n, nnz, row_ptr, col_idx, values);
-    return solver.solve(preconditioner, b, x, tolerance, max_iters);
 }

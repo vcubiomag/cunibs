@@ -55,15 +55,7 @@ NB_MODULE(_solver_ext, m) {
                 self.solve(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
             },
             nb::arg("b"), nb::arg("x"), nb::arg("stream"),
-            "Solve A x = b on device; x (length n) is overwritten with the solution.")
-        .def(
-            "apply",
-            [](AMGXSolver& self, f64_cuda b, f64_cuda x) {
-                int n = static_cast<int>(b.shape(0));
-                self.apply(n, b.data(), x.data());
-            },
-            nb::arg("b"), nb::arg("x"),
-            "Run the configured solver once without enforcing convergence.");
+            "Solve A x = b on device; x (length n) is overwritten with the solution.");
 
     // Abstract fp32-preconditioner interface: solve_mixed accepts any implementation
     // (the AMGx apply or the native V-cycle rebuilt from the exported hierarchy).
@@ -86,8 +78,6 @@ NB_MODULE(_solver_ext, m) {
                 self.apply(n, b.data(), x.data());
             },
             nb::arg("b"), nb::arg("x"))
-        .def("iterations", &AMGXFloatSolver::iterations)
-        .def("generation", &AMGXFloatSolver::generation)
         .def("amg_num_levels", &AMGXFloatSolver::amg_num_levels,
              "Number of levels in the AMG hierarchy built by the last setup().")
         .def(
@@ -141,8 +131,7 @@ NB_MODULE(_solver_ext, m) {
                 self.apply(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
             },
             nb::arg("b"), nb::arg("x"), nb::arg("stream"),
-            "One zero-initial-guess V-cycle: x = M^{-1} b (fp32, deterministic).")
-        .def("generation", &NativeVCycle::generation);
+            "One zero-initial-guess V-cycle: x = M^{-1} b (fp32, deterministic).");
 
     nb::class_<PcgAmgSolver>(m, "PcgAmgSolver")
         .def(
@@ -160,16 +149,6 @@ NB_MODULE(_solver_ext, m) {
             },
             nb::arg("values"), nb::arg("stream"))
         .def(
-            "solve",
-            [](PcgAmgSolver& self, AMGXSolver& preconditioner, f64_cuda b, f64_cuda x,
-               double tolerance, int max_iters) {
-                PcgResult result =
-                    self.solve(preconditioner, b.data(), x.data(), tolerance, max_iters);
-                return nb::make_tuple(result.iterations, result.relative_residual);
-            },
-            nb::arg("preconditioner"), nb::arg("b"), nb::arg("x"), nb::arg("tolerance"),
-            nb::arg("max_iters"))
-        .def(
             "solve_mixed",
             [](PcgAmgSolver& self, FloatPrecond& preconditioner, f64_cuda b, f64_cuda x,
                double tolerance, int max_iters, uintptr_t stream, std::optional<f64_cuda> x0) {
@@ -182,7 +161,7 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("max_iters"), nb::arg("stream"), nb::arg("x0") = nb::none())
         .def(
             "solve_mixed_block",
-            [](PcgAmgSolver& self, FloatPrecond& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
                double tolerance, int max_iters, uintptr_t stream,
                std::optional<f64_cuda_2d> X0) {
                 int k = static_cast<int>(B.shape(1));
@@ -198,21 +177,6 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("max_iters"), nb::arg("stream"), nb::arg("X0") = nb::none(),
             "Lockstep k-RHS mixed-precision PCG over row-major (n, k) operands; returns "
             "(iterations, per-column relative residuals). k in {2, 4, 8}.");
-
-    m.def(
-        "pcg_amg_solve",
-        [](i32_cuda row_ptr, i32_cuda col_idx, f64_cuda values, AMGXSolver& preconditioner,
-           f64_cuda b, f64_cuda x, double tolerance, int max_iters) {
-            int n = static_cast<int>(row_ptr.shape(0)) - 1;
-            int nnz = static_cast<int>(values.shape(0));
-            PcgResult result = pcg_amg_solve(n, nnz, row_ptr.data(), col_idx.data(),
-                                             values.data(), preconditioner, b.data(), x.data(),
-                                             tolerance, max_iters);
-            return nb::make_tuple(result.iterations, result.relative_residual);
-        },
-        nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"), nb::arg("preconditioner"),
-        nb::arg("b"), nb::arg("x"), nb::arg("tolerance"), nb::arg("max_iters"),
-        "Run double outer PCG with an AMGx preconditioner apply.");
 
     m.def(
         "dadt_nbody",
