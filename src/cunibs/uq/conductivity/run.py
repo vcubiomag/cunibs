@@ -10,11 +10,9 @@ import cupyx.scipy.sparse as csp
 from cunibs.coil import Coil
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-from cunibs.fem.solve import SolverContext, build_native_vcycle
+from cunibs.fem.solve import SolverContext
 from cunibs.simulation import Placement
 from cunibs.solver import (
-    AMGXFloatSolver,
-    NativeVCycle,
     accumulate_moments,
     dadt_node_to_element,
     reconstruct_e,
@@ -79,9 +77,10 @@ def run_conductivity_uq(
 
     The coil field (``dadt_elm``) and the per-tissue RHS/stiffness components are σ-independent and
     built once. Each sample re-weights the matrix and RHS by the sampled conductivities (two small
-    GEMVs), then solves against a preconditioner frozen at the nominal (ensemble-centre) σ — the
-    cheapest robust choice, since i.i.d. samples give a fixed central preconditioner no drift to
-    chase. ``preconditioner_refresh`` only controls the rare recovery/robustness behaviour.
+    GEMVs), then solves against a preconditioner built once at the nominal (ensemble-centre) σ,
+    which the i.i.d. samples stay clustered around. A draw that misses tolerance falls back to a
+    per-sample fp64 AMGx solve, so accuracy never depends on the preconditioner tracking the
+    sample.
 
     When ``record_rois`` (a ``{name: ResolvedTarget}`` mapping; ``{}`` is allowed and records the
     whole-field metrics only) is given, each draw's per-tet field is reduced in-place — no host
@@ -106,20 +105,7 @@ def run_conductivity_uq(
     # The double AMGx solver stays frozen at nominal σ as the mixed-solve fallback; built lazily on
     # the first extreme draw (``pre.ensure_solver()``), so most ensembles never allocate it.
     pcg = pre.pcg
-    float_precond = pre.float_preconditioner
-    nominal_f32 = cp.ascontiguousarray(pre.nominal_data.astype(cp.float32))
-    policy = config.preconditioner_refresh
-    periodic = policy if isinstance(policy, int) and not isinstance(policy, bool) else 0
-
-    # Frozen-preconditioner policies keep one hierarchy for the whole ensemble, so the
-    # apply can run on the native V-cycle.
-    precond: AMGXFloatSolver | NativeVCycle = float_precond
-    if policy in ("adaptive", "never"):
-        if pre.native_vcycle is None:
-            pre.native_vcycle = build_native_vcycle(
-                float_precond, pre.indptr, pre.indices, nominal_f32
-            )
-        precond = pre.native_vcycle
+    precond = pre.precond
 
     n_tet = int(ctx.tet_nodes.shape[0])
     n_red = int(pre.idx.shape[0])
@@ -187,8 +173,6 @@ def run_conductivity_uq(
     for k in range(config.n_samples):
         sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
         pcg.update_values(sample_data, stream)
-        if policy == "always" or (periodic and k > 0 and k % periodic == 0):
-            float_precond.setup(pre.indptr, pre.indices, sample_data.astype(cp.float32))
 
         b_red[:] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
         x0 = x_nominal
@@ -200,21 +184,13 @@ def run_conductivity_uq(
             precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
         )
         if rel > pre.tolerance:
-            if policy == "never":
-                raise RuntimeError(
-                    f"UQ mixed solve did not converge (rel={rel:.2e}) with a frozen "
-                    "preconditioner; use preconditioner_refresh='adaptive'."
-                )
-            # Rare extreme draw: match the preconditioner to this sample, solve, then restore
-            # the nominal-frozen hierarchy for the remaining (i.i.d.) samples.
+            # Rare extreme draw: the frozen preconditioner missed tolerance, so match a full fp64
+            # AMGx hierarchy to this sample and solve exactly. Each fallback uploads its own
+            # coefficients and re-setups, so there is no nominal state to restore afterwards.
             solver = pre.ensure_solver()
             solver.update_coefficients(sample_data)
             solver.resetup()
             solver.solve(b_red, x_red, stream)
-            solver.update_coefficients(pre.nominal_data)
-            solver.resetup()
-            if policy == "always" or periodic:
-                float_precond.setup(pre.indptr, pre.indices, nominal_f32)
 
         if recycle and recycle_w is None:
             d_basis[:, k] = x_red - x_nominal

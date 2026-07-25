@@ -91,9 +91,7 @@ def test_uq_degenerate_matches_forward(cp, cube_mesh):
     subj = Subject(cube_mesh)
     coil, pl = _coil(), _placement()
     det = subj.simulate(coil, pl, retain_fields=True, device="gpu")
-    cfg = ConductivityUQConfig(
-        n_samples=8, tissue_cov={2: 0.0}, seed=1, preconditioner_refresh="never"
-    )
+    cfg = ConductivityUQConfig(n_samples=8, tissue_cov={2: 0.0}, seed=1)
     r = subj.simulate(coil, pl, conductivity_uq=cfg, retain_fields=True, device="gpu")
     np.testing.assert_allclose(cp.asnumpy(r.mean_magnE), cp.asnumpy(det.magnE), atol=1e-6)
     assert float(cp.asarray(r.std_magnE).max()) == 0.0
@@ -131,41 +129,6 @@ def test_uq_two_tissue_has_variance(cp, two_tissue_cube):
     cov = cp.asarray(r.cov_magnE)
     assert float(cov.max()) > 1e-3
     assert bool(cp.isfinite(cov).all())
-
-
-def test_uq_refresh_modes_agree(cp, two_tissue_cube):
-    """The converged field is preconditioner-independent: frozen vs per-sample resetup must match."""
-    from cunibs import ConductivityUQConfig, Subject
-
-    subj = Subject(two_tissue_cube)
-    coil, pl = _coil(), _placement()
-    ra = subj.simulate(
-        coil,
-        pl,
-        conductivity_uq=ConductivityUQConfig(
-            n_samples=64,
-            tissue_cov={2: 0.2, 3: 0.3},
-            seed=7,
-            preconditioner_refresh="always",
-        ),
-        retain_fields=True,
-        device="gpu",
-    )
-    rn = subj.simulate(
-        coil,
-        pl,
-        conductivity_uq=ConductivityUQConfig(
-            n_samples=64,
-            tissue_cov={2: 0.2, 3: 0.3},
-            seed=7,
-            preconditioner_refresh="never",
-        ),
-        retain_fields=True,
-        device="gpu",
-    )
-    peak = float(cp.asarray(ra.mean_magnE).max())
-    diff = float(cp.abs(cp.asarray(ra.mean_magnE) - cp.asarray(rn.mean_magnE)).max())
-    assert diff / peak < 1e-5
 
 
 def test_uq_deterministic_seed(cp, two_tissue_cube):

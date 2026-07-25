@@ -24,8 +24,6 @@ DEFAULT_TISSUE_COV: dict[int, float] = {
     10: 0.20,  # muscle
 }
 
-RefreshPolicy = Literal["adaptive", "always", "never"]
-
 
 @dataclass(frozen=True)
 class ConductivityUQConfig:
@@ -35,15 +33,11 @@ class ConductivityUQConfig:
     coefficient of variation. The lognormal model keeps σ strictly positive and is parameterised
     so its mean equals the nominal ``TISSUE_CONDUCTIVITY`` value.
 
-    The AMG preconditioner is frozen at the nominal (ensemble-centre) σ for the whole run: with
-    i.i.d. samples there is no drift to chase, and the converged field is exact for any
-    preconditioner (only the iteration count changes). ``preconditioner_refresh`` only tunes
-    robustness/cost:
-    - ``"adaptive"`` (default) — frozen; on the rare draw that fails to converge, resetup, solve,
-      then restore the nominal hierarchy. Fastest robust choice.
-    - ``"never"``  — frozen with no recovery (a pathological draw would raise). Marginally faster.
-    - ``"always"`` — ``resetup`` every sample (most robust, ~20% slower; a diagnostic baseline).
-    - an ``int`` k — ``resetup`` every k-th sample.
+    The AMG preconditioner is built once at the nominal (ensemble-centre) σ and reused for the
+    whole run. The samples are i.i.d. about that centre, and the converged field is the same for
+    any preconditioner (only the iteration count changes). A draw that fails to reach tolerance
+    against it falls back to a per-sample fp64 AMGx solve (built lazily on the first such draw),
+    so accuracy never depends on the preconditioner tracking the sample.
     """
 
     n_samples: int = 500
@@ -52,7 +46,6 @@ class ConductivityUQConfig:
     tissue_cov: dict[int, float] = field(default_factory=dict)
     perturbed_tags: tuple[int, ...] | None = None
     distribution: Literal["lognormal", "normal"] = "lognormal"
-    preconditioner_refresh: RefreshPolicy | int = "adaptive"
 
     def cov_for(self, tag: int) -> float:
         """Resolve the CoV for a tissue: explicit override, then default table, then global."""

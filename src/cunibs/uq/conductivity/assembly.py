@@ -23,6 +23,7 @@ from cunibs.fem.solve import (
     UQ_AMGX_CONFIG,
     SolverContext,
     _amgx_config_value,
+    build_native_vcycle,
     ground_node_of,
     grounded_index,
     reduce_matrix,
@@ -41,7 +42,7 @@ class ConductivityUQPrecompute:
     indices: cp.ndarray
     base_data: cp.ndarray  # (nnz,) f64 — non-perturbed tissues at nominal σ
     tissue_data: cp.ndarray  # (n_perturbed, nnz) f64 — per-tissue unit-σ contribution
-    float_preconditioner: AMGXFloatSolver  # fp32 AMG V-cycle frozen at nominal σ
+    precond: NativeVCycle  # fp32 V-cycle frozen at nominal σ (AMGx hierarchy exported once)
     pcg: PcgAmgSolver  # fp64 outer PCG; matrix values swapped per sample
     tolerance: float
     max_iters: int
@@ -51,9 +52,6 @@ class ConductivityUQPrecompute:
     )  # (nnz,) f64 — reduced values at nominal σ (frozen-preconditioner point)
     # nominal σ, structure_reuse; the mixed-solve fallback, built lazily on the rare extreme draw.
     solver: AMGXSolver | None = None
-    # Native V-cycle rebuilt from the frozen nominal hierarchy, built lazily on the first
-    # frozen-preconditioner UQ run and reused across placements (see run_conductivity_uq).
-    native_vcycle: NativeVCycle | None = None
 
     def combine(self, sigma: cp.ndarray) -> cp.ndarray:
         """Assemble the reduced matrix values for one conductivity sample."""
@@ -103,7 +101,7 @@ def _reduced_data_for(
 def build_conductivity_uq_precompute(
     ctx: SolverContext, perturbed_tags: tuple[int, ...]
 ) -> ConductivityUQPrecompute:
-    """Assemble the reference pattern, per-tissue components, and the nominal-σ AMGx solver."""
+    """Assemble the reference pattern, per-tissue components, and the nominal-σ preconditioner."""
     g64, vols = gradient_operator(ctx.nodes_mm * 1e-3, ctx.tet_nodes)
     ground_node = ground_node_of(ctx.nodes_mm)
     idx = grounded_index(ctx.n_nodes, ground_node)
@@ -142,10 +140,13 @@ def build_conductivity_uq_precompute(
     row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
     col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
 
-    float_preconditioner = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
-    float_preconditioner.setup(
-        row_ptr, col_idx, cp.ascontiguousarray(nominal_data.astype(cp.float32))
-    )
+    # AMGx builds the aggregation hierarchy, the native V-cycle takes device copies of everything
+    # it needs, then the AMGx float solver is dropped (as in prepare_grounded_solver).
+    nominal_f32 = cp.ascontiguousarray(nominal_data.astype(cp.float32))
+    amgx_precond = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
+    amgx_precond.setup(row_ptr, col_idx, nominal_f32)
+    precond = build_native_vcycle(amgx_precond, row_ptr, col_idx, nominal_f32)
+    del amgx_precond
     pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data)
     tolerance = float(_amgx_config_value(UQ_AMGX_CONFIG, "tolerance", "1e-6"))
     max_iters = int(_amgx_config_value(UQ_AMGX_CONFIG, "max_iters", "2000"))
@@ -158,7 +159,7 @@ def build_conductivity_uq_precompute(
         indices=col_idx,
         base_data=base_data,
         tissue_data=tissue_data,
-        float_preconditioner=float_preconditioner,
+        precond=precond,
         pcg=pcg,
         tolerance=tolerance,
         max_iters=max_iters,
