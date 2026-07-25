@@ -204,6 +204,14 @@ class Subject:
         assert self._host_barycenters_mm is not None
         return self._host_vols, self._host_tet_tags, self._host_barycenters_mm
 
+    def _prepare(
+        self, placements: Placement | Sequence[Placement], device: Device
+    ) -> tuple[bool, list[Placement], SolverContext]:
+        if device not in ("cpu", "gpu"):
+            raise ValueError("device must be 'cpu' or 'gpu'.")
+        single = isinstance(placements, Placement)
+        return single, [placements] if single else list(placements), self.context
+
     def _field_summary(
         self,
         out: Mapping[str, ArrayT],
@@ -233,7 +241,6 @@ class Subject:
         coil: Coil,
         placements: Placement,
         didt: float = ...,
-        conductivity_uq: None = ...,
         *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
@@ -245,7 +252,6 @@ class Subject:
         coil: Coil,
         placements: Sequence[Placement],
         didt: float = ...,
-        conductivity_uq: None = ...,
         *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
@@ -257,7 +263,6 @@ class Subject:
         coil: Coil,
         placements: Placement,
         didt: float = ...,
-        conductivity_uq: None = ...,
         *,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
@@ -269,84 +274,22 @@ class Subject:
         coil: Coil,
         placements: Sequence[Placement],
         didt: float = ...,
-        conductivity_uq: None = ...,
         *,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
         block_k: int | None = ...,
     ) -> list["FieldResult"]: ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Placement,
-        didt: float = ...,
-        conductivity_uq: "ConductivityUQConfig" = ...,
-        *,
-        retain_fields: Literal[False] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> "ConductivityUQSummary": ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Sequence[Placement],
-        didt: float = ...,
-        conductivity_uq: "ConductivityUQConfig" = ...,
-        *,
-        retain_fields: Literal[False] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> list["ConductivityUQSummary"]: ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Placement,
-        didt: float = ...,
-        conductivity_uq: "ConductivityUQConfig" = ...,
-        *,
-        retain_fields: Literal[True] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> "ConductivityUQResult": ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Sequence[Placement],
-        didt: float = ...,
-        conductivity_uq: "ConductivityUQConfig" = ...,
-        *,
-        retain_fields: Literal[True] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> list["ConductivityUQResult"]: ...
-
     def simulate(
         self,
         coil: Coil,
         placements: Placement | Sequence[Placement],
         didt: float = 1e6,
-        conductivity_uq: "ConductivityUQConfig | None" = None,
         *,
         retain_fields: bool = False,
         device: Device = "cpu",
-        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
         block_k: int | None = None,
-    ) -> (
-        FieldSummary
-        | FieldResult
-        | ConductivityUQSummary
-        | ConductivityUQResult
-        | Sequence[FieldSummary | FieldResult | ConductivityUQSummary | ConductivityUQResult]
-    ):
+    ) -> FieldSummary | FieldResult | Sequence[FieldSummary | FieldResult]:
         """Solve one placement or a sequence of placements.
-
-        With ``conductivity_uq`` set, run a conductivity Monte Carlo per placement and return
-        :class:`~cunibs.uq.ConductivityUQResult` moments instead of a deterministic
-        :class:`FieldResult`.
 
         By default (``retain_fields=False``) only compact host-side summaries are returned and
         the full-volume field arrays are freed, so callers can loop over many subjects without
@@ -356,74 +299,13 @@ class Subject:
         ``"cpu"`` copies them to host). It has no effect when ``retain_fields=False``, since no
         field arrays are kept in that case.
 
-        ``block_k`` sets how many deterministic placements solve together as one lockstep block CG
-        that reads the stiffness/hierarchy once per chunk. It defaults to ``MAX_BLOCK``; ``1``
-        solves one placement at a time. Clamped to ``[1, MAX_BLOCK]``; ignored for conductivity
-        UQ.
+        ``block_k`` sets how many placements solve together as one lockstep block CG that reads
+        the stiffness/hierarchy once per chunk. It defaults to ``MAX_BLOCK``; ``1`` solves one
+        placement at a time. Clamped to ``[1, MAX_BLOCK]``.
 
-        ``record_rois`` (conductivity UQ only) is a ``{name: ResolvedTarget}`` mapping of ROIs from
-        :meth:`roi` / ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over
-        every ROI is recorded (``result.roi_samples[name]``), along with the per-draw gray-matter
-        peak, focality, and peak location — the distributional data that a metric of the mean field
-        cannot provide. These small per-draw arrays are returned even with ``retain_fields=False``.
+        See :meth:`simulate_conductivity_uq` to run a conductivity Monte Carlo instead.
         """
-        if device not in ("cpu", "gpu"):
-            raise ValueError("device must be 'cpu' or 'gpu'.")
-        single = isinstance(placements, Placement)
-        sites = [placements] if single else list(placements)
-        ctx = self.context
-
-        if conductivity_uq is not None:
-            from cunibs.uq import (
-                ConductivityUQResult,
-                run_conductivity_uq,
-            )
-
-            pre = self._conductivity_uq_precompute(conductivity_uq)
-            uq_results: list[ConductivityUQResult | ConductivityUQSummary] = []
-            temp_pool = cp.cuda.MemoryPool()
-            for site in sites:
-                if retain_fields and device == "gpu":
-                    result = run_conductivity_uq(
-                        ctx, pre, coil, site, conductivity_uq, didt, record_rois
-                    )
-                else:
-                    with cp.cuda.using_allocator(temp_pool.malloc):
-                        result = run_conductivity_uq(
-                            ctx, pre, coil, site, conductivity_uq, didt, record_rois
-                        )
-                        if not retain_fields:
-                            uq_results.append(result.summary())
-                            del result
-                            continue
-                if device == "gpu":
-                    uq_results.append(result)
-                    continue
-
-                vols, tet_tags, barycenters_mm = self._host_metric_inputs(ctx)
-                uq_results.append(
-                    ConductivityUQResult(
-                        mean_magnE=cp.asnumpy(result.mean_magnE),
-                        std_magnE=cp.asnumpy(result.std_magnE),
-                        cov_magnE=cp.asnumpy(result.cov_magnE),
-                        n_samples=result.n_samples,
-                        perturbed_tags=result.perturbed_tags,
-                        sigma_samples=np.asarray(result.sigma_samples),
-                        vols=vols,
-                        tet_tags=tet_tags,
-                        barycenters_mm=barycenters_mm,
-                        placement=result.placement,
-                        coil_name=result.coil_name,
-                        didt=result.didt,
-                        roi_samples=result.roi_samples,
-                        peak_samples=result.peak_samples,
-                        focality_samples=result.focality_samples,
-                        peak_location_samples=result.peak_location_samples,
-                    )
-                )
-                del result
-            temp_pool.free_all_blocks()
-            return uq_results[0] if single else uq_results
+        single, sites, ctx = self._prepare(placements, device)
 
         results: list[FieldResult | FieldSummary] = []
         dip_pos_m = cp.asarray(coil.positions_m)
@@ -480,6 +362,142 @@ class Subject:
                 del outs
         temp_pool.free_all_blocks()
         return results[0] if single else results
+
+    @overload
+    def simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placements: Placement,
+        config: "ConductivityUQConfig",
+        didt: float = ...,
+        *,
+        retain_fields: Literal[False] = ...,
+        device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
+    ) -> "ConductivityUQSummary": ...
+    @overload
+    def simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placements: Sequence[Placement],
+        config: "ConductivityUQConfig",
+        didt: float = ...,
+        *,
+        retain_fields: Literal[False] = ...,
+        device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
+    ) -> list["ConductivityUQSummary"]: ...
+    @overload
+    def simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placements: Placement,
+        config: "ConductivityUQConfig",
+        didt: float = ...,
+        *,
+        retain_fields: Literal[True] = ...,
+        device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
+    ) -> "ConductivityUQResult": ...
+    @overload
+    def simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placements: Sequence[Placement],
+        config: "ConductivityUQConfig",
+        didt: float = ...,
+        *,
+        retain_fields: Literal[True] = ...,
+        device: Device = ...,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
+    ) -> list["ConductivityUQResult"]: ...
+
+    def simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placements: Placement | Sequence[Placement],
+        config: "ConductivityUQConfig",
+        didt: float = 1e6,
+        *,
+        retain_fields: bool = False,
+        device: Device = "cpu",
+        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
+    ) -> (
+        ConductivityUQSummary
+        | ConductivityUQResult
+        | Sequence[ConductivityUQSummary | ConductivityUQResult]
+    ):
+        """Run a conductivity Monte Carlo for one placement or a sequence of placements.
+
+        Every sampled conductivity vector is solved with the same finite-element model, and
+        :class:`~cunibs.uq.ConductivityUQResult` reports per-tetrahedron moments of ``|E|``
+        instead of the deterministic :class:`FieldResult` that :meth:`simulate` returns.
+
+        By default (``retain_fields=False``) only compact host-side summaries are returned and
+        the full-volume moment arrays are freed, so callers can loop over many subjects without
+        accumulating device memory. Pass ``retain_fields=True`` to get the full result back.
+
+        ``device`` selects where retained fields live (``"gpu"`` keeps them on the device,
+        ``"cpu"`` copies them to host). It has no effect when ``retain_fields=False``, since no
+        field arrays are kept in that case.
+
+        ``record_rois`` is a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` /
+        ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over every ROI is
+        recorded (``result.roi_samples[name]``), along with the per-draw gray-matter peak,
+        focality, and peak location — the distributional data that a metric of the mean field
+        cannot provide. These small per-draw arrays are returned even with
+        ``retain_fields=False``.
+        """
+        from cunibs.uq import (
+            ConductivityUQResult,
+            run_conductivity_uq,
+        )
+
+        single, sites, ctx = self._prepare(placements, device)
+
+        pre = self._conductivity_uq_precompute(config)
+        uq_results: list[ConductivityUQResult | ConductivityUQSummary] = []
+        temp_pool = cp.cuda.MemoryPool()
+        for site in sites:
+            if retain_fields and device == "gpu":
+                result = run_conductivity_uq(ctx, pre, coil, site, config, didt, record_rois)
+            else:
+                with cp.cuda.using_allocator(temp_pool.malloc):
+                    result = run_conductivity_uq(
+                        ctx, pre, coil, site, config, didt, record_rois
+                    )
+                    if not retain_fields:
+                        uq_results.append(result.summary())
+                        del result
+                        continue
+            if device == "gpu":
+                uq_results.append(result)
+                continue
+
+            vols, tet_tags, barycenters_mm = self._host_metric_inputs(ctx)
+            uq_results.append(
+                ConductivityUQResult(
+                    mean_magnE=cp.asnumpy(result.mean_magnE),
+                    std_magnE=cp.asnumpy(result.std_magnE),
+                    cov_magnE=cp.asnumpy(result.cov_magnE),
+                    n_samples=result.n_samples,
+                    perturbed_tags=result.perturbed_tags,
+                    sigma_samples=np.asarray(result.sigma_samples),
+                    vols=vols,
+                    tet_tags=tet_tags,
+                    barycenters_mm=barycenters_mm,
+                    placement=result.placement,
+                    coil_name=result.coil_name,
+                    didt=result.didt,
+                    roi_samples=result.roi_samples,
+                    peak_samples=result.peak_samples,
+                    focality_samples=result.focality_samples,
+                    peak_location_samples=result.peak_location_samples,
+                )
+            )
+            del result
+        temp_pool.free_all_blocks()
+        return uq_results[0] if single else uq_results
 
 
 @dataclass

@@ -232,10 +232,11 @@ loaded = FieldResult.load("placement.h5")
 
 ## Conductivity uncertainty quantification
 
-`ConductivityUQConfig` runs a Monte Carlo analysis over tissue conductivities for
-one coil placement or a sequence of placements. Each sampled conductivity vector
-is solved with the same finite-element model, and `ConductivityUQResult` reports
-per-tetrahedron moments of the electric-field magnitude.
+`simulate_conductivity_uq` runs a Monte Carlo analysis over tissue conductivities
+for one coil placement or a sequence of placements, configured by a
+`ConductivityUQConfig`. Each sampled conductivity vector is solved with the same
+finite-element model, and `ConductivityUQResult` reports per-tetrahedron moments
+of the electric-field magnitude.
 
 For tissue tag $t$, the default model treats the conductivity as an independent
 random variable with nominal value $\sigma_{0,t}$ and coefficient of variation
@@ -276,7 +277,7 @@ config = ConductivityUQConfig(
     seed=1,
 )
 
-uq_result = subject.simulate(coil, placement, didt=1.0e6, conductivity_uq=config)
+uq_result = subject.simulate_conductivity_uq(coil, placement, config, didt=1.0e6)
 
 print(uq_result.peak_mean_magnE())
 print(uq_result.peak_cov())
@@ -286,11 +287,11 @@ By default, conductivity UQ returns compact CPU-side metrics. Retain the
 per-tetrahedron moment arrays explicitly:
 
 ```python
-uq_fields = subject.simulate(
+uq_fields = subject.simulate_conductivity_uq(
     coil,
     placement,
+    config,
     didt=1.0e6,
-    conductivity_uq=config,
     retain_fields=True,
 )
 ```
@@ -310,8 +311,8 @@ gray-matter peak, focality, and peak location:
 ```python
 m1 = subject.roi([-45.0, -5.0, 25.0], radius_mm=5.0, region="gray_matter")
 
-uq_result = subject.simulate(
-    coil, placement, didt=1.0e6, conductivity_uq=config, record_rois={"M1": m1}
+uq_result = subject.simulate_conductivity_uq(
+    coil, placement, config, didt=1.0e6, record_rois={"M1": m1}
 )
 
 uq_result.roi_samples["M1"]      # (n_samples,) per-draw ROI mean |E| (V/m)

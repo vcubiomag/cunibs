@@ -36,7 +36,7 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
         available = ["peak", "focality", *(result.roi_samples or {})]
         raise ValueError(
             f"No per-draw samples for output {output!r} (available: {available}); "
-            "run simulate(..., record_rois={...}) with that ROI name."
+            "run simulate_conductivity_uq(..., record_rois={...}) with that ROI name."
         )
     x = np.log(np.asarray(result.sigma_samples, dtype=np.float64))
     logy = np.log(np.asarray(y, dtype=np.float64))
