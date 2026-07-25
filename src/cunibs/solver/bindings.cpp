@@ -35,14 +35,15 @@ NB_MODULE(_solver_ext, m) {
                 int nnz = static_cast<int>(values.shape(0));
                 self.setup(n, nnz, row_ptr.data(), col_idx.data(), values.data());
             },
-            nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"),
+            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
+            nb::arg("values").noconvert(),
             "Upload the reduced CSR (device pointers) and build the AMG hierarchy once.")
         .def(
             "update_coefficients",
             [](AMGXSolver& self, f64_cuda values) {
                 self.update_coefficients(static_cast<int>(values.shape(0)), values.data());
             },
-            nb::arg("values"),
+            nb::arg("values").noconvert(),
             "Replace matrix values (device pointer) keeping the sparsity pattern; no re-analysis.")
         .def("resetup", &AMGXSolver::resetup,
              "Rebuild the numeric AMG hierarchy for the current values (reuses structure per config).")
@@ -54,7 +55,7 @@ NB_MODULE(_solver_ext, m) {
                 int n = static_cast<int>(b.shape(0));
                 self.solve(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
             },
-            nb::arg("b"), nb::arg("x"), nb::arg("stream"),
+            nb::arg("b").noconvert(), nb::arg("x").noconvert(), nb::arg("stream"),
             "Solve A x = b on device; x (length n) is overwritten with the solution.");
 
     nb::class_<AMGXFloatSolver>(m, "AMGXFloatSolver")
@@ -66,7 +67,8 @@ NB_MODULE(_solver_ext, m) {
                 int nnz = static_cast<int>(values.shape(0));
                 self.setup(n, nnz, row_ptr.data(), col_idx.data(), values.data());
             },
-            nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"))
+            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
+            nb::arg("values").noconvert())
         .def("amg_num_levels", &AMGXFloatSolver::amg_num_levels,
              "Number of levels in the AMG hierarchy built by the last setup().")
         .def(
@@ -82,7 +84,7 @@ NB_MODULE(_solver_ext, m) {
             [](const AMGXFloatSolver& self, int level, i32_cuda out) {
                 self.download_aggregates(level, out.data());
             },
-            nb::arg("level"), nb::arg("out"),
+            nb::arg("level"), nb::arg("out").noconvert(),
             "Copy the level's fine-row -> aggregate map into a device int32 array.");
 
     nb::class_<NativeVCycle>(m, "NativeVCycle")
@@ -98,8 +100,10 @@ NB_MODULE(_solver_ext, m) {
                                values.data(), dinv.data(), r_row_ptr.data(), r_col_idx.data(),
                                aggregates.data());
             },
-            nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"), nb::arg("dinv"),
-            nb::arg("r_row_ptr"), nb::arg("r_col_idx"), nb::arg("aggregates"),
+            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
+            nb::arg("values").noconvert(), nb::arg("dinv").noconvert(),
+            nb::arg("r_row_ptr").noconvert(), nb::arg("r_col_idx").noconvert(),
+            nb::arg("aggregates").noconvert(),
             "Append one non-coarsest level (fp32 CSR, omega/guard(d), restriction CSR, "
             "fine->aggregate map); device arrays are copied into solver-owned buffers.")
         .def(
@@ -110,7 +114,8 @@ NB_MODULE(_solver_ext, m) {
                 }
                 self.set_coarse(static_cast<int>(ainv.shape(0)), ainv.data());
             },
-            nb::arg("ainv"), "Set the dense (row-major) inverse of the coarsest matrix.")
+            nb::arg("ainv").noconvert(),
+            "Set the dense (row-major) inverse of the coarsest matrix.")
         .def("finalize", &NativeVCycle::finalize,
              "Validate level chain consistency; required before apply.");
 
@@ -122,13 +127,14 @@ NB_MODULE(_solver_ext, m) {
                 int nnz = static_cast<int>(values.shape(0));
                 new (self) PcgAmgSolver(n, nnz, row_ptr.data(), col_idx.data(), values.data());
             },
-            nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"))
+            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
+            nb::arg("values").noconvert())
         .def(
             "update_values",
             [](PcgAmgSolver& self, f64_cuda values, uintptr_t stream) {
                 self.update_values(values.data(), reinterpret_cast<cudaStream_t>(stream));
             },
-            nb::arg("values"), nb::arg("stream"))
+            nb::arg("values").noconvert(), nb::arg("stream"))
         .def(
             "solve_mixed",
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda b, f64_cuda x,
@@ -138,8 +144,9 @@ NB_MODULE(_solver_ext, m) {
                     reinterpret_cast<cudaStream_t>(stream), x0.has_value() ? x0->data() : nullptr);
                 return nb::make_tuple(result.iterations, result.relative_residual);
             },
-            nb::arg("preconditioner"), nb::arg("b"), nb::arg("x"), nb::arg("tolerance"),
-            nb::arg("max_iters"), nb::arg("stream"), nb::arg("x0") = nb::none())
+            nb::arg("preconditioner"), nb::arg("b").noconvert(), nb::arg("x").noconvert(),
+            nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
+            nb::arg("x0").noconvert() = nb::none())
         .def(
             "solve_mixed_block",
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
@@ -154,8 +161,9 @@ NB_MODULE(_solver_ext, m) {
                 for (double r : result.relative_residual) rels.append(r);
                 return nb::make_tuple(result.iterations, rels);
             },
-            nb::arg("preconditioner"), nb::arg("B"), nb::arg("X"), nb::arg("tolerance"),
-            nb::arg("max_iters"), nb::arg("stream"), nb::arg("X0") = nb::none(),
+            nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
+            nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
+            nb::arg("X0").noconvert() = nb::none(),
             "Lockstep k-RHS mixed-precision PCG over row-major (n, k) operands; returns "
             "(iterations, per-column relative residuals). k in {2, 4, 8}.");
 
@@ -168,8 +176,9 @@ NB_MODULE(_solver_ext, m) {
             launch_dadt(s.data(), mp.data(), sn.data(), r.data(), out.data(), n_dip, n_nodes,
                         didt, mu0_4pi, reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("s"), nb::arg("mp"), nb::arg("sn"), nb::arg("r"), nb::arg("out"), nb::arg("didt"),
-        nb::arg("mu0_4pi"), nb::arg("stream"),
+        nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
+        nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
+        nb::arg("stream"),
         "Fused dA/dt at nodes from placed magnetic dipoles; writes into caller-allocated out.");
 
     m.def(
@@ -179,7 +188,8 @@ NB_MODULE(_solver_ext, m) {
             launch_dadt_element_average(dadt_nodes.data(), tet_nodes.data(), out.data(), n_tet,
                                         reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("dadt_nodes"), nb::arg("tet_nodes"), nb::arg("out"), nb::arg("stream"),
+        nb::arg("dadt_nodes").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("stream"),
         "Average nodal dA/dt onto tetrahedra; writes into caller-allocated out.");
 
     m.def(
@@ -190,8 +200,9 @@ NB_MODULE(_solver_ext, m) {
             launch_rhs(dadt_elm.data(), g.data(), neg_vc.data(), ptr.data(), idx.data(), b.data(),
                        n_nodes, reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("dadt_elm"), nb::arg("g"), nb::arg("neg_vc"), nb::arg("ptr"), nb::arg("idx"),
-        nb::arg("b"), nb::arg("stream"),
+        nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
+        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("b").noconvert(),
+        nb::arg("stream"),
         "Deterministic node-centric RHS assembly; writes into caller-allocated b.");
 
     m.def(
@@ -203,8 +214,8 @@ NB_MODULE(_solver_ext, m) {
             launch_rhs_weighted(dadt_elm.data(), wg.data(), ptr.data(), idx.data(), b.data(),
                                 n_nodes, n_tet, reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("dadt_elm"), nb::arg("wg"), nb::arg("ptr"), nb::arg("idx"), nb::arg("b"),
-        nb::arg("stream"),
+        nb::arg("dadt_elm").noconvert(), nb::arg("wg").noconvert(), nb::arg("ptr").noconvert(),
+        nb::arg("idx").noconvert(), nb::arg("b").noconvert(), nb::arg("stream"),
         "Deterministic node-centric RHS assembly with preweighted gradients.");
 
     m.def(
@@ -224,8 +235,8 @@ NB_MODULE(_solver_ext, m) {
                                       b_block.data(), n_nodes, n_tet, k,
                                       reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("dadt_elm"), nb::arg("wg"), nb::arg("ptr"), nb::arg("idx"), nb::arg("b_block"),
-        nb::arg("stream"),
+        nb::arg("dadt_elm").noconvert(), nb::arg("wg").noconvert(), nb::arg("ptr").noconvert(),
+        nb::arg("idx").noconvert(), nb::arg("b_block").noconvert(), nb::arg("stream"),
         "Block RHS assembly for <=8 placements: wg/node2corner read once; writes "
         "row-major (n_nodes, k) float32.");
 
@@ -253,8 +264,9 @@ NB_MODULE(_solver_ext, m) {
                                      e_ptrs, m_ptrs, n_tet, k,
                                      reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("v_block"), nb::arg("tet_nodes"), nb::arg("g"), nb::arg("dadt_elm"),
-        nb::arg("e_out"), nb::arg("magn_out"), nb::arg("stream"),
+        nb::arg("v_block").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
+        nb::arg("dadt_elm").noconvert(), nb::arg("e_out").noconvert(),
+        nb::arg("magn_out").noconvert(), nb::arg("stream"),
         "Block E/magnE reconstruction for <=8 placements: tet_nodes/g read once; "
         "v_block is row-major (n_nodes, k) float64.");
 
@@ -265,7 +277,8 @@ NB_MODULE(_solver_ext, m) {
             launch_weighted_gradient(g.data(), neg_vc.data(), wg.data(), n_tet,
                                      reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("g"), nb::arg("neg_vc"), nb::arg("wg"), nb::arg("stream"),
+        nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(), nb::arg("wg").noconvert(),
+        nb::arg("stream"),
         "Precompute neg_vc-scaled gradients for repeated RHS assembly.");
 
     m.def(
@@ -276,8 +289,9 @@ NB_MODULE(_solver_ext, m) {
             launch_reconstruct(v.data(), tet_nodes.data(), g.data(), dadt_elm.data(), e_out.data(),
                                magn_out.data(), n_tet, reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("v"), nb::arg("tet_nodes"), nb::arg("g"), nb::arg("dadt_elm"), nb::arg("e_out"),
-        nb::arg("magn_out"), nb::arg("stream"),
+        nb::arg("v").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
+        nb::arg("dadt_elm").noconvert(), nb::arg("e_out").noconvert(),
+        nb::arg("magn_out").noconvert(), nb::arg("stream"),
         "Element-centric E/magnE reconstruction; writes into caller-allocated e_out/magn_out.");
 
     m.def(
@@ -288,8 +302,8 @@ NB_MODULE(_solver_ext, m) {
             launch_element_weight(values.data(), tet_nodes.data(), g.data(), neg_vc.data(),
                                   w_e.data(), n_tet, reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("values"), nb::arg("tet_nodes"), nb::arg("g"), nb::arg("neg_vc"), nb::arg("w_e"),
-        nb::arg("stream"),
+        nb::arg("values").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
+        nb::arg("neg_vc").noconvert(), nb::arg("w_e").noconvert(), nb::arg("stream"),
         "Per-element reciprocity weight w_e = vol*sigma*(G_e values); into caller-allocated w_e.");
 
     m.def(
@@ -299,7 +313,8 @@ NB_MODULE(_solver_ext, m) {
             launch_node_scatter3(w_e.data(), ptr.data(), idx.data(), node_w.data(), n_nodes,
                                  reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("w_e"), nb::arg("ptr"), nb::arg("idx"), nb::arg("node_w"), nb::arg("stream"),
+        nb::arg("w_e").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("node_w").noconvert(), nb::arg("stream"),
         "Node-centric 3-vector corner gather with 1/4 weight; into caller-allocated node_w.");
 
     m.def(
@@ -309,7 +324,8 @@ NB_MODULE(_solver_ext, m) {
             launch_accumulate_moments(magn.data(), sum_e.data(), sumsq_e.data(), n,
                                       reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("magn"), nb::arg("sum_e"), nb::arg("sumsq_e"), nb::arg("stream"),
+        nb::arg("magn").noconvert(), nb::arg("sum_e").noconvert(), nb::arg("sumsq_e").noconvert(),
+        nb::arg("stream"),
         "Fused streaming |E| moments: sum_e += magn; sumsq_e += magn^2 (in place).");
 
     m.def(
@@ -322,7 +338,9 @@ NB_MODULE(_solver_ext, m) {
                          tnorm.data(), out.data(), n_pl, n_tri,
                          reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("centers"), nb::arg("handles"), nb::arg("dists"), nb::arg("a"), nb::arg("b"),
-        nb::arg("c"), nb::arg("tnorm"), nb::arg("out"), nb::arg("stream"),
+        nb::arg("centers").noconvert(), nb::arg("handles").noconvert(),
+        nb::arg("dists").noconvert(), nb::arg("a").noconvert(), nb::arg("b").noconvert(),
+        nb::arg("c").noconvert(), nb::arg("tnorm").noconvert(), nb::arg("out").noconvert(),
+        nb::arg("stream"),
         "Batched closest-point scalp projection + coil frame; writes (P,16) row-major 4x4 out.");
 }
