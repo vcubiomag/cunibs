@@ -158,6 +158,15 @@ The first call builds the GPU solver state. Later calls on the same `Subject`
 reuse it. By default, `simulate` returns compact CPU-side summaries and does not
 retain full-volume field arrays.
 
+Placements in a sequence are solved in blocks that share a single stiffness /
+hierarchy read per block via a lockstep block CG. The block width defaults to the
+hardware sweet spot; tune it per GPU with `block_k` (`1` restores the serial
+per-placement path):
+
+```python
+results = subject.simulate(coil, placements, didt=1.0e6, block_k=4)
+```
+
 ### Batch over subjects
 
 A `Subject` caches its solver context and AMG hierarchy on the GPU for its

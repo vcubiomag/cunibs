@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -229,6 +228,7 @@ class Subject:
         *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
+        block_k: int | None = ...,
     ) -> "FieldSummary": ...
     @overload
     def simulate(
@@ -240,6 +240,7 @@ class Subject:
         *,
         retain_fields: Literal[False] = ...,
         device: Device = ...,
+        block_k: int | None = ...,
     ) -> list["FieldSummary"]: ...
     @overload
     def simulate(
@@ -251,6 +252,7 @@ class Subject:
         *,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
+        block_k: int | None = ...,
     ) -> "FieldResult": ...
     @overload
     def simulate(
@@ -262,6 +264,7 @@ class Subject:
         *,
         retain_fields: Literal[True] = ...,
         device: Device = ...,
+        block_k: int | None = ...,
     ) -> list["FieldResult"]: ...
     @overload
     def simulate(
@@ -322,6 +325,7 @@ class Subject:
         retain_fields: bool = False,
         device: Device = "cpu",
         record_rois: "Mapping[str, ResolvedTarget] | None" = None,
+        block_k: int | None = None,
     ) -> (
         FieldSummary
         | FieldResult
@@ -342,6 +346,11 @@ class Subject:
         ``device`` selects where retained fields live (``"gpu"`` keeps them on the device,
         ``"cpu"`` copies them to host). It has no effect when ``retain_fields=False``, since no
         field arrays are kept in that case.
+
+        ``block_k`` sets how many deterministic placements solve together as one lockstep block CG
+        that reads the stiffness/hierarchy once per chunk. It defaults to ``MAX_BLOCK``; ``1``
+        solves one placement at a time. Clamped to ``[1, MAX_BLOCK]``; ignored for conductivity
+        UQ.
 
         ``record_rois`` (conductivity UQ only) is a ``{name: ResolvedTarget}`` mapping of ROIs from
         :meth:`roi` / ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over
@@ -414,9 +423,8 @@ class Subject:
         dip_moment = cp.asarray(coil.moments)
         temp_pool = cp.cuda.MemoryPool()
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
-        # one lockstep block CG that reads the matrix/hierarchy once for the whole
-        # chunk. CUNIBS_BLOCK_K=1 restores the serial per-placement path exactly.
-        chunk_k = max(1, min(MAX_BLOCK, int(os.environ.get("CUNIBS_BLOCK_K", MAX_BLOCK))))
+        # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
+        chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
         warm = BlockWarmStart()
         with ExitStack() as scratch:
             # Retained device fields have to outlive the pool, so those solves allocate
