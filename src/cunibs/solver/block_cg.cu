@@ -187,8 +187,7 @@ __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
 }
 
 __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int n_blocks,
-                                       double* __restrict__ rz, double* __restrict__ rz_next,
-                                       double* __restrict__ beta) {
+                                       double* __restrict__ rz, double* __restrict__ beta) {
     __shared__ double sdata[kBlock];
     const int c = blockIdx.x;
     double local = 0.0;
@@ -203,7 +202,6 @@ __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int 
     }
     if (threadIdx.x == 0) {
         const double total = sdata[0];
-        rz_next[c] = total;
         beta[c] = total / rz[c];
         rz[c] = total;
     }
@@ -306,14 +304,14 @@ void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* 
 }
 
 void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
-                              double* partials, double* rz, double* rz_next, double* beta,
+                              double* partials, double* rz, double* beta,
                               cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k(k, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
     });
-    bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rz, rz_next, beta);
+    bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rz, beta);
 }
 
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,

@@ -203,9 +203,6 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
                               static_cast<size_t>(cg_partials_size(n_)) * sizeof(double)),
                    "malloc(partials)");
         check_cuda(cudaMallocHost(&h_norm_, sizeof(double)), "mallocHost(norm)");
-        const double host_one = 1.0;
-        check_cuda(cudaMemcpy(scalars_ + 7, &host_one, sizeof(double), cudaMemcpyHostToDevice),
-                   "copy(one)");
         check_cuda(cudaStreamCreateWithFlags(&solve_stream_, cudaStreamNonBlocking),
                    "create(solve_stream)");
         check_cuda(cudaEventCreateWithFlags(&join_event_, cudaEventDisableTiming),
@@ -275,7 +272,7 @@ void PcgAmgSolver::ensure_block_buffers(int k) {
     check_cuda(cudaMalloc(&X_int_blk_, nk * sizeof(double)), "malloc(X_int_blk)");
     check_cuda(cudaMalloc(&RF_blk_, nk * sizeof(float)), "malloc(RF_blk)");
     check_cuda(cudaMalloc(&ZF_blk_, nk * sizeof(float)), "malloc(ZF_blk)");
-    check_cuda(cudaMalloc(&scalars_blk_, static_cast<size_t>(7) * k * sizeof(double)),
+    check_cuda(cudaMalloc(&scalars_blk_, static_cast<size_t>(6) * k * sizeof(double)),
                "malloc(scalars_blk)");
     check_cuda(cudaMalloc(&partials_blk_,
                           static_cast<size_t>(k) * bcg_partials_blocks(n_) * sizeof(double)),
@@ -300,12 +297,11 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
 
     const size_t nk = static_cast<size_t>(n_) * k;
     double* const d_rz = scalars_blk_ + 0 * k;
-    double* const d_rz_next = scalars_blk_ + 1 * k;
-    double* const d_pap = scalars_blk_ + 2 * k;
-    double* const d_alpha = scalars_blk_ + 3 * k;
-    double* const d_neg_alpha = scalars_blk_ + 4 * k;
-    double* const d_norm = scalars_blk_ + 5 * k;
-    double* const d_beta = scalars_blk_ + 6 * k;
+    double* const d_pap = scalars_blk_ + 1 * k;
+    double* const d_alpha = scalars_blk_ + 2 * k;
+    double* const d_neg_alpha = scalars_blk_ + 3 * k;
+    double* const d_norm = scalars_blk_ + 4 * k;
+    double* const d_beta = scalars_blk_ + 5 * k;
     double* const h_norm = h_norms_blk_;
     double* const h_ref = h_norms_blk_ + k;
 
@@ -351,8 +347,7 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                    cudaMemcpyDeviceToHost, s),
                    "block:copy(norms)");
         preconditioner.apply_block(n_, k, RF_blk_, ZF_blk_, s);
-        launch_bcg_cast_dot_beta(n_, k, ZF_blk_, R_blk_, partials_blk_, d_rz, d_rz_next,
-                                 d_beta, s);
+        launch_bcg_cast_dot_beta(n_, k, ZF_blk_, R_blk_, partials_blk_, d_rz, d_beta, s);
         launch_bcg_update_p(n_, k, d_beta, ZF_blk_, P_blk_, s);
     };
 
@@ -431,12 +426,11 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     check_cublas(cublasSetStream(blas_, s), "set_stream(blas)");
     check(AMGX_set_thread_stream(reinterpret_cast<void*>(s)), "set_thread_stream");
     double* const d_rz = scalars_ + 0;
-    double* const d_rz_next = scalars_ + 1;
-    double* const d_pap = scalars_ + 2;
-    double* const d_alpha = scalars_ + 3;
-    double* const d_neg_alpha = scalars_ + 4;
-    double* const d_norm = scalars_ + 5;
-    double* const d_beta = scalars_ + 6;
+    double* const d_pap = scalars_ + 1;
+    double* const d_alpha = scalars_ + 2;
+    double* const d_neg_alpha = scalars_ + 3;
+    double* const d_norm = scalars_ + 4;
+    double* const d_beta = scalars_ + 5;
 
     // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
     // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
@@ -502,8 +496,8 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
         check_cuda(cudaMemcpyAsync(h_norm_, d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
                    "copy(norm)");
         preconditioner.apply(n_, rf_, zf_, s);
-        // rz_next = r·(double)zf; beta = rz_next/rz; rz <- rz_next (no fp64 z vector)
-        launch_cg_cast_dot_beta(zf_, r_, partials_, d_rz, d_rz_next, d_beta, n_, s);
+        // rz' = r·(double)zf; beta = rz'/rz; rz <- rz' (no fp64 z vector)
+        launch_cg_cast_dot_beta(zf_, r_, partials_, d_rz, d_beta, n_, s);
         launch_cg_update_p(d_beta, zf_, p_, n_, s);  // p = β p + (double)zf
     };
 

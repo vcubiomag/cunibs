@@ -105,9 +105,8 @@ private:
     double* x_int_ = nullptr;
     float* rf_ = nullptr;
     float* zf_ = nullptr;
-    void* spmv_buffer_ = nullptr;
-    // CG scalars kept on-device (device-pointer-mode cuBLAS): [rz, rz_next, pap, alpha, neg_alpha,
-    // norm, beta, one]. Only the residual norm is copied back, into pinned host memory, once/iter.
+    // CG scalars kept on-device (device-pointer-mode cuBLAS): [rz, pap, alpha, neg_alpha, norm,
+    // beta]. Only the residual norm is copied back, into pinned host memory, once/iter.
     double* scalars_ = nullptr;
     // Per-block partial sums for the fused deterministic reductions (‖r‖², r·z).
     double* partials_ = nullptr;
@@ -132,7 +131,7 @@ private:
     double* X_int_blk_ = nullptr;
     float* RF_blk_ = nullptr;
     float* ZF_blk_ = nullptr;
-    // Layout: [rz | rz_next | pap | alpha | neg_alpha | norm | beta], each k wide.
+    // Layout: [rz | pap | alpha | neg_alpha | norm | beta], each k wide.
     double* scalars_blk_ = nullptr;
     double* partials_blk_ = nullptr;
     double* h_norms_blk_ = nullptr;  // pinned, k residual norms + k reference norms
@@ -156,8 +155,7 @@ void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, cons
                               const double* ap, double* x, double* r, float* rf,
                               double* partials, double* norm_sq, int n, cudaStream_t stream);
 void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials,
-                             double* rz, double* rz_next, double* beta, int n,
-                             cudaStream_t stream);
+                             double* rz, double* beta, int n, cudaStream_t stream);
 
 // Block CG launchers (block_cg.cu); all dense operands row-major (n, k), k in {2, 4, 8}.
 int bcg_partials_blocks(int n);
@@ -175,7 +173,7 @@ void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* 
                                float* rf, double* partials, double* norms,
                                cudaStream_t stream);
 void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
-                              double* partials, double* rz, double* rz_next, double* beta,
+                              double* partials, double* rz, double* beta,
                               cudaStream_t stream);
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, cudaStream_t stream);

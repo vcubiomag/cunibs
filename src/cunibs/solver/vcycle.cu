@@ -417,7 +417,6 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, const int* row_p
     if (finalized_) throw std::runtime_error("NativeVCycle: add_level after finalize");
     Level lvl;
     lvl.n = n_rows;
-    lvl.nnz = nnz;
     lvl.n_coarse = n_coarse;
     lvl.row_ptr = device_copy(row_ptr, static_cast<size_t>(n_rows) + 1, "level row_ptr");
     lvl.col_idx = device_copy(col_idx, static_cast<size_t>(nnz), "level col_idx");

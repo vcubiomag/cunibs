@@ -101,13 +101,11 @@ __global__ void cg_cast_dot_kernel(const float* __restrict__ zf, const double* _
     block_reduce_partial(prod, partials);
 }
 
-// rz_next = Σ partials; β = rz_next/rz; rz ← rz_next (folds the old cg_beta kernel in)
+// β = (Σ partials)/rz; rz ← Σ partials
 __global__ void cg_reduce_beta_kernel(const double* __restrict__ partials, int nblocks,
-                                      double* __restrict__ rz, double* __restrict__ rz_next,
-                                      double* __restrict__ beta) {
+                                      double* __restrict__ rz, double* __restrict__ beta) {
     const double total = block_reduce_all(partials, nblocks);
     if (threadIdx.x == 0) {
-        *rz_next = total;
         *beta = total / (*rz);
         *rz = total;
     }
@@ -180,9 +178,8 @@ void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, cons
 }
 
 void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials,
-                             double* rz, double* rz_next, double* beta, int n,
-                             cudaStream_t stream) {
+                             double* rz, double* beta, int n, cudaStream_t stream) {
     const int blocks = (n + kBlock - 1) / kBlock;
     cg_cast_dot_kernel<<<blocks, kBlock, 0, stream>>>(zf, r, partials, n);
-    cg_reduce_beta_kernel<<<1, kBlock, 0, stream>>>(partials, blocks, rz, rz_next, beta);
+    cg_reduce_beta_kernel<<<1, kBlock, 0, stream>>>(partials, blocks, rz, beta);
 }

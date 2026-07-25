@@ -45,7 +45,6 @@ private:
 
     struct Level {
         int n = 0;
-        int nnz = 0;
         int n_coarse = 0;
         int* row_ptr = nullptr;
         int* col_idx = nullptr;
