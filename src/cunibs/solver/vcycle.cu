@@ -8,9 +8,9 @@
 namespace {
 
 constexpr int kBlock = 256;
-// A_0 has ~14 nnz/row (P1 tets); Galerkin coarse levels stay in the same regime, so the
-// warp-fraction row split of the production outer SpMV is reused. The fixed shuffle
-// order keeps every apply run-to-run deterministic.
+// A_0 has ~14 nnz/row (P1 tets) and the Galerkin coarse levels stay in the same regime,
+// so one warp fraction per row suits every level. The fixed shuffle order keeps every
+// apply run-to-run deterministic.
 constexpr int kTpr = 8;
 
 void check_cuda(cudaError_t err, const char* what) {
@@ -55,8 +55,8 @@ __global__ void vc_residual_kernel(int n, const int* __restrict__ row_ptr,
     if (row < n && lane == 0) r[row] = b[row] - sum;
 }
 
-// One thread per coarse row; the restriction row lists fine indices in the fork's
-// stable-sorted order, so the sequential sum is deterministic.
+// One thread per coarse row; the restriction row lists its fine indices in stable-sorted
+// order, so the sequential sum is deterministic.
 __global__ void vc_restrict_kernel(int n_coarse, const int* __restrict__ r_row_ptr,
                                    const int* __restrict__ r_col_idx,
                                    const float* __restrict__ r_fine,
@@ -79,7 +79,7 @@ __global__ void vc_prolongate_kernel(int n, const int* __restrict__ aggregates,
 }
 
 // Fused post-sweep: x_out = x_in + dinv * (b - A x_in). Out-of-place because rows gather
-// x_in across the whole vector (same shape as the fork's jacobi_l1_fused_postsmooth).
+// x_in across the whole vector.
 __global__ void vc_postsweep_kernel(int n, const int* __restrict__ row_ptr,
                                     const int* __restrict__ col_idx,
                                     const float* __restrict__ vals,
@@ -121,9 +121,10 @@ __global__ void vc_coarse_gemv_kernel(int n, const float* __restrict__ ainv,
 
 std::atomic<int> g_vcycle_generation{0};
 
+// fp32 block SpMV: threads-per-row drops at k=8, where the per-thread accumulators
+// crowd out occupancy.
 template <int K>
 __host__ __device__ constexpr int block_tpr() {
-    // fp32 block SpMV: probe_block_spmv measured tpr 8 best through k=4, 4 at k=8.
     return K >= 8 ? 4 : 8;
 }
 

@@ -39,8 +39,8 @@ from cunibs.solver import (
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
 
-# PCG requires a symmetric preconditioner. MULTICOLOR_GS and DILU stall near 1e-5.
-# JACOBI_L1 reaches the 1e-6 target across the tissue conductivity range.
+# PCG requires a symmetric preconditioner, so the smoother is l1-Jacobi rather than a
+# Gauss-Seidel or ILU variant.
 AMGX_CONFIG = (
     "config_version=2, determinism_flag=1, solver=PCG, tolerance=1e-6, max_iters=2000, "
     "norm=L2, convergence=RELATIVE_INI_CORE, monitor_residual=1, "
@@ -73,9 +73,10 @@ def _amgx_config_value(config: str, key: str, default: str) -> str:
 def _l1_dinv(a: csp.csr_matrix, omega: float = 0.9) -> cp.ndarray:
     """AMGx JACOBI_L1 smoother scaling: omega / d, d_i = sign(a_ii) * sum_j |a_ij|.
 
-    Matches the fork's compute_d_kernel (diagonal included in the L1 norm, sign flipped
-    for negative diagonals) with the default relaxation_factor 0.9 folded in. The
-    zero-guard never triggers for the SPD reduced stiffness but is kept for parity.
+    The diagonal is included in the L1 norm and the sign is flipped for negative diagonals,
+    matching how AMGx builds its l1-Jacobi diagonal; ``omega`` is its relaxation factor. The
+    zero row guard cannot fire for the SPD reduced stiffness, but keeps the reciprocal finite
+    for any input.
     """
     abs_a = csp.csr_matrix((cp.abs(a.data), a.indices, a.indptr), shape=a.shape)
     d = abs_a.dot(cp.ones(a.shape[1], dtype=cp.float32))
@@ -95,8 +96,7 @@ def build_native_vcycle(
     AMGx contributes only the per-level aggregate maps (the hard part of setup); the
     Galerkin products, l1-Jacobi diagonals, restriction ordering and the dense coarse
     inverse are recomputed here. Unsmoothed aggregation makes P a boolean map, so
-    A_{l+1} = P^T A_l P and the restriction row order is the stable sort by aggregate,
-    matching the fork's computeRestrictionOperator.
+    A_{l+1} = P^T A_l P and the restriction row order is the stable sort by aggregate.
     """
     n_levels = int(float_preconditioner.amg_num_levels())
     n = int(row_ptr.shape[0]) - 1
@@ -189,10 +189,10 @@ class GroundedSolver:
     def ensure_amgx(self) -> AMGXSolver:
         """Build the fp64 AMGx fallback solver on first use.
 
-        The fallback only runs when the mixed-precision PCG misses tolerance, so building its full
-        double AMG hierarchy eagerly holds a second (rarely used) hierarchy on the device for every
-        subject's lifetime. Deferring it raises how many subjects fit on one GPU. The reduced CSR is
-        already resident, so this only pays the one-time AMGx setup, not a reassembly.
+        The fallback only runs when the mixed-precision PCG misses tolerance, so deferring it
+        keeps a second full double AMG hierarchy off the device for the subject's lifetime. The
+        reduced CSR is already resident, so this pays only the one-time AMGx setup, not a
+        reassembly.
         """
         if self.amgx is None:
             amgx = AMGXSolver(self.config)
@@ -213,8 +213,8 @@ def prepare_grounded_solver(
     values = cp.ascontiguousarray(a_red.data.astype(cp.float64))
     values_f32 = cp.ascontiguousarray(values.astype(cp.float32))
     # AMGx only builds the aggregation hierarchy; the export-derived native V-cycle owns
-    # device copies of everything it needs, so the AMGx float solver is dropped at
-    # return, releasing its matrix + hierarchy (~160 MB per subject).
+    # device copies of everything it needs, so the AMGx float solver is dropped here,
+    # releasing its matrix and hierarchy.
     amgx_precond = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
     amgx_precond.setup(row_ptr, col_idx, values_f32)
     precond = build_native_vcycle(amgx_precond, row_ptr, col_idx, values_f32)
@@ -261,8 +261,7 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
 
 
 # Compiled block widths of the k-RHS solve kernels; smaller batches pad up by
-# replicating the last column (the padded column costs bandwidth but no extra
-# matrix reads, which is the point of the block path).
+# replicating the last column. The padded column costs bandwidth but no extra matrix reads.
 BLOCK_SIZES = (2, 4, 8)
 MAX_BLOCK = BLOCK_SIZES[-1]
 
@@ -283,9 +282,9 @@ def _warm_x0(
 ) -> cp.ndarray | None:
     """Build the (n_red, k_pad) initial guess from the nearest prior placements.
 
-    Warm and cold starts converge to the same ||r||/||b|| <= tol criterion (the
-    reference norm is ||b||, not the warm residual), so fields stay within the solver
-    tolerance either way; a warm start only changes the iteration count.
+    The solver's stopping criterion is ||r||/||b|| <= tol, measured against ||b|| rather than
+    the initial residual, so seeding x0 changes only the iteration count and not the accuracy
+    of the returned field.
     """
     if carry is None or carry.centers is None:
         return None
@@ -446,7 +445,6 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     del stiffness
 
     g = cp.ascontiguousarray(g.astype(RESIDENT_G_DTYPE))
-    # Negating after multiplication preserves the previous IEEE rounding order.
     neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
     wg = _weighted_gradient_kernel(g, neg_vc)
     vols = cp.ascontiguousarray(vols.astype(cp.float32))
@@ -537,7 +535,7 @@ def solve_placements_block(
 
     ``sites`` are (center_mm, pos_ydir_mm, distance_mm) triples. All stages that read
     large placement-independent arrays (scalp projection, tet connectivity, weighted
-    gradients, node2corner, g) run once per chunk instead of once per placement; the
+    gradients, node2corner, g) run once per chunk rather than once per placement, and the
     linear solve shares every stiffness/hierarchy read across the k columns.
     """
     k = len(sites)
@@ -563,9 +561,9 @@ def solve_placements_block(
         )
     )
 
-    # dA/dt node->element stays per placement: a k-wide version gathers from k separate
-    # 8.4 MB nodal arrays at once, which overflows L2 and measured 3x SLOWER than k
-    # serial passes (the shared tet_nodes read it would amortize is the smaller cost).
+    # dA/dt node->element stays per placement: a k-wide version would gather from k separate
+    # nodal arrays at once and overflow L2, which costs more than the shared tet_nodes read
+    # it would amortize.
     dadt_elms = []
     for i in range(k):
         dadt_nodes = coil_dadt_at_nodes(

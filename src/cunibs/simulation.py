@@ -109,9 +109,9 @@ class Subject:
         """Release cached GPU state (solver context, AMG hierarchies, UQ precompute).
 
         Dropping the cached solver objects triggers their teardown, so a loop over many subjects
-        can reclaim device memory between subjects instead of accumulating it. The subject stays
-        usable afterwards; cached state is rebuilt lazily on the next call. Also available via the
-        context manager: ``with Subject.from_mesh(path) as subject: ...``.
+        can reclaim device memory as it goes. The subject stays usable afterwards; cached state is
+        rebuilt lazily on the next call. Also available via the context manager:
+        ``with Subject.from_mesh(path) as subject: ...``.
         """
         self._conductivity_uq_pre.clear()
         self._ctx = None
@@ -444,7 +444,7 @@ class Subject:
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
                 outs = solve_placements_block(ctx, dip_pos_m, dip_moment, site_args, didt, warm)
                 if not retain_fields:
-                    # Pool-owned, so re-uploaded per chunk instead of cached on self.
+                    # Pool-owned: freed with the chunk, so it is re-uploaded rather than cached.
                     barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
                     results.extend(
                         self._field_summary(out, site, coil, didt, barycenters_mm)

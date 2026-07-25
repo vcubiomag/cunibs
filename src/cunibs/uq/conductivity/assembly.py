@@ -57,10 +57,11 @@ class ConductivityUQPrecompute:
         return self.base_data + sigma @ self.tissue_data
 
     def ensure_solver(self) -> AMGXSolver:
-        """Build the fp64 fallback AMGx solver (set up at nominal σ) on first non-convergent draw.
+        """Build the fp64 fallback AMGx solver on first non-convergent draw.
 
-        Frozen-preconditioner UQ almost never falls back, so the full double hierarchy is dead
-        weight for most ensembles; deferring it lets more subjects share one GPU.
+        Most ensembles never reach this path, so deferring it keeps a full double hierarchy off
+        the device unless a draw actually needs one. It is set up at nominal σ; each fallback
+        then re-uploads its own sample's coefficients.
         """
         if self.solver is None:
             solver = AMGXSolver(UQ_AMGX_CONFIG)

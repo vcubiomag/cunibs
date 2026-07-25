@@ -28,10 +28,9 @@ public:
 
     void setup(int n, int nnz, const int* row_ptr, const int* col_idx, const double* values);
 
-    // Swap only the matrix values (fixed sparsity), then rebuild the numeric hierarchy. The
-    // aggregation graph is reused when the config sets structure_reuse_levels, so this is far
-    // cheaper than setup(); update_coefficients without a following resetup freezes the
-    // preconditioner (used by the conductivity UQ sweep).
+    // Swap only the matrix values (fixed sparsity); resetup() then rebuilds the numeric
+    // hierarchy. The aggregation graph is reused when the config sets structure_reuse_levels,
+    // so the pair is far cheaper than setup().
     void update_coefficients(int nnz, const double* values);
     void resetup();
 

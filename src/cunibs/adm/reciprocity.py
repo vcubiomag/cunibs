@@ -33,9 +33,10 @@ from cunibs.fem.solve import (
 )
 from cunibs.solver import dadt_nbody, element_weight, node_scatter3
 
-# The adjoint RHS is a near-point source (Green's-function-like, singular at the target). At the
-# forward tolerance (1e-6) its residual leaves ~1% pointwise error in the functional, well above the
-# field budget. The adjoint solves are one-time (3 per target), so they use a tighter tolerance.
+# The adjoint RHS is a near-point source (Green's-function-like, singular at the target), so its
+# residual carries far more pointwise error in the functional than the same relative residual does
+# for a forward solve. The adjoint solves are one-time (3 per target), so they can afford a
+# tighter tolerance than the forward solve.
 ADJOINT_AMGX_CONFIG = AMGX_CONFIG.replace("tolerance=1e-6", "tolerance=1e-9").replace(
     "max_iters=2000", "max_iters=3000"
 )

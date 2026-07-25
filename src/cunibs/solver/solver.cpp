@@ -434,8 +434,7 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
 
     // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
     // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
-    // small initial residual. With x0 == 0 this is the old path exactly (r0 = b, so ‖b‖ was the
-    // reference either way). Setup uses host-pointer mode since it runs outside the captured loop.
+    // small initial residual. Setup uses host-pointer mode since it runs outside the captured loop.
     check_cublas(cublasSetPointerMode(blas_, CUBLAS_POINTER_MODE_HOST), "set_pointer_mode(host)");
     // The loop works on the solver-owned x_int_ (not the caller's x) so the captured graph contains
     // no per-call pointers and can be replayed across solves; the result is copied out at the end.

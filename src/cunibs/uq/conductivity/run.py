@@ -102,8 +102,8 @@ def run_conductivity_uq(
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
     b_base, b_tissue = _placement_rhs(ctx, pre, dadt_elm)
 
-    # The double AMGx solver stays frozen at nominal σ as the mixed-solve fallback; built lazily on
-    # the first extreme draw (``pre.ensure_solver()``), so most ensembles never allocate it.
+    # The fp64 AMGx solver is the mixed-solve fallback, built lazily on the first extreme draw
+    # (``pre.ensure_solver()``), so most ensembles never allocate it.
     pcg = pre.pcg
     precond = pre.precond
 
@@ -119,10 +119,10 @@ def run_conductivity_uq(
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
     # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
-    # initial guess for every draw, which are i.i.d. around nominal. solve_mixed measures convergence
-    # against ‖b‖ (not the warm ‖r0‖), so warm-started draws still reach the 1e-6-of-field criterion.
+    # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
+    # initial residual, so a warm-started draw still reaches the same accuracy criterion.
     # pcg is cached on `pre` and reused across placements, so its values may hold a previous
-    # placement's last draw — reset the matrix to nominal before seeding (the frozen preconditioner
+    # placement's last draw — reset the matrix to nominal before seeding (the preconditioner
     # affects only iteration count, not the solution, so it needs no reset).
     x_nominal = cp.empty(n_red, dtype=cp.float64)
     pcg.update_values(cp.ascontiguousarray(pre.nominal_data), stream)

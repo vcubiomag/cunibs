@@ -11,8 +11,8 @@
 //
 // Per level l (finest = 0, all but the coarsest): A_l as fp32 CSR, dinv_l = omega /
 // guard(d_l) with the l1 diagonal d and the smoother relaxation factor already folded
-// in, the restriction CSR (coarse row -> stably-ordered fine indices, matching the
-// fork's computeRestrictionOperator), and the fine->aggregate map for prolongation.
+// in, the restriction CSR (coarse row -> fine indices in stable-sorted order), and the
+// fine->aggregate map for prolongation.
 // The coarsest level is only the precomputed dense inverse.
 //
 // apply() is stream-ordered and CUDA-graph-capturable (no allocations, no host syncs).

@@ -91,8 +91,9 @@ def coil_dadt_at_nodes(
     r = target_nodes_mm * 1e-3 - o
     mp = cp.concatenate([m, cp.cross(m, s)], axis=1)
 
-    # Keep centering in float64, then use float32 for the dominant N-body kernel.
-    # The coil-scalp gap bounds |r - s| away from zero; measured relative L2 error is about 4e-7.
+    # Keep centering in float64, then use float32 for the dominant N-body kernel: the
+    # coil-scalp gap bounds |r - s| away from zero, so the |r - s|⁻³ weights stay well
+    # inside float32 range.
     s = cp.ascontiguousarray(s.astype(DADT_COMPUTE_DTYPE))
     r = cp.ascontiguousarray(r.astype(DADT_COMPUTE_DTYPE))
     mp = cp.ascontiguousarray(mp.astype(DADT_COMPUTE_DTYPE))

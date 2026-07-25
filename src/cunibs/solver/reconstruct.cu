@@ -7,7 +7,6 @@
 //   E[e]      = −grad_v − dadt_elm[e]
 //   magnE[e]  = ‖E[e]‖
 // Accumulate grad_v in float64 because subtracting dA/dt causes cancellation near the coil.
-// Float32 accumulation increases relative L2 error in magnE by about 1e-5.
 
 namespace {
 

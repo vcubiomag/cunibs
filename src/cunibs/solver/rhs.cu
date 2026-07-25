@@ -30,9 +30,10 @@ __global__ void rhs_kernel(const float* __restrict__ dadt_elm, const float* __re
     b[node] = acc;
 }
 
-// One thread per corner c: q[c] = dadt_elm[c>>2] · wg[c]. Split out from the node-centric gather so
-// both reads coalesce (corners c=4e..4e+3 share e → broadcast; wg[c] is corner-contiguous), whereas
-// gathering directly re-read dadt_elm[e] uncoalesced once per incident node.
+// One thread per corner c: q[c] = dadt_elm[c>>2] · wg[c]. Kept separate from the node-centric
+// gather so both reads coalesce (corners c=4e..4e+3 share e → broadcast; wg[c] is
+// corner-contiguous); a gather that indexed dadt_elm directly would read it uncoalesced once
+// per incident node.
 __global__ void rhs_corner_kernel(const float* __restrict__ dadt_elm, const float* __restrict__ wg,
                                   float* __restrict__ q, int n_corner) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -42,9 +43,8 @@ __global__ void rhs_corner_kernel(const float* __restrict__ dadt_elm, const floa
            dadt_elm[e * 3 + 2] * wg[c * 3 + 2];
 }
 
-// Segmented reduction b[node] = Σ_{p∈[ptr[node],ptr[node+1])} q[idx[p]]. Same accumulation order as
-// the old single kernel, so b is bit-identical, but it gathers a 4-byte q instead of dadt_elm+wg
-// (6 floats) per incidence.
+// Segmented reduction b[node] = Σ_{p∈[ptr[node],ptr[node+1])} q[idx[p]]. The per-node
+// accumulation order is fixed by ptr/idx, so b is bit-reproducible run to run.
 __global__ void rhs_gather_kernel(const float* __restrict__ q, const int* __restrict__ ptr,
                                   const int* __restrict__ idx, float* __restrict__ b, int n_nodes) {
     const int node = blockIdx.x * blockDim.x + threadIdx.x;

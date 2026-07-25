@@ -25,9 +25,8 @@ __global__ void cg_alpha_kernel(const double* rz, const double* pap, double* alp
     *neg_alpha = -a;
 }
 
-// Fuses p = β p + z (cublas scal(p) + axpy(z→p)): one read/write of p instead of two.
-// z is consumed as the raw fp32 preconditioner output (exact float→double cast on the
-// fly), so no fp64 z vector is ever materialized.
+// p = β p + z in one pass. z is consumed as the raw fp32 preconditioner output (exact
+// float→double cast on the fly), so no fp64 z vector is ever materialized.
 __global__ void cg_update_p_kernel(const double* __restrict__ beta, const float* __restrict__ zf,
                                    double* __restrict__ p, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -37,7 +36,6 @@ __global__ void cg_update_p_kernel(const double* __restrict__ beta, const float*
 
 // Deterministic two-stage reductions: stage 1 kernels emit one partial per block (fixed-order
 // shared-memory tree), stage 2 runs in a single block that strides the partials in a fixed order.
-// Replaces cuBLAS nrm2/dot passes that re-read full vectors the elementwise kernels already touch.
 __device__ void block_reduce_partial(double v, double* __restrict__ partials) {
     __shared__ double sdata[kBlock];
     sdata[threadIdx.x] = v;
@@ -62,9 +60,9 @@ __device__ double block_reduce_all(const double* __restrict__ partials, int nblo
     return sdata[0];
 }
 
-// update_xr + ‖r‖² partials: replaces cg_update_xr + cublasDnrm2 (drops a full re-read of r).
-// A standalone two-stage dot for p·ap was measured slower than cublasDdot — only reductions
-// FUSED into an elementwise pass that runs anyway are wins.
+// x/r update carrying the ‖r‖² partials, so r is read once. Only a reduction that rides
+// along on an elementwise pass pays off this way; a standalone two-stage dot is slower
+// than cuBLAS, which is why p·ap stays a separate pass.
 __global__ void cg_update_xr_norm_kernel(const double* __restrict__ alpha,
                                          const double* __restrict__ neg_alpha,
                                          const double* __restrict__ p,
@@ -89,8 +87,7 @@ __global__ void cg_reduce_norm_kernel(const double* __restrict__ partials, int n
     if (threadIdx.x == 0) *norm_sq = total;
 }
 
-// r·z partials with z cast from fp32 on the fly: replaces float_to_double + cublasDdot
-// (drops a full re-read of r plus the fp64 z write/read entirely).
+// r·z partials with z cast from fp32 on the fly, so no fp64 z vector is written or read.
 __global__ void cg_cast_dot_kernel(const float* __restrict__ zf, const double* __restrict__ r,
                                    double* __restrict__ partials, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -113,8 +110,6 @@ __global__ void cg_reduce_beta_kernel(const double* __restrict__ partials, int n
 
 // y = A x for the outer CG operator. Eight threads cooperate per row (the reduced stiffness has
 // ~14 nnz/row) with a fixed-order shuffle reduction, so results are run-to-run deterministic.
-// Measured ~15% faster than cusparseSpMV CSR_ALG1 at this size on RTX 5070 Ti
-// (benchmarks/probe_spmv_fp16.py).
 constexpr int kSpmvTpr = 8;
 
 __global__ void csrmv_f64_kernel(int n, const int* __restrict__ row_ptr,

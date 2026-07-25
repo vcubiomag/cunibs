@@ -34,9 +34,9 @@ void launch_place(const double* centers, const double* handles, const double* di
                   double* out, int n_pl, int n_tri, cudaStream_t stream);
 
 // Block (k <= 8 placements per chunk) variants of the per-placement stages: the shared
-// mesh arrays (tet_nodes, wg, node2corner, g) are read ONCE per chunk instead of once
+// mesh arrays (tet_nodes, wg, node2corner, g) are read once per chunk rather than once
 // per placement. Per-placement arrays stay separate contiguous buffers, passed as
-// pointer packs so the public per-placement result layout is unchanged.
+// pointer packs, so the per-placement result layout is the same as the serial path's.
 constexpr int kMaxStageBlock = 8;
 
 // b_block is row-major (n_nodes, k) float32 — the layout the block solver consumes.

@@ -1,9 +1,8 @@
 // Block (multi-RHS) CG kernels: k independent CG chains in lockstep sharing each
 // matrix read. All dense operands are row-major (n, k) so the k values of one mesh
 // node are contiguous; col_idx/vals are read once per nnz and reused across the k
-// columns (the amortization measured in benchmarks/probe_block_spmv.py). Every
-// reduction is a fixed-order two-stage tree per column, so results are run-to-run
-// deterministic and each column's arithmetic is independent of its neighbours.
+// columns. Every reduction is a fixed-order two-stage tree per column, so results are
+// run-to-run deterministic and each column's arithmetic is independent of its neighbours.
 #include <stdexcept>
 #include <type_traits>
 
@@ -13,16 +12,14 @@ namespace {
 
 constexpr int kBlock = 256;
 
-// Measured on RTX 5070 Ti (probe_block_spmv): best threads-per-row shifts down as the
-// per-thread register footprint grows with K.
+// Best threads-per-row shifts down as the per-thread register footprint grows with K.
 template <int K>
 __host__ __device__ constexpr int spmv_tpr() {
     return K >= 4 ? 4 : 8;
 }
 
-// At K=8 the 8 fp64 accumulators/thread spill without an occupancy floor;
-// __launch_bounds__ minBlocks=4 measured 81.3 -> 72.4 us/RHS on the 5070 Ti.
-// For K <= 4 the register footprint is small enough that minBlocks=2 is a no-op.
+// At K=8 the 8 fp64 accumulators/thread spill without an occupancy floor, so the
+// minBlocks hint is raised there.
 template <int K>
 __global__ void __launch_bounds__(kBlock, K == 8 ? 4 : 2)
     bcsrmv_f64_kernel(int n, const int* __restrict__ row_ptr,
@@ -58,11 +55,10 @@ __global__ void __launch_bounds__(kBlock, K == 8 ? 4 : 2)
 }
 
 // Column-wise per-block reduction of K register accumulators: warp shuffles, one
-// cross-warp pass through shared memory, a single __syncthreads(). The K-fold
-// block-wide tree it replaces cost ~8 barriers per column and throttled the streaming
-// kernels that embed it (measured 410 GB/s on the fused x/r update). Fixed order:
-// shuffle tree within each warp, then a sequential sum over the kBlock/32 warp
-// results, so partials stay deterministic.
+// cross-warp pass through shared memory, a single __syncthreads(). Keeping it to one
+// barrier matters because the streaming kernels that embed it are bandwidth-bound.
+// Fixed order: shuffle tree within each warp, then a sequential sum over the kBlock/32
+// warp results, so partials stay deterministic.
 template <int K>
 __device__ __forceinline__ void bcg_block_reduce_cols(double (&local)[K],
                                                       double* __restrict__ partials,

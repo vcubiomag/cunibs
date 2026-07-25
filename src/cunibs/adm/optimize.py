@@ -3,7 +3,7 @@
 Each candidate position is projected onto the scalp once. The in-plane rotation is a rigid rotation
 of the whole coil, so every target E-component ``E_d(θ)`` is band-limited in the angle. The optimum
 rotation is found in closed form by sampling ``E_d(θ)`` at a few angles, trigonometrically
-interpolating, and maximizing ``|E(θ)|²`` analytically, with no dense sweep and no FEM solves.
+interpolating, and maximizing ``|E(θ)|²`` analytically, without any FEM solve.
 """
 
 from __future__ import annotations
