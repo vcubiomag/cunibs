@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import mmap
 import struct
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Literal, NamedTuple, NoReturn
 
 import numpy as np
 import numpy.typing as npt
@@ -12,11 +13,12 @@ import numpy.typing as npt
 _ELEM_TYPE_TRIANGLE = 2
 _ELEM_TYPE_TET = 4
 _NODE_DTYPE = np.dtype([("id", "<i4"), ("xyz", "<f8", (3,))])
-_ELEMENT_BYTES = {1: 16, 2: 24, 3: 28, 4: 28, 5: 44}
+_I4 = np.dtype("<i4")
+_ELEMENT_NODES = {1: 2, 2: 3, 3: 4, 4: 4, 5: 8, 15: 1}
 
 SKIN_SURFACE_TAG = 1005
 
-TissueLabel: TypeAlias = Literal[
+type TissueLabel = Literal[
     "white_matter",
     "gray_matter",
     "csf",
@@ -57,99 +59,221 @@ _VOLUME_KEYS = np.fromiter(VOLUME_KEY_TO_LABEL, dtype=np.int32)
 _SURFACE_KEYS = np.fromiter(SURFACE_KEY_TO_LABEL, dtype=np.int32)
 
 
-def parse_msh_binary(
-    mesh_file: Path,
-) -> tuple[
-    npt.NDArray[np.float64],
-    npt.NDArray[np.int32],
-    npt.NDArray[np.int32],
-    npt.NDArray[np.int32],
-    npt.NDArray[np.int32],
-]:
+class MeshArrays(NamedTuple):
+    """The arrays a .msh file yields, filtered to known tissue tags and 0-indexed.
+
+    nodes_mm  : (N, 3) float64  node coordinates in millimetres
+    tet_nodes : (M, 4) int32    tetrahedron node indices
+    tet_tags  : (M,)   int32    tissue label per tetrahedron
+    surf_tris : (S, 3) int32    surface triangle node indices
+    surf_tags : (S,)   int32    tissue label per surface triangle
+    """
+
+    nodes_mm: npt.NDArray[np.float64]
+    tet_nodes: npt.NDArray[np.int32]
+    tet_tags: npt.NDArray[np.int32]
+    surf_tris: npt.NDArray[np.int32]
+    surf_tags: npt.NDArray[np.int32]
+
+
+class _SurfaceBlock(NamedTuple):
+    nodes: npt.NDArray[np.int32]
+    tags: npt.NDArray[np.int32]
+
+
+class _MshCursor:
+    """Byte cursor over a memory-mapped mesh, for Gmsh 2.2's interleaved text and binary."""
+
+    __slots__ = ("mm", "path", "pos")
+
+    def __init__(self, mm: mmap.mmap, path: Path) -> None:
+        self.mm = mm
+        self.path = path
+        self.pos = 0
+
+    def fail(self, problem: str) -> NoReturn:
+        raise ValueError(f"{self.path}: {problem}")
+
+    def line(self) -> str:
+        end = self.mm.find(b"\n", self.pos)
+        if end < 0:
+            self.fail("truncated: expected a newline-terminated line")
+        text = self.mm[self.pos : end].decode(errors="replace").strip()
+        self.pos = end + 1
+        return text
+
+    def expect(self, marker: str) -> None:
+        if (found := self.line()) != marker:
+            self.fail(f"expected {marker}, found {found!r}")
+
+    def count(self, what: str) -> int:
+        if not (text := self.line()).isdigit():
+            self.fail(f"expected a {what} count, found {text!r}")
+        return int(text)
+
+    def unpack(self, fmt: str) -> tuple[int, ...]:
+        size = struct.calcsize(fmt)
+        if self.pos + size > len(self.mm):
+            self.fail("truncated: expected another element block header")
+        values = struct.unpack_from(fmt, self.mm, self.pos)
+        self.pos += size
+        return values
+
+    def block(self, dtype: np.dtype, count: int) -> npt.NDArray:
+        n_bytes = count * dtype.itemsize
+        if count < 0 or self.pos + n_bytes > len(self.mm):
+            self.fail("truncated: a block extends past the end of the file")
+        out = np.frombuffer(self.mm, dtype=dtype, count=count, offset=self.pos)
+        self.pos += n_bytes
+        return out
+
+    def skip(self, n_bytes: int) -> None:
+        self.pos += n_bytes
+
+
+def _read_format(cursor: _MshCursor) -> None:
+    cursor.expect("$MeshFormat")
+    fields = cursor.line().split()
+    if fields[1:] != ["1", "8"]:
+        cursor.fail(f"expected a binary Gmsh 2.2 header, found {' '.join(fields)!r}")
+    if cursor.unpack("<i")[0] != 1:
+        cursor.fail("byte-order marker is not 1; big-endian meshes are not supported")
+    cursor.line()
+    cursor.expect("$EndMeshFormat")
+
+
+def _read_nodes(cursor: _MshCursor) -> tuple[int, npt.NDArray[np.float64]]:
+    cursor.expect("$Nodes")
+    num_nodes = cursor.count("node")
+    nodes_xyz = cursor.block(_NODE_DTYPE, num_nodes)["xyz"]
+    cursor.expect("$EndNodes")
+    return num_nodes, nodes_xyz
+
+
+def _known_surfaces(block: npt.NDArray[np.int32]) -> _SurfaceBlock:
+    """Filter per block so triangles with unknown tags never reach a contiguous buffer."""
+    tags = block[:, 1]
+    keep = np.isin(tags, _SURFACE_KEYS)
+    if keep.all():
+        return _SurfaceBlock(block[:, 3:], np.array(tags))
+    return _SurfaceBlock(block[:, 3:][keep], tags[keep])
+
+
+def _read_element_blocks(
+    cursor: _MshCursor,
+) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], list[_SurfaceBlock]]:
+    """Walk $Elements, keeping tetrahedra and surface triangles and skipping the rest."""
+    cursor.expect("$Elements")
+    total = cursor.count("element")
+
+    tet_nodes: npt.NDArray[np.int32] | None = None
+    tet_tags: npt.NDArray[np.int32] | None = None
+    surfaces: list[_SurfaceBlock] = []
+    consumed = 0
+
+    while consumed < total:
+        elem_type, count, num_tags = cursor.unpack("<3i")
+        if num_tags != 2:
+            cursor.fail(f"element block declares {num_tags} tags, expected 2")
+        if elem_type == _ELEM_TYPE_TRIANGLE:
+            surfaces.append(_known_surfaces(cursor.block(_I4, count * 6).reshape(count, 6)))
+        elif elem_type == _ELEM_TYPE_TET:
+            block = cursor.block(_I4, count * 7).reshape(count, 7)
+            tet_tags, tet_nodes = block[:, 1], block[:, 3:]
+        elif (n_elem_nodes := _ELEMENT_NODES.get(elem_type)) is not None:
+            cursor.skip(count * (1 + num_tags + n_elem_nodes) * 4)
+        else:
+            cursor.fail(f"unsupported Gmsh element type {elem_type}")
+        consumed += count
+
+    cursor.expect("$EndElements")
+    if tet_nodes is None or tet_tags is None:
+        cursor.fail("no tetrahedron block")
+    return tet_nodes, tet_tags, surfaces
+
+
+def _join_surfaces(surfaces: list[_SurfaceBlock]) -> _SurfaceBlock:
+    match surfaces:
+        case []:
+            return _SurfaceBlock(np.empty((0, 3), np.int32), np.empty(0, np.int32))
+        case [only]:
+            return only
+        case _:
+            return _SurfaceBlock(
+                np.concatenate([s.nodes for s in surfaces]),
+                np.concatenate([s.tags for s in surfaces]),
+            )
+
+
+def _node_id_error(path: Path, what: str) -> ValueError:
+    return ValueError(f"{path}: {what} references a node id outside the node table")
+
+
+def _reindex_nodes(
+    nodes_xyz: npt.NDArray[np.float64],
+    num_nodes: int,
+    tet_nodes: npt.NDArray[np.int32],
+    surf_tris: npt.NDArray[np.int32],
+    path: Path,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int32], npt.NDArray[np.int32]]:
+    """Drop nodes that no surviving tetrahedron references, and rebase indices to 0.
+
+    Both index arrays arrive already shifted to 0-based. When every node is referenced
+    that shift is the whole answer, the id-to-index map is the identity, so the
+    gather is skipped entirely.
+    """
+    used = np.zeros(num_nodes, dtype=bool)
+    # Viewing as unsigned turns a negative index, meaning a node id of 0 or less in the
+    # file, into a huge one, so numpy's own bounds check covers both ends in one pass.
+    try:
+        used[tet_nodes.view(np.uint32)] = True
+    except IndexError:
+        raise _node_id_error(path, "a tetrahedron") from None
+
+    if used.all():
+        if surf_tris.size and (surf_tris.min() < 0 or surf_tris.max() >= num_nodes):
+            raise _node_id_error(path, "a surface triangle")
+        return np.array(nodes_xyz), tet_nodes, surf_tris
+
+    unique_ids = np.flatnonzero(used)
+    node_index = np.full(num_nodes, -1, dtype=np.int32)
+    node_index[unique_ids] = np.arange(unique_ids.size, dtype=np.int32)
+    try:
+        surf_tris = node_index[surf_tris.view(np.uint32)]
+    except IndexError:
+        raise _node_id_error(path, "a surface triangle") from None
+    if (orphaned := surf_tris < 0).any():
+        raise ValueError(
+            f"{path}: {int(orphaned.any(axis=1).sum())} surface triangles reference nodes "
+            "that were dropped with a filtered tetrahedron"
+        )
+    return np.ascontiguousarray(nodes_xyz[unique_ids]), node_index[tet_nodes], surf_tris
+
+
+def parse_msh_binary(mesh_file: Path) -> MeshArrays:
     """Parse a binary Gmsh 2.2 .msh file.
 
-    Returns
-    -------
-    nodes       :   (N, 3)  float64 node XYZ coordinates in mm, 0-indexed
-    tet_nodes   :   (M, 4)  int32   tetrahedron node indices, 0-indexed
-    tet_tags    :   (M,)    int32   tissue label per tet
-    surf_tris   :   (S, 3)  int32   surface triangle node indices, 0-indexed
-    surf_tags   :   (S,)    int32   tissue label per surface triangle
+    The file is mapped rather than read, so node and element blocks are consumed as views
+    and only the returned arrays are materialized. Every field of the result owns its
+    data: nothing may alias the mapping, which is released when this frame returns.
     """
     with open(mesh_file, "rb") as f:
-        assert f.readline().decode().strip() == "$MeshFormat"
-        _, file_type, data_size = f.readline().decode().strip().split()
-        assert file_type == "1" and data_size == "8"
-        assert struct.unpack("<i", f.read(4))[0] == 1
-        f.readline()
-        assert f.readline().decode().strip() == "$EndMeshFormat"
+        cursor = _MshCursor(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ), mesh_file)
+        _read_format(cursor)
+        num_nodes, nodes_xyz = _read_nodes(cursor)
+        tet_nodes_raw, tet_tags_raw, surfaces = _read_element_blocks(cursor)
 
-        assert f.readline().decode().strip() == "$Nodes"
-        num_nodes = int(f.readline().decode().strip())
-        node_records = np.frombuffer(
-            f.read(num_nodes * _NODE_DTYPE.itemsize), dtype=_NODE_DTYPE
+        known = np.isin(tet_tags_raw, _VOLUME_KEYS)
+        if known.all():
+            tet_tags, tet_nodes = np.array(tet_tags_raw), tet_nodes_raw
+        else:
+            tet_tags, tet_nodes = tet_tags_raw[known], tet_nodes_raw[known]
+
+        surface = _join_surfaces(surfaces)
+        nodes_mm, tet_nodes, surf_tris = _reindex_nodes(
+            nodes_xyz, num_nodes, tet_nodes - 1, surface.nodes - 1, mesh_file
         )
-        nodes_xyz = node_records["xyz"]
-        assert f.readline().decode().strip() == "$EndNodes"
-
-        assert f.readline().decode().strip() == "$Elements"
-        total_elements = int(f.readline().decode().strip())
-
-        tet_nodes_raw: npt.NDArray[np.int32] | None = None
-        tet_tags_raw: npt.NDArray[np.int32] | None = None
-        tri_nodes_list: list[npt.NDArray[np.int32]] = []
-        tri_tags_list: list[npt.NDArray[np.int32]] = []
-        consumed = 0
-
-        while consumed < total_elements:
-            elem_type, count, num_tags = struct.unpack("<3i", f.read(12))
-            assert num_tags == 2
-            if elem_type == _ELEM_TYPE_TRIANGLE:
-                block = np.frombuffer(f.read(count * 24), dtype="<i4").reshape(count, 6)
-                tri_tags_list.append(block[:, 1])
-                tri_nodes_list.append(block[:, 3:])
-            elif elem_type == _ELEM_TYPE_TET:
-                block = np.frombuffer(f.read(count * 28), dtype="<i4").reshape(count, 7)
-                tet_tags_raw = block[:, 1]
-                tet_nodes_raw = block[:, 3:]
-            else:
-                bytes_per = _ELEMENT_BYTES.get(elem_type, 0)
-                if bytes_per:
-                    f.read(count * bytes_per)
-            consumed += count
-
-        assert f.readline().decode().strip() == "$EndElements"
-
-    assert tet_nodes_raw is not None and tet_tags_raw is not None
-
-    valid_tet = np.isin(tet_tags_raw, _VOLUME_KEYS)
-    tet_tags = tet_tags_raw[valid_tet]
-    tet_nodes_filt = tet_nodes_raw[valid_tet]
-
-    used_nodes = np.zeros(num_nodes + 1, dtype=bool)
-    used_nodes[tet_nodes_filt.ravel()] = True
-    unique_ids = np.flatnonzero(used_nodes)
-    node_index = np.full(num_nodes + 1, -1, dtype=np.int32)
-    node_index[unique_ids] = np.arange(unique_ids.size, dtype=np.int32)
-
-    nodes_out = np.ascontiguousarray(nodes_xyz[unique_ids - 1])
-    tet_nodes_out = node_index[tet_nodes_filt]
-
-    if tri_nodes_list:
-        tri_nodes_raw = np.concatenate(tri_nodes_list, axis=0)
-        tri_tags_raw_all = np.concatenate(tri_tags_list, axis=0)
-    else:
-        tri_nodes_raw = np.empty((0, 3), dtype=np.int32)
-        tri_tags_raw_all = np.empty((0,), dtype=np.int32)
-
-    valid_surf = np.isin(tri_tags_raw_all, _SURFACE_KEYS)
-    surf_tags = tri_tags_raw_all[valid_surf]
-    surf_nodes_filt = tri_nodes_raw[valid_surf]
-
-    surf_tris_out = node_index[surf_nodes_filt]
-    assert np.all(surf_tris_out >= 0)
-
-    return nodes_out, tet_nodes_out, tet_tags, surf_tris_out, surf_tags
+        return MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surface.tags)
 
 
 @dataclass
@@ -163,10 +287,6 @@ class HeadMesh:
     tet_nodes: npt.NDArray[np.int32]
     tet_tags: npt.NDArray[np.int32]
     skin_tris: npt.NDArray[np.int32]
-
-    @property
-    def nodes_m(self) -> npt.NDArray[np.float64]:
-        return self.nodes_mm * 1e-3
 
     @property
     def n_nodes(self) -> int:
@@ -184,12 +304,12 @@ class HeadMesh:
 
 def load_mesh(mesh_file: str | Path) -> HeadMesh:
     """Load a binary Gmsh 2.2 tetrahedral head mesh."""
-    nodes, tet_nodes, tet_tags, surf_tris, surf_tags = parse_msh_binary(Path(mesh_file))
-    skin_tris = surf_tris[surf_tags == SKIN_SURFACE_TAG]
+    arrays = parse_msh_binary(Path(mesh_file))
+    skin_tris = arrays.surf_tris[arrays.surf_tags == SKIN_SURFACE_TAG]
     return HeadMesh(
-        nodes_mm=np.ascontiguousarray(nodes, dtype=np.float64),
-        tet_nodes=np.ascontiguousarray(tet_nodes, dtype=np.int32),
-        tet_tags=np.ascontiguousarray(tet_tags, dtype=np.int32),
+        nodes_mm=np.ascontiguousarray(arrays.nodes_mm, dtype=np.float64),
+        tet_nodes=np.ascontiguousarray(arrays.tet_nodes, dtype=np.int32),
+        tet_tags=np.ascontiguousarray(arrays.tet_tags, dtype=np.int32),
         skin_tris=np.ascontiguousarray(skin_tris, dtype=np.int32),
     )
 
