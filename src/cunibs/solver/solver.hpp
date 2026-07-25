@@ -5,7 +5,6 @@
 #include <amgx_c.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <cusparse.h>
 
 #include "vcycle.hpp"
 
@@ -122,10 +121,6 @@ private:
     double* partials_ = nullptr;
     double* h_norm_ = nullptr;
     cublasHandle_t blas_ = nullptr;
-    cusparseHandle_t sparse_ = nullptr;
-    cusparseSpMatDescr_t mat_ = nullptr;
-    cusparseDnVecDescr_t p_vec_ = nullptr;
-    cusparseDnVecDescr_t ap_vec_ = nullptr;
     // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
     // un-capturable legacy default stream; b/x are handed off via join_event_. The iteration body
     // only touches solver-owned buffers (x_int_, not the caller's x), so the captured graph is

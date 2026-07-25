@@ -94,7 +94,7 @@ set_source_files_properties(src/cunibs/solver/dadt.cu PROPERTIES COMPILE_OPTIONS
 
 target_link_libraries(
   _solver_ext
-  PRIVATE CUDA::cudart CUDA::cublas CUDA::cusparse AMGX::amgxsh
+  PRIVATE CUDA::cudart CUDA::cublas AMGX::amgxsh
 )
 
 if(CUNIBS_USE_SYSTEM_CUDA)

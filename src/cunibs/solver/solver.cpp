@@ -2,12 +2,9 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
-#include <cusparse.h>
 
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -33,13 +30,6 @@ void check_cuda(cudaError_t rc, const char* what) {
 void check_cublas(cublasStatus_t rc, const char* what) {
     if (rc != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(std::string("cuBLAS ") + what + ": status " +
-                                 std::to_string(rc));
-    }
-}
-
-void check_cusparse(cusparseStatus_t rc, const char* what) {
-    if (rc != CUSPARSE_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string("cuSPARSE ") + what + ": status " +
                                  std::to_string(rc));
     }
 }
@@ -197,7 +187,6 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     : n_(n), nnz_(nnz) {
     try {
         check_cublas(cublasCreate(&blas_), "create");
-        check_cusparse(cusparseCreate(&sparse_), "create");
         check_cuda(cudaMalloc(&row_ptr_, static_cast<size_t>(n_ + 1) * sizeof(int)),
                    "malloc(row_ptr)");
         check_cuda(cudaMalloc(&col_idx_, static_cast<size_t>(nnz_) * sizeof(int)),
@@ -218,29 +207,7 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
                    "copy(col_idx)");
         update_values(values, nullptr);
 
-        check_cusparse(cusparseCreateCsr(&mat_, n_, n_, nnz_, row_ptr_, col_idx_, values_,
-                                         CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                         CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F),
-                       "create_csr");
-        check_cusparse(cusparseCreateDnVec(&p_vec_, n_, p_, CUDA_R_64F), "create_p_vec");
-        check_cusparse(cusparseCreateDnVec(&ap_vec_, n_, ap_, CUDA_R_64F), "create_ap_vec");
-
-        const double one = 1.0;
-        const double zero = 0.0;
-        size_t spmv_buffer_size = 0;
-        size_t spmv_buffer_size2 = 0;
-        check_cusparse(cusparseSpMV_bufferSize(sparse_, CUSPARSE_OPERATION_NON_TRANSPOSE, &one,
-                                               mat_, p_vec_, &zero, ap_vec_, CUDA_R_64F,
-                                               CUSPARSE_SPMV_CSR_ALG1, &spmv_buffer_size),
-                       "spmv_buffer_size");
-        check_cusparse(cusparseSpMV_bufferSize(sparse_, CUSPARSE_OPERATION_NON_TRANSPOSE, &one,
-                                               mat_, p_vec_, &zero, ap_vec_, CUDA_R_64F,
-                                               CUSPARSE_SPMV_CSR_ALG2, &spmv_buffer_size2),
-                       "spmv_buffer_size2");
-        if (spmv_buffer_size2 > spmv_buffer_size) spmv_buffer_size = spmv_buffer_size2;
-        check_cuda(cudaMalloc(&spmv_buffer_, spmv_buffer_size), "malloc(spmv_buffer)");
-
-        check_cuda(cudaMalloc(&scalars_, 8 * sizeof(double)), "malloc(scalars)");
+        check_cuda(cudaMalloc(&scalars_, 6 * sizeof(double)), "malloc(scalars)");
         check_cuda(cudaMalloc(&partials_,
                               static_cast<size_t>(cg_partials_size(n_)) * sizeof(double)),
                    "malloc(partials)");
@@ -281,10 +248,6 @@ PcgAmgSolver::~PcgAmgSolver() {
     if (h_norm_) cudaFreeHost(h_norm_);
     if (partials_) cudaFree(partials_);
     if (scalars_) cudaFree(scalars_);
-    if (spmv_buffer_) cudaFree(spmv_buffer_);
-    if (ap_vec_) cusparseDestroyDnVec(ap_vec_);
-    if (p_vec_) cusparseDestroyDnVec(p_vec_);
-    if (mat_) cusparseDestroySpMat(mat_);
     if (x_int_) cudaFree(x_int_);
     if (ap_) cudaFree(ap_);
     if (p_) cudaFree(p_);
@@ -294,7 +257,6 @@ PcgAmgSolver::~PcgAmgSolver() {
     if (values_) cudaFree(values_);
     if (col_idx_) cudaFree(col_idx_);
     if (row_ptr_) cudaFree(row_ptr_);
-    if (sparse_) cusparseDestroy(sparse_);
     if (blas_) cublasDestroy(blas_);
 }
 
@@ -337,15 +299,12 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                                int max_iters, cudaStream_t stream,
                                                const double* X0) {
     ensure_block_buffers(k);
-    const char* graph_env = getenv("CUNIBS_GRAPH");
-    const bool use_graph = (graph_env == nullptr) || (graph_env[0] != '0');
-    const char* check_env = getenv("CUNIBS_CHECK_EVERY");
-    const int check_every = (check_env != nullptr && atoi(check_env) > 1) ? atoi(check_env) : 1;
-    cudaStream_t s = use_graph ? solve_stream_ : stream;
-    if (use_graph) {
-        check_cuda(cudaEventRecord(join_event_, stream), "block:record_in");
-        check_cuda(cudaStreamWaitEvent(s, join_event_, 0), "block:wait_in");
-    }
+    // The solve runs on an internal capture-capable stream because the caller's is usually the
+    // un-capturable legacy default stream; the AMGx fork routes its kernels onto that stream so
+    // the preconditioner apply is capturable too.
+    cudaStream_t s = solve_stream_;
+    check_cuda(cudaEventRecord(join_event_, stream), "block:record_in");
+    check_cuda(cudaStreamWaitEvent(s, join_event_, 0), "block:wait_in");
     check(AMGX_set_thread_stream(reinterpret_cast<void*>(s)), "set_thread_stream(block)");
 
     const size_t nk = static_cast<size_t>(n_) * k;
@@ -418,8 +377,8 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     }
 
     std::vector<double> rel(k, 0.0);
-    bool have_graph = use_graph && block_graph_exec_ != nullptr;
-    bool capture_failed = !use_graph;
+    bool have_graph = block_graph_exec_ != nullptr;
+    bool capture_failed = false;
     int it = 1;
     int result_iters = max_iters;
     for (; it <= max_iters; ++it) {
@@ -447,25 +406,21 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                 run_body();
             }
         }
-        if (it % check_every == 0 || it == max_iters) {
-            check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
-            double worst = 0.0;
-            for (int c = 0; c < k; ++c) {
-                rel[c] = std::sqrt(h_norm[c]) / norm_ref[c];
-                if (rel[c] > worst) worst = rel[c];
-            }
-            if (worst <= tolerance) {
-                result_iters = it;
-                break;
-            }
+        check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
+        double worst = 0.0;
+        for (int c = 0; c < k; ++c) {
+            rel[c] = std::sqrt(h_norm[c]) / norm_ref[c];
+            if (rel[c] > worst) worst = rel[c];
+        }
+        if (worst <= tolerance) {
+            result_iters = it;
+            break;
         }
     }
     check_cuda(cudaMemcpyAsync(X, X_int_blk_, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
                "block:copy(X_out)");
     check_cuda(cudaStreamSynchronize(s), "block:sync(X_out)");
-    if (use_graph) {
-        check(AMGX_set_thread_stream(nullptr), "reset_thread_stream(block)");
-    }
+    check(AMGX_set_thread_stream(nullptr), "reset_thread_stream(block)");
     PcgBlockResult result;
     result.iterations = result_iters;
     result.relative_residual = std::move(rel);
@@ -475,21 +430,14 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
 PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* b,
                                     double* x, double tolerance, int max_iters,
                                     cudaStream_t stream, const double* x0) {
-    // Default-on (CUNIBS_GRAPH=0 forces the direct path). The solve runs on an internal
-    // capture-capable stream because the caller's is usually the un-capturable legacy default stream;
-    // the AMGx fork routes its kernels onto that stream so the preconditioner apply is capturable too.
-    // If capture is invalidated at runtime the loop falls back to direct execution.
-    const char* graph_env = getenv("CUNIBS_GRAPH");
-    const bool use_graph = (graph_env == nullptr) || (graph_env[0] != '0');
-    const char* check_env = getenv("CUNIBS_CHECK_EVERY");
-    const int check_every = (check_env != nullptr && atoi(check_env) > 1) ? atoi(check_env) : 1;
-    cudaStream_t s = use_graph ? solve_stream_ : stream;
-    if (use_graph) {
-        check_cuda(cudaEventRecord(join_event_, stream), "graph:record_in");
-        check_cuda(cudaStreamWaitEvent(s, join_event_, 0), "graph:wait_in");
-    }
+    // The solve runs on an internal capture-capable stream because the caller's is usually the
+    // un-capturable legacy default stream; the AMGx fork routes its kernels onto that stream so the
+    // preconditioner apply is capturable too. If capture is invalidated at runtime the loop falls
+    // back to direct execution.
+    cudaStream_t s = solve_stream_;
+    check_cuda(cudaEventRecord(join_event_, stream), "graph:record_in");
+    check_cuda(cudaStreamWaitEvent(s, join_event_, 0), "graph:wait_in");
     check_cublas(cublasSetStream(blas_, s), "set_stream(blas)");
-    check_cusparse(cusparseSetStream(sparse_, s), "set_stream(sparse)");
     check(AMGX_set_thread_stream(reinterpret_cast<void*>(s)), "set_thread_stream");
     double* const d_rz = scalars_ + 0;
     double* const d_rz_next = scalars_ + 1;
@@ -519,7 +467,7 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
         check_cuda(cudaMemsetAsync(x, 0, static_cast<size_t>(n_) * sizeof(double), s),
                    "memset(x_out)");
         check_cuda(cudaStreamSynchronize(s), "sync(x_out0)");
-        if (use_graph) { check(AMGX_set_thread_stream(nullptr), "reset_thread_stream"); }
+        check(AMGX_set_thread_stream(nullptr), "reset_thread_stream");
         return {0, 0.0};
     }
     if (x0 != nullptr) {
@@ -534,7 +482,7 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
                                        cudaMemcpyDeviceToDevice, s),
                        "copy(x_int,x)");
             check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
-            if (use_graph) { check(AMGX_set_thread_stream(nullptr), "reset_thread_stream"); }
+            check(AMGX_set_thread_stream(nullptr), "reset_thread_stream");
             return {0, norm_r0 / norm_ref};
         }
     }
@@ -551,28 +499,10 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
 
     // Identical every iteration (fixed buffers updated in place), so it is captured once and
     // replayed; the residual readback is inside the body but the host convergence test stays outside.
-    // Probe knob: the custom deterministic SpMV measured faster than cuSPARSE ALG1 on the RTX
-    // 5070 Ti; CUNIBS_OUTER_SPMV=alg1/alg2 re-enables cuSPARSE for comparison on other hardware.
-    const char* spmv_env = getenv("CUNIBS_OUTER_SPMV");
-    const bool custom_spmv = (spmv_env == nullptr) || (strcmp(spmv_env, "alg1") != 0 &&
-                                                       strcmp(spmv_env, "alg2") != 0);
-    const cusparseSpMVAlg_t spmv_alg = (spmv_env != nullptr && strcmp(spmv_env, "alg2") == 0)
-                                           ? CUSPARSE_SPMV_CSR_ALG2
-                                           : CUSPARSE_SPMV_CSR_ALG1;
-    const double one = 1.0;
-    const double zero = 0.0;
-
     auto run_body = [&]() {
-        // Folding p·(Ap) into the SpMV epilogue was measured slower (the block-wide reduction
-        // tree stalls the SpMV's memory pipeline), so the dot stays a separate cuBLAS pass.
-        if (custom_spmv) {
-            launch_csrmv_f64(n_, row_ptr_, col_idx_, values_, p_, ap_, s);
-        } else {
-            check_cusparse(cusparseSpMV(sparse_, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, mat_,
-                                        p_vec_, &zero, ap_vec_, CUDA_R_64F, spmv_alg,
-                                        spmv_buffer_),
-                           "spmv");
-        }
+        // p·(Ap) stays a separate cuBLAS pass: folding it into the SpMV epilogue makes the
+        // block-wide reduction tree stall the SpMV's memory pipeline.
+        launch_csrmv_f64(n_, row_ptr_, col_idx_, values_, p_, ap_, s);
         check_cublas(cublasDdot(blas_, n_, p_, 1, ap_, 1, d_pap), "dot(p,ap)");
         launch_cg_alpha(d_rz, d_pap, d_alpha, d_neg_alpha, s);
         // x += α p; r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)
@@ -596,8 +526,8 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
     }
 
     double rel = 0.0;
-    bool have_graph = use_graph && graph_exec_ != nullptr;
-    bool capture_failed = !use_graph;  // when off, always execute the body directly (no capture)
+    bool have_graph = graph_exec_ != nullptr;
+    bool capture_failed = false;
     int it = 1;
     int result_iters = max_iters;
     for (; it <= max_iters; ++it) {
@@ -623,16 +553,11 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
                 run_body();
             }
         }
-        // Checking every iteration costs a host sync each time; with a cadence > 1 the launches
-        // queue up and the host only wakes to test convergence every check_every-th iteration
-        // (worst case check_every-1 extra iterations past convergence).
-        if (it % check_every == 0 || it == max_iters) {
-            check_cuda(cudaStreamSynchronize(s), "sync(iter)");
-            rel = std::sqrt(*h_norm_) / norm_ref;
-            if (rel <= tolerance) {
-                result_iters = it;
-                break;
-            }
+        check_cuda(cudaStreamSynchronize(s), "sync(iter)");
+        rel = std::sqrt(*h_norm_) / norm_ref;
+        if (rel <= tolerance) {
+            result_iters = it;
+            break;
         }
     }
     check_cuda(cudaMemcpyAsync(x, x_int_, static_cast<size_t>(n_) * sizeof(double),
@@ -641,8 +566,6 @@ PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* 
     check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
     // solve_stream_ is destroyed with this solver, so reset AMGx's per-thread stream to the default
     // rather than leave it dangling for a later AMGx op on this thread.
-    if (use_graph) {
-        check(AMGX_set_thread_stream(nullptr), "reset_thread_stream");
-    }
+    check(AMGX_set_thread_stream(nullptr), "reset_thread_stream");
     return {result_iters, rel};
 }
