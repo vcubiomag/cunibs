@@ -152,18 +152,9 @@ AMGXFloatSolver::~AMGXFloatSolver() {
 
 void AMGXFloatSolver::setup(int n, int nnz, const int* row_ptr, const int* col_idx,
                             const float* values) {
-    n_ = n;
-    ++generation_;
     check(AMGX_matrix_upload_all(A_, n, nnz, 1, 1, row_ptr, col_idx, values, nullptr),
           "matrix_upload_all(float)");
     check(AMGX_solver_setup(solver_, A_), "solver_setup(float)");
-}
-
-void AMGXFloatSolver::apply(int n, const float* b, float* x) {
-    check(AMGX_vector_upload(b_, n, 1, b), "vector_upload(float b)");
-    check(AMGX_vector_set_zero(x_, n, 1), "vector_set_zero(float x)");
-    check(AMGX_solver_solve_with_0_initial_guess(solver_, b_, x_), "solver_apply(float)");
-    check(AMGX_vector_download(x_, x), "vector_download(float x)");
 }
 
 int AMGXFloatSolver::amg_num_levels() const {
@@ -427,7 +418,7 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     return result;
 }
 
-PcgResult PcgAmgSolver::solve_mixed(FloatPrecond& preconditioner, const double* b,
+PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* b,
                                     double* x, double tolerance, int max_iters,
                                     cudaStream_t stream, const double* x0) {
     // The solve runs on an internal capture-capable stream because the caller's is usually the

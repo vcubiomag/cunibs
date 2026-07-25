@@ -47,23 +47,17 @@ private:
     AMGX_solver_handle solver_ = nullptr;
 };
 
-class AMGXFloatSolver : public FloatPrecond {
+// Builds an AMGx aggregation hierarchy and exports its per-level aggregate maps, which is all
+// that build_native_vcycle needs to reconstruct the V-cycle operators itself.
+class AMGXFloatSolver {
 public:
     explicit AMGXFloatSolver(const std::string& config);
-    ~AMGXFloatSolver() override;
+    ~AMGXFloatSolver();
 
     AMGXFloatSolver(const AMGXFloatSolver&) = delete;
     AMGXFloatSolver& operator=(const AMGXFloatSolver&) = delete;
 
     void setup(int n, int nnz, const int* row_ptr, const int* col_idx, const float* values);
-    void apply(int n, const float* b, float* x);
-    // AMGx runs on its per-thread stream (bound by the caller before the solve), so the
-    // stream argument of the FloatPrecond interface is not needed here.
-    void apply(int n, const float* b, float* x, cudaStream_t) override { apply(n, b, x); }
-    // Bumped on every setup(): a captured CUDA graph embeds pointers into this solver's hierarchy
-    // buffers, so PcgAmgSolver keys its cached graph on (solver address, generation) and recaptures
-    // after any re-setup.
-    int generation() const override { return generation_; }
 
     // cuNIBS fork extension: aggregation-hierarchy export for the native V-cycle rebuild.
     int amg_num_levels() const;
@@ -71,8 +65,6 @@ public:
     void download_aggregates(int level, int* aggregates) const;
 
 private:
-    int n_ = 0;
-    int generation_ = 0;
     AMGX_config_handle cfg_ = nullptr;
     AMGX_matrix_handle A_ = nullptr;
     AMGX_vector_handle b_ = nullptr;
@@ -89,7 +81,7 @@ public:
     PcgAmgSolver& operator=(const PcgAmgSolver&) = delete;
 
     void update_values(const double* values, cudaStream_t stream);
-    PcgResult solve_mixed(FloatPrecond& preconditioner, const double* b, double* x,
+    PcgResult solve_mixed(NativeVCycle& preconditioner, const double* b, double* x,
                           double tolerance, int max_iters, cudaStream_t stream,
                           const double* x0 = nullptr);
     // Block solve: k independent CG chains in lockstep over row-major (n, k) operands,
@@ -129,7 +121,7 @@ private:
     cudaEvent_t join_event_ = nullptr;
     cudaGraph_t graph_ = nullptr;
     cudaGraphExec_t graph_exec_ = nullptr;
-    const FloatPrecond* captured_precond_ = nullptr;
+    const NativeVCycle* captured_precond_ = nullptr;
     int captured_precond_gen_ = 0;
     // Block-solve state: (n, k) row-major work buffers (lazily sized to the largest k
     // seen) and a separate cached graph keyed additionally on k.

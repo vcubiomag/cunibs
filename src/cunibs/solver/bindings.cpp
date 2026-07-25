@@ -57,11 +57,7 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("b"), nb::arg("x"), nb::arg("stream"),
             "Solve A x = b on device; x (length n) is overwritten with the solution.");
 
-    // Abstract fp32-preconditioner interface: solve_mixed accepts any implementation
-    // (the AMGx apply or the native V-cycle rebuilt from the exported hierarchy).
-    nb::class_<FloatPrecond>(m, "FloatPrecond");
-
-    nb::class_<AMGXFloatSolver, FloatPrecond>(m, "AMGXFloatSolver")
+    nb::class_<AMGXFloatSolver>(m, "AMGXFloatSolver")
         .def(nb::init<const std::string&>(), nb::arg("config"))
         .def(
             "setup",
@@ -71,13 +67,6 @@ NB_MODULE(_solver_ext, m) {
                 self.setup(n, nnz, row_ptr.data(), col_idx.data(), values.data());
             },
             nb::arg("row_ptr"), nb::arg("col_idx"), nb::arg("values"))
-        .def(
-            "apply",
-            [](AMGXFloatSolver& self, f32_cuda_1d b, f32_cuda_1d x) {
-                int n = static_cast<int>(b.shape(0));
-                self.apply(n, b.data(), x.data());
-            },
-            nb::arg("b"), nb::arg("x"))
         .def("amg_num_levels", &AMGXFloatSolver::amg_num_levels,
              "Number of levels in the AMG hierarchy built by the last setup().")
         .def(
@@ -96,7 +85,7 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("level"), nb::arg("out"),
             "Copy the level's fine-row -> aggregate map into a device int32 array.");
 
-    nb::class_<NativeVCycle, FloatPrecond>(m, "NativeVCycle")
+    nb::class_<NativeVCycle>(m, "NativeVCycle")
         .def(nb::init<>())
         .def(
             "add_level",
@@ -123,15 +112,7 @@ NB_MODULE(_solver_ext, m) {
             },
             nb::arg("ainv"), "Set the dense (row-major) inverse of the coarsest matrix.")
         .def("finalize", &NativeVCycle::finalize,
-             "Validate level chain consistency; required before apply.")
-        .def(
-            "apply",
-            [](NativeVCycle& self, f32_cuda_1d b, f32_cuda_1d x, uintptr_t stream) {
-                int n = static_cast<int>(b.shape(0));
-                self.apply(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
-            },
-            nb::arg("b"), nb::arg("x"), nb::arg("stream"),
-            "One zero-initial-guess V-cycle: x = M^{-1} b (fp32, deterministic).");
+             "Validate level chain consistency; required before apply.");
 
     nb::class_<PcgAmgSolver>(m, "PcgAmgSolver")
         .def(
@@ -150,7 +131,7 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("values"), nb::arg("stream"))
         .def(
             "solve_mixed",
-            [](PcgAmgSolver& self, FloatPrecond& preconditioner, f64_cuda b, f64_cuda x,
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda b, f64_cuda x,
                double tolerance, int max_iters, uintptr_t stream, std::optional<f64_cuda> x0) {
                 PcgResult result = self.solve_mixed(
                     preconditioner, b.data(), x.data(), tolerance, max_iters,

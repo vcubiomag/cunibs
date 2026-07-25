@@ -3,17 +3,6 @@
 
 #include <vector>
 
-// Common interface for the fp32 preconditioner apply inside the mixed-precision PCG.
-// Implementations must be stream-ordered and CUDA-graph-capturable (no allocations,
-// no host syncs inside apply). generation() keys the cached CG graph: any value change
-// means previously captured graphs referencing this preconditioner must be recaptured.
-class FloatPrecond {
-public:
-    virtual ~FloatPrecond() = default;
-    virtual void apply(int n, const float* b, float* x, cudaStream_t stream) = 0;
-    virtual int generation() const = 0;
-};
-
 // Native replication of the AMGx AGGREGATION/JACOBI_L1/V/DENSE_LU preconditioner apply
 // (one zero-initial-guess V-cycle). The hierarchy operators are built outside (Galerkin
 // products, l1-Jacobi diagonals, restriction order, dense coarse inverse) from the
@@ -25,10 +14,14 @@ public:
 // in, the restriction CSR (coarse row -> stably-ordered fine indices, matching the
 // fork's computeRestrictionOperator), and the fine->aggregate map for prolongation.
 // The coarsest level is only the precomputed dense inverse.
-class NativeVCycle : public FloatPrecond {
+//
+// apply() is stream-ordered and CUDA-graph-capturable (no allocations, no host syncs).
+// generation() keys PcgAmgSolver's cached CG graph, which embeds pointers into the buffers
+// owned here.
+class NativeVCycle {
 public:
     NativeVCycle();
-    ~NativeVCycle() override;
+    ~NativeVCycle();
 
     NativeVCycle(const NativeVCycle&) = delete;
     NativeVCycle& operator=(const NativeVCycle&) = delete;
@@ -41,12 +34,11 @@ public:
     void set_coarse(int n, const float* ainv);
     void finalize();
 
-    void apply(int n, const float* b, float* x, cudaStream_t stream) override;
+    void apply(int n, const float* b, float* x, cudaStream_t stream);
     // Block variant: B and X are row-major (n, k). Must be graph-capturable after a
-    // first (warm-up) call. Native-only: PcgAmgSolver::solve_mixed_block takes a
-    // NativeVCycle directly, so this is not part of the FloatPrecond interface.
+    // first (warm-up) call.
     void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
-    int generation() const override { return generation_; }
+    int generation() const { return generation_; }
 
 private:
     void ensure_block_buffers(int k);
