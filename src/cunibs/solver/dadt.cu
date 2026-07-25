@@ -11,19 +11,9 @@
 
 namespace {
 
-#ifndef KDADT_BLOCK
-#define KDADT_BLOCK 128
-#endif
-#ifndef KDADT_DIPTILE
-#define KDADT_DIPTILE 128
-#endif
-#ifndef KDADT_NODES
-#define KDADT_NODES 4
-#endif
-
-constexpr int kBlock = KDADT_BLOCK;
-constexpr int kDipTile = KDADT_DIPTILE;
-constexpr int kNodes = KDADT_NODES;
+constexpr int kBlock = 128;
+constexpr int kDipTile = 128;
+constexpr int kNodes = 4;
 
 template <int K>
 __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict__ mp,

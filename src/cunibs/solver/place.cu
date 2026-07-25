@@ -10,10 +10,7 @@
 
 namespace {
 
-#ifndef KPLACE_BLOCK
-#define KPLACE_BLOCK 256
-#endif
-constexpr int kBlock = KPLACE_BLOCK;
+constexpr int kBlock = 256;
 
 __device__ inline double dot3(const double* u, const double* v) {
     return u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
