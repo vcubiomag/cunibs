@@ -127,7 +127,7 @@ def run_conductivity_uq(
     x_nominal = cp.empty(n_red, dtype=cp.float64)
     pcg.update_values(cp.ascontiguousarray(pre.nominal_data), stream)
     b_nom = cp.ascontiguousarray(
-        (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx]
+        (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx], dtype=cp.float64
     )
     pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
 
