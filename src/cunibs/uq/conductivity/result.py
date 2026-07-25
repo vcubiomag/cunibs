@@ -11,7 +11,7 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
-from cunibs.simulation import ArrayT, Placement
+from cunibs.simulation import ArrayT, Placement, _check_format_version
 
 _FORMAT_VERSION = 1
 
@@ -234,6 +234,7 @@ class ConductivityUQResult:
     def load(cls, path: str | Path) -> "ConductivityUQResult":
         """Read a saved conductivity-UQ result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
+            _check_format_version(h5f, path, _FORMAT_VERSION)
             data = {
                 k: np.asarray(h5f[k])
                 for k in (

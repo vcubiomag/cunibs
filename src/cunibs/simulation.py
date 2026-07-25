@@ -38,6 +38,15 @@ ArrayT: TypeAlias = cp.ndarray | np.ndarray
 Device: TypeAlias = Literal["cpu", "gpu"]
 
 
+def _check_format_version(h5f: h5py.File, path: str | Path, expected: int) -> None:
+    stored = int(h5f.attrs.get("format_version", 0))
+    if stored != expected:
+        raise ValueError(
+            f"{path}: file format version {stored} is not readable by this version of "
+            f"cuNIBS (expected {expected})."
+        )
+
+
 def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     p = np.ascontiguousarray(value, dtype=np.float64).reshape(-1)
     if p.shape != (3,):
@@ -585,6 +594,7 @@ class FieldResult:
     def load(cls, path: str | Path) -> "FieldResult":
         """Read a saved result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
+            _check_format_version(h5f, path, _FORMAT_VERSION)
             data = {
                 k: np.asarray(h5f[k])
                 for k in ("E", "magnE", "v", "transform", "vols", "tet_tags", "barycenters_mm")
