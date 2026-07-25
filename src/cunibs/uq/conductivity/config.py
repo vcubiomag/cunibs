@@ -42,16 +42,15 @@ class ConductivityUQConfig:
 
     n_samples: int = 500
     seed: int = 0
-    cov: float = 0.1
     tissue_cov: dict[int, float] = field(default_factory=dict)
     perturbed_tags: tuple[int, ...] | None = None
     distribution: Literal["lognormal", "normal"] = "lognormal"
 
     def cov_for(self, tag: int) -> float:
-        """Resolve the CoV for a tissue: explicit override, then default table, then global."""
+        """Resolve the CoV for a tissue: explicit override, then the default table."""
         if tag in self.tissue_cov:
             return self.tissue_cov[tag]
-        return DEFAULT_TISSUE_COV.get(tag, self.cov)
+        return DEFAULT_TISSUE_COV[tag]
 
 
 def sample_conductivities(

@@ -151,7 +151,6 @@ class ReciprocityField:
     target: ResolvedTarget
     grid: Grid
     q: cp.ndarray  # (D, nx, ny, nz, 3) float32
-    center_m: cp.ndarray  # (3,) float64, translation used for the float32 N-body
     magnitude: bool
 
 
@@ -183,7 +182,6 @@ def sample_qfield(adjoint: AdjointField, grid: Grid) -> ReciprocityField:
         target=adjoint.target,
         grid=grid,
         q=q,
-        center_m=cp.ascontiguousarray(center),
         magnitude=adjoint.target.magnitude,
     )
 

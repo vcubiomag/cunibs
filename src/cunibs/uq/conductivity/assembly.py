@@ -37,7 +37,6 @@ class ConductivityUQPrecompute:
 
     perturbed_tags: tuple[int, ...]
     idx: cp.ndarray  # grounded row/col index (drops the ground DOF)
-    n_nodes: int
     indptr: cp.ndarray  # reduced CSR pattern (device pointers handed to AMGx once)
     indices: cp.ndarray
     base_data: cp.ndarray  # (nnz,) f64 — non-perturbed tissues at nominal σ
@@ -154,7 +153,6 @@ def build_conductivity_uq_precompute(
     return ConductivityUQPrecompute(
         perturbed_tags=perturbed_tags,
         idx=idx,
-        n_nodes=ctx.n_nodes,
         indptr=row_ptr,
         indices=col_idx,
         base_data=base_data,

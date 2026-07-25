@@ -396,8 +396,6 @@ class Subject:
                             uq_results.append(result.summary())
                             del result
                             continue
-                if not retain_fields:
-                    continue
                 if device == "gpu":
                     uq_results.append(result)
                     continue
