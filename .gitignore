@@ -13,6 +13,7 @@ wheels/
 # Tooling
 .pytest_cache
 .ruff_cache
+compile_commands.json
 
 # Benchmarking
 benchmarks

@@ -1,13 +1,26 @@
-"""Build synthetic test fixtures."""
+"""Shared test fixtures: synthetic cubes, coils, and the cropped real head-mesh patch.
+
+The ``Subject`` fixtures are session-scoped so the GPU context and UQ precompute are built
+once for the whole run. Never call ``.free()`` on one, and never mutate its ``HeadMesh``
+(``skin_triangle_normals`` and ``tet_barycenters_mm`` are ``cached_property``) — take the
+``fresh_subject`` factory instead.
+"""
 
 from __future__ import annotations
 
-import struct
+import gzip
+import json
+import os
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from cunibs.mesh import HeadMesh
+
+DATA_DIR = Path(__file__).parent / "data"
+PATCH_GZ = DATA_DIR / "head_patch_r25.msh.gz"
+PATCH_MANIFEST = DATA_DIR / "head_patch_r25.json"
 
 _CUBE_CORNERS = np.array(
     [
@@ -51,55 +64,184 @@ _CUBE_TRIS = np.array(
     dtype=np.int32,
 )
 
+_has_gpu: bool | None = None
 
-@pytest.fixture
+
+def has_gpu() -> bool:
+    global _has_gpu
+    if _has_gpu is None:
+        try:
+            import cupy
+
+            _has_gpu = cupy.cuda.runtime.getDeviceCount() > 0
+        except Exception:  # noqa: BLE001 — any import/driver failure means "no GPU here"
+            _has_gpu = False
+    return _has_gpu
+
+
+def pytest_collection_modifyitems(config, items):
+    no_gpu = pytest.mark.skip(reason="no CUDA GPU available")
+    no_patch = pytest.mark.skip(reason=f"missing {PATCH_GZ}")
+    no_reference = pytest.mark.skip(reason="CUNIBS_REFERENCE_MESH is not set")
+    gpu_ok = has_gpu()
+    patch_ok = PATCH_GZ.exists()
+    reference_ok = bool(os.environ.get("CUNIBS_REFERENCE_MESH"))
+    for item in items:
+        if "gpu" in item.keywords and not gpu_ok:
+            item.add_marker(no_gpu)
+        if "realmesh" in item.keywords and not patch_ok:
+            item.add_marker(no_patch)
+        if "reference" in item.keywords and not reference_ok:
+            item.add_marker(no_reference)
+
+
+@pytest.fixture(scope="session")
+def cp():
+    import cupy
+
+    return cupy
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _free_gpu_pool():
+    yield
+    if has_gpu():
+        import cupy
+
+        cupy.get_default_memory_pool().free_all_blocks()
+
+
+@pytest.fixture(scope="session")
 def cube_mesh() -> HeadMesh:
-    """Return a solvable 100 mm gray-matter cube."""
-    nodes_mm = _CUBE_CORNERS * 100.0
-    tet_tags = np.full(_CUBE_TETS.shape[0], 2, dtype=np.int32)  # gray matter
+    """A solvable 100 mm all-gray-matter cube."""
     return HeadMesh(
-        nodes_mm=np.ascontiguousarray(nodes_mm),
+        nodes_mm=np.ascontiguousarray(_CUBE_CORNERS * 100.0),
         tet_nodes=_CUBE_TETS.copy(),
-        tet_tags=tet_tags,
+        tet_tags=np.full(_CUBE_TETS.shape[0], 2, dtype=np.int32),
         skin_tris=_CUBE_TRIS.copy(),
     )
 
 
-def build_binary_msh(
-    nodes_mm: np.ndarray,
-    tets_1based: np.ndarray,
-    tet_tags: np.ndarray,
-    tris_1based: np.ndarray,
-    tri_tags: np.ndarray,
-) -> bytes:
-    """Serialize a minimal binary Gmsh 2.2 mesh matching ``parse_msh_binary``'s reader."""
-    buf = bytearray()
-    buf += b"$MeshFormat\n2.2 1 8\n"
-    buf += struct.pack("<i", 1)
-    buf += b"\n$EndMeshFormat\n"
-
-    buf += b"$Nodes\n%d\n" % nodes_mm.shape[0]
-    for i, (x, y, z) in enumerate(nodes_mm, start=1):
-        buf += struct.pack("<i3d", i, float(x), float(y), float(z))
-    buf += b"$EndNodes\n"
-
-    total = tets_1based.shape[0] + tris_1based.shape[0]
-    buf += b"$Elements\n%d\n" % total
-    buf += struct.pack("<3i", 2, tris_1based.shape[0], 2)
-    for e, (tri, tag) in enumerate(zip(tris_1based, tri_tags), start=1):
-        buf += struct.pack("<6i", e, int(tag), int(tag), *[int(n) for n in tri])
-    base = tris_1based.shape[0]
-    buf += struct.pack("<3i", 4, tets_1based.shape[0], 2)
-    for e, (tet, tag) in enumerate(zip(tets_1based, tet_tags), start=base + 1):
-        buf += struct.pack("<7i", e, int(tag), int(tag), *[int(n) for n in tet])
-    buf += b"$EndElements\n"
-    return bytes(buf)
+@pytest.fixture(scope="session")
+def two_tissue_cube_mesh() -> HeadMesh:
+    """A 100 mm cube split into gray matter (2) and CSF (3) so |E| depends on the σ ratio."""
+    return HeadMesh(
+        nodes_mm=np.ascontiguousarray(_CUBE_CORNERS * 100.0),
+        tet_nodes=_CUBE_TETS.copy(),
+        tet_tags=np.array([2, 2, 2, 3, 3, 3], dtype=np.int32),
+        skin_tris=_CUBE_TRIS.copy(),
+    )
 
 
+@pytest.fixture(scope="session")
 def synthetic_coil():
-    """Return a two-dipole coil in its local frame."""
+    """A two-dipole coil in its local frame."""
     from cunibs.coil import Coil
 
-    positions_m = np.array([[-0.02, 0.0, 0.0], [0.02, 0.0, 0.0]], dtype=np.float64)
-    moments = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64)
-    return Coil(positions_m=positions_m, moments=moments, name="synthetic", didt_max=1e6)
+    return Coil(
+        positions_m=np.array([[-0.02, 0.0, 0.0], [0.02, 0.0, 0.0]], dtype=np.float64),
+        moments=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64),
+        name="synthetic",
+        didt_max=1e6,
+    )
+
+
+@pytest.fixture(scope="session")
+def figure8_coil():
+    """A wider dipole pair, so the field over the cube is non-trivial."""
+    from cunibs.coil import Coil
+
+    return Coil(
+        positions_m=np.array([[-0.03, 0.0, 0.0], [0.03, 0.0, 0.0]], dtype=np.float64),
+        moments=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64),
+        name="test",
+        didt_max=1e6,
+    )
+
+
+@pytest.fixture(scope="session")
+def d70_coil():
+    from cunibs.coil import MAGSTIM_D70, Coil
+
+    return Coil.load(MAGSTIM_D70)
+
+
+@pytest.fixture(scope="session")
+def patch_manifest() -> dict:
+    return json.loads(PATCH_MANIFEST.read_text())
+
+
+@pytest.fixture(scope="session")
+def patch_mesh_path(tmp_path_factory) -> Path:
+    """Decompress the committed patch once per session (the parser needs a real path)."""
+    path = tmp_path_factory.mktemp("mesh") / "head_patch_r25.msh"
+    path.write_bytes(gzip.decompress(PATCH_GZ.read_bytes()))
+    return path
+
+
+@pytest.fixture(scope="session")
+def patch_mesh(patch_mesh_path) -> HeadMesh:
+    from cunibs.mesh import load_mesh
+
+    return load_mesh(patch_mesh_path)
+
+
+@pytest.fixture(scope="session")
+def patch_top_mm(patch_mesh) -> np.ndarray:
+    """The topmost scalp node of the patch — the canonical coil target."""
+    skin_nodes = np.unique(patch_mesh.skin_tris)
+    coords = patch_mesh.nodes_mm[skin_nodes]
+    return np.ascontiguousarray(coords[np.argmax(coords[:, 2])])
+
+
+@pytest.fixture(scope="session")
+def patch_placement(patch_top_mm):
+    from cunibs import Placement
+
+    return Placement(patch_top_mm, patch_top_mm + np.array([0.0, 50.0, 0.0]), 4.0)
+
+
+@pytest.fixture(scope="session")
+def cube_subject(cube_mesh):
+    from cunibs import Subject
+
+    return Subject(cube_mesh)
+
+
+@pytest.fixture(scope="session")
+def two_tissue_subject(two_tissue_cube_mesh):
+    from cunibs import Subject
+
+    return Subject(two_tissue_cube_mesh)
+
+
+@pytest.fixture(scope="session")
+def patch_subject(patch_mesh):
+    from cunibs import Subject
+
+    return Subject(patch_mesh)
+
+
+@pytest.fixture
+def fresh_subject():
+    """Factory for throwaway subjects, for tests that free or mutate solver state."""
+    from cunibs import Subject
+
+    made = []
+
+    def make(mesh) -> Subject:
+        subj = Subject(mesh)
+        made.append(subj)
+        return subj
+
+    yield make
+    for subj in made:
+        subj.free()
+
+
+@pytest.fixture(scope="session")
+def reference_mesh_path() -> Path:
+    path = os.environ.get("CUNIBS_REFERENCE_MESH")
+    if not path:
+        pytest.skip("CUNIBS_REFERENCE_MESH is not set")
+    return Path(path)

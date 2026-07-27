@@ -3,16 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gpu import requires_gpu
-
-pytestmark = requires_gpu
-
-
-@pytest.fixture
-def cp():
-    import cupy
-
-    return cupy
+pytestmark = pytest.mark.gpu
 
 
 def test_conductivity_mapping_and_unknown_tag(cp):
@@ -73,6 +64,240 @@ def test_solve_placement_zero_didt_gives_zero_field(cp, cube_mesh):
     coil_mom = np.array([[0, 0, 1.0], [0, 0, -1.0]])
     out = solve_placement(ctx, coil_pos, coil_mom, [50, 50, 100], [50, 100, 100], 4.0, 0.0)
     np.testing.assert_allclose(cp.asnumpy(out["magnE"]), 0.0, atol=1e-20)
+
+
+def test_ground_node_is_lowest_z(cp):
+    from cunibs.fem.solve import ground_node_of
+
+    nodes = cp.asarray([[0, 0, 5.0], [0, 0, -2.0], [0, 0, 3.0], [0, 0, -2.0]])
+    assert ground_node_of(nodes) == 1  # ties resolve to the lowest index
+
+
+def test_ground_node_matches_argmin_on_cube(cp, cube_mesh):
+    from cunibs.fem.solve import ground_node_of
+
+    assert ground_node_of(cp.asarray(cube_mesh.nodes_mm)) == int(
+        np.argmin(cube_mesh.nodes_mm[:, 2])
+    )
+
+
+@pytest.mark.parametrize("ground", [0, 3, 7])
+def test_grounded_index_skips_ground(cp, ground):
+    from cunibs.fem.solve import grounded_index
+
+    idx = cp.asnumpy(grounded_index(8, ground))
+    np.testing.assert_array_equal(idx, np.delete(np.arange(8), ground))
+    assert idx.dtype == np.int32
+
+
+def test_reduce_matrix_drops_row_and_col(cp, cube_mesh):
+    from cunibs.fem.assembly import (
+        assemble_stiffness,
+        conductivity_per_tet,
+        gradient_operator,
+    )
+    from cunibs.fem.solve import ground_node_of, grounded_index, reduce_matrix
+
+    nodes = cp.asarray(cube_mesh.nodes_mm) * 1e-3
+    tets = cp.asarray(cube_mesh.tet_nodes)
+    g, vols = gradient_operator(nodes, tets)
+    cond = conductivity_per_tet(cp.asarray(cube_mesh.tet_tags))
+    a = assemble_stiffness(g, vols, cond, cube_mesh.n_nodes, tets)
+
+    ground = ground_node_of(cp.asarray(cube_mesh.nodes_mm))
+    a_red = reduce_matrix(a, grounded_index(cube_mesh.n_nodes, ground))
+
+    dense = cp.asnumpy(a.toarray())
+    expected = np.delete(np.delete(dense, ground, axis=0), ground, axis=1)
+    np.testing.assert_allclose(cp.asnumpy(a_red.toarray()), expected, atol=1e-14)
+
+
+def test_l1_dinv_matches_dense_reference(cp, cube_subject):
+    """The JACOBI_L1 scaling is ω / (sign(aᵢᵢ) · Σⱼ|aᵢⱼ|) with ω = 0.9, diagonal included."""
+    import cupyx.scipy.sparse as csp
+
+    from cunibs.fem.solve import _l1_dinv
+
+    solver = cube_subject.context.solver
+    n = int(solver.idx.shape[0])
+    a32 = csp.csr_matrix(
+        (solver.values.astype(cp.float32), solver.col_idx, solver.row_ptr), shape=(n, n)
+    )
+    dense = cp.asnumpy(a32.toarray()).astype(np.float64)
+    d = np.abs(dense).sum(axis=1) * np.sign(np.diag(dense))
+    np.testing.assert_allclose(cp.asnumpy(_l1_dinv(a32)), 0.9 / d, rtol=1e-6)
+
+
+def test_solve_grounded_matches_dense_solve(cp, cube_subject):
+    """The mixed-precision PCG must reproduce a dense fp64 solve of the reduced system."""
+    import cupyx.scipy.sparse as csp
+
+    from cunibs.fem.solve import solve_grounded
+
+    solver = cube_subject.context.solver
+    n_red = int(solver.idx.shape[0])
+    a_red = csp.csr_matrix(
+        (solver.values, solver.col_idx, solver.row_ptr), shape=(n_red, n_red)
+    )
+    rng = np.random.default_rng(0)
+    b = cp.asarray(rng.standard_normal(solver.n))
+
+    v = solve_grounded(solver, b)
+    assert float(v[int(np.argmin(cp.asnumpy(cube_subject.mesh.nodes_mm)[:, 2]))]) == 0.0
+
+    x_ref = np.linalg.solve(
+        cp.asnumpy(a_red.toarray()), cp.asnumpy(b[solver.idx]).astype(np.float64)
+    )
+    # The PCG stops at a 1e-6 relative residual, so the solution error is bounded by that
+    # times the system's conditioning, not by machine precision.
+    got = cp.asnumpy(v[solver.idx])
+    assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
+
+
+def test_solve_placement_is_linear_in_didt(cp, cube_subject, synthetic_coil):
+    from cunibs.fem import solve_placement
+
+    ctx = cube_subject.context
+    args = (
+        synthetic_coil.positions_m,
+        synthetic_coil.moments,
+        [50, 50, 100],
+        [50, 100, 100],
+        4.0,
+    )
+    one = solve_placement(ctx, *args, 1e6)
+    two = solve_placement(ctx, *args, 2e6)
+    np.testing.assert_allclose(
+        cp.asnumpy(two["E"]), 2.0 * cp.asnumpy(one["E"]), rtol=1e-5, atol=0
+    )
+
+
+def test_solve_placement_far_coil_gives_negligible_field(cp, cube_subject, synthetic_coil):
+    """A dipole field falls off as r⁻³, so a coil 10 m away must contribute nothing."""
+    from cunibs.fem import solve_placement
+
+    ctx = cube_subject.context
+    args = (synthetic_coil.positions_m, synthetic_coil.moments, [50, 50, 100], [50, 100, 100])
+    near = float(cp.abs(solve_placement(ctx, *args, 4.0, 1e6)["E"]).max())
+    far = float(cp.abs(solve_placement(ctx, *args, 1e4, 1e6)["E"]).max())
+    assert far < 1e-6 * near
+
+
+def test_build_context_dtypes_and_contiguity(cp, cube_subject):
+    """The placement kernels take fp32 C-contiguous device arrays; the bindings enforce it."""
+    from cunibs.fem.assembly import conductivity_per_tet
+
+    ctx = cube_subject.context
+    n_tet = int(ctx.tet_nodes.shape[0])
+    assert ctx.g.dtype == cp.float32 and ctx.g.shape == (n_tet, 4, 3)
+    assert ctx.vols.dtype == cp.float32 and ctx.vols.shape == (n_tet,)
+    assert ctx.neg_vc.dtype == cp.float32
+    assert ctx.wg.shape == ctx.g.shape and ctx.wg.dtype == cp.float32
+    for name in ("g", "wg", "vols", "neg_vc", "tet_nodes", "tet_tags"):
+        assert getattr(ctx, name).flags.c_contiguous, name
+
+    cond = conductivity_per_tet(ctx.tet_tags).astype(cp.float32)
+    np.testing.assert_allclose(
+        cp.asnumpy(ctx.neg_vc), -cp.asnumpy(ctx.vols) * cp.asnumpy(cond), rtol=1e-6
+    )
+
+
+def test_weighted_gradient_matches_numpy(cp, cube_subject):
+    ctx = cube_subject.context
+    np.testing.assert_allclose(
+        cp.asnumpy(ctx.wg),
+        cp.asnumpy(ctx.g) * cp.asnumpy(ctx.neg_vc)[:, None, None],
+        rtol=1e-6,
+    )
+
+
+def test_solver_bindings_reject_host_arrays(cp, cube_subject):
+    """``nb::device::cuda`` on every binding parameter: a host array is a type error."""
+    from cunibs.solver import weighted_gradient
+
+    ctx = cube_subject.context
+    host_g = cp.asnumpy(ctx.g)
+    out = cp.empty_like(ctx.g)
+    with pytest.raises(TypeError):
+        weighted_gradient(host_g, ctx.neg_vc, out, cp.cuda.get_current_stream().ptr)
+
+
+def test_solver_bindings_reject_dtype_and_layout(cp):
+    """``.noconvert()`` on every array parameter: dtype and layout are strict, not converting.
+
+    Without it nanobind repairs a mismatch through cupy's ``.astype(dtype, order)``, costing a
+    device allocation and copy per call — invisible in a hot loop.
+    """
+    from cunibs.solver import weighted_gradient
+
+    stream = cp.cuda.get_current_stream().ptr
+    g = cp.arange(5 * 4 * 3, dtype=cp.float32).reshape(5, 4, 3)
+    neg_vc = cp.full(5, -2.0, dtype=cp.float32)
+
+    for variant in (g.astype(cp.float64), cp.repeat(g, 2, axis=0)[::2]):
+        out = cp.zeros_like(g)
+        with pytest.raises(TypeError):
+            weighted_gradient(variant, neg_vc, out, stream)
+
+
+def test_solver_bindings_reject_mismatched_output_buffer(cp):
+    """A converted *output* buffer would swallow the kernel's writes.
+
+    nanobind has no writeback: it would hand the kernel a converted temporary, free it after the
+    call, and leave the caller's array untouched with no error. Verified against the pre-fix
+    build — an fp64 or strided ``out`` came back still all-zero.
+    """
+    from cunibs.solver import weighted_gradient
+
+    stream = cp.cuda.get_current_stream().ptr
+    g = cp.arange(5 * 4 * 3, dtype=cp.float32).reshape(5, 4, 3)
+    neg_vc = cp.full(5, -2.0, dtype=cp.float32)
+
+    for bad_out in (
+        cp.zeros(g.shape, dtype=cp.float64),
+        cp.zeros((10, 4, 3), dtype=cp.float32)[::2],
+    ):
+        with pytest.raises(TypeError):
+            weighted_gradient(g, neg_vc, bad_out, stream)
+
+
+def test_solver_bindings_reject_dtype_inside_list_arg(cp):
+    """``.noconvert()`` reaches through ``std::vector<nb::ndarray>`` to the element caster.
+
+    nanobind's list caster forwards the flags unchanged, so one wrong-dtype entry in the
+    per-placement list is rejected rather than silently converted.
+    """
+    from cunibs.solver import rhs_assemble_weighted_block
+
+    stream = cp.cuda.get_current_stream().ptr
+    n_tet, n_nodes, k = 6, 5, 2
+    wg = cp.zeros((n_tet, 4, 3), dtype=cp.float32)
+    ptr = cp.zeros(n_nodes + 1, dtype=cp.int32)
+    idx = cp.zeros(1, dtype=cp.int32)
+    b_block = cp.zeros((n_nodes, k), dtype=cp.float32)
+    good = cp.zeros((n_tet, 3), dtype=cp.float32)
+
+    dadt_elm = [good, good.astype(cp.float64)]
+    with pytest.raises(TypeError):
+        rhs_assemble_weighted_block(dadt_elm, wg, ptr, idx, b_block, stream)
+
+
+@pytest.mark.realmesh
+def test_build_node2corner_on_patch(cp, patch_mesh):
+    """The corner transpose at 41k tets, where the stable sort actually has work to do."""
+    from cunibs.fem.assembly import build_node2corner
+
+    tets = cp.asarray(patch_mesh.tet_nodes)
+    ptr, idx = build_node2corner(tets, patch_mesh.n_nodes)
+    ptr, idx = cp.asnumpy(ptr), cp.asnumpy(idx)
+    flat = patch_mesh.tet_nodes.ravel()
+
+    assert idx.size == patch_mesh.tet_nodes.size
+    assert ptr[0] == 0 and ptr[-1] == idx.size
+    # Every corner slot appears exactly once, under the node it belongs to.
+    np.testing.assert_array_equal(np.sort(idx), np.arange(idx.size))
+    owner = np.repeat(np.arange(patch_mesh.n_nodes), np.diff(ptr))
+    np.testing.assert_array_equal(flat[idx], owner)
 
 
 def test_reconstruct_matches_numpy_reference(cp, cube_mesh):

@@ -46,6 +46,19 @@ dev = [
     "pytest>=9.1.1",
 ]
 
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+pythonpath = ["tools"]
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib --durations=15"
+xfail_strict = true
+markers = [
+    "gpu: requires a CUDA device",
+    "slow: multi-second test",
+    "realmesh: requires tests/data/head_patch_r25.msh.gz",
+    "reference: requires the full head mesh via CUNIBS_REFERENCE_MESH",
+]
+
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,cu,hpp,cpp}" }, { file = "CMakeLists.txt" }]
 
