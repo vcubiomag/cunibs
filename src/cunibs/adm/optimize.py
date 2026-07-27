@@ -9,18 +9,22 @@ interpolating, and maximizing ``|E(θ)|²`` analytically, without any FEM solve.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import cupy as cp
-import numpy as np
-import numpy.typing as npt
 
 from cunibs.adm.evaluate import _interp_reduce
 from cunibs.adm.place import place_coil_dipoles_batch
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
-from cunibs.adm.target import Target
-from cunibs.coil import Coil
 from cunibs.fem.placement import compute_coil_transforms
-from cunibs.fem.solve import SolverContext
+
+if TYPE_CHECKING:
+    import numpy as np
+    import numpy.typing as npt
+
+    from cunibs.adm.target import Target
+    from cunibs.coil import Coil
+    from cunibs.fem.solve import SolverContext
 
 
 @dataclass

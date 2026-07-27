@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cupy as cp
 import h5py
@@ -12,7 +12,6 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
-from cunibs.metrics import ArrayT
 from cunibs.simulation import (
     _DEFAULT_REGION,
     Placement,
@@ -21,6 +20,9 @@ from cunibs.simulation import (
     _read_metrics,
     _write_metrics,
 )
+
+if TYPE_CHECKING:
+    from cunibs.metrics import ArrayT
 
 _FORMAT_VERSION = 1
 
@@ -56,7 +58,7 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
         return {int(t): 0.0 for t in result.perturbed_tags}
     beta, *_ = np.linalg.lstsq(xc, yc, rcond=None)
     contrib = beta**2 * xc.var(0) / var_y
-    return {int(t): float(c) for t, c in zip(result.perturbed_tags, contrib)}
+    return {int(t): float(c) for t, c in zip(result.perturbed_tags, contrib, strict=False)}
 
 
 @dataclass
@@ -159,7 +161,7 @@ class ConductivityUQResult:
         """
         return _tissue_sensitivity(self, output)
 
-    def to_numpy(self) -> "ConductivityUQResult":
+    def to_numpy(self) -> ConductivityUQResult:
         """Copy any device arrays to NumPy."""
 
         def host(a: ArrayT | None) -> npt.NDArray[Any] | None:
@@ -221,7 +223,7 @@ class ConductivityUQResult:
             h5f.attrs["placement_distance_mm"] = self.placement.distance_mm
 
     @classmethod
-    def load(cls, path: str | Path) -> "ConductivityUQResult":
+    def load(cls, path: str | Path) -> ConductivityUQResult:
         """Read a saved conductivity-UQ result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
             _check_format_version(h5f, path, _FORMAT_VERSION)

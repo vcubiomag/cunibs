@@ -76,8 +76,8 @@ def _reduced_data_for(
     vols: cp.ndarray,
     cond: cp.ndarray,
     idx: cp.ndarray,
-    template: "cp.ndarray | None",
-    sel: "cp.ndarray | None" = None,
+    template: cp.ndarray | None,
+    sel: cp.ndarray | None = None,
 ) -> cp.ndarray:
     """Assemble a stiffness with conductivity ``cond``, ground it, and align to the pattern.
 

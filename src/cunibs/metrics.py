@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, TypeAlias, TypedDict
+from typing import Literal, TypedDict
 
 import cupy as cp
 import numpy as np
@@ -10,8 +10,8 @@ import numpy.typing as npt
 
 from cunibs.mesh import VOLUME_KEY_TO_LABEL, TissueLabel
 
-ArrayT: TypeAlias = cp.ndarray | np.ndarray
-Region: TypeAlias = TissueLabel | Literal["all"]
+type ArrayT = cp.ndarray | np.ndarray
+type Region = TissueLabel | Literal["all"]
 
 _LABEL_TO_TAG: dict[str, int] = {label: tag for tag, label in VOLUME_KEY_TO_LABEL.items()}
 
@@ -108,7 +108,7 @@ def distribution(
     qs = xp.asarray([p / 100.0 for p in percentiles], dtype=m.dtype)
     pvals = cp.asnumpy(_weighted_quantiles(m, w, qs))
     out = {"mean": mean, "std": float(np.sqrt(var))}
-    out.update({f"p{p:g}": float(val) for p, val in zip(percentiles, pvals)})
+    out.update({f"p{p:g}": float(val) for p, val in zip(percentiles, pvals, strict=False)})
     return out
 
 

@@ -11,13 +11,12 @@ with ``W_n = ¼ Σ_{e∋n} w_e``, evaluable as a node-sourced N-body with no ext
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import cupy as cp
-import numpy.typing as npt
 
 from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
-from cunibs.coil import Coil
 from cunibs.fem.assembly import (
     assemble_stiffness,
     conductivity_per_tet,
@@ -32,6 +31,11 @@ from cunibs.fem.solve import (
     solve_grounded,
 )
 from cunibs.solver import dadt_nbody, element_weight, node_scatter3
+
+if TYPE_CHECKING:
+    import numpy.typing as npt
+
+    from cunibs.coil import Coil
 
 # The adjoint RHS is a near-point source (Green's-function-like, singular at the target), so its
 # residual carries far more pointwise error in the functional than the same relative residual does
@@ -170,14 +174,14 @@ def sample_qfield(adjoint: AdjointField, grid: Grid) -> ReciprocityField:
     r = cp.ascontiguousarray((grid.points_m() - center[None, :]).astype(cp.float32))
 
     n_dir = int(adjoint.node_weights.shape[0])
-    q = cp.empty((n_dir,) + grid.shape + (3,), dtype=cp.float32)
+    q = cp.empty((n_dir, *grid.shape, 3), dtype=cp.float32)
     out = cp.empty((grid.n_points, 3), dtype=cp.float32)
     stream = cp.cuda.get_current_stream().ptr
     for d in range(n_dir):
         w = adjoint.node_weights[d].astype(cp.float32)  # (n_nodes, 3)
         mp = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, s)], axis=1))
         dadt_nbody(s, mp, sn, r, out, 1.0, MU0_OVER_4PI, stream)
-        q[d] = out.reshape(grid.shape + (3,))
+        q[d] = out.reshape((*grid.shape, 3))
     return ReciprocityField(
         ctx=ctx,
         target=adjoint.target,

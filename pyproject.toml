@@ -67,3 +67,38 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,cu,hpp,cpp}" 
 line-length = 96
 target-version = "py312"
 exclude = ["external"]
+
+[tool.ruff.lint]
+exclude = ["external"]
+extend-select = [
+    "I",
+    "B",
+    "PERF",
+    "ARG",
+    "RUF",
+    "S",
+    "N",
+    "UP",
+    "C4",
+    "FA",
+    "ISC",
+    "ICN",
+    "RET",
+    "SIM",
+    "TID",
+    "TC",
+    "PTH",
+    "TD",
+    "NPY",
+    "A",
+]
+ignore = [
+    "RUF002",
+    "RUF003",
+    "RUF005",
+    "S101",
+    "N806",
+    "N803",
+    "N815",
+    "N802",
+]

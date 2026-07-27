@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import cupy as cp
 from cupyx.scipy.ndimage import map_coordinates
 
 from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.place import place_coil_dipoles_batch
-from cunibs.adm.reciprocity import AdjointField, ReciprocityField
-from cunibs.coil import Coil
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
-from cunibs.fem.solve import SolverContext
 from cunibs.simulation import Placement
 from cunibs.solver import dadt_nbody
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from cunibs.adm.reciprocity import AdjointField, ReciprocityField
+    from cunibs.coil import Coil
+    from cunibs.fem.solve import SolverContext
 
 
 def _placed_dipoles(

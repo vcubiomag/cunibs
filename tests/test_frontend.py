@@ -114,7 +114,7 @@ def test_summary_and_field_paths_agree(cube_subject, synthetic_coil):
     sites = _placements()
     summaries = list(cube_subject.iter_simulate(synthetic_coil, sites))
     fields = list(cube_subject.iter_simulate(synthetic_coil, sites, magnitude=True))
-    for s, f in zip(summaries, fields):
+    for s, f in zip(summaries, fields, strict=False):
         np.testing.assert_allclose(s.peak_magnE(), f.peak_magnE(), rtol=1e-6)
         np.testing.assert_allclose(s.focality(0.5), f.focality(0.5), rtol=1e-6)
         np.testing.assert_allclose(s.peak_location_mm(), f.peak_location_mm())
@@ -130,7 +130,7 @@ def test_depth_probes_walk_inward(cp, cube_subject):
     assert len(probes) == len(depths)
 
     # Each probe is the ROI at the point that far inward along the direction.
-    for depth, probe in zip(depths, probes):
+    for depth, probe in zip(depths, probes, strict=False):
         expected = subj.roi([50.0, 50.0, 100.0 - depth], radius_mm=40.0, region="all")
         np.testing.assert_array_equal(cp.asnumpy(probe.elem_idx), cp.asnumpy(expected.elem_idx))
         np.testing.assert_allclose(
@@ -139,7 +139,7 @@ def test_depth_probes_walk_inward(cp, cube_subject):
 
     # inward_dir is normalized, so its magnitude must not shift the probe spacing.
     scaled = subj.depth_probes(point, [0.0, 0.0, -7.5], depths, radius_mm=40.0)
-    for probe, other in zip(probes, scaled):
+    for probe, other in zip(probes, scaled, strict=False):
         np.testing.assert_array_equal(cp.asnumpy(probe.elem_idx), cp.asnumpy(other.elem_idx))
 
     z = [float(p.barycenter_mm[2]) for p in probes]

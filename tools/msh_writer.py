@@ -1,16 +1,20 @@
 """Serialize binary Gmsh 2.2 meshes in the dialect ``cunibs.mesh.parse_msh_binary`` reads.
 
-Shared by ``tests/conftest.py`` and ``tools/make_test_patch.py`` via the ``pythonpath``
+Shared by ``tests/test_mesh.py`` and ``tools/make_test_patch.py`` via the ``pythonpath``
 setting in ``pyproject.toml``.
 """
 
 from __future__ import annotations
 
 import struct
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
-import numpy.typing as npt
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import numpy.typing as npt
 
 _NODE_DTYPE = np.dtype([("id", "<i4"), ("xyz", "<f8", (3,))])
 

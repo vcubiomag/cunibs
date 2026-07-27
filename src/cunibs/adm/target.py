@@ -69,7 +69,7 @@ class ResolvedTarget:
     barycenter_mm: cp.ndarray  # (3,) float64 ROI centroid
 
 
-def resolve_target(ctx: "SolverContext", target: Target) -> ResolvedTarget:
+def resolve_target(ctx: SolverContext, target: Target) -> ResolvedTarget:
     """Map a :class:`Target` to ROI elements, weights, and adjoint directions."""
     barys = cp.asarray(ctx.mesh.tet_barycenters_mm)
     mask = region_mask(ctx.tet_tags, target.region)

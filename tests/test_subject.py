@@ -19,7 +19,7 @@ PLACEMENT = Placement([50, 50, 100], [50, 100, 100])
 
 
 @pytest.mark.realmesh
-def test_from_mesh_matches_load_mesh(fresh_subject, patch_mesh_path, patch_mesh):
+def test_from_mesh_matches_load_mesh(patch_mesh_path, patch_mesh):
     subj = Subject.from_mesh(patch_mesh_path)
     try:
         assert subj.mesh.n_nodes == patch_mesh.n_nodes
@@ -171,7 +171,7 @@ def test_depth_probes_normalizes_the_direction(cp, cube_subject):
     depths = [0.0, 10.0, 30.0]
     unit = cube_subject.depth_probes([50, 50, 100], [0, 0, -1], depths, radius_mm=40.0)
     scaled = cube_subject.depth_probes([50, 50, 100], [0, 0, -12.5], depths, radius_mm=40.0)
-    for a, b in zip(unit, scaled):
+    for a, b in zip(unit, scaled, strict=False):
         np.testing.assert_array_equal(cp.asnumpy(a.elem_idx), cp.asnumpy(b.elem_idx))
         np.testing.assert_allclose(cp.asnumpy(a.barycenter_mm), cp.asnumpy(b.barycenter_mm))
 
@@ -179,7 +179,7 @@ def test_depth_probes_normalizes_the_direction(cp, cube_subject):
 def test_depth_probes_matches_roi_at_each_depth(cp, cube_subject):
     depths = [0.0, 15.0, 35.0]
     probes = cube_subject.depth_probes([50, 50, 100], [0, 0, -1], depths, radius_mm=40.0)
-    for depth, probe in zip(depths, probes):
+    for depth, probe in zip(depths, probes, strict=False):
         expected = cube_subject.roi([50, 50, 100 - depth], radius_mm=40.0, region="gray_matter")
         np.testing.assert_array_equal(cp.asnumpy(probe.elem_idx), cp.asnumpy(expected.elem_idx))
 

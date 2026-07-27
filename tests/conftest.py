@@ -74,12 +74,13 @@ def has_gpu() -> bool:
             import cupy
 
             _has_gpu = cupy.cuda.runtime.getDeviceCount() > 0
-        except Exception:  # noqa: BLE001 — any import/driver failure means "no GPU here"
+        # cupy raises its own driver/runtime errors when no device or driver is present.
+        except Exception:  # noqa: BLE001
             _has_gpu = False
     return _has_gpu
 
 
-def pytest_collection_modifyitems(config, items):
+def pytest_collection_modifyitems(items):
     no_gpu = pytest.mark.skip(reason="no CUDA GPU available")
     no_patch = pytest.mark.skip(reason=f"missing {PATCH_GZ}")
     no_reference = pytest.mark.skip(reason="CUNIBS_REFERENCE_MESH is not set")

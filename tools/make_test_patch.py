@@ -84,7 +84,7 @@ def main() -> None:
         "n_nodes": int(p_nodes.shape[0]),
         "n_tets": int(p_tets.shape[0]),
         "n_skin_tris": int(p_skin.shape[0]),
-        "tet_tags": {str(int(t)): int(c) for t, c in zip(tags, counts)},
+        "tet_tags": {str(int(t)): int(c) for t, c in zip(tags, counts, strict=True)},
         "raw_sha256": hashlib.sha256(raw).hexdigest(),
     }
     args.out.with_suffix("").with_suffix(".json").write_text(

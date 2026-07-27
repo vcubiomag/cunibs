@@ -178,7 +178,7 @@ def test_parser_rejects_ascii_header(tmp_path):
     blob = pack_msh(_NODES, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS)
     path = tmp_path / "ascii.msh"
     path.write_bytes(blob.replace(b"2.2 1 8", b"2.2 0 8", 1))
-    with pytest.raises(ValueError, match="binary Gmsh 2.2 header"):
+    with pytest.raises(ValueError, match=r"binary Gmsh 2\.2 header"):
         parse_msh_binary(path)
 
 

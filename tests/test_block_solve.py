@@ -50,7 +50,7 @@ def patch_sites(patch_mesh):
     picked = top[:: max(len(top) // 8, 1)][:8]
     return [
         (c, c + np.array([40.0 * np.cos(a), 40.0 * np.sin(a), 0.0]), 4.0)
-        for c, a in zip(picked, np.linspace(0, 2 * np.pi, 8, endpoint=False))
+        for c, a in zip(picked, np.linspace(0, 2 * np.pi, 8, endpoint=False), strict=False)
     ]
 
 
@@ -79,7 +79,9 @@ def test_block_k1_delegates_to_serial(cube_subject, synthetic_coil):
 def test_block_matches_serial_cube(cube_subject, synthetic_coil, k):
     sites = cube_sites(k)
     ctx = cube_subject.context
-    for got, ref in zip(block(ctx, synthetic_coil, sites), serial(ctx, synthetic_coil, sites)):
+    for got, ref in zip(
+        block(ctx, synthetic_coil, sites), serial(ctx, synthetic_coil, sites), strict=False
+    ):
         assert rel_l2(got["magnE"], ref["magnE"]) <= PARITY
         assert rel_l2(got["E"], ref["E"]) <= PARITY
         assert rel_l2(got["v"], ref["v"]) <= PARITY
@@ -97,7 +99,7 @@ def test_block_padding_widths(cube_subject, synthetic_coil, k):
     got = block(ctx, synthetic_coil, sites)
     ref = serial(ctx, synthetic_coil, sites)
     assert len(got) == k
-    for i, (g, r) in enumerate(zip(got, ref)):
+    for i, (g, r) in enumerate(zip(got, ref, strict=False)):
         assert rel_l2(g["magnE"], r["magnE"]) <= PARITY, f"column {i}"
         assert rel_l2(g["E"], r["E"]) <= PARITY, f"column {i}"
 
@@ -108,7 +110,7 @@ def test_block_matches_serial_patch_k8(patch_subject, d70_coil, patch_sites):
     ctx = patch_subject.context
     got = block(ctx, d70_coil, patch_sites)
     ref = serial(ctx, d70_coil, patch_sites)
-    for i, (g, r) in enumerate(zip(got, ref)):
+    for i, (g, r) in enumerate(zip(got, ref, strict=False)):
         assert rel_l2(g["magnE"], r["magnE"]) <= PARITY, f"placement {i}"
         assert rel_l2(g["E"], r["E"]) <= PARITY, f"placement {i}"
         assert rel_l2(g["v"], r["v"]) <= PARITY, f"placement {i}"
@@ -132,7 +134,7 @@ def test_warm_start_does_not_change_solution(patch_subject, d70_coil, patch_site
 
     warmed = block(ctx, d70_coil, second, warm)
     cold = block(ctx, d70_coil, second, None)
-    for i, (w, c) in enumerate(zip(warmed, cold)):
+    for i, (w, c) in enumerate(zip(warmed, cold, strict=False)):
         assert rel_l2(w["magnE"], c["magnE"]) <= 2e-6, f"placement {i}"
         assert rel_l2(w["v"], c["v"]) <= 2e-6, f"placement {i}"
 
@@ -162,7 +164,7 @@ def test_simulate_block_k_matches_serial(patch_subject, d70_coil, patch_sites):
     blocked = list(patch_subject.iter_simulate(d70_coil, placements, DIDT))
     serialized = list(patch_subject.iter_simulate(d70_coil, placements, DIDT, block_k=1))
     assert len(blocked) == len(serialized) == len(placements)
-    for b, s in zip(blocked, serialized):
+    for b, s in zip(blocked, serialized, strict=False):
         assert b.peak_magnE() == pytest.approx(s.peak_magnE(), rel=1e-5)
         np.testing.assert_allclose(b.peak_location_mm(), s.peak_location_mm(), atol=1e-9)
 
@@ -204,7 +206,7 @@ def test_fp64_fallback_matches_mixed_solve(fresh_subject, patch_mesh, d70_coil, 
     fallback = block(ctx, d70_coil, sites)
     assert ctx.solver.amgx is not None
 
-    for i, (f, r) in enumerate(zip(fallback, reference)):
+    for i, (f, r) in enumerate(zip(fallback, reference, strict=False)):
         assert rel_l2(f["magnE"], r["magnE"]) <= PARITY, f"placement {i}"
         assert rel_l2(f["v"], r["v"]) <= PARITY, f"placement {i}"
 

@@ -41,7 +41,9 @@ def test_patch_counts_match_manifest(patch_mesh, patch_manifest):
     assert patch_mesh.skin_tris.shape == (patch_manifest["n_skin_tris"], 3)
 
     tags, counts = np.unique(patch_mesh.tet_tags, return_counts=True)
-    assert {str(int(t)): int(c) for t, c in zip(tags, counts)} == patch_manifest["tet_tags"]
+    assert {str(int(t)): int(c) for t, c in zip(tags, counts, strict=False)} == patch_manifest[
+        "tet_tags"
+    ]
     assert set(tags.tolist()) == {1, 2, 3, 5, 7, 8, 9}
 
 
@@ -219,7 +221,7 @@ def test_patch_metrics_all_present_regions(patch_subject, patch_placement, d70_c
     present = {VOLUME_KEY_TO_LABEL[int(t)] for t in np.unique(patch_subject.mesh.tet_tags)}
     assert len(present) == 7
 
-    for region in sorted(present) + ["all"]:
+    for region in [*sorted(present), "all"]:
         m = r.summary_for(region)
         assert np.isfinite(m["peak_magnE"]) and m["peak_magnE"] > 0, region
         assert m["region_volume_m3"] > 0, region
@@ -248,7 +250,7 @@ def test_patch_field_result_roundtrip(tmp_path, patch_subject, patch_placement, 
 
 
 @pytest.mark.realmesh
-def test_patch_uq_multi_tissue(cp, patch_subject, patch_placement, d70_coil):
+def test_patch_uq_multi_tissue(patch_subject, patch_placement, d70_coil):
     """Conductivity UQ across three real tissues produces finite, non-trivial local variance."""
     from cunibs import ConductivityUQConfig
 

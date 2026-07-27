@@ -72,7 +72,7 @@ def rel_l2(got, ref) -> float:
     return float(np.linalg.norm(got - ref) / np.linalg.norm(ref))
 
 
-def test_transform_frame_is_orthonormal_right_handed(cp, cube_subject):
+def test_transform_frame_is_orthonormal_right_handed(cube_subject):
     tf = compute_coil_transform(cube_subject.context, [50, 50, 100], [50, 150, 100], 4.0)
     r = tf[:3, :3]
     np.testing.assert_allclose(r.T @ r, np.eye(3), atol=1e-12)
@@ -205,7 +205,7 @@ def _identity_transform(translation=(0.0, 0.0, 0.0)):
     return tf
 
 
-def test_dadt_matches_analytic_dipole(cp, cube_subject, synthetic_coil):
+def test_dadt_matches_analytic_dipole(cp, cube_subject):
     """The fp32 N-body against the closed-form vector potential, over the cube's nodes."""
     from cunibs.fem.placement import coil_dadt_at_nodes
 

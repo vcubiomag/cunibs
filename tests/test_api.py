@@ -19,21 +19,21 @@ def _field_result(**overrides) -> FieldResult:
     vols = rng.random(m) + 0.1
     tet_tags = np.array([2] * 8 + [3] * 4, dtype=np.int32)
     barycenters_mm = rng.standard_normal((m, 3))
-    kwargs = dict(
-        summary=metrics.compute_metrics(
+    kwargs = {
+        "summary": metrics.compute_metrics(
             magnE, vols, barycenters_mm, tet_tags, region="gray_matter"
         ),
-        magnE=magnE,
-        E=rng.standard_normal((m, 3)),
-        v=rng.standard_normal(n),
-        transform=np.eye(4),
-        placement=Placement([1, 2, 3], [4, 5, 6]),
-        coil_name="synthetic",
-        didt=1e6,
-        vols=vols,
-        tet_tags=tet_tags,
-        barycenters_mm=barycenters_mm,
-    )
+        "magnE": magnE,
+        "E": rng.standard_normal((m, 3)),
+        "v": rng.standard_normal(n),
+        "transform": np.eye(4),
+        "placement": Placement([1, 2, 3], [4, 5, 6]),
+        "coil_name": "synthetic",
+        "didt": 1e6,
+        "vols": vols,
+        "tet_tags": tet_tags,
+        "barycenters_mm": barycenters_mm,
+    }
     return FieldResult(**{**kwargs, **overrides})
 
 

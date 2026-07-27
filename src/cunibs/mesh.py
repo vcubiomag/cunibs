@@ -257,7 +257,7 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
     and only the returned arrays are materialized. Every field of the result owns its
     data: nothing may alias the mapping, which is released when this frame returns.
     """
-    with open(mesh_file, "rb") as f:
+    with Path.open(mesh_file, "rb") as f:
         cursor = _MshCursor(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ), mesh_file)
         _read_format(cursor)
         num_nodes, nodes_xyz = _read_nodes(cursor)

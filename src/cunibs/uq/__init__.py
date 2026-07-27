@@ -13,13 +13,13 @@ from cunibs.uq.conductivity import (
 )
 
 __all__ = [
+    "DEFAULT_TISSUE_COV",
     "ConductivityUQConfig",
+    "ConductivityUQPrecompute",
     "ConductivityUQResult",
     "ConductivityUQSummary",
-    "ConductivityUQPrecompute",
     "build_conductivity_uq_precompute",
-    "sample_conductivities",
-    "run_conductivity_uq",
-    "DEFAULT_TISSUE_COV",
     "conductivity",
+    "run_conductivity_uq",
+    "sample_conductivities",
 ]

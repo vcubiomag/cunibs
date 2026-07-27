@@ -60,8 +60,8 @@ def test_registry_is_not_empty():
     assert len(BUNDLED) >= 25
 
 
-@pytest.mark.parametrize("name,path", BUNDLED, ids=[n for n, _ in BUNDLED])
-def test_all_bundled_coils_load(name, path):
+@pytest.mark.parametrize("path", [p for _, p in BUNDLED], ids=[n for n, _ in BUNDLED])
+def test_all_bundled_coils_load(path):
     assert path.exists(), path
     c = Coil.load(path)
     n = c.positions_m.shape[0]

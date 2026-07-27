@@ -119,7 +119,7 @@ def test_field_result_format_version_mismatch_raises(tmp_path):
     _make_result().save(path)
     with h5py.File(path, "r+") as f:
         f.attrs["format_version"] = 99
-    with pytest.raises(ValueError, match="99.*expected 1"):
+    with pytest.raises(ValueError, match=r"99.*expected 1"):
         FieldResult.load(path)
 
 
@@ -173,7 +173,7 @@ def test_uq_result_format_version_mismatch_raises(tmp_path):
 
 def test_unretained_arrays_are_absent_from_the_file(tmp_path):
     factory, cls, kept, dropped = _make_result, FieldResult, "magnE", ("E", "v")
-    r = dataclasses.replace(factory(), **{name: None for name in dropped})
+    r = dataclasses.replace(factory(), **dict.fromkeys(dropped))
     path = tmp_path / "partial.h5"
     r.save(path)
     with h5py.File(path, "r") as f:

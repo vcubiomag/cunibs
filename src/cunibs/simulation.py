@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import cupy as cp
 import h5py
@@ -12,7 +12,6 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
-from cunibs.coil import Coil
 from cunibs.fem import (
     MAX_BLOCK,
     BlockWarmStart,
@@ -24,7 +23,11 @@ from cunibs.fem import (
 from cunibs.mesh import HeadMesh, load_mesh
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping, Sequence
+    from typing import Self
+
     from cunibs.adm.target import ResolvedTarget
+    from cunibs.coil import Coil
     from cunibs.uq import (
         ConductivityUQConfig,
         ConductivityUQPrecompute,
@@ -38,7 +41,7 @@ _FORMAT_VERSION = 1
 _DEFAULT_REGION: metrics.Region = "gray_matter"
 
 # Per-tetrahedron metric inputs on the host, shared by reference across every FieldResult.
-_HostMetricInputs: TypeAlias = tuple[
+type _HostMetricInputs = tuple[
     npt.NDArray[np.float32], npt.NDArray[np.int32], npt.NDArray[np.float64]
 ]
 
@@ -57,7 +60,7 @@ def _write_metrics(grp: h5py.Group, m: metrics.FieldMetrics) -> None:
 
 def _read_metrics(grp: h5py.Group) -> metrics.FieldMetrics:
     return metrics.FieldMetrics(
-        region=cast(metrics.Region, str(grp.attrs["region"])),
+        region=cast("metrics.Region", str(grp.attrs["region"])),
         peak_magnE=float(grp.attrs["peak_magnE"]),
         peak_location_mm=np.asarray(grp["peak_location_mm"]),
         center_of_gravity_mm=np.asarray(grp["center_of_gravity_mm"]),
@@ -88,7 +91,7 @@ def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return p
 
 
-def _sites(placements: "Sequence[Placement]", method: str) -> list["Placement"]:
+def _sites(placements: Sequence[Placement], method: str) -> list[Placement]:
     if isinstance(placements, Placement):
         raise TypeError(
             f"{method}() takes a sequence of placements; wrap a single one in a list, or "
@@ -136,10 +139,10 @@ class Subject:
         self._mesh = mesh
         self._ctx: SolverContext | None = None
         self._host_metrics: _HostMetricInputs | None = None
-        self._conductivity_uq_pre: dict[tuple[int, ...], "ConductivityUQPrecompute"] = {}
+        self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
 
     @classmethod
-    def from_mesh(cls, mesh_file: str | Path) -> "Subject":
+    def from_mesh(cls, mesh_file: str | Path) -> Subject:
         return cls(load_mesh(mesh_file))
 
     def free(self) -> None:
@@ -155,7 +158,7 @@ class Subject:
         self._host_metrics = None
         cp.get_default_memory_pool().free_all_blocks()
 
-    def __enter__(self) -> "Subject":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -176,7 +179,7 @@ class Subject:
         point_mm: npt.ArrayLike,
         radius_mm: float = 0.0,
         region: metrics.Region = "gray_matter",
-    ) -> "ResolvedTarget":
+    ) -> ResolvedTarget:
         """Volume-weighted ROI of ``region`` elements around ``point_mm`` (nearest one if radius 0).
 
         Returns a :class:`~cunibs.adm.target.ResolvedTarget` usable as a ``record_rois`` probe or an
@@ -195,7 +198,7 @@ class Subject:
         depths_mm: Sequence[float],
         radius_mm: float = 0.0,
         region: metrics.Region = "all",
-    ) -> list["ResolvedTarget"]:
+    ) -> list[ResolvedTarget]:
         """ROIs at increasing depth along ``inward_dir`` from a cortical point."""
         p = _as_point(cortical_point_mm)
         d = _as_point(inward_dir)
@@ -205,8 +208,8 @@ class Subject:
         ]
 
     def _conductivity_uq_precompute(
-        self, config: "ConductivityUQConfig"
-    ) -> "ConductivityUQPrecompute":
+        self, config: ConductivityUQConfig
+    ) -> ConductivityUQPrecompute:
         """Build (and cache) the per-tissue stiffness components for a UQ configuration.
 
         Cached by the set of perturbed tissues so repeated UQ runs on the same subject reuse the
@@ -242,7 +245,7 @@ class Subject:
         coil: Coil,
         didt: float,
         retain: _Retain,
-    ) -> "list[FieldResult]":
+    ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
         Runs inside the scratch pool, so nothing it returns may be device-backed.
@@ -273,7 +276,7 @@ class Subject:
                 tet_tags=host[1] if host else None,
                 barycenters_mm=host[2] if host else None,
             )
-            for site, out in zip(chunk, outs)
+            for site, out in zip(chunk, outs, strict=False)
         ]
 
     def _iter_reduced(
@@ -283,7 +286,7 @@ class Subject:
         didt: float,
         block_k: int | None,
         retain: _Retain,
-    ) -> Iterator["FieldResult"]:
+    ) -> Iterator[FieldResult]:
         """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
 
         The reduction runs under the scratch allocator so every intermediate is bulk-freed
@@ -323,7 +326,7 @@ class Subject:
         vectors: bool = False,
         potential: bool = False,
         block_k: int | None = None,
-    ) -> Iterator["FieldResult"]:
+    ) -> Iterator[FieldResult]:
         """Stream one :class:`FieldResult` per placement, in the order given.
 
         Every result carries its gray-matter metrics; the flags say which of the
@@ -360,7 +363,7 @@ class Subject:
         vectors: bool = False,
         potential: bool = False,
         block_k: int | None = None,
-    ) -> "FieldResult":
+    ) -> FieldResult:
         """Solve a single placement, taking the same flags as :meth:`iter_simulate`.
 
         Sequences go through :meth:`iter_simulate`, which bounds peak memory by the block
@@ -387,11 +390,11 @@ class Subject:
         self,
         coil: Coil,
         sites: Sequence[Placement],
-        config: "ConductivityUQConfig",
+        config: ConductivityUQConfig,
         didt: float,
         moments: bool,
-        record_rois: "Mapping[str, ResolvedTarget] | None",
-    ) -> Iterator["ConductivityUQResult"]:
+        record_rois: Mapping[str, ResolvedTarget] | None,
+    ) -> Iterator[ConductivityUQResult]:
         """One Monte Carlo per placement, reduced inside a scratch pool and yielded outside.
 
         Unlike the deterministic path there is no block solve, so the chunk is a single
@@ -429,12 +432,12 @@ class Subject:
         self,
         coil: Coil,
         placements: Sequence[Placement],
-        config: "ConductivityUQConfig",
+        config: ConductivityUQConfig,
         didt: float = 1e6,
         *,
         moments: bool = False,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
-    ) -> Iterator["ConductivityUQResult"]:
+        record_rois: Mapping[str, ResolvedTarget] | None = None,
+    ) -> Iterator[ConductivityUQResult]:
         """Stream a conductivity Monte Carlo per placement, in the order given.
 
         Every sampled conductivity vector is solved with the same finite-element model, and
@@ -461,12 +464,12 @@ class Subject:
         self,
         coil: Coil,
         placement: Placement,
-        config: "ConductivityUQConfig",
+        config: ConductivityUQConfig,
         didt: float = 1e6,
         *,
         moments: bool = False,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
-    ) -> "ConductivityUQResult":
+        record_rois: Mapping[str, ResolvedTarget] | None = None,
+    ) -> ConductivityUQResult:
         """Run a conductivity Monte Carlo for a single placement.
 
         Takes the same options as :meth:`iter_simulate_conductivity_uq`; sequences go
@@ -585,7 +588,7 @@ class FieldResult:
             h5f.attrs["placement_distance_mm"] = self.placement.distance_mm
 
     @classmethod
-    def load(cls, path: str | Path) -> "FieldResult":
+    def load(cls, path: str | Path) -> FieldResult:
         """Read a saved result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
             _check_format_version(h5f, path, _FORMAT_VERSION)

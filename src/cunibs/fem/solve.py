@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
@@ -22,7 +21,6 @@ from cunibs.fem.placement import (
     compute_coil_transform,
     compute_coil_transforms,
 )
-from cunibs.mesh import HeadMesh
 from cunibs.solver import (
     AMGXFloatSolver,
     AMGXSolver,
@@ -35,6 +33,11 @@ from cunibs.solver import (
     rhs_assemble_weighted_block,
     weighted_gradient,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from cunibs.mesh import HeadMesh
 
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
@@ -599,15 +602,15 @@ def solve_placements_block(
     magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(k)]
     reconstruct_e_block(v_block, ctx.tet_nodes, ctx.g, dadt_elms, es, magns, stream)
 
-    results: list[PlacementResult] = []
-    for i in range(k):
-        results.append(
-            {
-                "transform": transforms[i],
-                "dadt_elm": dadt_elms[i],
-                "E": es[i],
-                "magnE": magns[i],
-                "v": cp.ascontiguousarray(v_block[:, i]),
-            }
-        )
+    results: list[PlacementResult] = [
+        {
+            "transform": transforms[i],
+            "dadt_elm": dadt_elms[i],
+            "E": es[i],
+            "magnE": magns[i],
+            "v": cp.ascontiguousarray(v_block[:, i]),
+        }
+        for i in range(k)
+    ]
+
     return results

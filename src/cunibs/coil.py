@@ -7,7 +7,6 @@ import h5py
 import numpy as np
 import numpy.typing as npt
 
-
 _COILS_ROOT = Path(__file__).resolve().parent / "coils"
 DEYMED_50BF = _COILS_ROOT / "Deymed_50BF.h5"
 DEYMED_70BF = _COILS_ROOT / "Deymed_70BF.h5"
@@ -41,7 +40,7 @@ def _decode_attr(value: object) -> str | int | float:
         return value.decode()
     if isinstance(value, np.generic):
         value = value.item()
-    if isinstance(value, (str, int, float)):
+    if isinstance(value, str | int | float):
         return value
     return str(value)
 
@@ -60,7 +59,7 @@ class Coil:
     metadata: dict[str, str | int | float] | None = None
 
     @classmethod
-    def load(cls, source: str | Path) -> "Coil":
+    def load(cls, source: str | Path) -> Coil:
         """Load a coil from a bundled/encoded ``.h5`` file (see :func:`encode_ccd`)."""
         with h5py.File(Path(source), "r") as h5f:
             dset = h5f["dipoles"]
@@ -79,7 +78,7 @@ class Coil:
 
 
 def encode_ccd(ccd_file: Path, output_h5: Path) -> None:
-    with open(ccd_file, "r") as f:
+    with Path.open(ccd_file) as f:
         meta_line = f.readline().strip().lstrip("#").strip()
         num_elements = int(f.readline().strip())
         data = np.loadtxt(f, dtype=np.float64, skiprows=1, max_rows=num_elements)

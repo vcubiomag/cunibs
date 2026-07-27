@@ -2,28 +2,30 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
 
-from cunibs.coil import Coil
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-from cunibs.fem.solve import SolverContext
-from cunibs.simulation import Placement
 from cunibs.solver import (
     accumulate_moments,
     dadt_node_to_element,
     reconstruct_e,
     rhs_assemble,
 )
-from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
 from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductivities
 from cunibs.uq.conductivity.result import ConductivityUQResult
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from cunibs.adm.target import ResolvedTarget
+    from cunibs.coil import Coil
+    from cunibs.fem.solve import SolverContext
+    from cunibs.simulation import Placement
+    from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
 
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
@@ -70,7 +72,7 @@ def run_conductivity_uq(
     placement: Placement,
     config: ConductivityUQConfig,
     didt: float = 1e6,
-    record_rois: Mapping[str, "ResolvedTarget"] | None = None,
+    record_rois: Mapping[str, ResolvedTarget] | None = None,
     focality_frac: float = 0.5,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
@@ -214,7 +216,7 @@ def run_conductivity_uq(
             peak_s[k] = peak
             foc_s[k] = vols_gm[magn_gm >= focality_frac * peak].sum()
             peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
-            for j, (idx, w) in enumerate(zip(probe_idx, probe_w)):
+            for j, (idx, w) in enumerate(zip(probe_idx, probe_w, strict=False)):
                 roi_s[k, j] = (magn[idx].astype(cp.float64) * w).sum()
 
     n = config.n_samples

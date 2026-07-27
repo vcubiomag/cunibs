@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-
 pytestmark = pytest.mark.gpu
 
 
@@ -123,7 +122,7 @@ def test_uq_precompute_cached_per_tagset(two_tissue_subject):
     assert csf_only.perturbed_tags == (3,)
 
 
-def test_uq_perturbed_tags_subset(cp, two_tissue_subject):
+def test_uq_perturbed_tags_subset(two_tissue_subject):
     """Perturbing only CSF must leave the gray-matter elements' conductivity fixed."""
     from cunibs import ConductivityUQConfig
 
@@ -330,7 +329,7 @@ def test_tissue_sensitivity_requires_recorded_samples(two_tissue_subject):
         r.tissue_sensitivity("peak")
 
 
-def test_uq_recycling_path_does_not_change_the_answer(cp, two_tissue_subject):
+def test_uq_recycling_path_does_not_change_the_answer(two_tissue_subject):
     """n_samples ≥ 2·RECYCLE_BUILD enables subspace recycling; the seeded guess must not bias it.
 
     Both runs share a seed, so the first 8 draws are the same conductivities either way — only
@@ -374,7 +373,7 @@ def test_uq_fp64_fallback_matches(cp, fresh_subject, two_tissue_cube_mesh):
     assert np.linalg.norm(got - ref) / np.linalg.norm(ref) <= 1e-5
 
 
-def test_uq_result_save_load(cp, tmp_path, two_tissue_cube):
+def test_uq_result_save_load(tmp_path, two_tissue_cube):
     from cunibs import ConductivityUQConfig, Subject
     from cunibs.uq.conductivity import ConductivityUQResult
 
