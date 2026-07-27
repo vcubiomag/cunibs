@@ -33,7 +33,9 @@ def test_encode_ccd_roundtrips_to_coil(tmp_path):
 
     c = Coil.load(h5)
     assert c.name == "Synth"
-    assert c.didt_max == 100.0
+    # The header is A/us; the field is A/s. The raw string survives in metadata.
+    assert c.didt_max == 100.0e6
+    assert c.metadata is not None and c.metadata["dIdtmax"] == "100.0"
     np.testing.assert_allclose(c.positions_m, [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
     np.testing.assert_allclose(c.moments, [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
     assert c.positions_m.shape == (2, 3) and c.moments.shape == (2, 3)
@@ -56,6 +58,13 @@ def test_load_bundled_coil():
     assert c.name
 
 
+def test_bundled_didt_max_is_in_a_per_s():
+    """dIdtmax is stored in A/us and exposed in A/s, so didt=coil.didt_max is a real pulse."""
+    c = Coil.load(coil_registry.MAGSTIM_D70)
+    assert c.metadata is not None and c.metadata["dIdtmax"] == "114.73"
+    assert c.didt_max == pytest.approx(114.73e6)
+
+
 def test_registry_is_not_empty():
     assert len(BUNDLED) >= 25
 
@@ -73,7 +82,8 @@ def test_all_bundled_coils_load(path):
     assert np.abs(c.positions_m).max() < 1.0
     assert np.abs(c.moments).max() > 0.0
     assert c.name
-    assert c.didt_max is None or c.didt_max > 0
+    # A/s, not the A/us the header carries: every bundled coil rates >= 84 A/us.
+    assert c.didt_max is None or c.didt_max > 1e7
     assert c.metadata is not None and "coilname" in c.metadata
 
 

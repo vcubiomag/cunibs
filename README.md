@@ -104,6 +104,8 @@ constants in `cunibs.coil`. The package includes the 25 validated coil models
 reported by Drakaki et al. (2022), covering common coils from several
 manufacturers.
 
+`coil.didt_max` is the stimulator's rated peak dI/dt in A/s.
+
 Import a SimNIBS CCD coil by converting it to HDF5:
 
 ```python
@@ -244,6 +246,7 @@ Results are always NumPy. If you need device-resident fields, call
 | `vols` | Tetrahedron volumes | m³ |
 | `tet_tags` | Volume tissue tags | dimensionless |
 | `barycenters_mm` | Tetrahedron barycentres | mm |
+| `didt` | Coil current rate of change | A/s |
 
 The metric API reports the peak field, peak location, stimulated volume,
 field-weighted centre of gravity, and volume-weighted distribution statistics.

@@ -143,7 +143,7 @@ def synthetic_coil():
         positions_m=np.array([[-0.02, 0.0, 0.0], [0.02, 0.0, 0.0]], dtype=np.float64),
         moments=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64),
         name="synthetic",
-        didt_max=1e6,
+        didt_max=100e6,
     )
 
 
@@ -156,7 +156,7 @@ def figure8_coil():
         positions_m=np.array([[-0.03, 0.0, 0.0], [0.03, 0.0, 0.0]], dtype=np.float64),
         moments=np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]], dtype=np.float64),
         name="test",
-        didt_max=1e6,
+        didt_max=150e6,
     )
 
 

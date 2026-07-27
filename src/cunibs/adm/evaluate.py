@@ -86,6 +86,8 @@ def evaluate(
 
     Returns ``(P, D)``: for magnitude targets ``D=3`` (orthonormal basis, ``|E| = ‖row‖``); for a
     directional target ``D=1``. No FEM solve, only trilinear sampling of the cached Q-field.
+
+    ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
     """
     single = isinstance(placements, Placement)
     pls = [placements] if single else list(placements)
@@ -106,6 +108,8 @@ def evaluate_exact(
     Isolates the grid-interpolation error: this is the auxiliary-dipole method *without* the
     auxiliary grid, so it must agree with the exact reciprocity functional to float32 precision.
     ``Q(s_j) = dadt_nbody(sources=mesh nodes, moments=W_n, targets=s_j)``.
+
+    ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
     """
     single = isinstance(placements, Placement)
     pls = [placements] if single else list(placements)

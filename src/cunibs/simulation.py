@@ -329,6 +329,8 @@ class Subject:
     ) -> Iterator[FieldResult]:
         """Stream one :class:`FieldResult` per placement, in the order given.
 
+        ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
+
         Every result carries its gray-matter metrics; the flags say which of the
         full-volume arrays to keep as well. All three default to off because they are what
         makes a result large -- on a 4M-tetrahedron mesh they total roughly 70 MB, against

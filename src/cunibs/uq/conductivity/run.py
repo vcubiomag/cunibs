@@ -77,6 +77,8 @@ def run_conductivity_uq(
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
 
+    ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
+
     The coil field (``dadt_elm``) and the per-tissue RHS/stiffness components are σ-independent and
     built once. Each sample re-weights the matrix and RHS by the sampled conductivities (two small
     GEMVs), then solves against a preconditioner built once at the nominal (ensemble-centre) σ,

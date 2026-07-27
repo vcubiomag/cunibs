@@ -18,7 +18,7 @@ def _coil():
         positions_m=np.array([[-0.02, 0, 0], [0.02, 0, 0]]),
         moments=np.array([[0, 0, 1.0], [0, 0, -1.0]]),
         name="syn",
-        didt_max=1e6,
+        didt_max=100e6,
     )
 
 

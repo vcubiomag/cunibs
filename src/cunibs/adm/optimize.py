@@ -142,7 +142,11 @@ def optimize(
     spacing_mm: float = 3.0,
 ) -> OptimizeResult:
     """Build the reciprocity field for ``target`` and search ``centers_mm`` × rotations for the best
-    coil placement, with no per-placement FEM solve."""
+    coil placement, with no per-placement FEM solve.
+
+    ``didt`` is the coil current's rate of change in A/s. It scales ``best_E`` linearly and
+    leaves the chosen placement unchanged.
+    """
     recip = build_reciprocity(
         ctx, coil, target, centers_mm, distance_mm=distance_mm, spacing_mm=spacing_mm
     )
@@ -166,6 +170,12 @@ def optimize_placement(
     ``centers_mm`` is a set of candidate scalp targets ``(C,3)`` (each is projected onto the scalp).
     The rotation is optimized in closed form: ``E_d(θ)`` is sampled at ``n_samples`` (odd) angles,
     Fourier-interpolated to ``resolution`` points, and ``|E(θ)|²`` is maximized on that fine grid.
+
+    ``didt`` is the coil current's rate of change in A/s. It scales ``best_E`` linearly and
+    leaves the chosen placement unchanged.
+
+    The angle sweep is flattened over (position, angle), so a grid-bounds error from it names
+    a sample index that decodes as ``position = index // n_samples``.
     """
     if n_samples % 2 == 0:
         raise ValueError("n_samples must be odd for symmetric Fourier interpolation.")

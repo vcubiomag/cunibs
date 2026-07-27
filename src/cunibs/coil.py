@@ -45,11 +45,16 @@ def _decode_attr(value: object) -> str | int | float:
     return str(value)
 
 
+# The .ccd header states dIdtmax in A/us, we want A/s.
+_CCD_DIDTMAX_TO_A_PER_S = 1e6
+
+
 @dataclass(frozen=True)
 class Coil:
     """Store magnetic dipoles and coil metadata.
 
-    Positions use metres. Moments use A·m².
+    Positions use metres and moments A·m². ``didt_max`` records the stimulator's rated peak
+    dI/dt in A/s, or ``None`` when the source file gives none; it is metadata.
     """
 
     positions_m: npt.NDArray[np.float64]
@@ -72,7 +77,7 @@ class Coil:
             positions_m=np.ascontiguousarray(data[:, 0:3]),
             moments=np.ascontiguousarray(data[:, 3:6]),
             name=str(attrs.get("coilname", Path(source).stem)),
-            didt_max=float(didt_raw) if didt_raw is not None else None,
+            didt_max=None if didt_raw is None else float(didt_raw) * _CCD_DIDTMAX_TO_A_PER_S,
             metadata=attrs,
         )
 
