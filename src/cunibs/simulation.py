@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Mapping, Sequence, TypeAlias, overload
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, Sequence, TypeAlias, cast
 
 import cupy as cp
 import h5py
@@ -17,6 +16,7 @@ from cunibs.coil import Coil
 from cunibs.fem import (
     MAX_BLOCK,
     BlockWarmStart,
+    PlacementResult,
     SolverContext,
     build_context,
     solve_placements_block,
@@ -29,13 +29,42 @@ if TYPE_CHECKING:
         ConductivityUQConfig,
         ConductivityUQPrecompute,
         ConductivityUQResult,
-        ConductivityUQSummary,
     )
 
 _FORMAT_VERSION = 1
 
-ArrayT: TypeAlias = cp.ndarray | np.ndarray
-Device: TypeAlias = Literal["cpu", "gpu"]
+# The region every result is summarised over up front. Others are computed on demand from
+# a retained magnE.
+_DEFAULT_REGION: metrics.Region = "gray_matter"
+
+# Per-tetrahedron metric inputs on the host, shared by reference across every FieldResult.
+_HostMetricInputs: TypeAlias = tuple[
+    npt.NDArray[np.float32], npt.NDArray[np.int32], npt.NDArray[np.float64]
+]
+
+
+def _write_metrics(grp: h5py.Group, m: metrics.FieldMetrics) -> None:
+    grp.attrs["region"] = m["region"]
+    grp.attrs["peak_magnE"] = m["peak_magnE"]
+    grp.attrs["region_volume_m3"] = m["region_volume_m3"]
+    grp.create_dataset("peak_location_mm", data=m["peak_location_mm"])
+    grp.create_dataset("center_of_gravity_mm", data=m["center_of_gravity_mm"])
+    for name in ("focality_m3", "distribution"):
+        sub = grp.create_group(name)
+        for key, value in m[name].items():
+            sub.attrs[key] = float(value)
+
+
+def _read_metrics(grp: h5py.Group) -> metrics.FieldMetrics:
+    return metrics.FieldMetrics(
+        region=cast(metrics.Region, str(grp.attrs["region"])),
+        peak_magnE=float(grp.attrs["peak_magnE"]),
+        peak_location_mm=np.asarray(grp["peak_location_mm"]),
+        center_of_gravity_mm=np.asarray(grp["center_of_gravity_mm"]),
+        region_volume_m3=float(grp.attrs["region_volume_m3"]),
+        focality_m3={k: float(v) for k, v in grp["focality_m3"].attrs.items()},
+        distribution={k: float(v) for k, v in grp["distribution"].attrs.items()},
+    )
 
 
 def _check_format_version(h5f: h5py.File, path: str | Path, expected: int) -> None:
@@ -47,6 +76,11 @@ def _check_format_version(h5f: h5py.File, path: str | Path, expected: int) -> No
         )
 
 
+def _opt_array(h5f: h5py.File, name: str) -> npt.NDArray[Any] | None:
+    """Read a dataset that the run may not have retained."""
+    return np.asarray(h5f[name]) if name in h5f else None
+
+
 def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     p = np.ascontiguousarray(value, dtype=np.float64).reshape(-1)
     if p.shape != (3,):
@@ -54,16 +88,22 @@ def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return p
 
 
-def _copy_metrics(m: metrics.FieldMetrics) -> metrics.FieldMetrics:
-    return {
-        "region": m["region"],
-        "peak_magnE": float(m["peak_magnE"]),
-        "peak_location_mm": np.asarray(m["peak_location_mm"], dtype=np.float64),
-        "center_of_gravity_mm": np.asarray(m["center_of_gravity_mm"], dtype=np.float64),
-        "region_volume_m3": float(m["region_volume_m3"]),
-        "focality_m3": dict(m["focality_m3"]),
-        "distribution": dict(m["distribution"]),
-    }
+def _sites(placements: "Sequence[Placement]", method: str) -> list["Placement"]:
+    if isinstance(placements, Placement):
+        raise TypeError(
+            f"{method}() takes a sequence of placements; wrap a single one in a list, or "
+            "use the matching simulate() method."
+        )
+    return list(placements)
+
+
+@dataclass(frozen=True)
+class _Retain:
+    """Which full-volume arrays a result keeps. Metrics are always computed regardless."""
+
+    magnitude: bool
+    vectors: bool
+    potential: bool
 
 
 @dataclass(frozen=True, init=False)
@@ -95,10 +135,7 @@ class Subject:
     def __init__(self, mesh: HeadMesh) -> None:
         self._mesh = mesh
         self._ctx: SolverContext | None = None
-        self._barycenters_mm: cp.ndarray | None = None
-        self._host_vols: npt.NDArray[np.float32] | None = None
-        self._host_tet_tags: npt.NDArray[np.int32] | None = None
-        self._host_barycenters_mm: npt.NDArray[np.float64] | None = None
+        self._host_metrics: _HostMetricInputs | None = None
         self._conductivity_uq_pre: dict[tuple[int, ...], "ConductivityUQPrecompute"] = {}
 
     @classmethod
@@ -115,10 +152,7 @@ class Subject:
         """
         self._conductivity_uq_pre.clear()
         self._ctx = None
-        self._barycenters_mm = None
-        self._host_vols = None
-        self._host_tet_tags = None
-        self._host_barycenters_mm = None
+        self._host_metrics = None
         cp.get_default_memory_pool().free_all_blocks()
 
     def __enter__(self) -> "Subject":
@@ -189,416 +223,360 @@ class Subject:
             self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
         return self._conductivity_uq_pre[tags]
 
-    def _host_metric_inputs(
-        self, ctx: SolverContext
-    ) -> tuple[
-        npt.NDArray[np.float32],
-        npt.NDArray[np.int32],
-        npt.NDArray[np.float64],
-    ]:
-        if self._host_vols is None:
-            self._host_vols = cp.asnumpy(ctx.vols)
-            self._host_tet_tags = cp.asnumpy(ctx.tet_tags)
-            self._host_barycenters_mm = np.asarray(self._mesh.tet_barycenters_mm)
-        assert self._host_tet_tags is not None
-        assert self._host_barycenters_mm is not None
-        return self._host_vols, self._host_tet_tags, self._host_barycenters_mm
+    @property
+    def _host_metric_inputs(self) -> _HostMetricInputs:
+        """Host ``(vols, tet_tags, barycenters_mm)``, built once and shared by every result."""
+        if self._host_metrics is None:
+            ctx = self.context
+            self._host_metrics = (
+                cp.asnumpy(ctx.vols),
+                cp.asnumpy(ctx.tet_tags),
+                np.asarray(self._mesh.tet_barycenters_mm),
+            )
+        return self._host_metrics
 
-    def _prepare(
-        self, placements: Placement | Sequence[Placement], device: Device
-    ) -> tuple[bool, list[Placement], SolverContext]:
-        if device not in ("cpu", "gpu"):
-            raise ValueError("device must be 'cpu' or 'gpu'.")
-        single = isinstance(placements, Placement)
-        return single, [placements] if single else list(placements), self.context
-
-    def _field_summary(
+    def _reduce_chunk(
         self,
-        out: Mapping[str, ArrayT],
-        site: Placement,
+        chunk: Sequence[Placement],
+        outs: Sequence[PlacementResult],
         coil: Coil,
         didt: float,
-        barycenters_mm: ArrayT,
-    ) -> "FieldSummary":
-        summary = metrics.compute_metrics(
-            out["magnE"],
-            self.context.vols,
-            barycenters_mm,
-            self.context.tet_tags,
-            region="gray_matter",
-        )
-        return FieldSummary(
-            summary=_copy_metrics(summary),
-            transform=np.asarray(out["transform"]),
-            placement=site,
-            coil_name=coil.name,
-            didt=didt,
-        )
+        retain: _Retain,
+    ) -> "list[FieldResult]":
+        """Turn one solved chunk into results, summarising on the device.
 
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Placement,
-        didt: float = ...,
-        *,
-        retain_fields: Literal[False] = ...,
-        device: Device = ...,
-        block_k: int | None = ...,
-    ) -> "FieldSummary": ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Sequence[Placement],
-        didt: float = ...,
-        *,
-        retain_fields: Literal[False] = ...,
-        device: Device = ...,
-        block_k: int | None = ...,
-    ) -> list["FieldSummary"]: ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Placement,
-        didt: float = ...,
-        *,
-        retain_fields: Literal[True] = ...,
-        device: Device = ...,
-        block_k: int | None = ...,
-    ) -> "FieldResult": ...
-    @overload
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Sequence[Placement],
-        didt: float = ...,
-        *,
-        retain_fields: Literal[True] = ...,
-        device: Device = ...,
-        block_k: int | None = ...,
-    ) -> list["FieldResult"]: ...
-    def simulate(
-        self,
-        coil: Coil,
-        placements: Placement | Sequence[Placement],
-        didt: float = 1e6,
-        *,
-        retain_fields: bool = False,
-        device: Device = "cpu",
-        block_k: int | None = None,
-    ) -> FieldSummary | FieldResult | Sequence[FieldSummary | FieldResult]:
-        """Solve one placement or a sequence of placements.
-
-        By default (``retain_fields=False``) only compact host-side summaries are returned and
-        the full-volume field arrays are freed, so callers can loop over many subjects without
-        accumulating device memory. Pass ``retain_fields=True`` to get the full result back.
-
-        ``device`` selects where retained fields live (``"gpu"`` keeps them on the device,
-        ``"cpu"`` copies them to host). It has no effect when ``retain_fields=False``, since no
-        field arrays are kept in that case.
-
-        ``block_k`` sets how many placements solve together as one lockstep block CG that reads
-        the stiffness/hierarchy once per chunk. It defaults to ``MAX_BLOCK``; ``1`` solves one
-        placement at a time. Clamped to ``[1, MAX_BLOCK]``.
-
-        See :meth:`simulate_conductivity_uq` to run a conductivity Monte Carlo instead.
+        Runs inside the scratch pool, so nothing it returns may be device-backed.
+        ``compute_metrics`` satisfies that: it returns Python floats and host arrays even
+        when every input is on the device.
         """
-        single, sites, ctx = self._prepare(placements, device)
+        ctx = self.context
+        # Pool-owned: freed with the chunk, so it is re-uploaded rather than cached.
+        barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
+        host = self._host_metric_inputs if retain.magnitude else None
+        return [
+            FieldResult(
+                summary=metrics.compute_metrics(
+                    out["magnE"],
+                    ctx.vols,
+                    barycenters_mm,
+                    ctx.tet_tags,
+                    region=_DEFAULT_REGION,
+                ),
+                magnE=cp.asnumpy(out["magnE"]) if retain.magnitude else None,
+                E=cp.asnumpy(out["E"]) if retain.vectors else None,
+                v=cp.asnumpy(out["v"]) if retain.potential else None,
+                transform=np.asarray(out["transform"]),
+                placement=site,
+                coil_name=coil.name,
+                didt=didt,
+                vols=host[0] if host else None,
+                tet_tags=host[1] if host else None,
+                barycenters_mm=host[2] if host else None,
+            )
+            for site, out in zip(chunk, outs)
+        ]
 
-        results: list[FieldResult | FieldSummary] = []
+    def _iter_reduced(
+        self,
+        coil: Coil,
+        sites: Sequence[Placement],
+        didt: float,
+        block_k: int | None,
+        retain: _Retain,
+    ) -> Iterator["FieldResult"]:
+        """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
+
+        The reduction runs under the scratch allocator so every intermediate is bulk-freed
+        with its chunk, but the yield happens after the allocator is popped: control passes
+        to caller code between chunks, and its allocations must not land in our pool.
+        """
+        ctx = self.context
+        # Held across chunks, so these are allocated outside the scratch pool.
         dip_pos_m = cp.asarray(coil.positions_m)
         dip_moment = cp.asarray(coil.moments)
-        temp_pool = cp.cuda.MemoryPool()
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
         warm = BlockWarmStart()
-        with ExitStack() as scratch:
-            # Retained device fields have to outlive the pool, so those solves allocate
-            # normally; everything else is scratch and gets bulk-freed below.
-            if not (retain_fields and device == "gpu"):
-                scratch.enter_context(cp.cuda.using_allocator(temp_pool.malloc))
-
+        temp_pool = cp.cuda.MemoryPool()
+        try:
             for start in range(0, len(sites), chunk_k):
                 chunk = sites[start : start + chunk_k]
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
-                outs = solve_placements_block(ctx, dip_pos_m, dip_moment, site_args, didt, warm)
-                if not retain_fields:
-                    # Pool-owned: freed with the chunk, so it is re-uploaded rather than cached.
-                    barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
-                    results.extend(
-                        self._field_summary(out, site, coil, didt, barycenters_mm)
-                        for site, out in zip(chunk, outs)
+                with cp.cuda.using_allocator(temp_pool.malloc):
+                    outs = solve_placements_block(
+                        ctx, dip_pos_m, dip_moment, site_args, didt, warm
                     )
+                    batch = self._reduce_chunk(chunk, outs, coil, didt, retain)
                     del outs
-                    continue
+                yield from batch
+        finally:
+            temp_pool.free_all_blocks()
 
-                if device == "gpu":
-                    if self._barycenters_mm is None:
-                        self._barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
-                    to_out = cp.asarray
-                    vols, tet_tags = ctx.vols, ctx.tet_tags
-                    barycenters_mm = self._barycenters_mm
-                else:
-                    to_out = cp.asnumpy
-                    vols, tet_tags, barycenters_mm = self._host_metric_inputs(ctx)
-                results.extend(
-                    FieldResult(
-                        E=to_out(out["E"]),
-                        magnE=to_out(out["magnE"]),
-                        v=to_out(out["v"]),
-                        transform=np.asarray(out["transform"]),
-                        placement=site,
-                        coil_name=coil.name,
-                        didt=didt,
-                        vols=vols,
-                        tet_tags=tet_tags,
-                        barycenters_mm=barycenters_mm,
-                    )
-                    for site, out in zip(chunk, outs)
-                )
-                del outs
-        temp_pool.free_all_blocks()
-        return results[0] if single else results
-
-    @overload
-    def simulate_conductivity_uq(
-        self,
-        coil: Coil,
-        placements: Placement,
-        config: "ConductivityUQConfig",
-        didt: float = ...,
-        *,
-        retain_fields: Literal[False] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> "ConductivityUQSummary": ...
-    @overload
-    def simulate_conductivity_uq(
+    def iter_simulate(
         self,
         coil: Coil,
         placements: Sequence[Placement],
-        config: "ConductivityUQConfig",
-        didt: float = ...,
-        *,
-        retain_fields: Literal[False] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> list["ConductivityUQSummary"]: ...
-    @overload
-    def simulate_conductivity_uq(
-        self,
-        coil: Coil,
-        placements: Placement,
-        config: "ConductivityUQConfig",
-        didt: float = ...,
-        *,
-        retain_fields: Literal[True] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> "ConductivityUQResult": ...
-    @overload
-    def simulate_conductivity_uq(
-        self,
-        coil: Coil,
-        placements: Sequence[Placement],
-        config: "ConductivityUQConfig",
-        didt: float = ...,
-        *,
-        retain_fields: Literal[True] = ...,
-        device: Device = ...,
-        record_rois: "Mapping[str, ResolvedTarget] | None" = ...,
-    ) -> list["ConductivityUQResult"]: ...
-
-    def simulate_conductivity_uq(
-        self,
-        coil: Coil,
-        placements: Placement | Sequence[Placement],
-        config: "ConductivityUQConfig",
         didt: float = 1e6,
         *,
-        retain_fields: bool = False,
-        device: Device = "cpu",
-        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
-    ) -> (
-        ConductivityUQSummary
-        | ConductivityUQResult
-        | Sequence[ConductivityUQSummary | ConductivityUQResult]
-    ):
-        """Run a conductivity Monte Carlo for one placement or a sequence of placements.
+        magnitude: bool = False,
+        vectors: bool = False,
+        potential: bool = False,
+        block_k: int | None = None,
+    ) -> Iterator["FieldResult"]:
+        """Stream one :class:`FieldResult` per placement, in the order given.
 
-        Every sampled conductivity vector is solved with the same finite-element model, and
-        :class:`~cunibs.uq.ConductivityUQResult` reports per-tetrahedron moments of ``|E|``
-        instead of the deterministic :class:`FieldResult` that :meth:`simulate` returns.
+        Every result carries its gray-matter metrics; the flags say which of the
+        full-volume arrays to keep as well. All three default to off because they are what
+        makes a result large -- on a 4M-tetrahedron mesh they total roughly 70 MB, against
+        about a kilobyte for a result with none of them.
 
-        By default (``retain_fields=False``) only compact host-side summaries are returned and
-        the full-volume moment arrays are freed, so callers can loop over many subjects without
-        accumulating device memory. Pass ``retain_fields=True`` to get the full result back.
+        Retaining ``magnitude`` also unlocks the metrics a precomputed summary cannot
+        answer: :meth:`FieldResult.summary_for` for a non-default region, and
+        :meth:`FieldResult.focality` at an arbitrary fraction.
 
-        ``device`` selects where retained fields live (``"gpu"`` keeps them on the device,
-        ``"cpu"`` copies them to host). It has no effect when ``retain_fields=False``, since no
-        field arrays are kept in that case.
+        Placements are solved in blocks of ``block_k`` that share a single stiffness and
+        hierarchy read. It defaults to ``MAX_BLOCK`` and is clamped to ``[1, MAX_BLOCK]``.
+        A block is solved and reduced as a unit, so it also caps peak memory: only
+        ``block_k`` results are live at once, however long the sweep.
 
-        ``record_rois`` is a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` /
-        ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over every ROI is
-        recorded (``result.roi_samples[name]``), along with the per-draw gray-matter peak,
-        focality, and peak location — the distributional data that a metric of the mean field
-        cannot provide. These small per-draw arrays are returned even with
-        ``retain_fields=False``.
+        See :meth:`iter_simulate_conductivity_uq` to stream a conductivity Monte Carlo
+        instead.
         """
-        from cunibs.uq import (
-            ConductivityUQResult,
-            run_conductivity_uq,
+        # The loop lives in a separate generator so this stays a plain function: a `yield`
+        # here would defer the check below to the caller's first next(), surfacing the
+        # error at the consumption site instead of where the bad argument was passed.
+        sites = _sites(placements, "iter_simulate")
+        retain = _Retain(magnitude, vectors, potential)
+        return self._iter_reduced(coil, sites, didt, block_k, retain)
+
+    def simulate(
+        self,
+        coil: Coil,
+        placement: Placement,
+        didt: float = 1e6,
+        *,
+        magnitude: bool = False,
+        vectors: bool = False,
+        potential: bool = False,
+        block_k: int | None = None,
+    ) -> "FieldResult":
+        """Solve a single placement, taking the same flags as :meth:`iter_simulate`.
+
+        Sequences go through :meth:`iter_simulate`, which bounds peak memory by the block
+        rather than by the number of placements.
+        """
+        if not isinstance(placement, Placement):
+            raise TypeError(
+                "simulate() takes a single Placement. Use Subject.iter_simulate(...) to "
+                "stream a sequence, wrapping it in list() if you want them all at once."
+            )
+        # Unpacking drives the generator to exhaustion, so its scratch pool is released.
+        (result,) = self.iter_simulate(
+            coil,
+            [placement],
+            didt,
+            magnitude=magnitude,
+            vectors=vectors,
+            potential=potential,
+            block_k=block_k,
         )
+        return result
 
-        single, sites, ctx = self._prepare(placements, device)
+    def _iter_uq_reduced(
+        self,
+        coil: Coil,
+        sites: Sequence[Placement],
+        config: "ConductivityUQConfig",
+        didt: float,
+        moments: bool,
+        record_rois: "Mapping[str, ResolvedTarget] | None",
+    ) -> Iterator["ConductivityUQResult"]:
+        """One Monte Carlo per placement, reduced inside a scratch pool and yielded outside.
 
+        Unlike the deterministic path there is no block solve, so the chunk is a single
+        placement; the pool scoping is otherwise identical.
+        """
+        from cunibs.uq import run_conductivity_uq
+
+        ctx = self.context
         pre = self._conductivity_uq_precompute(config)
-        uq_results: list[ConductivityUQResult | ConductivityUQSummary] = []
         temp_pool = cp.cuda.MemoryPool()
-        for site in sites:
-            if retain_fields and device == "gpu":
-                result = run_conductivity_uq(ctx, pre, coil, site, config, didt, record_rois)
-            else:
+        try:
+            for site in sites:
                 with cp.cuda.using_allocator(temp_pool.malloc):
                     result = run_conductivity_uq(
                         ctx, pre, coil, site, config, didt, record_rois
                     )
-                    if not retain_fields:
-                        uq_results.append(result.summary())
-                        del result
-                        continue
-            if device == "gpu":
-                uq_results.append(result)
-                continue
+                    # Summarised on the device before anything is copied back.
+                    host = self._host_metric_inputs if moments else None
+                    reduced = replace(
+                        result,
+                        summary=result.compute_summary(),
+                        mean_magnE=cp.asnumpy(result.mean_magnE) if moments else None,
+                        std_magnE=cp.asnumpy(result.std_magnE) if moments else None,
+                        cov_magnE=cp.asnumpy(result.cov_magnE) if moments else None,
+                        vols=host[0] if host else None,
+                        tet_tags=host[1] if host else None,
+                        barycenters_mm=host[2] if host else None,
+                    )
+                    del result
+                yield reduced
+        finally:
+            temp_pool.free_all_blocks()
 
-            vols, tet_tags, barycenters_mm = self._host_metric_inputs(ctx)
-            uq_results.append(
-                ConductivityUQResult(
-                    mean_magnE=cp.asnumpy(result.mean_magnE),
-                    std_magnE=cp.asnumpy(result.std_magnE),
-                    cov_magnE=cp.asnumpy(result.cov_magnE),
-                    n_samples=result.n_samples,
-                    perturbed_tags=result.perturbed_tags,
-                    sigma_samples=np.asarray(result.sigma_samples),
-                    vols=vols,
-                    tet_tags=tet_tags,
-                    barycenters_mm=barycenters_mm,
-                    placement=result.placement,
-                    coil_name=result.coil_name,
-                    didt=result.didt,
-                    roi_samples=result.roi_samples,
-                    peak_samples=result.peak_samples,
-                    focality_samples=result.focality_samples,
-                    peak_location_samples=result.peak_location_samples,
-                )
+    def iter_simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placements: Sequence[Placement],
+        config: "ConductivityUQConfig",
+        didt: float = 1e6,
+        *,
+        moments: bool = False,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
+    ) -> Iterator["ConductivityUQResult"]:
+        """Stream a conductivity Monte Carlo per placement, in the order given.
+
+        Every sampled conductivity vector is solved with the same finite-element model, and
+        :class:`~cunibs.uq.ConductivityUQResult` reports per-tetrahedron moments of ``|E|``
+        instead of the deterministic :class:`FieldResult` that :meth:`iter_simulate`
+        returns. Every result carries its gray-matter summary.
+
+        ``moments=True`` also keeps the per-tetrahedron ``mean``/``std``/``cov`` arrays.
+        The three come as a set, since any two determine the third.
+
+        ``record_rois`` is a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` /
+        ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over every
+        ROI is recorded (``result.roi_samples[name]``), along with the per-draw gray-matter
+        peak, focality, and peak location -- the distributional data that a metric of the
+        mean field cannot provide. These small per-draw arrays are always kept.
+        """
+        # The loop lives in a separate generator so this stays a plain function: a `yield`
+        # here would defer the check below to the caller's first next(), surfacing the error
+        # at the consumption site instead of where the bad argument was passed.
+        sites = _sites(placements, "iter_simulate_conductivity_uq")
+        return self._iter_uq_reduced(coil, sites, config, didt, moments, record_rois)
+
+    def simulate_conductivity_uq(
+        self,
+        coil: Coil,
+        placement: Placement,
+        config: "ConductivityUQConfig",
+        didt: float = 1e6,
+        *,
+        moments: bool = False,
+        record_rois: "Mapping[str, ResolvedTarget] | None" = None,
+    ) -> "ConductivityUQResult":
+        """Run a conductivity Monte Carlo for a single placement.
+
+        Takes the same options as :meth:`iter_simulate_conductivity_uq`; sequences go
+        through that method, which holds only one placement's moments at a time.
+        """
+        if not isinstance(placement, Placement):
+            raise TypeError(
+                "simulate_conductivity_uq() takes a single Placement. Use "
+                "Subject.iter_simulate_conductivity_uq(...) to stream a sequence, "
+                "wrapping it in list() if you want them all at once."
             )
-            del result
-        temp_pool.free_all_blocks()
-        return uq_results[0] if single else uq_results
-
-
-@dataclass
-class FieldSummary:
-    """Compact CPU-side metrics for one deterministic placement."""
-
-    summary: metrics.FieldMetrics
-    transform: npt.NDArray[np.float64]
-    placement: Placement
-    coil_name: str
-    didt: float
-
-    def peak_magnE(self, region: metrics.Region = "gray_matter") -> float:
-        if region != self.summary["region"]:
-            raise ValueError("Only the default gray_matter summary is retained.")
-        return self.summary["peak_magnE"]
-
-    def peak_location_mm(
-        self, region: metrics.Region = "gray_matter"
-    ) -> npt.NDArray[np.float64]:
-        if region != self.summary["region"]:
-            raise ValueError("Only the default gray_matter summary is retained.")
-        return self.summary["peak_location_mm"]
-
-    def focality(self, frac: float = 0.5, region: metrics.Region = "gray_matter") -> float:
-        if region != self.summary["region"]:
-            raise ValueError("Only the default gray_matter summary is retained.")
-        key = f"{frac:g}"
-        if key not in self.summary["focality_m3"]:
-            available = ", ".join(sorted(self.summary["focality_m3"]))
-            raise ValueError(
-                f"Focality at frac={key} was not retained (available: {available}). "
-                "Pass retain_fields=True to compute focality at arbitrary fractions."
-            )
-        return self.summary["focality_m3"][key]
+        # Unpacking drives the generator to exhaustion, so its scratch pool is released.
+        (result,) = self.iter_simulate_conductivity_uq(
+            coil, [placement], config, didt, moments=moments, record_rois=record_rois
+        )
+        return result
 
 
 @dataclass
 class FieldResult:
-    """Store the E-field and metric inputs for one placement.
+    """Metrics for one placement, plus whichever full-volume arrays were retained.
 
-    Arrays use CuPy after simulation and NumPy after :meth:`load` or :meth:`to_numpy`.
+    ``summary`` holds the gray-matter metrics and is always present. ``magnE``, ``E`` and
+    ``v`` are ``None`` unless the run asked for them with ``magnitude=``, ``vectors=`` or
+    ``potential=``. All arrays are NumPy.
+
+    ``vols``, ``tet_tags`` and ``barycenters_mm`` accompany ``magnE`` -- they are what the
+    on-demand metrics need. Results from one subject share them, so treat them as
+    read-only.
     """
 
-    E: ArrayT
-    magnE: ArrayT
-    v: ArrayT
+    summary: metrics.FieldMetrics
+    magnE: npt.NDArray[np.float32] | None
+    E: npt.NDArray[np.float32] | None
+    v: npt.NDArray[np.float64] | None
     transform: npt.NDArray[np.float64]
     placement: Placement
     coil_name: str
     didt: float
-    vols: ArrayT
-    tet_tags: ArrayT
-    barycenters_mm: ArrayT
+    vols: npt.NDArray[np.float32] | None
+    tet_tags: npt.NDArray[np.int32] | None
+    barycenters_mm: npt.NDArray[np.float64] | None
     _summaries: dict[str, metrics.FieldMetrics] = field(default_factory=dict, repr=False)
 
-    def _mask(self, region: metrics.Region) -> ArrayT:
-        return metrics.region_mask(self.tet_tags, region)
+    def _require_magnitude(self, what: str) -> npt.NDArray[np.float32]:
+        if self.magnE is None:
+            raise ValueError(
+                f"{what} needs the per-element |E|, which this result did not retain. "
+                "Re-run with magnitude=True."
+            )
+        return self.magnE
 
-    def peak_magnE(self, region: metrics.Region = "gray_matter") -> float:
-        return metrics.peak_magnitude(self.magnE, self._mask(region))
+    def peak_magnE(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+        return self.summary_for(region)["peak_magnE"]
 
     def peak_location_mm(
-        self, region: metrics.Region = "gray_matter"
+        self, region: metrics.Region = _DEFAULT_REGION
     ) -> npt.NDArray[np.float64]:
-        return metrics.peak_location_mm(self.magnE, self.barycenters_mm, self._mask(region))
+        return self.summary_for(region)["peak_location_mm"]
 
-    def focality(self, frac: float = 0.5, region: metrics.Region = "gray_matter") -> float:
-        return metrics.focality(self.magnE, self.vols, self._mask(region), frac)
+    def center_of_gravity_mm(
+        self, region: metrics.Region = _DEFAULT_REGION
+    ) -> npt.NDArray[np.float64]:
+        return self.summary_for(region)["center_of_gravity_mm"]
 
-    def summary(self, region: metrics.Region = "gray_matter") -> metrics.FieldMetrics:
-        """Return cached metrics for a tissue region."""
+    def focality(self, frac: float = 0.5, region: metrics.Region = _DEFAULT_REGION) -> float:
+        """Volume with ``|E| >= frac * peak``.
+
+        ``summary`` already carries the default fraction; any other one needs ``magnE``,
+        so the run has to have passed ``magnitude=True``.
+        """
+        key = f"{frac:g}"
+        summary = self.summary_for(region)
+        if key in summary["focality_m3"]:
+            return summary["focality_m3"][key]
+        magnE = self._require_magnitude(f"focality at frac={key}")
+        assert self.vols is not None and self.tet_tags is not None
+        mask = metrics.region_mask(self.tet_tags, region)
+        return metrics.focality(magnE, self.vols, mask, frac)
+
+    def summary_for(self, region: metrics.Region) -> metrics.FieldMetrics:
+        """Metrics for a tissue region, cached.
+
+        ``summary``'s own region is free; any other needs ``magnE``, so the run has to have
+        passed ``magnitude=True``.
+        """
+        if region == self.summary["region"]:
+            return self.summary
         if region not in self._summaries:
+            magnE = self._require_magnitude(f"metrics for region {region!r}")
+            assert self.vols is not None and self.barycenters_mm is not None
+            assert self.tet_tags is not None
             self._summaries[region] = metrics.compute_metrics(
-                self.magnE, self.vols, self.barycenters_mm, self.tet_tags, region=region
+                magnE, self.vols, self.barycenters_mm, self.tet_tags, region=region
             )
         return self._summaries[region]
 
-    def to_numpy(self) -> "FieldResult":
-        """Copy all arrays to NumPy."""
-        return FieldResult(
-            E=cp.asnumpy(self.E),
-            magnE=cp.asnumpy(self.magnE),
-            v=cp.asnumpy(self.v),
-            transform=np.asarray(self.transform),
-            placement=self.placement,
-            coil_name=self.coil_name,
-            didt=self.didt,
-            vols=cp.asnumpy(self.vols),
-            tet_tags=cp.asnumpy(self.tet_tags),
-            barycenters_mm=cp.asnumpy(self.barycenters_mm),
-        )
-
     def save(self, path: str | Path) -> None:
-        """Write the result to a self-contained HDF5 file."""
+        """Write the result to a self-contained HDF5 file.
+
+        Arrays the run did not retain are absent from the file and load back as ``None``.
+        """
         with h5py.File(Path(path), "w") as h5f:
-            for name in ("E", "magnE", "v", "vols", "tet_tags", "barycenters_mm"):
-                h5f.create_dataset(
-                    name, data=cp.asnumpy(getattr(self, name)), compression="gzip"
-                )
-            h5f.create_dataset("transform", data=np.asarray(self.transform))
+            for name in ("magnE", "E", "v", "vols", "tet_tags", "barycenters_mm"):
+                arr = getattr(self, name)
+                if arr is None:
+                    continue
+                h5f.create_dataset(name, data=arr, compression="gzip")
+            h5f.create_dataset("transform", data=self.transform)
+            _write_metrics(h5f.create_group("summary"), self.summary)
             h5f.attrs["format_version"] = _FORMAT_VERSION
             h5f.attrs["coil_name"] = self.coil_name
             h5f.attrs["didt"] = self.didt
@@ -611,26 +589,20 @@ class FieldResult:
         """Read a saved result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
             _check_format_version(h5f, path, _FORMAT_VERSION)
-            data = {
-                k: np.asarray(h5f[k])
-                for k in ("E", "magnE", "v", "transform", "vols", "tet_tags", "barycenters_mm")
-            }
-            placement = Placement(
-                center_mm=h5f.attrs["placement_center_mm"],
-                handle_mm=h5f.attrs["placement_handle_mm"],
-                distance_mm=float(h5f.attrs["placement_distance_mm"]),
+            return cls(
+                summary=_read_metrics(h5f["summary"]),
+                magnE=_opt_array(h5f, "magnE"),
+                E=_opt_array(h5f, "E"),
+                v=_opt_array(h5f, "v"),
+                transform=np.asarray(h5f["transform"]),
+                placement=Placement(
+                    center_mm=h5f.attrs["placement_center_mm"],
+                    handle_mm=h5f.attrs["placement_handle_mm"],
+                    distance_mm=float(h5f.attrs["placement_distance_mm"]),
+                ),
+                coil_name=str(h5f.attrs["coil_name"]),
+                didt=float(h5f.attrs["didt"]),
+                vols=_opt_array(h5f, "vols"),
+                tet_tags=_opt_array(h5f, "tet_tags"),
+                barycenters_mm=_opt_array(h5f, "barycenters_mm"),
             )
-            coil_name = str(h5f.attrs["coil_name"])
-            didt = float(h5f.attrs["didt"])
-        return cls(
-            E=data["E"],
-            magnE=data["magnE"],
-            v=data["v"],
-            transform=data["transform"],
-            placement=placement,
-            coil_name=coil_name,
-            didt=didt,
-            vols=data["vols"],
-            tet_tags=data["tet_tags"],
-            barycenters_mm=data["barycenters_mm"],
-        )

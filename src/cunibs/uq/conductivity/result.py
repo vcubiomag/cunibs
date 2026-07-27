@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import cupy as cp
 import h5py
@@ -11,7 +12,15 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
-from cunibs.simulation import ArrayT, Placement, _check_format_version
+from cunibs.metrics import ArrayT
+from cunibs.simulation import (
+    _DEFAULT_REGION,
+    Placement,
+    _check_format_version,
+    _opt_array,
+    _read_metrics,
+    _write_metrics,
+)
 
 _FORMAT_VERSION = 1
 
@@ -52,76 +61,44 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
 
 @dataclass
 class ConductivityUQSummary:
-    """Compact CPU-side conductivity-UQ metrics for one placement.
+    """Metrics of the *mean* field, plus the peak local CoV, for one placement.
 
-    ``mean_summary`` holds metrics computed on the *mean* field. For a nonlinear metric (peak,
-    focality) that is **not** the mean of the metric over the ensemble: ``peak_cov`` is the CoV of
-    the mean field, not the CoV of the per-draw peak. To characterise the distribution of a scalar
-    metric, run with ``record_rois=...`` and use the per-draw arrays (``peak_samples``,
-    ``focality_samples``, ``roi_samples[name]``).
+    For a nonlinear metric (peak, focality) the metric of the mean is **not** the mean of
+    the metric over the ensemble: ``peak_cov`` is the CoV of the mean field, not the CoV of
+    the per-draw peak. To characterise the distribution of a scalar metric, run with
+    ``record_rois=...`` and use the per-draw arrays on the result.
     """
 
-    mean_summary: metrics.FieldMetrics
-    peak_cov_value: float
-    n_samples: int
-    perturbed_tags: tuple[int, ...]
-    sigma_samples: npt.NDArray[np.float64]
-    placement: Placement
-    coil_name: str
-    didt: float
-    # per-draw samples, present only when the run was given record_rois=
-    roi_samples: dict[str, npt.NDArray[np.float64]] | None = (
-        None  # name -> (n_samples,) ROI mean |E|
-    )
-    peak_samples: npt.NDArray[np.float64] | None = None  # (n_samples,) gray-matter peak |E|
-    focality_samples: npt.NDArray[np.float64] | None = (
-        None  # (n_samples,) stimulated volume (m^3)
-    )
-    peak_location_samples: npt.NDArray[np.float64] | None = (
-        None  # (n_samples, 3) peak location (mm)
-    )
-
-    def peak_mean_magnE(self, region: metrics.Region = "gray_matter") -> float:
-        if region != self.mean_summary["region"]:
-            raise ValueError("Only the default gray_matter summary is retained.")
-        return self.mean_summary["peak_magnE"]
-
-    def peak_cov(self, region: metrics.Region = "gray_matter") -> float:
-        """CoV of the *mean* field (not the CoV of the per-draw peak; see class docstring)."""
-        if region != self.mean_summary["region"]:
-            raise ValueError("Only the default gray_matter summary is retained.")
-        return self.peak_cov_value
-
-    def tissue_sensitivity(self, output: str = "peak") -> dict[int, float]:
-        """First-order share of each perturbed tissue in a per-draw output's variance.
-
-        ``output`` is ``"peak"``, ``"focality"``, or a recorded ROI name; requires the run to have
-        recorded per-draw samples (``record_rois={...}``). A linear-in-log first-order index, not a
-        Saltelli Sobol estimate -- see :func:`_tissue_sensitivity`.
-        """
-        return _tissue_sensitivity(self, output)
+    mean_field: metrics.FieldMetrics
+    peak_cov: float
 
 
 @dataclass
 class ConductivityUQResult:
-    """Per-tetrahedron moments of ``|E|`` over the conductivity ensemble.
+    """Conductivity-UQ metrics for one placement, plus the moment arrays if retained.
 
-    ``cov_magnE`` is the coefficient of variation (std / mean), the dimensionless local
-    sensitivity of the field to conductivity uncertainty. Arrays are CuPy until :meth:`to_numpy`.
+    ``mean_magnE``, ``std_magnE`` and ``cov_magnE`` are the per-tetrahedron moments of
+    ``|E|`` over the ensemble, ``cov`` being the coefficient of variation (std / mean).
+    They are ``None`` unless the run asked for them with ``moments=True``.
+
+    Results from :class:`~cunibs.Subject` are NumPy and always carry a ``summary``. The
+    lower-level :func:`~cunibs.uq.run_conductivity_uq` returns device arrays and no
+    summary; call :meth:`compute_summary` and :meth:`to_numpy` yourself.
     """
 
-    mean_magnE: ArrayT
-    std_magnE: ArrayT
-    cov_magnE: ArrayT
+    mean_magnE: ArrayT | None
+    std_magnE: ArrayT | None
+    cov_magnE: ArrayT | None
     n_samples: int
     perturbed_tags: tuple[int, ...]
     sigma_samples: npt.NDArray[np.float64]  # (n_samples, n_perturbed), host
-    vols: ArrayT
-    tet_tags: ArrayT
-    barycenters_mm: ArrayT
+    vols: ArrayT | None
+    tet_tags: ArrayT | None
+    barycenters_mm: ArrayT | None
     placement: Placement
     coil_name: str
     didt: float
+    summary: ConductivityUQSummary | None = None
     # per-draw samples, present only when the run was given record_rois=
     roi_samples: dict[str, npt.NDArray[np.float64]] | None = (
         None  # name -> (n_samples,) ROI mean |E|
@@ -134,72 +111,81 @@ class ConductivityUQResult:
         None  # (n_samples, 3) peak location (mm)
     )
 
-    def _mask(self, region: metrics.Region) -> ArrayT:
-        return metrics.region_mask(self.tet_tags, region)
+    def compute_summary(
+        self, region: metrics.Region = _DEFAULT_REGION
+    ) -> ConductivityUQSummary:
+        """Summarise the moment arrays over ``region``, which needs ``moments=True``.
 
-    def peak_mean_magnE(self, region: metrics.Region = "gray_matter") -> float:
-        """Peak of the mean field in a region."""
-        return metrics.peak_magnitude(self.mean_magnE, self._mask(region))
-
-    def peak_cov(self, region: metrics.Region = "gray_matter") -> float:
-        """Largest local coefficient of variation in a region."""
-        return metrics.peak_magnitude(self.cov_magnE, self._mask(region))
-
-    def summary(self, region: metrics.Region = "gray_matter") -> ConductivityUQSummary:
-        mask = self._mask(region)
+        Results from :class:`~cunibs.Subject` already carry a gray-matter ``summary``. One
+        straight from :func:`~cunibs.uq.run_conductivity_uq` does not, so call this before
+        :meth:`save`.
+        """
+        if self.mean_magnE is None or self.cov_magnE is None:
+            raise ValueError(
+                f"Metrics for region {region!r} need the per-element moment arrays, which "
+                "this result did not retain. Re-run with moments=True."
+            )
+        assert self.vols is not None and self.tet_tags is not None
+        assert self.barycenters_mm is not None
         return ConductivityUQSummary(
-            mean_summary=metrics.compute_metrics(
-                self.mean_magnE,
-                self.vols,
-                self.barycenters_mm,
-                self.tet_tags,
-                region=region,
+            mean_field=metrics.compute_metrics(
+                self.mean_magnE, self.vols, self.barycenters_mm, self.tet_tags, region=region
             ),
-            peak_cov_value=metrics.peak_magnitude(self.cov_magnE, mask),
-            n_samples=self.n_samples,
-            perturbed_tags=self.perturbed_tags,
-            sigma_samples=np.asarray(self.sigma_samples),
-            placement=self.placement,
-            coil_name=self.coil_name,
-            didt=self.didt,
-            roi_samples=self.roi_samples,
-            peak_samples=self.peak_samples,
-            focality_samples=self.focality_samples,
-            peak_location_samples=self.peak_location_samples,
+            peak_cov=metrics.peak_magnitude(
+                self.cov_magnE, metrics.region_mask(self.tet_tags, region)
+            ),
         )
+
+    def _summary_for(self, region: metrics.Region) -> ConductivityUQSummary:
+        if self.summary is not None and region == self.summary.mean_field["region"]:
+            return self.summary
+        return self.compute_summary(region)
+
+    def peak_mean_magnE(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+        """Peak of the mean field in a region."""
+        return self._summary_for(region).mean_field["peak_magnE"]
+
+    def peak_cov(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+        """Largest local coefficient of variation in a region."""
+        return self._summary_for(region).peak_cov
 
     def tissue_sensitivity(self, output: str = "peak") -> dict[int, float]:
         """First-order share of each perturbed tissue in a per-draw output's variance.
 
-        ``output`` is ``"peak"``, ``"focality"``, or a recorded ROI name; requires the run to have
-        recorded per-draw samples (``record_rois={...}``). A linear-in-log first-order index, not a
-        Saltelli Sobol estimate -- see :func:`_tissue_sensitivity`.
+        ``output`` is ``"peak"``, ``"focality"``, or a recorded ROI name, so the run needs
+        ``record_rois={...}``. Regressing the log output on the log conductivity draws gives
+        each tag's first-order share under a local log-linear response; it captures only the
+        linear-in-log part of the sensitivity and is not a Saltelli Sobol estimate.
         """
         return _tissue_sensitivity(self, output)
 
     def to_numpy(self) -> "ConductivityUQResult":
-        """Copy device arrays to NumPy."""
-        return ConductivityUQResult(
-            mean_magnE=cp.asnumpy(self.mean_magnE),
-            std_magnE=cp.asnumpy(self.std_magnE),
-            cov_magnE=cp.asnumpy(self.cov_magnE),
-            n_samples=self.n_samples,
-            perturbed_tags=self.perturbed_tags,
-            sigma_samples=np.asarray(self.sigma_samples),
-            vols=cp.asnumpy(self.vols),
-            tet_tags=cp.asnumpy(self.tet_tags),
-            barycenters_mm=cp.asnumpy(self.barycenters_mm),
-            placement=self.placement,
-            coil_name=self.coil_name,
-            didt=self.didt,
-            roi_samples=self.roi_samples,
-            peak_samples=self.peak_samples,
-            focality_samples=self.focality_samples,
-            peak_location_samples=self.peak_location_samples,
+        """Copy any device arrays to NumPy."""
+
+        def host(a: ArrayT | None) -> npt.NDArray[Any] | None:
+            return None if a is None else cp.asnumpy(a)
+
+        return replace(
+            self,
+            mean_magnE=host(self.mean_magnE),
+            std_magnE=host(self.std_magnE),
+            cov_magnE=host(self.cov_magnE),
+            vols=host(self.vols),
+            tet_tags=host(self.tet_tags),
+            barycenters_mm=host(self.barycenters_mm),
         )
 
     def save(self, path: str | Path) -> None:
-        """Write the conductivity-UQ result to a self-contained HDF5 file."""
+        """Write the conductivity-UQ result to a self-contained HDF5 file.
+
+        Moment arrays the run did not retain are absent from the file and load back as
+        ``None``.
+        """
+        if self.summary is None:
+            raise ValueError(
+                "This result has no summary to save; call compute_summary() first "
+                "(results from Subject already carry one)."
+            )
         with h5py.File(Path(path), "w") as h5f:
             for name in (
                 "mean_magnE",
@@ -209,14 +195,18 @@ class ConductivityUQResult:
                 "tet_tags",
                 "barycenters_mm",
             ):
-                h5f.create_dataset(
-                    name, data=cp.asnumpy(getattr(self, name)), compression="gzip"
-                )
+                arr = getattr(self, name)
+                if arr is None:
+                    continue
+                h5f.create_dataset(name, data=cp.asnumpy(arr), compression="gzip")
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
+            grp = h5f.create_group("summary")
+            _write_metrics(grp.create_group("mean_field"), self.summary.mean_field)
+            grp.attrs["peak_cov"] = self.summary.peak_cov
             if self.roi_samples is not None:
-                grp = h5f.create_group("roi_samples")
+                roi = h5f.create_group("roi_samples")
                 for roi_name, arr in self.roi_samples.items():
-                    grp.create_dataset(roi_name, data=np.asarray(arr))
+                    roi.create_dataset(roi_name, data=np.asarray(arr))
             for name in ("peak_samples", "focality_samples", "peak_location_samples"):
                 value = getattr(self, name)
                 if value is not None:
@@ -235,45 +225,33 @@ class ConductivityUQResult:
         """Read a saved conductivity-UQ result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
             _check_format_version(h5f, path, _FORMAT_VERSION)
-            data = {
-                k: np.asarray(h5f[k])
-                for k in (
-                    "mean_magnE",
-                    "std_magnE",
-                    "cov_magnE",
-                    "vols",
-                    "tet_tags",
-                    "barycenters_mm",
-                    "sigma_samples",
-                )
-            }
-            placement = Placement(
-                center_mm=h5f.attrs["placement_center_mm"],
-                handle_mm=h5f.attrs["placement_handle_mm"],
-                distance_mm=float(h5f.attrs["placement_distance_mm"]),
-            )
-            roi_samples = (
-                {k: np.asarray(v) for k, v in h5f["roi_samples"].items()}
-                if "roi_samples" in h5f
-                else None
-            )
-            per_draw = {
-                name: np.asarray(h5f[name]) if name in h5f else None
-                for name in ("peak_samples", "focality_samples", "peak_location_samples")
-            }
             return cls(
-                mean_magnE=data["mean_magnE"],
-                std_magnE=data["std_magnE"],
-                cov_magnE=data["cov_magnE"],
+                mean_magnE=_opt_array(h5f, "mean_magnE"),
+                std_magnE=_opt_array(h5f, "std_magnE"),
+                cov_magnE=_opt_array(h5f, "cov_magnE"),
                 n_samples=int(h5f.attrs["n_samples"]),
                 perturbed_tags=tuple(int(t) for t in h5f.attrs["perturbed_tags"]),
-                sigma_samples=data["sigma_samples"],
-                vols=data["vols"],
-                tet_tags=data["tet_tags"],
-                barycenters_mm=data["barycenters_mm"],
-                placement=placement,
+                sigma_samples=np.asarray(h5f["sigma_samples"]),
+                vols=_opt_array(h5f, "vols"),
+                tet_tags=_opt_array(h5f, "tet_tags"),
+                barycenters_mm=_opt_array(h5f, "barycenters_mm"),
+                placement=Placement(
+                    center_mm=h5f.attrs["placement_center_mm"],
+                    handle_mm=h5f.attrs["placement_handle_mm"],
+                    distance_mm=float(h5f.attrs["placement_distance_mm"]),
+                ),
                 coil_name=str(h5f.attrs["coil_name"]),
                 didt=float(h5f.attrs["didt"]),
-                roi_samples=roi_samples,
-                **per_draw,
+                summary=ConductivityUQSummary(
+                    mean_field=_read_metrics(h5f["summary"]["mean_field"]),
+                    peak_cov=float(h5f["summary"].attrs["peak_cov"]),
+                ),
+                roi_samples=(
+                    {k: np.asarray(v) for k, v in h5f["roi_samples"].items()}
+                    if "roi_samples" in h5f
+                    else None
+                ),
+                peak_samples=_opt_array(h5f, "peak_samples"),
+                focality_samples=_opt_array(h5f, "focality_samples"),
+                peak_location_samples=_opt_array(h5f, "peak_location_samples"),
             )

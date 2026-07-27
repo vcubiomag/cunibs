@@ -5,7 +5,7 @@ from importlib.metadata import version
 from cunibs import coil, metrics
 from cunibs.coil import Coil
 from cunibs.mesh import HeadMesh, load_mesh
-from cunibs.simulation import FieldResult, FieldSummary, Placement, Subject
+from cunibs.simulation import FieldResult, Placement, Subject
 from cunibs import adm, uq
 from cunibs.adm import ResolvedTarget, Target, resolve_target
 from cunibs.uq import ConductivityUQConfig, ConductivityUQResult, ConductivityUQSummary
@@ -17,7 +17,6 @@ __all__ = [
     "Subject",
     "Placement",
     "FieldResult",
-    "FieldSummary",
     "Coil",
     "HeadMesh",
     "load_mesh",

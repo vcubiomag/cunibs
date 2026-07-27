@@ -143,7 +143,8 @@ positive coil-handle direction. cuNIBS projects the target onto the scalp,
 constructs the coil frame from the local surface normal, and applies
 `distance_mm` along the outward normal.
 
-Pass a sequence of placements to reuse the assembled system and AMG hierarchy:
+`simulate` takes one placement. Use `iter_simulate` to sweep many, reusing the
+assembled system and AMG hierarchy:
 
 ```python
 placements = [
@@ -151,26 +152,37 @@ placements = [
     Placement([20.0, 0.0, 80.0], [70.0, 0.0, 80.0]),
 ]
 
-results = subject.simulate(coil, placements, didt=1.0e6)
+for result in subject.iter_simulate(coil, placements, didt=1.0e6):
+    print(result.peak_magnE())
 ```
 
-The first call builds the GPU solver state. Later calls on the same `Subject`
-reuse it. By default, `simulate` returns compact CPU-side summaries and does not
-retain full-volume field arrays.
+`iter_simulate` is a generator: it yields one result per placement, in the order
+given, and the previous one is freed as the loop advances. Peak memory is bounded
+by one block rather than by the number of placements, so a sweep of any length
+fits. Nothing is computed until you iterate. Wrap the call in `list()` if you
+want them all at once (always safe for summaries, which are about a kilobyte
+of memory each).
 
-Placements in a sequence are solved in blocks that share a single stiffness /
-hierarchy read per block via a lockstep block CG. The block width defaults to the
-hardware sweet spot; tune it per GPU with `block_k` (`1` restores the serial
-per-placement path):
+The first call builds the GPU solver state. Later calls on the same `Subject`
+reuse it. By default both methods return compact CPU-side summaries, computed on
+the GPU without ever copying a full-volume array to the host.
+
+Placements are solved in blocks that share a single stiffness / hierarchy read
+per block via a lockstep block CG. The block width defaults to the hardware sweet
+spot; tune it per GPU with `block_k` (`1` restores the serial per-placement
+path). Because a block is solved as a unit, `block_k` also caps peak memory when
+fields are retained. The default `block_k` of 8 is likely sufficent for most modern
+GPUs:
 
 ```python
-results = subject.simulate(coil, placements, didt=1.0e6, block_k=4)
+for result in subject.iter_simulate(coil, placements, didt=1.0e6, block_k=4):
+    ...
 ```
 
 ### Batch over subjects
 
 A `Subject` caches its solver context and AMG hierarchy on the GPU for its
-lifetime, which is what makes repeated placements cheap but also means the device
+lifetime, which makes repeated placements cheap but also means the device
 memory is held until the subject is released. When looping over many subjects,
 use the context manager (or call `subject.free()`) to reclaim that memory between
 subjects instead of accumulating it:
@@ -187,16 +199,39 @@ for mesh_file in Path("subjects").glob("m2m_*/*.msh"):
 
 ## Results
 
-`FieldSummary` contains the placement metadata, the coil-to-head transform, and
-the gray-matter metric summary. Retain raw fields explicitly when per-tetrahedron
-arrays are needed:
+Every `FieldResult` carries `summary`, the gray-matter metrics, alongside the
+placement metadata and the coil-to-head transform:
 
 ```python
-field = subject.simulate(coil, placement, didt=1.0e6, retain_fields=True)
-gpu_field = subject.simulate(
-    coil, placement, didt=1.0e6, retain_fields=True, device="gpu"
-)
+result = subject.simulate(coil, placement, didt=1.0e6)
+
+result.peak_magnE()
+result.focality(0.5)
+result.summary["distribution"]["p99"]
 ```
+
+The full-volume arrays are opt-in, because they are what makes a result large. On
+a 4M-tetrahedron head model the three together are roughly 70 MB, of which `E` is
+about 69%, `magnE` 23%, and `v` 8%; with none of them a result is about a
+kilobyte. Ask for the ones you need:
+
+```python
+result = subject.simulate(coil, placement, didt=1.0e6, magnitude=True)
+
+for result in subject.iter_simulate(
+    coil, placements, magnitude=True, vectors=True, potential=True
+):
+    ...
+```
+
+`result.magnE`, `result.E` and `result.v` are `None` when they were not
+requested. Retaining `magnitude` additionally unlocks the two metrics a
+precomputed summary cannot answer -- `summary_for(region)` for a non-default
+tissue, and `focality(frac)` at an arbitrary fraction -- both of which otherwise
+raise a message naming the flag to pass.
+
+Results are always NumPy. If you need device-resident fields, call
+`cunibs.fem.solve_placements_block` directly.
 
 `FieldResult` contains:
 
@@ -216,11 +251,12 @@ Metrics can be computed over gray matter or the complete volume when fields are
 retained:
 
 ```python
-gray_matter = result.summary("gray_matter")
-whole_model = result.summary("all")
+gray_matter = result.summary_for("gray_matter")
+whole_model = result.summary_for("all")
 ```
 
-Save a result and its metric inputs to HDF5:
+Save a result and its metric inputs to HDF5. Fields that were not retained are
+absent from the file and load back as `None`:
 
 ```python
 field.save("placement.h5")
@@ -283,8 +319,8 @@ print(uq_result.peak_mean_magnE())
 print(uq_result.peak_cov())
 ```
 
-By default, conductivity UQ returns compact CPU-side metrics. Retain the
-per-tetrahedron moment arrays explicitly:
+A `ConductivityUQResult` carries its `summary` the same way, computed on the
+device. Pass `moments=True` to also retain the per-tetrahedron moment arrays:
 
 ```python
 uq_fields = subject.simulate_conductivity_uq(
@@ -292,9 +328,16 @@ uq_fields = subject.simulate_conductivity_uq(
     placement,
     config,
     didt=1.0e6,
-    retain_fields=True,
+    moments=True,
 )
 ```
+
+The three moments are kept or dropped together: the metrics need both the mean
+and the CoV, and the third is recoverable from those two, so a subset would break
+them to save a third of the bytes.
+
+`iter_simulate_conductivity_uq` streams a sequence of placements the same way
+`iter_simulate` does.
 
 `mean_magnE`, `std_magnE`, and `cov_magnE` use the same tetrahedron ordering as
 `FieldResult.magnE` when fields are retained. `peak_mean_magnE` and `peak_cov`
