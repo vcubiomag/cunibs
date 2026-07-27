@@ -250,6 +250,12 @@ Results are always NumPy. If you need device-resident fields, call
 
 The metric API reports the peak field, peak location, stimulated volume,
 field-weighted centre of gravity, and volume-weighted distribution statistics.
+
+`peak_magnE()` is the true maximum of `|E|`. Focality is measured against the
+volume-weighted 99.9th percentile instead where `focality(0.5)` is the volume with
+`|E|` at or above half of that percentile. This is because on a tetrahedral mesh the
+maximum is routinely set by a single sliver element at a tissue boundary.
+
 Metrics can be computed over gray matter or the complete volume when fields are
 retained:
 

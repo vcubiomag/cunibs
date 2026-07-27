@@ -15,8 +15,13 @@ type Region = TissueLabel | Literal["all"]
 
 _LABEL_TO_TAG: dict[str, int] = {label: tag for tag, label in VOLUME_KEY_TO_LABEL.items()}
 
-DEFAULT_PERCENTILES = (50.0, 95.0, 99.0, 99.9)
-DEFAULT_FOCALITY_FRAC = 0.5
+_SUMMARY_PERCENTILES = (50.0, 95.0, 99.0, 99.9)
+_SUMMARY_FOCALITY_FRACS = (0.5, 0.75)
+
+# Focality is measured against a high percentile rather than the maximum: on a tetrahedral
+# mesh the max |E| is routinely set by one sliver element at a tissue boundary, too noisy to
+# anchor a threshold to.
+FOCALITY_ANCHOR_PERCENTILE = 99.9
 
 
 class FieldMetrics(TypedDict):
@@ -44,7 +49,7 @@ def region_mask(tet_tags: ArrayT, region: Region) -> ArrayT:
     return tet_tags == tag
 
 
-def _weighted_quantiles(values: ArrayT, weights: ArrayT, qs: ArrayT) -> ArrayT:
+def weighted_quantiles(values: ArrayT, weights: ArrayT, qs: ArrayT) -> ArrayT:
     """Volume-weighted quantiles of ``values`` (``qs`` in [0, 1])."""
     xp = cp.get_array_module(values)
     order = xp.argsort(values)
@@ -53,11 +58,26 @@ def _weighted_quantiles(values: ArrayT, weights: ArrayT, qs: ArrayT) -> ArrayT:
     cw = xp.cumsum(w)
     # Midpoint positions prevent a single element from spanning its full weight interval.
     pos = (cw - 0.5 * w) / cw[-1]
-    return xp.interp(qs, pos, v)
+    # Evaluate at pos's precision: in float32 a tail quantile like 0.999 lands ~1e-8 off, and
+    # where the tail is steep that moves a focality threshold enough to flip elements across it.
+    return xp.interp(xp.asarray(qs, dtype=pos.dtype), pos, v)
 
 
 def peak_magnitude(magnE: ArrayT, mask: ArrayT) -> float:
+    """Largest |E| in the region.
+
+    This is the true maximum. For a value less sensitive to a single outlier element, use
+    :func:`percentile_magnitude`.
+    """
     return float(magnE[mask].max())
+
+
+def percentile_magnitude(magnE: ArrayT, vols: ArrayT, mask: ArrayT, percentile: float) -> float:
+    """Volume-weighted percentile of |E| in the region."""
+    xp = cp.get_array_module(magnE)
+    m = magnE[mask]
+    q = xp.asarray([percentile / 100.0], dtype=m.dtype)
+    return float(cp.asnumpy(weighted_quantiles(m, vols[mask], q))[0])
 
 
 def peak_location_mm(
@@ -77,10 +97,18 @@ def stimulated_volume(magnE: ArrayT, vols: ArrayT, mask: ArrayT, threshold: floa
 
 
 def focality(
-    magnE: ArrayT, vols: ArrayT, mask: ArrayT, frac: float = DEFAULT_FOCALITY_FRAC
+    magnE: ArrayT,
+    vols: ArrayT,
+    mask: ArrayT,
+    frac: float = 0.5,
+    anchor_percentile: float = FOCALITY_ANCHOR_PERCENTILE,
 ) -> float:
-    """Return the volume with ``|E| >= frac * peak(|E|)``."""
-    return stimulated_volume(magnE, vols, mask, frac * peak_magnitude(magnE, mask))
+    """Volume with ``|E| >= frac * P``, ``P`` being the volume-weighted ``anchor_percentile``.
+
+    Pass ``anchor_percentile=100`` to measure against the true maximum instead.
+    """
+    anchor = percentile_magnitude(magnE, vols, mask, anchor_percentile)
+    return stimulated_volume(magnE, vols, mask, frac * anchor)
 
 
 def center_of_gravity_mm(
@@ -96,7 +124,7 @@ def distribution(
     magnE: ArrayT,
     vols: ArrayT,
     mask: ArrayT,
-    percentiles: tuple[float, ...] = DEFAULT_PERCENTILES,
+    percentiles: tuple[float, ...] = _SUMMARY_PERCENTILES,
 ) -> dict[str, float]:
     """Volume-weighted mean/std and percentiles of |E| in the region."""
     xp = cp.get_array_module(magnE)
@@ -106,7 +134,7 @@ def distribution(
     mean = float((w * m).sum() / wsum)
     var = float((w * (m - mean) ** 2).sum() / wsum)
     qs = xp.asarray([p / 100.0 for p in percentiles], dtype=m.dtype)
-    pvals = cp.asnumpy(_weighted_quantiles(m, w, qs))
+    pvals = cp.asnumpy(weighted_quantiles(m, w, qs))
     out = {"mean": mean, "std": float(np.sqrt(var))}
     out.update({f"p{p:g}": float(val) for p, val in zip(percentiles, pvals, strict=False)})
     return out
@@ -119,13 +147,25 @@ def compute_metrics(
     tet_tags: ArrayT,
     *,
     region: Region = "gray_matter",
-    focality_fracs: tuple[float, ...] = (DEFAULT_FOCALITY_FRAC,),
-    percentiles: tuple[float, ...] = DEFAULT_PERCENTILES,
+    focality_fracs: tuple[float, ...] = _SUMMARY_FOCALITY_FRACS,
+    percentiles: tuple[float, ...] = _SUMMARY_PERCENTILES,
 ) -> FieldMetrics:
-    """Compute all E-field metrics for one tissue region."""
+    """Compute all E-field metrics for one tissue region.
+
+    ``peak_magnE`` is the true maximum; the focality volumes are measured against
+    :data:`FOCALITY_ANCHOR_PERCENTILE` of |E| instead (see :func:`focality`).
+    """
     mask = region_mask(tet_tags, region)
     peak = peak_magnitude(magnE, mask)
     dist = distribution(magnE, vols, mask, percentiles)
+    # Reuse the percentile the distribution already sorted for, and share the one anchor
+    # across every fraction.
+    anchor_key = f"p{FOCALITY_ANCHOR_PERCENTILE:g}"
+    anchor = (
+        dist[anchor_key]
+        if anchor_key in dist
+        else percentile_magnitude(magnE, vols, mask, FOCALITY_ANCHOR_PERCENTILE)
+    )
     return {
         "region": region,
         "peak_magnE": peak,
@@ -133,7 +173,8 @@ def compute_metrics(
         "center_of_gravity_mm": center_of_gravity_mm(magnE, vols, barycenters_mm, mask),
         "region_volume_m3": float(vols[mask].sum()),
         "focality_m3": {
-            f"{frac:g}": focality(magnE, vols, mask, frac) for frac in focality_fracs
+            f"{frac:g}": stimulated_volume(magnE, vols, mask, frac * anchor)
+            for frac in focality_fracs
         },
         "distribution": dist,
     }

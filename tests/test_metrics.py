@@ -28,10 +28,38 @@ def test_peak_excludes_other_regions():
     np.testing.assert_allclose(metrics.peak_location_mm(MAGNE, BARY, mask), [2, 0, 0])
 
 
-def test_focality_volume_above_half_peak():
+def test_focality_volume_above_half_the_anchor():
     mask = metrics.region_mask(TAGS, "gray_matter")
+    # Three elements: p99.9 saturates to the max, so both anchors agree here.
     assert metrics.focality(MAGNE, VOLS, mask, 0.5) == 2.0
     assert metrics.stimulated_volume(MAGNE, VOLS, mask, 2.5) == 1.0
+
+
+def test_focality_anchors_to_a_percentile_not_the_max():
+    """One hot sliver must not drag the focality threshold up with it."""
+    magn = np.concatenate([np.ones(9999), [100.0]])
+    vols = np.ones(10000)
+    mask = np.ones(10000, dtype=bool)
+
+    assert metrics.peak_magnitude(magn, mask) == 100.0
+    assert metrics.percentile_magnitude(magn, vols, mask, 99.9) == pytest.approx(1.0)
+
+    assert metrics.focality(magn, vols, mask, 0.5) == pytest.approx(10000.0)
+    assert metrics.focality(magn, vols, mask, 0.5, anchor_percentile=100.0) == pytest.approx(
+        1.0
+    )
+
+
+def test_compute_metrics_focality_matches_the_focality_function():
+    m = metrics.compute_metrics(
+        MAGNE, VOLS, BARY, TAGS, region="gray_matter", focality_fracs=(0.25, 0.5, 0.9)
+    )
+    assert set(m["focality_m3"]) == {"0.25", "0.5", "0.9"}
+    mask = metrics.region_mask(TAGS, "gray_matter")
+    for frac in (0.25, 0.5, 0.9):
+        assert m["focality_m3"][f"{frac:g}"] == pytest.approx(
+            metrics.focality(MAGNE, VOLS, mask, frac)
+        )
 
 
 def test_distribution_volume_weighted_mean():
@@ -46,7 +74,7 @@ def test_compute_metrics_shape():
     m = metrics.compute_metrics(MAGNE, VOLS, BARY, TAGS, region="gray_matter")
     assert m["peak_magnE"] == 3.0
     assert m["region_volume_m3"] == 3.0
-    assert set(m["focality_m3"]) == {"0.5"}
+    assert set(m["focality_m3"]) == {"0.5", "0.75"}
     assert "mean" in m["distribution"]
     assert m["center_of_gravity_mm"].shape == (3,)
 
@@ -63,15 +91,15 @@ def test_weighted_quantiles_matches_hazen_under_uniform_weights():
     rng = np.random.default_rng(0)
     values = rng.random(1001)
     qs = np.array([0.01, 0.1, 0.5, 0.95, 0.99, 0.999])
-    got = metrics._weighted_quantiles(values, np.ones_like(values), qs)
+    got = metrics.weighted_quantiles(values, np.ones_like(values), qs)
     np.testing.assert_allclose(got, np.quantile(values, qs, method="hazen"), atol=1e-9)
 
 
 def test_weighted_quantiles_respects_weights():
     """A 9:1 weight split pulls the median almost all the way onto the heavy value."""
     values = np.array([1.0, 2.0])
-    light = metrics._weighted_quantiles(values, np.array([1.0, 9.0]), np.array([0.5]))
-    heavy = metrics._weighted_quantiles(values, np.array([9.0, 1.0]), np.array([0.5]))
+    light = metrics.weighted_quantiles(values, np.array([1.0, 9.0]), np.array([0.5]))
+    heavy = metrics.weighted_quantiles(values, np.array([9.0, 1.0]), np.array([0.5]))
     assert float(light[0]) > 1.8
     assert float(heavy[0]) < 1.2
 
@@ -81,8 +109,8 @@ def test_weighted_quantiles_is_scale_invariant_in_weights():
     values, weights = rng.random(50), rng.random(50) + 0.1
     qs = np.array([0.25, 0.5, 0.9])
     np.testing.assert_allclose(
-        metrics._weighted_quantiles(values, weights, qs),
-        metrics._weighted_quantiles(values, weights * 1e6, qs),
+        metrics.weighted_quantiles(values, weights, qs),
+        metrics.weighted_quantiles(values, weights * 1e6, qs),
         rtol=1e-12,
     )
 

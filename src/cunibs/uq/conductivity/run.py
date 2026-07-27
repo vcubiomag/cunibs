@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import cupyx.scipy.sparse as csp
 
+from cunibs import metrics
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.solver import (
@@ -90,7 +91,8 @@ def run_conductivity_uq(
     whole-field metrics only) is given, each draw's per-tet field is reduced in-place — no host
     sync in the loop — into the per-sample arrays returned on the result: the volume-weighted mean
     ``|E|`` over each named ROI (``roi_samples``), plus the gray-matter peak ``|E|``
-    (``peak_samples``), the stimulated volume ``|E| >= focality_frac * peak`` (``focality_samples``),
+    (``peak_samples``), the focality volume anchored as in :func:`cunibs.metrics.focality`
+    (``focality_samples``),
     and the peak location (``peak_location_samples``). These are the distributional quantities that a
     metric of the mean field (``ConductivityUQResult.summary``) cannot provide.
     """
@@ -162,6 +164,7 @@ def run_conductivity_uq(
         gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
         vols_gm = ctx.vols[gm_idx].astype(cp.float64)
         bary_gm = cp.asarray(ctx.mesh.tet_barycenters_mm)[gm_idx]
+        anchor_q = cp.asarray([metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0], dtype=cp.float64)
         roi_names = list(record_rois)
         probe_idx = [
             cp.ascontiguousarray(record_rois[n].elem_idx.astype(cp.int64)) for n in roi_names
@@ -214,9 +217,11 @@ def run_conductivity_uq(
 
         if recording:
             magn_gm = magn[gm_idx]
-            peak = magn_gm.max()
-            peak_s[k] = peak
-            foc_s[k] = vols_gm[magn_gm >= focality_frac * peak].sum()
+            peak_s[k] = magn_gm.max()
+            # Same percentile anchor as metrics.focality, so a per-draw focality and the
+            # summary's measure the same thing. Kept on device: reading it would sync the loop.
+            anchor = metrics.weighted_quantiles(magn_gm, vols_gm, anchor_q)
+            foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
             peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
             for j, (idx, w) in enumerate(zip(probe_idx, probe_w, strict=False)):
                 roi_s[k, j] = (magn[idx].astype(cp.float64) * w).sum()

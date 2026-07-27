@@ -151,6 +151,28 @@ def test_uq_degenerate_matches_forward(cp, cube_mesh):
     assert float(cp.asarray(r.std_magnE).max()) == 0.0
 
 
+@pytest.mark.realmesh
+def test_per_draw_focality_uses_the_same_anchor_as_the_summary(
+    patch_subject, patch_placement, d70_coil
+):
+    """With no conductivity spread every draw is the mean field, so the two must agree.
+
+    Needs the patch: the cube's six gray-matter elements make p99.9 saturate to the max, so
+    both anchors would agree there whether or not they are the same.
+    """
+    from cunibs import ConductivityUQConfig
+
+    # Every tissue pinned: unlisted tags fall back to DEFAULT_TISSUE_COV and would vary.
+    cfg = ConductivityUQConfig(n_samples=4, tissue_cov={2: 0.0}, perturbed_tags=(2,), seed=1)
+    r = patch_subject.simulate_conductivity_uq(
+        d70_coil, patch_placement, config=cfg, moments=True, record_rois={}
+    )
+
+    assert r.summary is not None
+    expected = r.summary.mean_field["focality_m3"]["0.5"]
+    np.testing.assert_allclose(r.focality_samples, expected, rtol=1e-6)
+
+
 def test_uq_homogeneous_has_no_sensitivity(cp, cube_mesh):
     """A single-tissue domain: scaling σ scales K and b equally, so |E| is σ-invariant."""
     from cunibs import ConductivityUQConfig, Subject

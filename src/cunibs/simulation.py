@@ -538,9 +538,12 @@ class FieldResult:
         return self.summary_for(region)["center_of_gravity_mm"]
 
     def focality(self, frac: float = 0.5, region: metrics.Region = _DEFAULT_REGION) -> float:
-        """Volume with ``|E| >= frac * peak``.
+        """Volume with ``|E| >= frac *`` the 99.9th percentile of |E| in the region.
 
-        ``summary`` already carries the default fraction; any other one needs ``magnE``,
+        The anchor is a high percentile rather than :meth:`peak_magnE` so that one outlier
+        element cannot move the threshold; see :func:`cunibs.metrics.focality`.
+
+        ``summary`` already carries the default fractions; any other one needs ``magnE``,
         so the run has to have passed ``magnitude=True``.
         """
         key = f"{frac:g}"
