@@ -441,6 +441,7 @@ def test_place_transforms_batches_independently(cp, cube_subject, stream):
 
     def run(sel):
         out = cp.empty((len(sel), 16), dtype=cp.float64)
+        degenerate = cp.empty(len(sel), dtype=cp.int32)
         place_transforms(
             cp.ascontiguousarray(cp.asarray(centers[sel])),
             cp.ascontiguousarray(cp.asarray(handles[sel])),
@@ -450,8 +451,10 @@ def test_place_transforms_batches_independently(cp, cube_subject, stream):
             ctx.skin_c,
             cp.ascontiguousarray(ctx.skin_tri_normals, dtype=cp.float64),
             out,
+            degenerate,
             stream,
         )
+        assert not cp.asnumpy(degenerate).any()
         return cp.asnumpy(out).reshape(-1, 4, 4)
 
     everything = run(np.arange(4))

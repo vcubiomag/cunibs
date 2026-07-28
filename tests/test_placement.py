@@ -113,6 +113,118 @@ def test_transform_orthogonalizes_the_handle(cube_subject):
     assert y[1] > 0  # still points along +y, the in-plane part of the handle
 
 
+def test_transform_rejects_a_handle_along_the_normal(cube_subject, cube_mesh):
+    """A handle straight above the projected centre leaves the in-plane axis undefined.
+
+    Placement cannot catch this one: the degeneracy is against the scalp projection of
+    center_mm, not against center_mm itself.
+    """
+    ctx = cube_subject.context
+    center = np.array([50.0, 50.0, 120.0])
+    proj, tri = project_to_skin(cube_mesh, center)
+    normal = cube_mesh.skin_triangle_normals[tri]
+
+    with pytest.raises(ValueError, match="Degenerate coil placement"):
+        compute_coil_transform(ctx, center, proj + 10.0 * normal, 4.0)
+
+
+def test_transform_rejects_a_handle_on_the_projected_centre(cube_subject, cube_mesh):
+    center = np.array([50.0, 50.0, 120.0])
+    proj, _ = project_to_skin(cube_mesh, center)
+    with pytest.raises(ValueError, match="Degenerate coil placement"):
+        compute_coil_transform(cube_subject.context, center, proj, 4.0)
+
+
+def test_transform_batch_names_the_degenerate_placement(cube_subject, cube_mesh):
+    ctx = cube_subject.context
+    center = np.array([50.0, 50.0, 120.0])
+    proj, tri = project_to_skin(cube_mesh, center)
+    normal = cube_mesh.skin_triangle_normals[tri]
+
+    centers = np.stack([center, center])
+    handles = np.stack([np.array([50.0, 150.0, 100.0]), proj + 10.0 * normal])
+    with pytest.raises(ValueError, match=r"index 1 of 2"):
+        compute_coil_transforms(ctx, centers, handles, np.array([4.0, 4.0]))
+
+
+def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(cp, cube_subject, cube_mesh):
+    """Show the failure the guard exists for, by reading the kernel's raw output.
+
+    Two handles that differ only in their (annihilated) in-plane component must describe two
+    different coil rotations. They do not: the frames come back identical, because the axis is
+    whatever the fallback picked. Reporting that as a valid placement is the bug.
+    """
+    from cunibs.solver import place_transforms
+
+    ctx = cube_subject.context
+    center = np.array([50.0, 50.0, 120.0])
+    proj, tri = project_to_skin(cube_mesh, center)
+    normal = cube_mesh.skin_triangle_normals[tri]
+
+    # Both handles sit on the outward normal through proj, so neither carries an in-plane
+    # direction; a caller could reasonably expect them to mean different rotations.
+    handles = np.stack([proj + 10.0 * normal, proj + 250.0 * normal])
+    out = cp.empty((2, 16), dtype=cp.float64)
+    degenerate = cp.empty(2, dtype=cp.int32)
+    place_transforms(
+        cp.asarray(np.stack([center, center])),
+        cp.asarray(handles),
+        cp.asarray([4.0, 4.0]),
+        ctx.skin_a,
+        ctx.skin_b,
+        ctx.skin_c,
+        cp.ascontiguousarray(ctx.skin_tri_normals, dtype=cp.float64),
+        out,
+        degenerate,
+        cp.cuda.get_current_stream().ptr,
+    )
+    tf = cp.asnumpy(out).reshape(2, 4, 4)
+
+    assert cp.asnumpy(degenerate).tolist() == [1, 1]
+    # Frames are finite and orthonormal -- nothing downstream could detect the problem.
+    assert np.isfinite(tf).all()
+    np.testing.assert_allclose(tf[0, :3, :3] @ tf[0, :3, :3].T, np.eye(3), atol=1e-12)
+    # And identical, so the handle contributed nothing.
+    np.testing.assert_allclose(tf[0, :3, :3], tf[1, :3, :3], atol=1e-15)
+
+
+def test_near_degenerate_handle_is_rejected_before_it_becomes_noise(cube_subject, cube_mesh):
+    """The tolerance has to catch handles that are merely *nearly* along the normal.
+
+    At 1e-9 rad off the normal the in-plane component is pure rounding error, so the resulting
+    rotation is arbitrary even though nothing is exactly zero.
+    """
+    ctx = cube_subject.context
+    center = np.array([50.0, 50.0, 120.0])
+    proj, tri = project_to_skin(cube_mesh, center)
+    normal = cube_mesh.skin_triangle_normals[tri]
+    tangent = np.cross(normal, [1.0, 0.0, 0.0])
+    tangent /= np.linalg.norm(tangent)
+
+    with pytest.raises(ValueError, match="Degenerate coil placement"):
+        compute_coil_transform(ctx, center, proj + normal + 1e-9 * tangent, 4.0)
+
+    # One well clear of the threshold still resolves, and follows the tangent it was given.
+    tf = compute_coil_transform(ctx, center, proj + normal + 1e-3 * tangent, 4.0)
+    np.testing.assert_allclose(tf[:3, 1], tangent, atol=1e-6)
+
+
+def test_transform_without_a_handle_is_orthonormal(cp, cube_subject):
+    """The no-handle path still has to produce a usable frame, not a poisoned one."""
+    ctx = cube_subject.context
+    centers = np.array([[50.0, 50.0, 120.0], [30.0, 70.0, 120.0]])
+    tf = cp.asnumpy(compute_coil_transforms(ctx, centers, None, np.array([4.0, 4.0])))
+
+    for i in range(2):
+        r = tf[i, :3, :3]
+        np.testing.assert_allclose(r @ r.T, np.eye(3), atol=1e-12)
+        assert np.linalg.det(r) == pytest.approx(1.0, abs=1e-12)
+        # The translation and inward normal must match the handled path exactly.
+        withhandle = compute_coil_transform(ctx, centers[i], centers[i] + [0, 50, 0], 4.0)
+        np.testing.assert_allclose(tf[i, :3, 3], withhandle[:3, 3], atol=1e-12)
+        np.testing.assert_allclose(tf[i, :3, 2], withhandle[:3, 2], atol=1e-12)
+
+
 def test_transform_distance_offsets_along_the_outward_normal(cube_subject, cube_mesh):
     """distance_mm slides the origin along the outward normal and rotates nothing."""
     ctx = cube_subject.context

@@ -118,6 +118,10 @@ class Placement:
 
     ``center_mm`` is the scalp target. ``handle_mm`` defines the positive handle direction.
     ``distance_mm`` sets the offset along the outward normal.
+
+    All three must be finite, and ``handle_mm`` must differ from ``center_mm``. A handle on
+    the outward normal through the scalp projection of ``center_mm`` is rejected too, but only
+    once a mesh is available to project against.
     """
 
     center_mm: npt.NDArray[np.float64]
@@ -130,9 +134,20 @@ class Placement:
         handle_mm: npt.ArrayLike,
         distance_mm: float = 4.0,
     ) -> None:
-        object.__setattr__(self, "center_mm", _as_point(center_mm))
-        object.__setattr__(self, "handle_mm", _as_point(handle_mm))
-        object.__setattr__(self, "distance_mm", float(distance_mm))
+        center = _as_point(center_mm)
+        handle = _as_point(handle_mm)
+        distance = float(distance_mm)
+        if not (np.isfinite(center).all() and np.isfinite(handle).all()):
+            raise ValueError("center_mm and handle_mm must be finite 3-vectors.")
+        if not np.isfinite(distance):
+            raise ValueError("distance_mm must be finite.")
+        if np.array_equal(center, handle):
+            raise ValueError(
+                "handle_mm must differ from center_mm; it defines the coil's handle direction."
+            )
+        object.__setattr__(self, "center_mm", center)
+        object.__setattr__(self, "handle_mm", handle)
+        object.__setattr__(self, "distance_mm", distance)
 
 
 class Subject:
@@ -205,7 +220,10 @@ class Subject:
         """ROIs at increasing depth along ``inward_dir`` from a cortical point."""
         p = _as_point(cortical_point_mm)
         d = _as_point(inward_dir)
-        d = d / np.linalg.norm(d)
+        norm = float(np.linalg.norm(d))
+        if not np.isfinite(norm) or norm == 0.0:
+            raise ValueError("inward_dir must be a non-zero, finite 3-vector.")
+        d = d / norm
         return [
             self.roi(p + depth * d, radius_mm=radius_mm, region=region) for depth in depths_mm
         ]

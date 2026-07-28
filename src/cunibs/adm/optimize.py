@@ -123,7 +123,9 @@ def _project(
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Scalp contact point, outward normal, and in-plane rotation basis for each center."""
     dist = cp.full(centers.shape[0], distance_mm, dtype=cp.float64)
-    base = compute_coil_transforms(ctx, centers, centers + cp.asarray([1.0, 0.0, 0.0]), dist)
+    # No handle: only the normal and translation are read, and the rotation basis comes from
+    # _inplane_basis below.
+    base = compute_coil_transforms(ctx, centers, None, dist)
     normal = -base[:, :3, 2]
     proj = base[:, :3, 3] - distance_mm * normal
     u, v = _inplane_basis(normal)

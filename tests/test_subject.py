@@ -191,6 +191,13 @@ def test_depth_probes_rejects_bad_vectors(cube_subject):
         cube_subject.depth_probes([50, 50, 100], [0, 0], [0.0])
 
 
+@pytest.mark.parametrize("bad", [[0, 0, 0], [np.nan, 0, -1]])
+def test_depth_probes_rejects_an_undefined_direction(cube_subject, bad):
+    """Otherwise the probe points are NaN and every depth silently resolves to element 0."""
+    with pytest.raises(ValueError, match="inward_dir must be a non-zero, finite 3-vector"):
+        cube_subject.depth_probes([50, 50, 100], bad, [0.0, 5.0], radius_mm=40.0)
+
+
 @pytest.mark.realmesh
 def test_two_subjects_are_independent(fresh_subject, patch_mesh, cube_mesh, synthetic_coil):
     """Freeing one subject must not disturb another's cached state."""

@@ -52,6 +52,22 @@ def test_placement_rejects_non_3vector(bad):
         Placement([0, 0, 1], bad)
 
 
+def test_placement_rejects_a_handle_equal_to_the_centre():
+    """Without a direction the coil's rotation about the normal is undefined, not merely odd."""
+    with pytest.raises(ValueError, match="handle_mm must differ from center_mm"):
+        Placement([1, 2, 3], [1, 2, 3])
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+def test_placement_rejects_non_finite_points(bad):
+    with pytest.raises(ValueError, match="must be finite"):
+        Placement([bad, 0, 0], [0, 0, 1])
+    with pytest.raises(ValueError, match="must be finite"):
+        Placement([0, 0, 0], [0, 0, bad])
+    with pytest.raises(ValueError, match="must be finite"):
+        Placement([0, 0, 0], [0, 0, 1], distance_mm=bad)
+
+
 def test_placement_accepts_any_shape_holding_three_values():
     p = Placement(np.array([[1.0], [2.0], [3.0]]), (4, 5, 6))
     np.testing.assert_array_equal(p.center_mm, [1, 2, 3])

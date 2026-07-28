@@ -29,9 +29,14 @@ void launch_node_scatter3(const double* w_e, const int* ptr, const int* idx, dou
 void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
                                cudaStream_t stream);
 
+// handles may be null, for callers that want only the scalp projection and normal; the frame
+// then takes an arbitrary but deterministic in-plane axis. degenerate (n_pl) is set to 1 where
+// a supplied handle left the in-plane axis undefined and that same fallback was used instead;
+// pass null alongside a null handles, where the flag would carry no information. The transform
+// is orthonormal either way.
 void launch_place(const double* centers, const double* handles, const double* dists,
                   const double* a, const double* b, const double* c, const double* tnorm,
-                  double* out, int n_pl, int n_tri, cudaStream_t stream);
+                  double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream);
 
 // Block (k <= 8 placements per chunk) variants of the per-placement stages: the shared
 // mesh arrays (tet_nodes, wg, node2corner, g) are read once per chunk rather than once

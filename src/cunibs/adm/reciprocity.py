@@ -201,12 +201,8 @@ def _coverage_grid(
 ) -> Grid:
     """Grid covering every coil dipole for the coil placed at any rotation on each center."""
     centers = cp.ascontiguousarray(cp.asarray(centers_mm, dtype=cp.float64).reshape(-1, 3))
-    base = compute_coil_transforms(
-        ctx,
-        centers,
-        centers + cp.asarray([1.0, 0.0, 0.0]),
-        cp.full(centers.shape[0], distance_mm),
-    )
+    # No handle: only the translation is read, and the reach dilation below is rotation-invariant.
+    base = compute_coil_transforms(ctx, centers, None, cp.full(centers.shape[0], distance_mm))
     origins_m = base[:, :3, 3] * 1e-3
     # A dipole stays within max|position| of the coil origin at any rotation; dilate by that + margin.
     reach_mm = float(cp.linalg.norm(cp.asarray(coil.positions_m), axis=1).max()) * 1e3

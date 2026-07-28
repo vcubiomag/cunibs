@@ -12,6 +12,11 @@ namespace {
 
 constexpr int kBlock = 256;
 
+// Smallest sin^2 of the angle between the handle direction and the scalp tangent plane that
+// still defines an in-plane axis: (1e-6 rad)^2. Below it the tangential component is numerical
+// noise and the coil's rotation about the normal is arbitrary.
+constexpr double kMinSin2 = 1e-12;
+
 __device__ inline double dot3(const double* u, const double* v) {
     return u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
 }
@@ -76,8 +81,8 @@ __device__ double closest_on_tri(const double* p, const double* a, const double*
 __global__ void place_kernel(const double* __restrict__ centers, const double* __restrict__ handles,
                              const double* __restrict__ dists, const double* __restrict__ av,
                              const double* __restrict__ bv, const double* __restrict__ cv,
-                             const double* __restrict__ tnorm, double* __restrict__ out, int n_pl,
-                             int n_tri) {
+                             const double* __restrict__ tnorm, double* __restrict__ out,
+                             int* __restrict__ degenerate, int n_pl, int n_tri) {
     __shared__ double sdist[kBlock];
     __shared__ int stri[kBlock];
 
@@ -119,14 +124,45 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
     const double normal[3] = {tnorm[tri * 3], tnorm[tri * 3 + 1], tnorm[tri * 3 + 2]};
     const double z[3] = {-normal[0], -normal[1], -normal[2]};
 
+    // In-plane axis from the handle. It is undefined when the handle direction has no
+    // component in the tangent plane, in which case fall back to a canonical axis and say so
+    // through `degenerate`: the frame stays orthonormal either way, so no caller can be handed
+    // a NaN, and the ones that supplied a handle can reject the placement.
     double y[3];
-    for (int i = 0; i < 3; ++i) y[i] = handles[p * 3 + i] - proj[i];
-    double yn = rnorm3d(y[0], y[1], y[2]);
-    for (int i = 0; i < 3; ++i) y[i] *= yn;
-    double yz = dot3(y, z);
-    for (int i = 0; i < 3; ++i) y[i] -= z[i] * yz;
-    yn = rnorm3d(y[0], y[1], y[2]);
-    for (int i = 0; i < 3; ++i) y[i] *= yn;
+    bool from_handle = false;
+    if (handles != nullptr) {
+        for (int i = 0; i < 3; ++i) y[i] = handles[p * 3 + i] - proj[i];
+        if (dot3(y, y) > 0.0) {
+            const double inv = rnorm3d(y[0], y[1], y[2]);
+            for (int i = 0; i < 3; ++i) y[i] *= inv;
+            const double cz = dot3(y, z);
+            // After removing the out-of-plane part, |y|^2 = 1 - cos^2 = sin^2 of the angle to
+            // the tangent plane, so this test is exact and scale-free. kMinSin2 is (1e-6 rad)^2
+            // -- a numerical-annihilation threshold, not a geometry-quality one: on a curved
+            // scalp a legitimate handle can sit quite close to the normal.
+            if ((1.0 - cz * cz) > kMinSin2) {
+                for (int i = 0; i < 3; ++i) y[i] -= z[i] * cz;
+                const double inv2 = rnorm3d(y[0], y[1], y[2]);
+                for (int i = 0; i < 3; ++i) y[i] *= inv2;
+                from_handle = true;
+            }
+        }
+    }
+    if (!from_handle) {
+        // Any deterministic in-plane axis serves; crossing z against the canonical direction it
+        // is least aligned with keeps that cross product far from zero.
+        int m = 0;
+        if (fabs(z[1]) < fabs(z[m])) m = 1;
+        if (fabs(z[2]) < fabs(z[m])) m = 2;
+        double ref[3] = {0.0, 0.0, 0.0};
+        ref[m] = 1.0;
+        y[0] = z[1] * ref[2] - z[2] * ref[1];
+        y[1] = z[2] * ref[0] - z[0] * ref[2];
+        y[2] = z[0] * ref[1] - z[1] * ref[0];
+        const double inv = rnorm3d(y[0], y[1], y[2]);
+        for (int i = 0; i < 3; ++i) y[i] *= inv;
+    }
+    if (degenerate != nullptr) degenerate[p] = from_handle ? 0 : 1;
     const double x[3] = {y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2],
                          y[0] * z[1] - y[1] * z[0]};
 
@@ -145,7 +181,7 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
 
 void launch_place(const double* centers, const double* handles, const double* dists,
                   const double* a, const double* b, const double* c, const double* tnorm,
-                  double* out, int n_pl, int n_tri, cudaStream_t stream) {
-    place_kernel<<<n_pl, kBlock, 0, stream>>>(centers, handles, dists, a, b, c, tnorm, out, n_pl,
-                                              n_tri);
+                  double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream) {
+    place_kernel<<<n_pl, kBlock, 0, stream>>>(centers, handles, dists, a, b, c, tnorm, out,
+                                              degenerate, n_pl, n_tri);
 }

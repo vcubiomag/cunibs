@@ -330,17 +330,21 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "place_transforms",
-        [](f64_cuda_2d centers, f64_cuda_2d handles, f64_cuda dists, f64_cuda_2d a, f64_cuda_2d b,
-           f64_cuda_2d c, f64_cuda_2d tnorm, f64_cuda_2d out, uintptr_t stream) {
+        [](f64_cuda_2d centers, std::optional<f64_cuda_2d> handles, f64_cuda dists, f64_cuda_2d a,
+           f64_cuda_2d b, f64_cuda_2d c, f64_cuda_2d tnorm, f64_cuda_2d out,
+           std::optional<i32_cuda> degenerate, uintptr_t stream) {
             int n_pl = static_cast<int>(centers.shape(0));
             int n_tri = static_cast<int>(a.shape(0));
-            launch_place(centers.data(), handles.data(), dists.data(), a.data(), b.data(), c.data(),
-                         tnorm.data(), out.data(), n_pl, n_tri,
+            launch_place(centers.data(), handles ? handles->data() : nullptr, dists.data(),
+                         a.data(), b.data(), c.data(), tnorm.data(), out.data(),
+                         degenerate ? degenerate->data() : nullptr, n_pl, n_tri,
                          reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("centers").noconvert(), nb::arg("handles").noconvert(),
         nb::arg("dists").noconvert(), nb::arg("a").noconvert(), nb::arg("b").noconvert(),
         nb::arg("c").noconvert(), nb::arg("tnorm").noconvert(), nb::arg("out").noconvert(),
-        nb::arg("stream"),
-        "Batched closest-point scalp projection + coil frame; writes (P,16) row-major 4x4 out.");
+        nb::arg("degenerate").noconvert(), nb::arg("stream"),
+        "Batched closest-point scalp projection + coil frame; writes (P,16) row-major 4x4 out "
+        "and a (P,) flag marking placements whose handle left the in-plane axis undefined. "
+        "Pass handles=None for the projection and normal alone, with degenerate=None.");
 }

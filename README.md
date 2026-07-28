@@ -145,6 +145,10 @@ positive coil-handle direction. cuNIBS projects the target onto the scalp,
 constructs the coil frame from the local surface normal, and applies
 `distance_mm` along the outward normal.
 
+The handle must not lie on the outward normal through that projected point: it
+would give no in-plane direction, leaving the coil's rotation about the normal
+undefined. Such a placement is rejected rather than resolved arbitrarily.
+
 `simulate` takes one placement. Use `iter_simulate` to sweep many, reusing the
 assembled system and AMG hierarchy:
 
