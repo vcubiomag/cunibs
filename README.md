@@ -325,7 +325,7 @@ config = ConductivityUQConfig(
 uq_result = subject.simulate_conductivity_uq(coil, placement, config, didt=1.0e6)
 
 print(uq_result.peak_mean_magnE())
-print(uq_result.peak_cov())
+print(uq_result.max_local_cov())
 ```
 
 A `ConductivityUQResult` carries its `summary` the same way, computed on the
@@ -349,16 +349,16 @@ them to save a third of the bytes.
 `iter_simulate` does.
 
 `mean_magnE`, `std_magnE`, and `cov_magnE` use the same tetrahedron ordering as
-`FieldResult.magnE` when fields are retained. `peak_mean_magnE` and `peak_cov`
-accept the same region names as the deterministic metric API.
+`FieldResult.magnE` when fields are retained. `peak_mean_magnE` and
+`max_local_cov` accept the same region names as the deterministic metric API:
+the first is the peak of the mean field, the second the largest
+per-tetrahedron coefficient of variation.
 
-These are metrics *of the mean field*. For a nonlinear metric such as the peak or
-focality, the metric of the mean is **not** the mean of the metric over the
-ensemble — `peak_cov()` is the coefficient of variation of the mean field, not
-the CoV of the per-draw peak. To characterise the distribution of a scalar, pass
-`record_rois=` — a `{name: ROI}` mapping — to record it per draw. Each ROI comes
-from `subject.roi(...)` (or `resolve_target`); the run also records the per-draw
-gray-matter peak, focality, and peak location:
+Both are metrics *of* the moment fields, not moments of a metric. For a nonlinear
+metric such as the peak or focality, the metric of the mean is **not** the mean of
+the metric over the ensemble. To characterise the distribution of a scalar across
+draws, use the per-draw arrays. `record_rois=`, a `{name: ROI}` mapping, each from
+`subject.roi(...)` or `resolve_target` adds each draw's ROI mean:
 
 ```python
 m1 = subject.roi([-45.0, -5.0, 25.0], radius_mm=5.0, region="gray_matter")
@@ -377,7 +377,7 @@ uq_result.tissue_sensitivity("peak")  # first-order variance share per tissue ta
 `tissue_sensitivity` regresses the log of a per-draw scalar (`"peak"`,
 `"focality"`, or an ROI name) on the log conductivity draws to attribute the
 output variance across tissues. It is a first-order linear-in-log index on the
-i.i.d. ensemble, not a Saltelli Sobol estimate, and requires `record_rois=`.
+i.i.d. ensemble, not a Saltelli Sobol estimate.
 
 Save a conductivity-UQ result to HDF5:
 

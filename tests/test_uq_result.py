@@ -22,6 +22,9 @@ def _result(sigma, y_peak=None, roi=None, focality=None) -> ConductivityUQResult
     m = 6
     mean = rng.random(m) + 0.5
     std = rng.random(m) * 0.1
+    # A real run always records these, so stand in for the ones a test does not care about.
+    y_peak = rng.random(n) + 1.0 if y_peak is None else y_peak
+    focality = rng.random(n) + 1.0 if focality is None else focality
     return ConductivityUQResult(
         mean_magnE=mean,
         std_magnE=std,
@@ -37,7 +40,8 @@ def _result(sigma, y_peak=None, roi=None, focality=None) -> ConductivityUQResult
         didt=1e6,
         peak_samples=y_peak,
         focality_samples=focality,
-        roi_samples=roi,
+        peak_location_samples=rng.standard_normal((n, 3)),
+        roi_samples={} if roi is None else roi,
     )
 
 
@@ -89,17 +93,16 @@ def test_tissue_sensitivity_reads_focality_and_roi_outputs():
     assert r.tissue_sensitivity("m1")[2] == pytest.approx(1.0, abs=1e-6)
 
 
-def test_tissue_sensitivity_without_record_rois_raises():
-    r = _result(_lognormal_draws(16, 2))
-    with pytest.raises(ValueError, match="No per-draw samples"):
-        r.tissue_sensitivity("peak")
-
-
-def test_tissue_sensitivity_unknown_output_raises():
+def test_tissue_sensitivity_unknown_output_lists_what_is_available():
+    """peak and focality always exist; only the ROI names depend on the run."""
     sigma = _lognormal_draws(16, 2)
-    r = _result(sigma, y_peak=sigma[:, 0], roi={"m1": sigma[:, 1]})
+    r = _result(sigma, roi={"m1": sigma[:, 1]})
     with pytest.raises(ValueError, match=r"available: \['peak', 'focality', 'm1'\]"):
         r.tissue_sensitivity("nope")
+
+    bare = _result(sigma)
+    with pytest.raises(ValueError, match=r"available: \['peak', 'focality'\]"):
+        bare.tissue_sensitivity("m1")
 
 
 def test_per_draw_samples_and_sensitivity_live_on_the_result():
@@ -113,7 +116,7 @@ def test_per_draw_samples_and_sensitivity_live_on_the_result():
 def test_non_default_region_is_computed_from_the_retained_moments():
     r = _result(_lognormal_draws(16, 2))
     assert r.peak_mean_magnE("csf") > 0
-    assert r.peak_cov("csf") >= 0
+    assert r.max_local_cov("csf") >= 0
 
 
 def test_non_default_region_needs_the_moments():
@@ -134,4 +137,4 @@ def test_result_peak_and_cov_are_region_masked():
     for region in ("gray_matter", "csf", "all"):
         mask = metrics.region_mask(r.tet_tags, region)
         assert r.peak_mean_magnE(region) == r.mean_magnE[mask].max()
-        assert r.peak_cov(region) == r.cov_magnE[mask].max()
+        assert r.max_local_cov(region) == r.cov_magnE[mask].max()

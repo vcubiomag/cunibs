@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
     from cunibs.fem.solve import SolverContext
     from cunibs.simulation import Placement
     from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
+
+
+_NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
 
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
@@ -73,7 +77,7 @@ def run_conductivity_uq(
     placement: Placement,
     config: ConductivityUQConfig,
     didt: float = 1e6,
-    record_rois: Mapping[str, ResolvedTarget] | None = None,
+    record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     focality_frac: float = 0.5,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
@@ -87,14 +91,11 @@ def run_conductivity_uq(
     per-sample fp64 AMGx solve, so accuracy never depends on the preconditioner tracking the
     sample.
 
-    When ``record_rois`` (a ``{name: ResolvedTarget}`` mapping; ``{}`` is allowed and records the
-    whole-field metrics only) is given, each draw's per-tet field is reduced in-place — no host
-    sync in the loop — into the per-sample arrays returned on the result: the volume-weighted mean
-    ``|E|`` over each named ROI (``roi_samples``), plus the gray-matter peak ``|E|``
-    (``peak_samples``), the focality volume anchored as in :func:`cunibs.metrics.focality`
-    (``focality_samples``),
-    and the peak location (``peak_location_samples``). These are the distributional quantities that a
-    metric of the mean field (``ConductivityUQResult.summary``) cannot provide.
+    Every draw's gray-matter peak ``|E|``, focality, and peak location are recorded — the
+    distributional quantities a metric of the mean field cannot provide. ``record_rois``, a
+    ``{name: ResolvedTarget}`` mapping, adds each draw's volume-weighted mean ``|E|`` per named
+    ROI. The reductions run in-place into device-resident per-sample arrays, so they add no
+    host sync inside the loop.
     """
     sigmas = sample_conductivities(config, pre.perturbed_tags)  # (N, P) f64
     sig_f32 = sigmas.astype(cp.float32)
@@ -159,23 +160,22 @@ def run_conductivity_uq(
             )
             ax_tissue[t] = a_t @ x_nominal
 
-    recording = record_rois is not None
-    if recording:
-        gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
-        vols_gm = ctx.vols[gm_idx].astype(cp.float64)
-        bary_gm = cp.asarray(ctx.mesh.tet_barycenters_mm)[gm_idx]
-        anchor_q = cp.asarray([metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0], dtype=cp.float64)
-        roi_names = list(record_rois)
-        probe_idx = [
-            cp.ascontiguousarray(record_rois[n].elem_idx.astype(cp.int64)) for n in roi_names
-        ]
-        probe_w = [
-            cp.ascontiguousarray(record_rois[n].weights.astype(cp.float64)) for n in roi_names
-        ]
-        roi_s = cp.empty((config.n_samples, len(roi_names)), dtype=cp.float64)
-        peak_s = cp.empty(config.n_samples, dtype=cp.float64)
-        foc_s = cp.empty(config.n_samples, dtype=cp.float64)
-        peakloc_s = cp.empty((config.n_samples, 3), dtype=cp.float64)
+    gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
+    vols_gm = ctx.vols[gm_idx].astype(cp.float64)
+    bary_gm = cp.asarray(ctx.mesh.tet_barycenters_mm)[gm_idx]
+    anchor_q = cp.asarray([metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0], dtype=cp.float64)
+    roi_names = list(record_rois)
+    probes = [
+        (
+            cp.ascontiguousarray(record_rois[name].elem_idx.astype(cp.int64)),
+            cp.ascontiguousarray(record_rois[name].weights.astype(cp.float64)),
+        )
+        for name in roi_names
+    ]
+    roi_s = cp.empty((config.n_samples, len(roi_names)), dtype=cp.float64)
+    peak_s = cp.empty(config.n_samples, dtype=cp.float64)
+    foc_s = cp.empty(config.n_samples, dtype=cp.float64)
+    peakloc_s = cp.empty((config.n_samples, 3), dtype=cp.float64)
 
     for k in range(config.n_samples):
         sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
@@ -215,16 +215,15 @@ def run_conductivity_uq(
         reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
         accumulate_moments(magn, sum_e, sumsq_e, stream)
 
-        if recording:
-            magn_gm = magn[gm_idx]
-            peak_s[k] = magn_gm.max()
-            # Same percentile anchor as metrics.focality, so a per-draw focality and the
-            # summary's measure the same thing. Kept on device: reading it would sync the loop.
-            anchor = metrics.weighted_quantiles(magn_gm, vols_gm, anchor_q)
-            foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
-            peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
-            for j, (idx, w) in enumerate(zip(probe_idx, probe_w, strict=False)):
-                roi_s[k, j] = (magn[idx].astype(cp.float64) * w).sum()
+        magn_gm = magn[gm_idx]
+        peak_s[k] = magn_gm.max()
+        # Same percentile anchor as metrics.focality, so a per-draw focality and the summary's
+        # measure the same thing. Kept on device: reading the anchor would sync the loop.
+        anchor = metrics.weighted_quantiles(magn_gm, vols_gm, anchor_q)
+        foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
+        peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
+        for j, (idx, w) in enumerate(probes):
+            roi_s[k, j] = (magn[idx].astype(cp.float64) * w).sum()
 
     n = config.n_samples
     mean = sum_e / n
@@ -245,10 +244,8 @@ def run_conductivity_uq(
         placement=placement,
         coil_name=coil.name,
         didt=didt,
-        roi_samples=(
-            {n: cp.asnumpy(roi_s[:, j]) for j, n in enumerate(roi_names)} if recording else None
-        ),
-        peak_samples=cp.asnumpy(peak_s) if recording else None,
-        focality_samples=cp.asnumpy(foc_s) if recording else None,
-        peak_location_samples=cp.asnumpy(peakloc_s) if recording else None,
+        peak_samples=cp.asnumpy(peak_s),
+        focality_samples=cp.asnumpy(foc_s),
+        peak_location_samples=cp.asnumpy(peakloc_s),
+        roi_samples={name: cp.asnumpy(roi_s[:, j]) for j, name in enumerate(roi_names)},
     )

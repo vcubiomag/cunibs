@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import cupy as cp
@@ -39,6 +40,8 @@ _FORMAT_VERSION = 1
 # The region every result is summarised over up front. Others are computed on demand from
 # a retained magnE.
 _DEFAULT_REGION: metrics.Region = "gray_matter"
+
+_NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
 
 # Per-tetrahedron metric inputs on the host, shared by reference across every FieldResult.
 type _HostMetricInputs = tuple[
@@ -395,7 +398,7 @@ class Subject:
         config: ConductivityUQConfig,
         didt: float,
         moments: bool,
-        record_rois: Mapping[str, ResolvedTarget] | None,
+        record_rois: Mapping[str, ResolvedTarget],
     ) -> Iterator[ConductivityUQResult]:
         """One Monte Carlo per placement, reduced inside a scratch pool and yielded outside.
 
@@ -438,7 +441,7 @@ class Subject:
         didt: float = 1e6,
         *,
         moments: bool = False,
-        record_rois: Mapping[str, ResolvedTarget] | None = None,
+        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     ) -> Iterator[ConductivityUQResult]:
         """Stream a conductivity Monte Carlo per placement, in the order given.
 
@@ -450,11 +453,10 @@ class Subject:
         ``moments=True`` also keeps the per-tetrahedron ``mean``/``std``/``cov`` arrays.
         The three come as a set, since any two determine the third.
 
-        ``record_rois`` is a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` /
-        ``resolve_target``. When given, each draw's volume-weighted mean ``|E|`` over every
-        ROI is recorded (``result.roi_samples[name]``), along with the per-draw gray-matter
-        peak, focality, and peak location -- the distributional data that a metric of the
-        mean field cannot provide. These small per-draw arrays are always kept.
+        Every result carries per-draw arrays of the gray-matter peak ``|E|``, focality, and
+        peak location. They are kilobytes, so there is no flag to enable them.
+        ``record_rois``, a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` / ``resolve_target``,
+        adds each draw's volume-weighted mean ``|E|`` per ROI (``result.roi_samples[name]``).
         """
         # The loop lives in a separate generator so this stays a plain function: a `yield`
         # here would defer the check below to the caller's first next(), surfacing the error
@@ -470,7 +472,7 @@ class Subject:
         didt: float = 1e6,
         *,
         moments: bool = False,
-        record_rois: Mapping[str, ResolvedTarget] | None = None,
+        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     ) -> ConductivityUQResult:
         """Run a conductivity Monte Carlo for a single placement.
 

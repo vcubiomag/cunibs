@@ -11,19 +11,11 @@ from cunibs.simulation import FieldResult, Placement
 from cunibs.uq.conductivity import ConductivityUQResult
 
 
-def _make_uq_result(*, with_samples: bool) -> ConductivityUQResult:
+def _make_uq_result(*, with_rois: bool) -> ConductivityUQResult:
     rng = np.random.default_rng(1)
     m, n = 6, 4
     mean = rng.random(m) + 0.5
     std = rng.random(m) * 0.1
-    extra = {}
-    if with_samples:
-        extra = {
-            "roi_samples": {"m1": rng.random(n), "sma": rng.random(n)},
-            "peak_samples": rng.random(n) + 1.0,
-            "focality_samples": rng.random(n),
-            "peak_location_samples": rng.standard_normal((n, 3)),
-        }
     r = ConductivityUQResult(
         mean_magnE=mean,
         std_magnE=std,
@@ -37,7 +29,10 @@ def _make_uq_result(*, with_samples: bool) -> ConductivityUQResult:
         placement=Placement([1, 2, 3], [4, 5, 6], 7.5),
         coil_name="synthetic",
         didt=1e6,
-        **extra,
+        peak_samples=rng.random(n) + 1.0,
+        focality_samples=rng.random(n),
+        peak_location_samples=rng.standard_normal((n, 3)),
+        roi_samples={"m1": rng.random(n), "sma": rng.random(n)} if with_rois else {},
     )
     # Subject attaches this on the device; a hand-built result reduces on the host.
     return dataclasses.replace(r, summary=r.compute_summary())
@@ -134,7 +129,7 @@ def test_field_result_missing_format_version_raises(tmp_path):
 
 
 def test_uq_result_roundtrip_without_record_rois(tmp_path):
-    r = _make_uq_result(with_samples=False)
+    r = _make_uq_result(with_rois=False)
     path = tmp_path / "uq.h5"
     r.save(path)
     loaded = ConductivityUQResult.load(path)
@@ -142,15 +137,15 @@ def test_uq_result_roundtrip_without_record_rois(tmp_path):
         np.testing.assert_array_equal(getattr(loaded, name), getattr(r, name), err_msg=name)
     assert loaded.n_samples == r.n_samples
     assert loaded.perturbed_tags == (2, 3)
-    assert loaded.roi_samples is None
-    assert loaded.peak_samples is None
-    assert loaded.focality_samples is None
-    assert loaded.peak_location_samples is None
+    assert loaded.roi_samples == {}
+    # Per-draw arrays are not tied to record_rois; they survive a round trip regardless.
+    for name in ("peak_samples", "focality_samples", "peak_location_samples"):
+        np.testing.assert_array_equal(getattr(loaded, name), getattr(r, name), err_msg=name)
     assert loaded.placement.distance_mm == 7.5
 
 
 def test_uq_result_roundtrip_with_record_rois(tmp_path):
-    r = _make_uq_result(with_samples=True)
+    r = _make_uq_result(with_rois=True)
     path = tmp_path / "uq.h5"
     r.save(path)
     loaded = ConductivityUQResult.load(path)
@@ -164,7 +159,7 @@ def test_uq_result_roundtrip_with_record_rois(tmp_path):
 def test_uq_result_format_version_mismatch_raises(tmp_path):
     """The UQ format version is tracked independently of the FieldResult one."""
     path = tmp_path / "uq.h5"
-    _make_uq_result(with_samples=False).save(path)
+    _make_uq_result(with_rois=False).save(path)
     with h5py.File(path, "r+") as f:
         f.attrs["format_version"] = 2
     with pytest.raises(ValueError, match="version 2 is not readable"):
@@ -187,13 +182,13 @@ def test_unretained_arrays_are_absent_from_the_file(tmp_path):
 
 
 def test_uq_summary_from_loaded_result(tmp_path):
-    r = _make_uq_result(with_samples=True)
+    r = _make_uq_result(with_rois=True)
     path = tmp_path / "uq.h5"
     r.save(path)
     loaded = ConductivityUQResult.load(path)
     before, after = r.summary, loaded.summary
     assert before.mean_field["peak_magnE"] == after.mean_field["peak_magnE"]
-    assert before.peak_cov == after.peak_cov
+    assert before.max_local_cov == after.max_local_cov
     assert before.mean_field["region_volume_m3"] == after.mean_field["region_volume_m3"]
     np.testing.assert_array_equal(
         before.mean_field["peak_location_mm"], after.mean_field["peak_location_mm"]

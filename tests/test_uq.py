@@ -165,7 +165,7 @@ def test_per_draw_focality_uses_the_same_anchor_as_the_summary(
     # Every tissue pinned: unlisted tags fall back to DEFAULT_TISSUE_COV and would vary.
     cfg = ConductivityUQConfig(n_samples=4, tissue_cov={2: 0.0}, perturbed_tags=(2,), seed=1)
     r = patch_subject.simulate_conductivity_uq(
-        d70_coil, patch_placement, config=cfg, moments=True, record_rois={}
+        d70_coil, patch_placement, config=cfg, moments=True
     )
 
     assert r.summary is not None
@@ -234,7 +234,7 @@ def test_uq_default_sequence_returns_summaries(two_tissue_cube):
     assert len(r) == 2
     for item in r:
         assert item.peak_mean_magnE() > 0.0
-        assert item.peak_cov() >= 0.0
+        assert item.max_local_cov() >= 0.0
 
 
 def test_uq_streamed_sequence_results_are_host_backed(cp, two_tissue_cube):
@@ -294,8 +294,8 @@ def test_record_rois_per_draw_arrays(cp, two_tissue_subject):
     assert abs(samples.mean() - on_mean_field) < 5 * samples.std() / np.sqrt(n) + 1e-12
 
 
-def test_record_rois_empty_mapping_records_whole_field_only(two_tissue_subject):
-    """``record_rois={}`` is meaningful: no ROIs, but the whole-field per-draw metrics appear."""
+def test_per_draw_arrays_are_always_recorded(two_tissue_subject):
+    """No flag gates them: a plain run still yields the whole-field per-draw metrics."""
     from cunibs import ConductivityUQConfig
 
     r = two_tissue_subject.simulate_conductivity_uq(
@@ -303,23 +303,28 @@ def test_record_rois_empty_mapping_records_whole_field_only(two_tissue_subject):
         _placement(),
         config=ConductivityUQConfig(n_samples=16, tissue_cov={2: 0.2, 3: 0.3}, seed=4),
         moments=True,
-        record_rois={},
     )
     assert r.roi_samples == {}
-    assert r.peak_samples is not None and r.peak_samples.shape == (16,)
+    assert r.peak_samples.shape == (16,)
+    assert r.focality_samples.shape == (16,)
+    assert r.peak_location_samples.shape == (16, 3)
 
 
-def test_no_record_rois_leaves_per_draw_arrays_unset(two_tissue_subject):
+def test_record_rois_adds_named_probes(two_tissue_subject):
+    """record_rois only adds ROI columns; the whole-field arrays are there regardless."""
     from cunibs import ConductivityUQConfig
 
-    r = two_tissue_subject.simulate_conductivity_uq(
+    subj = two_tissue_subject
+    r = subj.simulate_conductivity_uq(
         _coil(),
         _placement(),
-        config=ConductivityUQConfig(n_samples=8, seed=4),
+        config=ConductivityUQConfig(n_samples=8, tissue_cov={2: 0.2, 3: 0.3}, seed=4),
         moments=True,
+        record_rois={"centre": subj.roi([50.0, 50.0, 60.0], radius_mm=8.0)},
     )
-    assert r.roi_samples is None
-    assert r.peak_samples is None and r.focality_samples is None
+    assert set(r.roi_samples) == {"centre"}
+    assert r.roi_samples["centre"].shape == (8,)
+    assert r.peak_samples.shape == (8,)
 
 
 def test_tissue_sensitivity_identifies_the_varying_tissue(two_tissue_subject):
@@ -331,14 +336,13 @@ def test_tissue_sensitivity_identifies_the_varying_tissue(two_tissue_subject):
         _placement(),
         config=ConductivityUQConfig(n_samples=256, tissue_cov={2: 0.0, 3: 0.3}, seed=6),
         moments=True,
-        record_rois={},
     )
     s = r.tissue_sensitivity("peak")
     assert s[3] > 0.9
     assert abs(s[2]) < 0.05
 
 
-def test_tissue_sensitivity_requires_recorded_samples(two_tissue_subject):
+def test_tissue_sensitivity_rejects_an_unrecorded_roi(two_tissue_subject):
     from cunibs import ConductivityUQConfig
 
     r = two_tissue_subject.simulate_conductivity_uq(
@@ -347,8 +351,9 @@ def test_tissue_sensitivity_requires_recorded_samples(two_tissue_subject):
         config=ConductivityUQConfig(n_samples=8, seed=6),
         moments=True,
     )
-    with pytest.raises(ValueError, match="No per-draw samples"):
-        r.tissue_sensitivity("peak")
+    r.tissue_sensitivity("peak")  # always available
+    with pytest.raises(ValueError, match="Unknown output 'm1'"):
+        r.tissue_sensitivity("m1")
 
 
 def test_uq_recycling_path_does_not_change_the_answer(two_tissue_subject):
@@ -365,7 +370,6 @@ def test_uq_recycling_path_does_not_change_the_answer(two_tissue_subject):
             _placement(),
             config=ConductivityUQConfig(n_samples=n, tissue_cov={2: 0.2, 3: 0.3}, seed=9),
             moments=True,
-            record_rois={},
         )
 
     small, large = run(8), run(64)  # 8 < 32 → no recycling; 64 ≥ 32 → recycling

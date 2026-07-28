@@ -39,15 +39,13 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
         y = result.peak_samples
     elif output == "focality":
         y = result.focality_samples
-    elif result.roi_samples is not None and output in result.roi_samples:
+    elif output in result.roi_samples:
         y = result.roi_samples[output]
     else:
-        y = None
-    if y is None:
-        available = ["peak", "focality", *(result.roi_samples or {})]
         raise ValueError(
-            f"No per-draw samples for output {output!r} (available: {available}); "
-            "run simulate_conductivity_uq(..., record_rois={...}) with that ROI name."
+            f"Unknown output {output!r}; expected 'peak', 'focality', or a recorded ROI name "
+            f"(available: {['peak', 'focality', *result.roi_samples]}). Name an ROI with "
+            "simulate_conductivity_uq(..., record_rois={...}) to select it here."
         )
     x = np.log(np.asarray(result.sigma_samples, dtype=np.float64))
     logy = np.log(np.asarray(y, dtype=np.float64))
@@ -63,16 +61,16 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
 
 @dataclass
 class ConductivityUQSummary:
-    """Metrics of the *mean* field, plus the peak local CoV, for one placement.
+    """Metrics of the ensemble-mean field, plus the largest local CoV, for one placement.
 
-    For a nonlinear metric (peak, focality) the metric of the mean is **not** the mean of
-    the metric over the ensemble: ``peak_cov`` is the CoV of the mean field, not the CoV of
-    the per-draw peak. To characterise the distribution of a scalar metric, run with
-    ``record_rois=...`` and use the per-draw arrays on the result.
+    Both are metrics *of* the moment fields, not moments of a metric: for a nonlinear metric
+    such as the peak or focality, the metric of the mean is not the mean of the metric over
+    the ensemble. To characterise the distribution of a scalar across draws, use the
+    per-draw arrays on the result.
     """
 
     mean_field: metrics.FieldMetrics
-    peak_cov: float
+    max_local_cov: float
 
 
 @dataclass
@@ -82,6 +80,9 @@ class ConductivityUQResult:
     ``mean_magnE``, ``std_magnE`` and ``cov_magnE`` are the per-tetrahedron moments of
     ``|E|`` over the ensemble, ``cov`` being the coefficient of variation (std / mean).
     They are ``None`` unless the run asked for them with ``moments=True``.
+
+    The ``*_samples`` arrays hold one entry per conductivity draw and are always present:
+    kilobytes against moment arrays in the tens of megabytes.
 
     Results from :class:`~cunibs.Subject` are NumPy and always carry a ``summary``. The
     lower-level :func:`~cunibs.uq.run_conductivity_uq` returns device arrays and no
@@ -100,18 +101,11 @@ class ConductivityUQResult:
     placement: Placement
     coil_name: str
     didt: float
+    peak_samples: npt.NDArray[np.float64]  # (n_samples,) gray-matter peak |E|
+    focality_samples: npt.NDArray[np.float64]  # (n_samples,) stimulated volume (m^3)
+    peak_location_samples: npt.NDArray[np.float64]  # (n_samples, 3) peak location (mm)
+    roi_samples: dict[str, npt.NDArray[np.float64]]  # name -> (n_samples,) ROI mean |E|
     summary: ConductivityUQSummary | None = None
-    # per-draw samples, present only when the run was given record_rois=
-    roi_samples: dict[str, npt.NDArray[np.float64]] | None = (
-        None  # name -> (n_samples,) ROI mean |E|
-    )
-    peak_samples: npt.NDArray[np.float64] | None = None  # (n_samples,) gray-matter peak |E|
-    focality_samples: npt.NDArray[np.float64] | None = (
-        None  # (n_samples,) stimulated volume (m^3)
-    )
-    peak_location_samples: npt.NDArray[np.float64] | None = (
-        None  # (n_samples, 3) peak location (mm)
-    )
 
     def compute_summary(
         self, region: metrics.Region = _DEFAULT_REGION
@@ -133,7 +127,7 @@ class ConductivityUQResult:
             mean_field=metrics.compute_metrics(
                 self.mean_magnE, self.vols, self.barycenters_mm, self.tet_tags, region=region
             ),
-            peak_cov=metrics.peak_magnitude(
+            max_local_cov=metrics.peak_magnitude(
                 self.cov_magnE, metrics.region_mask(self.tet_tags, region)
             ),
         )
@@ -147,17 +141,21 @@ class ConductivityUQResult:
         """Peak of the mean field in a region."""
         return self._summary_for(region).mean_field["peak_magnE"]
 
-    def peak_cov(self, region: metrics.Region = _DEFAULT_REGION) -> float:
-        """Largest local coefficient of variation in a region."""
-        return self._summary_for(region).peak_cov
+    def max_local_cov(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+        """Largest per-tetrahedron coefficient of variation (std / mean) of |E| in a region.
+
+        This is the worst local sensitivity to conductivity uncertainty, not the coefficient
+        of variation of the per-draw peak. For the latter, take the CoV of ``peak_samples``.
+        """
+        return self._summary_for(region).max_local_cov
 
     def tissue_sensitivity(self, output: str = "peak") -> dict[int, float]:
         """First-order share of each perturbed tissue in a per-draw output's variance.
 
-        ``output`` is ``"peak"``, ``"focality"``, or a recorded ROI name, so the run needs
-        ``record_rois={...}``. Regressing the log output on the log conductivity draws gives
-        each tag's first-order share under a local log-linear response; it captures only the
-        linear-in-log part of the sensitivity and is not a Saltelli Sobol estimate.
+        ``output`` is ``"peak"``, ``"focality"``, or the name of an ROI the run recorded.
+        Regressing the log output on the log conductivity draws gives each tag's first-order
+        share under a local log-linear response; it captures only the linear-in-log part of
+        the sensitivity and is not a Saltelli Sobol estimate.
         """
         return _tissue_sensitivity(self, output)
 
@@ -204,15 +202,12 @@ class ConductivityUQResult:
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
             grp = h5f.create_group("summary")
             _write_metrics(grp.create_group("mean_field"), self.summary.mean_field)
-            grp.attrs["peak_cov"] = self.summary.peak_cov
-            if self.roi_samples is not None:
-                roi = h5f.create_group("roi_samples")
-                for roi_name, arr in self.roi_samples.items():
-                    roi.create_dataset(roi_name, data=np.asarray(arr))
+            grp.attrs["max_local_cov"] = self.summary.max_local_cov
+            roi = h5f.create_group("roi_samples")
+            for roi_name, arr in self.roi_samples.items():
+                roi.create_dataset(roi_name, data=np.asarray(arr))
             for name in ("peak_samples", "focality_samples", "peak_location_samples"):
-                value = getattr(self, name)
-                if value is not None:
-                    h5f.create_dataset(name, data=np.asarray(value))
+                h5f.create_dataset(name, data=np.asarray(getattr(self, name)))
             h5f.attrs["format_version"] = _FORMAT_VERSION
             h5f.attrs["n_samples"] = self.n_samples
             h5f.attrs["perturbed_tags"] = np.asarray(self.perturbed_tags, dtype=np.int32)
@@ -246,14 +241,10 @@ class ConductivityUQResult:
                 didt=float(h5f.attrs["didt"]),
                 summary=ConductivityUQSummary(
                     mean_field=_read_metrics(h5f["summary"]["mean_field"]),
-                    peak_cov=float(h5f["summary"].attrs["peak_cov"]),
+                    max_local_cov=float(h5f["summary"].attrs["max_local_cov"]),
                 ),
-                roi_samples=(
-                    {k: np.asarray(v) for k, v in h5f["roi_samples"].items()}
-                    if "roi_samples" in h5f
-                    else None
-                ),
-                peak_samples=_opt_array(h5f, "peak_samples"),
-                focality_samples=_opt_array(h5f, "focality_samples"),
-                peak_location_samples=_opt_array(h5f, "peak_location_samples"),
+                roi_samples={k: np.asarray(v) for k, v in h5f["roi_samples"].items()},
+                peak_samples=np.asarray(h5f["peak_samples"]),
+                focality_samples=np.asarray(h5f["focality_samples"]),
+                peak_location_samples=np.asarray(h5f["peak_location_samples"]),
             )
