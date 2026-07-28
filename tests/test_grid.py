@@ -88,7 +88,7 @@ def test_map_coordinates_on_linear_field_is_exact(cp):
 
     rng = np.random.default_rng(2)
     lo = cp.asnumpy(grid.origin_m)
-    hi = lo + cp.asnumpy(grid.spacing_m) * (np.asarray(grid.shape) - 1)
+    hi = cp.asnumpy(grid.upper_m)
     query = rng.uniform(lo, hi, size=(500, 3))
 
     got = cp.asnumpy(
@@ -97,8 +97,15 @@ def test_map_coordinates_on_linear_field_is_exact(cp):
     np.testing.assert_allclose(got, query @ a + b, rtol=1e-6)
 
 
+def test_upper_m_is_the_last_sample_on_each_axis(cp, dipole_cloud):
+    """``max_index`` is the bound the evaluate check compares against, so it must be a real sample."""
+    grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
+    idx = grid.world_to_index(grid.upper_m[None, :])
+    np.testing.assert_allclose(cp.asnumpy(idx).ravel(), cp.asnumpy(grid.max_index), atol=1e-9)
+
+
 def test_outside_grid_clamps_to_the_edge(cp):
-    """``mode="nearest"`` means an out-of-grid placement is silently clamped, not flagged."""
+    """The hazard ``_require_in_grid`` exists to catch: clamping, not an error, past the edge."""
     from cupyx.scipy.ndimage import map_coordinates
 
     grid = Grid(
@@ -184,7 +191,7 @@ def test_grid_for_placements_contains_every_dipole(cp, cube_subject, figure8_coi
     s, _ = _placed_dipoles(ctx, figure8_coil, placements)
 
     lo = cp.asnumpy(grid.origin_m)
-    hi = lo + cp.asnumpy(grid.spacing_m) * (np.asarray(grid.shape) - 1)
+    hi = cp.asnumpy(grid.upper_m)
     pts = cp.asnumpy(s).reshape(-1, 3)
     assert np.all(pts >= lo) and np.all(pts <= hi)
 
@@ -210,6 +217,6 @@ def test_coverage_grid_contains_all_rotations(cp, cube_subject, figure8_coil):
     s, _ = _placed_dipoles(ctx, figure8_coil, sweep)
 
     lo = cp.asnumpy(grid.origin_m)
-    hi = lo + cp.asnumpy(grid.spacing_m) * (np.asarray(grid.shape) - 1)
+    hi = cp.asnumpy(grid.upper_m)
     pts = cp.asnumpy(s).reshape(-1, 3)
     assert np.all(pts >= lo) and np.all(pts <= hi)

@@ -53,6 +53,40 @@ def _reduce(dipole_q: cp.ndarray, moments: cp.ndarray, didt: float) -> cp.ndarra
 # allocate a multi-gigabyte (D, P·N, 3) buffer; placements are processed in chunks under this bound.
 _INTERP_CHUNK_SAMPLES = 1 << 23
 
+# Slack on the fractional index bounds. At a 3 mm spacing this is 3 nm (noise).
+_INDEX_TOL = 1e-6
+
+
+def _require_in_grid(
+    grid: Grid, coords: cp.ndarray, offset: int, n_dip: int, n_total: int
+) -> None:
+    """Raise if any sample falls outside ``grid``.
+
+    Interpolation runs with ``mode="nearest"``, so an out-of-grid dipole would be clamped to the
+    grid edge and yield a wrong field rather than an error.
+    """
+    # >= / <= rather than a negated < / >: a non-finite coordinate compares false either way, so
+    # it fails closed instead of reaching map_coordinates.
+    ok = (coords >= -_INDEX_TOL) & (coords <= grid.max_index[:, None] + _INDEX_TOL)
+    if bool(ok.all()):
+        return
+
+    bad = ~ok
+    axis = int(cp.argmax(bad.any(axis=1)))
+    flat = int(cp.argmax(bad[axis]))
+    sample = offset + flat // n_dip
+    origin_mm = float(grid.origin_m[axis]) * 1e3
+    upper_mm = float(grid.upper_m[axis]) * 1e3
+    pos_mm = origin_mm + float(coords[axis, flat]) * float(grid.spacing_m[axis]) * 1e3
+    outside_mm = origin_mm - pos_mm if pos_mm < origin_mm else pos_mm - upper_mm
+    raise ValueError(
+        f"A coil dipole falls outside the reciprocity grid: sample {sample} of {n_total} on "
+        f"axis {axis} ({'xyz'[axis]}), dipole at {pos_mm:.3f} mm against a grid spanning "
+        f"[{origin_mm:.3f}, {upper_mm:.3f}] mm ({outside_mm:.3f} mm outside). Rebuild the "
+        "reciprocity field so the grid covers it: widen coverage_centers_mm or margin_mm, or "
+        "evaluate at the distance_mm the grid was built with."
+    )
+
 
 def _interp_reduce(
     recip: ReciprocityField, s: cp.ndarray, m: cp.ndarray, didt: float
@@ -66,6 +100,7 @@ def _interp_reduce(
         hi = min(lo + chunk, p)
         pc = hi - lo
         coords = recip.grid.world_to_index(s[lo:hi].reshape(-1, 3))  # (3, pc*N)
+        _require_in_grid(recip.grid, coords, lo, n, p)
         dipole_q = cp.empty((n_dir, pc * n, 3), dtype=cp.float64)
         for d in range(n_dir):
             for k in range(3):

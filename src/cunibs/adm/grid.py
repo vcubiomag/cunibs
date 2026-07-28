@@ -25,8 +25,18 @@ class Grid:
         return int(self.shape[0] * self.shape[1] * self.shape[2])
 
     @property
+    def max_index(self) -> cp.ndarray:
+        """Largest valid fractional index per axis; anything beyond it is off the grid."""
+        return cp.asarray(self.shape, dtype=cp.float64) - 1.0
+
+    @property
+    def upper_m(self) -> cp.ndarray:
+        """Coordinate of the last sample on each axis (the inclusive upper corner)."""
+        return self.origin_m + self.spacing_m * self.max_index
+
+    @property
     def center_m(self) -> cp.ndarray:
-        return self.origin_m + 0.5 * self.spacing_m * (cp.asarray(self.shape) - 1)
+        return 0.5 * (self.origin_m + self.upper_m)
 
     def points_m(self) -> cp.ndarray:
         """All grid points as ``(n_points, 3)`` in C order (matches ``reshape(shape+(3,))``)."""

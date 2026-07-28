@@ -289,6 +289,35 @@ def test_evaluate_batched_matches_single(cp, cube_reciprocity, coil):
         np.testing.assert_allclose(batched[i], one, rtol=1e-12)
 
 
+def test_evaluate_outside_the_grid_raises(cube_reciprocity, coil):
+    """The grid is sized for distance_mm=4; a far larger stand-off leaves it entirely."""
+    from cunibs.adm import evaluate
+    from cunibs.simulation import Placement
+
+    far = Placement([50, 50, 100], [50, 150, 100], 200.0)
+    with pytest.raises(ValueError, match="outside the reciprocity grid"):
+        evaluate(cube_reciprocity, coil, far, DIDT)
+
+
+def test_evaluate_reports_the_offending_sample_in_a_batch(cube_reciprocity, coil):
+    from cunibs.adm import evaluate
+    from cunibs.simulation import Placement
+
+    good = Placement([50, 50, 100], [50, 150, 100], 4.0)
+    far = Placement([50, 50, 100], [50, 150, 100], 200.0)
+    with pytest.raises(ValueError, match=r"sample 2 of 3"):
+        evaluate(cube_reciprocity, coil, [good, good, far], DIDT)
+
+
+def test_evaluate_accepts_a_dipole_on_the_grid_corner(cp, cube_reciprocity):
+    """The bounds check has to admit the last sample, not just the interior."""
+    from cunibs.adm.evaluate import _require_in_grid
+
+    grid = cube_reciprocity.grid
+    corners = cp.stack([grid.origin_m, grid.upper_m])
+    _require_in_grid(grid, grid.world_to_index(corners), offset=0, n_dip=1, n_total=2)
+
+
 def test_evaluate_is_linear_in_didt(cp, cube_reciprocity, coil):
     from cunibs.adm import evaluate
     from cunibs.simulation import Placement
