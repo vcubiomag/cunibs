@@ -17,7 +17,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "cuda-toolkit[cudart,cublas,cusparse,cusolver]>=13.2",
+    "cuda-toolkit[cudart,cublas,cusparse,cusolver]>=13.0,<14",
     "cupy-cuda13x>=14.0.0",
     "h5py>=3.10.0",
     "numpy>=1.26.0",
