@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 // Assign one thread per tetrahedron to avoid scatter writes.
 //   grad_v[k] = Σ_i v[tet_nodes[e,i]] · g[e,i,k]
 //   E[e]      = −grad_v − dadt_elm[e]
@@ -70,7 +72,7 @@ __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
         double gx = 0.0, gy = 0.0, gz = 0.0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const double vi = v_block[static_cast<long>(nodes[i]) * k + c];
+            const double vi = v_block[static_cast<std::int64_t>(nodes[i]) * k + c];
             gx += vi * static_cast<double>(gm[i][0]);
             gy += vi * static_cast<double>(gm[i][1]);
             gz += vi * static_cast<double>(gm[i][2]);

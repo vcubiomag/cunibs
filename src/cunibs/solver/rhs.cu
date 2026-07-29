@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 // Assign one thread per node to avoid atomic updates and fix the sum order.
 //   b[node] = Σ_{(e,i): tet_nodes[e,i]=node}  neg_vc[e] · dot(dadt_elm[e], g[e,i])
 // ``neg_vc[e] = -vols[e] * cond[e]`` is precomputed because it does not change by placement.
@@ -78,7 +80,7 @@ __global__ void rhs_corner_block_kernel(RhsInPack dadt_elm, const float* __restr
     const float w0 = wg[c * 3 + 0];
     const float w1 = wg[c * 3 + 1];
     const float w2 = wg[c * 3 + 2];
-    const long out = static_cast<long>(c) * k;
+    const std::int64_t out = static_cast<std::int64_t>(c) * k;
     for (int i = 0; i < k; ++i) {
         const float* de = dadt_elm.p[i] + e * 3;
         q_block[out + i] = de[0] * w0 + de[1] * w1 + de[2] * w2;
@@ -99,10 +101,10 @@ __global__ void rhs_gather_block_kernel(const float* __restrict__ q_block,
     float acc[kMaxStageBlock];
     for (int i = 0; i < k; ++i) acc[i] = 0.f;
     for (int p = begin; p < end; ++p) {
-        const long base = static_cast<long>(idx[p]) * k;
+        const std::int64_t base = static_cast<std::int64_t>(idx[p]) * k;
         for (int i = 0; i < k; ++i) acc[i] += q_block[base + i];
     }
-    const long out = static_cast<long>(node) * k;
+    const std::int64_t out = static_cast<std::int64_t>(node) * k;
     for (int i = 0; i < k; ++i) b_block[out + i] = acc[i];
 }
 

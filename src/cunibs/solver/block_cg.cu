@@ -3,6 +3,7 @@
 // node are contiguous; col_idx/vals are read once per nnz and reused across the k
 // columns. Every reduction is a fixed-order two-stage tree per column, so results are
 // run-to-run deterministic and each column's arithmetic is independent of its neighbours.
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 
@@ -35,7 +36,7 @@ __global__ void __launch_bounds__(kBlock, K == 8 ? 4 : 2)
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += kTpr) {
             const double v = vals[j];
-            const long base = static_cast<long>(col_idx[j]) * K;
+            const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * __ldg(x + base + c);
         }
@@ -48,7 +49,7 @@ __global__ void __launch_bounds__(kBlock, K == 8 ? 4 : 2)
         }
     }
     if (row < n && lane == 0) {
-        const long base = static_cast<long>(row) * K;
+        const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) y[base + c] = sum[c];
     }
@@ -81,7 +82,7 @@ __device__ __forceinline__ void bcg_block_reduce_cols(double (&local)[K],
         double v = 0.0;
 #pragma unroll
         for (int w = 0; w < kWarps; ++w) v += s[w][threadIdx.x];
-        partials[static_cast<long>(threadIdx.x) * n_blocks + blockIdx.x] = v;
+        partials[static_cast<std::int64_t>(threadIdx.x) * n_blocks + blockIdx.x] = v;
     }
 }
 
@@ -95,7 +96,7 @@ __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
     if (i < n) {
-        const long base = static_cast<long>(i) * K;
+        const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             const double xv = x[base + c];
@@ -112,7 +113,7 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
     const int c = blockIdx.x;
     double local = 0.0;
     for (int b = threadIdx.x; b < n_blocks; b += kBlock) {
-        local += partials[static_cast<long>(c) * n_blocks + b];
+        local += partials[static_cast<std::int64_t>(c) * n_blocks + b];
     }
     sdata[threadIdx.x] = local;
     __syncthreads();
@@ -146,7 +147,7 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
 #pragma unroll
     for (int c = 0; c < K; ++c) rloc[c] = 0.0;
     if (i < n) {
-        const long base = static_cast<long>(i) * K;
+        const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             const double a = __ldg(alpha + c);
@@ -173,7 +174,7 @@ __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
     if (i < n) {
-        const long base = static_cast<long>(i) * K;
+        const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             local[c] = r[base + c] * static_cast<double>(zf[base + c]);
@@ -188,7 +189,7 @@ __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int 
     const int c = blockIdx.x;
     double local = 0.0;
     for (int b = threadIdx.x; b < n_blocks; b += kBlock) {
-        local += partials[static_cast<long>(c) * n_blocks + b];
+        local += partials[static_cast<std::int64_t>(c) * n_blocks + b];
     }
     sdata[threadIdx.x] = local;
     __syncthreads();
@@ -208,7 +209,7 @@ __global__ void bcg_update_p_kernel(int n, const double* __restrict__ beta,
                                     const float* __restrict__ zf, double* __restrict__ p) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const long base = static_cast<long>(i) * K;
+        const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             p[base + c] = __ldg(beta + c) * p[base + c] + static_cast<double>(zf[base + c]);
@@ -216,22 +217,22 @@ __global__ void bcg_update_p_kernel(int n, const double* __restrict__ beta,
     }
 }
 
-__global__ void bcg_f2d_kernel(long n_total, const float* __restrict__ in,
+__global__ void bcg_f2d_kernel(std::int64_t n_total, const float* __restrict__ in,
                                double* __restrict__ out) {
-    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n_total) out[i] = static_cast<double>(in[i]);
 }
 
-__global__ void bcg_d2f_kernel(long n_total, const double* __restrict__ in,
+__global__ void bcg_d2f_kernel(std::int64_t n_total, const double* __restrict__ in,
                                float* __restrict__ out) {
-    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n_total) out[i] = static_cast<float>(in[i]);
 }
 
 // R = B - AP (warm-start residual), all (n, k) row-major.
-__global__ void bcg_residual_kernel(long n_total, const double* __restrict__ b,
+__global__ void bcg_residual_kernel(std::int64_t n_total, const double* __restrict__ b,
                                     const double* __restrict__ ap, double* __restrict__ r) {
-    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n_total) r[i] = b[i] - ap[i];
 }
 
@@ -329,18 +330,18 @@ void launch_bcg_update_p(int n, int k, const double* beta, const float* zf, doub
     });
 }
 
-void launch_bcg_f2d(long n_total, const float* in, double* out, cudaStream_t stream) {
-    const long blocks = (n_total + kBlock - 1) / kBlock;
+void launch_bcg_f2d(std::int64_t n_total, const float* in, double* out, cudaStream_t stream) {
+    const std::int64_t blocks = (n_total + kBlock - 1) / kBlock;
     bcg_f2d_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, in, out);
 }
 
-void launch_bcg_d2f(long n_total, const double* in, float* out, cudaStream_t stream) {
-    const long blocks = (n_total + kBlock - 1) / kBlock;
+void launch_bcg_d2f(std::int64_t n_total, const double* in, float* out, cudaStream_t stream) {
+    const std::int64_t blocks = (n_total + kBlock - 1) / kBlock;
     bcg_d2f_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, in, out);
 }
 
-void launch_bcg_residual(long n_total, const double* b, const double* ap, double* r,
+void launch_bcg_residual(std::int64_t n_total, const double* b, const double* ap, double* r,
                          cudaStream_t stream) {
-    const long blocks = (n_total + kBlock - 1) / kBlock;
+    const std::int64_t blocks = (n_total + kBlock - 1) / kBlock;
     bcg_residual_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, b, ap, r);
 }

@@ -1,6 +1,7 @@
 #include "vcycle.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -128,11 +129,11 @@ __host__ __device__ constexpr int block_tpr() {
     return K >= 8 ? 4 : 8;
 }
 
-__global__ void vc_jacobi_zero_block_kernel(long n_total, int k,
+__global__ void vc_jacobi_zero_block_kernel(std::int64_t n_total, int k,
                                             const float* __restrict__ dinv,
                                             const float* __restrict__ b,
                                             float* __restrict__ x) {
-    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n_total) x[i] = dinv[i / k] * b[i];
 }
 
@@ -152,7 +153,7 @@ __global__ void vc_residual_block_kernel(int n, const int* __restrict__ row_ptr,
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += kTprB) {
             const float v = vals[j];
-            const long base = static_cast<long>(col_idx[j]) * K;
+            const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * __ldg(x + base + c);
         }
@@ -163,7 +164,7 @@ __global__ void vc_residual_block_kernel(int n, const int* __restrict__ row_ptr,
         for (int c = 0; c < K; ++c) sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kTprB);
     }
     if (row < n && lane == 0) {
-        const long base = static_cast<long>(row) * K;
+        const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) r[base + c] = b[base + c] - sum[c];
     }
@@ -181,22 +182,22 @@ __global__ void vc_restrict_block_kernel(int n_coarse, const int* __restrict__ r
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     for (int j = r_row_ptr[row]; j < row_e; ++j) {
-        const long base = static_cast<long>(r_col_idx[j]) * K;
+        const std::int64_t base = static_cast<std::int64_t>(r_col_idx[j]) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) sum[c] += r_fine[base + c];
     }
-    const long out = static_cast<long>(row) * K;
+    const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll
     for (int c = 0; c < K; ++c) b_coarse[out + c] = sum[c];
 }
 
-__global__ void vc_prolongate_block_kernel(long n_total, int k,
+__global__ void vc_prolongate_block_kernel(std::int64_t n_total, int k,
                                            const int* __restrict__ aggregates,
                                            const float* __restrict__ x_coarse,
                                            float* __restrict__ x_fine) {
-    const long i = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n_total) {
-        x_fine[i] += __ldg(x_coarse + static_cast<long>(aggregates[i / k]) * k + (i % k));
+        x_fine[i] += __ldg(x_coarse + static_cast<std::int64_t>(aggregates[i / k]) * k + (i % k));
     }
 }
 
@@ -218,7 +219,7 @@ __global__ void vc_postsweep_block_kernel(int n, const int* __restrict__ row_ptr
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += kTprB) {
             const float v = vals[j];
-            const long base = static_cast<long>(col_idx[j]) * K;
+            const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * __ldg(x_in + base + c);
         }
@@ -230,7 +231,7 @@ __global__ void vc_postsweep_block_kernel(int n, const int* __restrict__ row_ptr
     }
     if (row < n && lane == 0) {
         const float d = dinv[row];
-        const long base = static_cast<long>(row) * K;
+        const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             x_out[base + c] = x_in[base + c] + d * (b[base + c] - sum[c]);
@@ -250,11 +251,11 @@ __global__ void vc_coarse_gemv_block_kernel(int n, const float* __restrict__ ain
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     for (int j = 0; j < n; ++j) {
         const float a = arow[j];
-        const long base = static_cast<long>(j) * K;
+        const std::int64_t base = static_cast<std::int64_t>(j) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) sum[c] += a * b[base + c];
     }
-    const long out = static_cast<long>(row) * K;
+    const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll
     for (int c = 0; c < K; ++c) x[out + c] = sum[c];
 }
@@ -312,8 +313,8 @@ void launch_vc_coarse_gemv(int n, const float* ainv, const float* b, float* x,
 
 void launch_vc_jacobi_zero_block(int n, int k, const float* dinv, const float* b, float* x,
                                  cudaStream_t stream) {
-    const long total = static_cast<long>(n) * k;
-    const long blocks = (total + kBlock - 1) / kBlock;
+    const std::int64_t total = static_cast<std::int64_t>(n) * k;
+    const std::int64_t blocks = (total + kBlock - 1) / kBlock;
     vc_jacobi_zero_block_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(
         total, k, dinv, b, x);
 }
@@ -341,8 +342,8 @@ void launch_vc_restrict_block(int n_coarse, int k, const int* r_row_ptr, const i
 
 void launch_vc_prolongate_block(int n, int k, const int* aggregates, const float* x_coarse,
                                 float* x_fine, cudaStream_t stream) {
-    const long total = static_cast<long>(n) * k;
-    const long blocks = (total + kBlock - 1) / kBlock;
+    const std::int64_t total = static_cast<std::int64_t>(n) * k;
+    const std::int64_t blocks = (total + kBlock - 1) / kBlock;
     vc_prolongate_block_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(
         total, k, aggregates, x_coarse, x_fine);
 }

@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -143,6 +144,7 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     check_cuda(cudaStreamWaitEvent(s, join_event_, 0), "block:wait_in");
 
     const size_t nk = static_cast<size_t>(n_) * k;
+    const std::int64_t nk_signed = static_cast<std::int64_t>(nk);
     double* const d_rz = scalars_blk_ + 0 * k;
     double* const d_pap = scalars_blk_ + 1 * k;
     double* const d_alpha = scalars_blk_ + 2 * k;
@@ -171,18 +173,18 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                    cudaMemcpyDeviceToDevice, s),
                    "block:copy(X0)");
         launch_bcsrmv_f64_block(n_, k, row_ptr_, col_idx_, values_, X_int_blk_, AP_blk_, s);
-        launch_bcg_residual(static_cast<long>(nk), B, AP_blk_, R_blk_, s);
+        launch_bcg_residual(nk_signed, B, AP_blk_, R_blk_, s);
     } else {
         check_cuda(cudaMemsetAsync(X_int_blk_, 0, nk * sizeof(double), s), "block:memset(X)");
         check_cuda(cudaMemcpyAsync(R_blk_, B, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
                    "block:copy(B,R)");
     }
 
-    launch_bcg_d2f(static_cast<long>(nk), R_blk_, RF_blk_, s);
+    launch_bcg_d2f(nk_signed, R_blk_, RF_blk_, s);
     check_cuda(cudaStreamSynchronize(s), "block:sync(precond_in0)");
     preconditioner.apply_block(n_, k, RF_blk_, ZF_blk_, s);
     launch_bcg_cast_dot_init(n_, k, ZF_blk_, R_blk_, partials_blk_, d_rz, s);
-    launch_bcg_f2d(static_cast<long>(nk), ZF_blk_, P_blk_, s);
+    launch_bcg_f2d(nk_signed, ZF_blk_, P_blk_, s);
 
     auto run_body = [&]() {
         launch_bcsrmv_f64_block(n_, k, row_ptr_, col_idx_, values_, P_blk_, AP_blk_, s);
