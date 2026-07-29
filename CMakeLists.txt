@@ -1,40 +1,43 @@
 cmake_minimum_required(VERSION 3.21)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+
+project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
+
 find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 
-option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the Python CUDA toolkit" OFF)
+option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the CUDA wheels" OFF)
+
+set(CUNIBS_CUDA_LIBS cudart cublasLt cublas nvJitLink cusparse cusolver)
 
 if(NOT CUNIBS_USE_SYSTEM_CUDA)
-  execute_process(
-    COMMAND "${Python_EXECUTABLE}" -c "import nvidia.cu13 as m, os; print(os.path.join(m.__path__[0], 'bin', 'nvcc'))"
-    RESULT_VARIABLE _CUDA_COMPILER_RESULT
-    OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE CMAKE_CUDA_COMPILER
-  )
-  if(NOT _CUDA_COMPILER_RESULT EQUAL 0)
-    message(FATAL_ERROR "Could not locate nvcc from the Python CUDA toolkit")
+  include(CunibsCudaPathfinder)
+  cunibs_probe_cuda(LIBS ${CUNIBS_CUDA_LIBS})
+
+  # CMakeDetermineCUDACompiler is skipped entirely once CMakeCUDACompiler.cmake
+  # exists, so a stale compiler would survive a moved venv or a switch to a
+  # system toolkit until the build directory is wiped.
+  if(CMAKE_CUDA_COMPILER AND NOT CMAKE_CUDA_COMPILER STREQUAL CUNIBS_CUDA_NVCC)
+    message(FATAL_ERROR
+      "The cached CUDA compiler no longer matches the one cuda.pathfinder resolves.\n"
+      "  cached: ${CMAKE_CUDA_COMPILER}\n"
+      "  probed: ${CUNIBS_CUDA_NVCC}\n"
+      "Delete ${CMAKE_BINARY_DIR} and reconfigure.")
   endif()
+  set(CMAKE_CUDA_COMPILER "${CUNIBS_CUDA_NVCC}")
 endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX CUDA)
+enable_language(CUDA)
 
-if(NOT CUNIBS_USE_SYSTEM_CUDA)
-  get_filename_component(_CUDA_BIN_DIR "${CMAKE_CUDA_COMPILER}" DIRECTORY)
-  set(_CUDA_LIB_DIR "${_CUDA_BIN_DIR}/../lib")
-  set(_CUDA_SHIM_LIBS cudart cublas cusparse cusolver)
-  foreach(_lib ${_CUDA_SHIM_LIBS})
-    if(EXISTS "${_CUDA_LIB_DIR}" AND NOT EXISTS "${_CUDA_LIB_DIR}/lib${_lib}.so")
-      file(GLOB _versioned "${_CUDA_LIB_DIR}/lib${_lib}.so.[0-9]*")
-      list(LENGTH _versioned _count)
-      if(_count GREATER 0)
-        list(GET _versioned 0 _first)
-        file(CREATE_LINK "${_first}" "${_CUDA_LIB_DIR}/lib${_lib}.so" SYMBOLIC)
-      endif()
-    endif()
-  endforeach()
+if(NOT CUNIBS_USE_SYSTEM_CUDA AND NOT WIN32)
+  cunibs_seed_cuda_toolkit(
+    LIBS ${CUNIBS_CUDA_LIBS}
+    INCLUDE_DIR "${CUNIBS_CUDA_INCLUDE_DIR}"
+    FINGERPRINT "${CUNIBS_CUDA_FINGERPRINT}")
 endif()
 
 find_package(CUDAToolkit 12.0 REQUIRED)
@@ -67,8 +70,10 @@ target_compile_definitions(amgx_libs PUBLIC
 )
 
 target_compile_options(amgx_libs PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-deprecated-declarations>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>)
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:GNU,Clang>>:-Xcompiler=-Wno-deprecated-declarations>
+  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/wd4996>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang>>:-Wno-deprecated-declarations>
+  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/wd4996>)
 
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
@@ -97,19 +102,30 @@ target_link_libraries(
   PRIVATE CUDA::cudart CUDA::cublas AMGX::amgxsh
 )
 
-if(CUNIBS_USE_SYSTEM_CUDA)
-  set(_CUNIBS_INSTALL_RPATH "$ORIGIN")
-else()
-  set(_CUNIBS_INSTALL_RPATH "$ORIGIN;$ORIGIN/../../nvidia/cu13/lib")
+set(_CUNIBS_INSTALL_RPATH "$ORIGIN")
+if(NOT CUNIBS_USE_SYSTEM_CUDA)
+  list(APPEND _CUNIBS_INSTALL_RPATH "$ORIGIN/../../nvidia/cu13/lib")
 endif()
 set_target_properties(_solver_ext amgxsh PROPERTIES INSTALL_RPATH "${_CUNIBS_INSTALL_RPATH}")
 
-get_target_property(_amgxsh_soversion amgxsh SOVERSION)
-set_target_properties(amgxsh PROPERTIES VERSION ${_amgxsh_soversion})
+# AMGX turns on CMAKE_INSTALL_RPATH_USE_LINK_PATH in its own scope, which would
+# otherwise append this machine's CUDA library directories to libamgxsh.
+set_target_properties(amgxsh PROPERTIES INSTALL_RPATH_USE_LINK_PATH FALSE)
+
+foreach(_target IN ITEMS _solver_ext amgxsh)
+  target_link_options(${_target} PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wl,--disable-new-dtags>)
+endforeach()
+
+if(NOT WIN32)
+  get_target_property(_amgxsh_soversion amgxsh SOVERSION)
+  set_target_properties(amgxsh PROPERTIES VERSION ${_amgxsh_soversion})
+endif()
 
 install(TARGETS _solver_ext amgxsh
-  LIBRARY DESTINATION cunibs/solver
-  NAMELINK_SKIP
+  RUNTIME DESTINATION cunibs/solver
+  LIBRARY DESTINATION cunibs/solver NAMELINK_SKIP
+  ARCHIVE DESTINATION ${SKBUILD_NULL_DIR}
 )
 
 nanobind_add_stub(

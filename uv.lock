@@ -51,6 +51,7 @@ name = "cunibs"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "cuda-pathfinder" },
     { name = "cuda-toolkit", extra = ["cublas", "cudart", "cusolver", "cusparse"] },
     { name = "cupy-cuda13x" },
     { name = "h5py" },
@@ -65,7 +66,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cuda-toolkit", extras = ["cudart", "cublas", "cusparse", "cusolver"], specifier = ">=13.2" },
+    { name = "cuda-pathfinder", specifier = ">=1.5,<2" },
+    { name = "cuda-toolkit", extras = ["cudart", "cublas", "cusparse", "cusolver"], specifier = ">=13.0,<14" },
     { name = "cupy-cuda13x", specifier = ">=14.0.0" },
     { name = "h5py", specifier = ">=3.10.0" },
     { name = "numpy", specifier = ">=1.26.0" },

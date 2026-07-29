@@ -46,15 +46,15 @@ The right-hand side uses a fixed per-node corner reduction order.
 
 ## Installation
 
-cuNIBS requires Python 3.12 or later and an NVIDIA GPU with a compatible
-driver. Install the repository with pip:
+cuNIBS requires Python 3.12 or later and an NVIDIA GPU. Install with pip:
 
 ```bash
 python -m pip install cunibs
 ```
 
-The build installs the required Python packages, CUDA components, and the
-bundled AMGx library.
+This pulls the CUDA 13 toolkit wheels, cupy, and the bundled AMGx library. No
+system CUDA installation is needed, but the driver must be new enough for
+CUDA 13 (r580 or later).
 
 ## Input data
 

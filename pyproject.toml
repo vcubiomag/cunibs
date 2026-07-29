@@ -17,6 +17,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "cuda-pathfinder>=1.5,<2",
     "cuda-toolkit[cudart,cublas,cusparse,cusolver]>=13.0,<14",
     "cupy-cuda13x>=14.0.0",
     "h5py>=3.10.0",
@@ -32,6 +33,7 @@ Repository = "https://github.com/vcubiomag/cunibs"
 requires = [
     "scikit-build-core>=0.12",
     "nanobind>=2.13.0",
+    "cuda-pathfinder>=1.5,<2",
     "cuda-toolkit[nvcc,cudart,cccl,cublas,cusparse,cusolver,nvtx]==13.2.*"
 ]
 build-backend = "scikit_build_core.build"
