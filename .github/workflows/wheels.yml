@@ -4,42 +4,60 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  CUDA_ARCHS: "75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+
 jobs:
   build-wheels:
-    name: Build ${{ matrix.python }} wheel
-    runs-on: ubuntu-24.04
+    name: Build ${{ matrix.python }} ${{ matrix.platform.tag }} wheel
+    runs-on: ${{ matrix.platform.runs-on }}
     strategy:
+      fail-fast: false
       matrix:
         python:
           - cp312
           - cp313
           - cp314
           - cp314t
+        platform:
+          - { tag: manylinux_x86_64, runs-on: ubuntu-24.04 }
+          - { tag: win_amd64, runs-on: windows-2025 }
 
     steps:
       - uses: actions/checkout@v7.0.0
         with:
           persist-credentials: false
 
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+
       - uses: pypa/cibuildwheel@v4.1.0
         env:
           CIBW_ARCHS_LINUX: x86_64
-          CIBW_BUILD: ${{ matrix.python }}-manylinux_x86_64
-          CIBW_ENVIRONMENT_LINUX: >-
-            CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;100;120"
+          CIBW_ARCHS_WINDOWS: AMD64
+          CIBW_BUILD: ${{ matrix.python }}-${{ matrix.platform.tag }}
+          CIBW_ENVIRONMENT: CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCHS }}"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
             auditwheel repair -w {dest_dir}
             --exclude 'libcu*.so.*'
             --exclude 'libnv*.so.*'
             {wheel}
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+            delvewheel repair -w {dest_dir} {wheel}
+            --no-mangle-all
+            --exclude "cu*.dll;nv*.dll"
+          CIBW_TEST_COMMAND: python -c "import cunibs.solver"
 
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: wheels-${{ matrix.python }}-manylinux-x86_64
+          name: wheels-${{ matrix.python }}-${{ matrix.platform.tag }}
           path: wheelhouse/*.whl
           if-no-files-found: error
 

@@ -18,7 +18,6 @@ def emit_path(key: str, value: str | Path) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--libs", required=True, help="comma-separated, in dependency order")
-    parser.add_argument("--emit-lib-paths", action="store_true")
     args = parser.parse_args()
 
     try:
@@ -51,8 +50,6 @@ def main() -> int:
     for libname in (name for name in args.libs.split(",") if name):
         loaded = load_nvidia_dynamic_lib(libname)
         emit(f"FOUND_VIA_{libname}", loaded.found_via)
-        if not args.emit_lib_paths:
-            continue
         if not loaded.abs_path:
             print(
                 f"{libname} was loaded but reports no path on disk "

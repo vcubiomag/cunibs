@@ -1,24 +1,14 @@
-# Locate the CUDA toolkit through cuda.pathfinder (PyPI wheels -> conda ->
-# system -> CUDA_HOME) rather than assuming a filesystem layout.
-
 function(cunibs_probe_cuda)
   cmake_parse_arguments(arg "" "" "LIBS" ${ARGN})
 
   set(_probe "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cuda_pathfinder_probe.py")
   list(JOIN arg_LIBS "," _libs)
 
-  set(_flags "")
-  if(NOT WIN32)
-    # The Linux wheels ship only versioned SONAMEs (libcudart.so.13) with no .so
-    # development symlink, so we link the absolute versioned file instead of
-    # letting find_library look for a name that does not exist. The Windows
-    # wheels ship unversioned .lib import libraries, which FindCUDAToolkit
-    # locates without help.
-    list(APPEND _flags --emit-lib-paths)
-  endif()
-
+  # The probe reports absolute paths because neither platform's wheels ship an artifact
+  # find_library could locate: Linux has only versioned SONAMEs (libcudart.so.13) with no
+  # .so development symlink, and Windows ships bare DLLs.
   execute_process(
-    COMMAND "${Python_EXECUTABLE}" "${_probe}" --libs "${_libs}" ${_flags}
+    COMMAND "${Python_EXECUTABLE}" "${_probe}" --libs "${_libs}"
     RESULT_VARIABLE _result
     OUTPUT_VARIABLE _stdout
     ERROR_VARIABLE _stderr
@@ -54,11 +44,10 @@ function(cunibs_probe_cuda)
   set(CUNIBS_CUDA_FINGERPRINT "${_fingerprint}" PARENT_SCOPE)
 endfunction()
 
-# Seed FindCUDAToolkit so it never needs a development symlink, and pre-create
-# the imported targets so it cannot widen their interfaces with libraries from
-# an unrelated system toolkit. FindCUDAToolkit guards the whole target setup
-# with `if(NOT TARGET CUDA::<lib> AND CUDA_<lib>_LIBRARY)`, so targets created
-# here survive untouched.
+# Seed FindCUDAToolkit so it never needs a development symlink, and pre-create the
+# imported targets so it cannot widen their interfaces with libraries from an unrelated
+# system toolkit. FindCUDAToolkit guards its target setup with
+# `if(NOT TARGET CUDA::<lib> AND CUDA_<lib>_LIBRARY)`, so targets created here survive.
 function(cunibs_seed_cuda_toolkit)
   cmake_parse_arguments(arg "" "INCLUDE_DIR;FINGERPRINT" "LIBS" ${ARGN})
 
@@ -73,8 +62,16 @@ function(cunibs_seed_cuda_toolkit)
       CACHE INTERNAL "fingerprint of the CUDA toolkit seeded into the cache" FORCE)
   endif()
 
+  # Windows links against the synthesized import library, not the DLL. FindCUDAToolkit
+  # likewise records a .lib in IMPORTED_LOCATION there -- its IMPORTED_IMPLIB branch is
+  # Unix-only -- so the target shape below is the same on both platforms.
+  set(_link_var CUNIBS_CUDA_LIB_)
+  if(WIN32)
+    set(_link_var CUNIBS_CUDA_IMPLIB_)
+  endif()
+
   foreach(_lib IN LISTS arg_LIBS)
-    set(_path "${CUNIBS_CUDA_LIB_${_lib}}")
+    set(_path "${${_link_var}${_lib}}")
     if(NOT _path)
       message(FATAL_ERROR "The cuda.pathfinder probe reported no path for '${_lib}'")
     endif()
@@ -90,7 +87,7 @@ function(cunibs_seed_cuda_toolkit)
   # A REQUIRED_VARS entry of find_package_handle_standard_args, and the anchor
   # FindCUDAToolkit derives CUDAToolkit_LIBRARY_DIR from. Distinct from
   # CUDA_cudart_LIBRARY above.
-  set(CUDA_CUDART "${CUNIBS_CUDA_LIB_cudart}" CACHE FILEPATH "CUDA toolkit anchor" ${_force})
+  set(CUDA_CUDART "${${_link_var}cudart}" CACHE FILEPATH "CUDA toolkit anchor" ${_force})
 
   # FindCUDAToolkit's dependency edge, minus culibos: it is a static library
   # that the wheels do not ship, so leaving it to FindCUDAToolkit means linking

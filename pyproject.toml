@@ -46,6 +46,15 @@ minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
 wheel.exclude = ["**.cpp", "**.cu", "**.hpp"]
 
+# Left to itself, scikit-build-core picks the Visual Studio generator, which compiles
+# CUDA through MSBuild's CUDA toolset rather than CMAKE_CUDA_COMPILER. That toolset only
+# ships with the system CUDA installer, so with the toolkit coming from wheels
+# enable_language(CUDA) fails with "No CUDA toolset found". Ninja needs cl.exe on PATH,
+# i.e. a developer shell locally and ilammy/msvc-dev-cmd in CI.
+[[tool.scikit-build.overrides]]
+if.platform-system = "win32"
+cmake.args = ["-GNinja"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
@@ -66,7 +75,12 @@ markers = [
 ]
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.{h,c,cu,hpp,cpp}" }, { file = "CMakeLists.txt" }]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/**/*.{h,c,cu,hpp,cpp}" },
+    { file = "CMakeLists.txt" },
+    { file = "cmake/*.{cmake,py}" },
+]
 
 [tool.ruff]
 line-length = 96

@@ -19,6 +19,9 @@ _FAILURES = _preload()
 
 
 def describe_failure(exc: ImportError) -> str:
+    if not _FAILURES:
+        return f"cunibs could not load its solver extension: {exc}"
+
     detail = "".join(f"\n  {name}: {reason}" for name, reason in _FAILURES.items())
     return (
         f"cunibs could not load its solver extension: {exc}\n"

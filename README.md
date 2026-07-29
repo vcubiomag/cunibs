@@ -52,8 +52,9 @@ cuNIBS requires Python 3.12 or later and an NVIDIA GPU. Install with pip:
 python -m pip install cunibs
 ```
 
-This pulls the CUDA 13 toolkit wheels and cupy. No system CUDA installation is
-needed, but the driver must be new enough for
+Wheels are published for x86-64 Linux and Windows, for CPython 3.12 through 3.14
+including free-threaded 3.14. This pulls the CUDA 13 toolkit wheels and cupy. No
+system CUDA installation is needed, but the driver must be new enough for
 CUDA 13 (r580 or later).
 
 ## Input data
