@@ -18,6 +18,8 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "cuda-pathfinder>=1.5,<2",
+    # cusparse and cusolver are cupy's, for cupyx.scipy.sparse and cp.linalg; the
+    # extension itself links only cudart and cublas.
     "cuda-toolkit[cudart,cublas,cusparse,cusolver]>=13.0,<14",
     "cupy-cuda13x>=14.0.0",
     "h5py>=3.10.0",
@@ -34,7 +36,8 @@ requires = [
     "scikit-build-core>=0.12",
     "nanobind>=2.13.0",
     "cuda-pathfinder>=1.5,<2",
-    "cuda-toolkit[nvcc,cudart,cccl,cublas,cusparse,cusolver,nvtx]==13.2.*"
+    # cccl carries nv/target, which cuda_fp16.h includes on the cublas_v2.h path.
+    "cuda-toolkit[nvcc,cudart,cccl,cublas]==13.2.*"
 ]
 build-backend = "scikit_build_core.build"
 

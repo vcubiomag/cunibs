@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from cuda.pathfinder import DynamicLibNotFoundError, load_nvidia_dynamic_lib
 
-CUDA_LIBNAMES = ("cudart", "cublas", "cusparse", "cusolver")
+CUDA_LIBNAMES = ("cudart", "cublas")
 
 
 def _preload() -> dict[str, str]:

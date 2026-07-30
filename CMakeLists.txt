@@ -8,7 +8,7 @@ find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 
 option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the CUDA wheels" OFF)
 
-set(CUNIBS_CUDA_LIBS cudart cublasLt cublas nvJitLink cusparse cusolver)
+set(CUNIBS_CUDA_LIBS cudart cublasLt cublas)
 
 if(NOT CUNIBS_USE_SYSTEM_CUDA)
   include(CunibsCudaPathfinder)
