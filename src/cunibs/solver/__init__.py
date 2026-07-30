@@ -3,8 +3,6 @@ from cunibs.solver import _cuda_preload
 
 try:
     from cunibs.solver._solver_ext import (
-        AMGXFloatSolver,
-        AMGXSolver,
         NativeVCycle,
         PcgAmgSolver,
         accumulate_moments,
@@ -18,14 +16,13 @@ try:
         rhs_assemble,
         rhs_assemble_weighted,
         rhs_assemble_weighted_block,
+        select_size4,
         weighted_gradient,
     )
 except ImportError as exc:
     raise ImportError(_cuda_preload.describe_failure(exc)) from exc
 
 __all__ = [
-    "AMGXFloatSolver",
-    "AMGXSolver",
     "NativeVCycle",
     "PcgAmgSolver",
     "accumulate_moments",
@@ -39,5 +36,6 @@ __all__ = [
     "rhs_assemble",
     "rhs_assemble_weighted",
     "rhs_assemble_weighted_block",
+    "select_size4",
     "weighted_gradient",
 ]

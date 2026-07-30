@@ -36,8 +36,8 @@ class ConductivityUQConfig:
     The AMG preconditioner is built once at the nominal (ensemble-centre) σ and reused for the
     whole run. The samples are i.i.d. about that centre, and the converged field is the same for
     any preconditioner (only the iteration count changes). A draw that fails to reach tolerance
-    against it falls back to a per-sample fp64 AMGx solve (built lazily on the first such draw),
-    so accuracy never depends on the preconditioner tracking the sample.
+    against it retries against a preconditioner rebuilt for that draw, so accuracy never depends
+    on the preconditioner tracking the sample.
     """
 
     n_samples: int = 500

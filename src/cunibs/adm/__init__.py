@@ -1,6 +1,6 @@
 """Auxiliary Dipole Method: fast reciprocity-based TMS coil-placement evaluation.
 
-A few one-time adjoint solves (reusing the forward AMGx hierarchy) sample a reciprocity field on a
+A few one-time adjoint solves (reusing the forward AMG hierarchy) sample a reciprocity field on a
 regular grid; thereafter the target E-field of any placement is a trilinear interpolation plus a
 dipole sum.
 """

@@ -1,4 +1,4 @@
-"""GPU P1 FEM backend for the TMS E-field (cupy + AMGx)."""
+"""GPU P1 FEM backend for the TMS E-field (cupy + custom CUDA kernels)."""
 
 from cunibs.fem.assembly import (
     GM_TAG,
@@ -17,13 +17,14 @@ from cunibs.fem.placement import (
     compute_coil_transforms,
 )
 from cunibs.fem.solve import (
-    AMGX_CONFIG,
+    DEFAULT_MAX_ITERS,
+    DEFAULT_TOLERANCE,
     MAX_BLOCK,
-    UQ_AMGX_CONFIG,
     BlockWarmStart,
     GroundedSolver,
     PlacementResult,
     SolverContext,
+    SolverConvergenceError,
     build_context,
     ground_node_of,
     grounded_index,
@@ -35,18 +36,19 @@ from cunibs.fem.solve import (
 )
 
 __all__ = [
-    "AMGX_CONFIG",
+    "DEFAULT_MAX_ITERS",
+    "DEFAULT_TOLERANCE",
     "GM_TAG",
     "GRADIENT_TILE_TETS",
     "MAX_BLOCK",
     "MU0_OVER_4PI",
     "STIFFNESS_TILE_TETS",
     "TISSUE_CONDUCTIVITY",
-    "UQ_AMGX_CONFIG",
     "BlockWarmStart",
     "GroundedSolver",
     "PlacementResult",
     "SolverContext",
+    "SolverConvergenceError",
     "assemble_stiffness",
     "build_context",
     "build_node2corner",

@@ -24,7 +24,6 @@ from cunibs.fem.assembly import (
 )
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.fem.solve import (
-    AMGX_CONFIG,
     GroundedSolver,
     SolverContext,
     prepare_grounded_solver,
@@ -41,13 +40,14 @@ if TYPE_CHECKING:
 # residual carries far more pointwise error in the functional than the same relative residual does
 # for a forward solve. The adjoint solves are one-time (3 per target), so they can afford a
 # tighter tolerance than the forward solve.
-ADJOINT_AMGX_CONFIG = AMGX_CONFIG.replace("tolerance=1e-6", "tolerance=1e-9").replace(
-    "max_iters=2000", "max_iters=3000"
-)
+ADJOINT_TOLERANCE = 1e-9
+ADJOINT_MAX_ITERS = 3000
 
 
 def build_adjoint_solver(
-    ctx: SolverContext, config: str = ADJOINT_AMGX_CONFIG
+    ctx: SolverContext,
+    tolerance: float = ADJOINT_TOLERANCE,
+    max_iters: int = ADJOINT_MAX_ITERS,
 ) -> GroundedSolver:
     """Assemble a dedicated tight-tolerance grounded solver for the adjoint (reciprocity) solves.
 
@@ -58,7 +58,7 @@ def build_adjoint_solver(
     cond = conductivity_per_tet(ctx.tet_tags)
     stiffness = assemble_stiffness(g64, vols, cond, ctx.n_nodes, ctx.tet_nodes)
     ground_node = int(cp.argmin(ctx.nodes_mm[:, 2]))
-    solver = prepare_grounded_solver(stiffness, ground_node, config)
+    solver = prepare_grounded_solver(stiffness, ground_node, tolerance, max_iters)
     del stiffness, g64, vols, cond
     return solver
 

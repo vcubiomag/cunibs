@@ -4,9 +4,9 @@
 
 cuNIBS computes the electric field induced by transcranial magnetic stimulation
 (TMS) in a tetrahedral head model. It uses first-order finite elements, magnetic
-dipole coil models, CUDA kernels, and an AMGx-preconditioned linear solve. Mesh
-state and the AMG hierarchy remain on the GPU and are reused across coil
-placements.
+dipole coil models, CUDA kernels, and a mixed-precision conjugate-gradient solve
+preconditioned by an aggregation-AMG V-cycle. Mesh state and the AMG hierarchy
+remain on the GPU and are reused across coil placements.
 
 The package is intended for computational research. It currently supports
 isotropic conductivity models, conductivity uncertainty quantification, and
@@ -52,8 +52,8 @@ cuNIBS requires Python 3.12 or later and an NVIDIA GPU. Install with pip:
 python -m pip install cunibs
 ```
 
-This pulls the CUDA 13 toolkit wheels, cupy, and the bundled AMGx library. No
-system CUDA installation is needed, but the driver must be new enough for
+This pulls the CUDA 13 toolkit wheels and cupy. No system CUDA installation is
+needed, but the driver must be new enough for
 CUDA 13 (r580 or later).
 
 ## Input data
@@ -440,8 +440,9 @@ E = adm.evaluate(recip, coil, placements, didt=1.0e6)   # (P, D) target E-vector
 
 ## Reproducibility
 
-The solver configuration uses deterministic AMGx execution and a fixed
-right-hand-side reduction order. Floating-point results can still vary across
+Every solver kernel is deterministic by construction: the aggregation runs one
+thread per row with fixed tie-breaks and no atomics, and the reductions and the
+right-hand-side assembly use fixed summation orders. Floating-point results can still vary across
 GPU architectures, CUDA versions, compiler versions, and dependency versions.
 The ADM adjoint solves use a tighter tolerance (`1e-9`) than the forward solve
 because their near-point-source right-hand side is more sensitive.
@@ -486,4 +487,5 @@ mesh, coil model, and placement parameters used in the analysis.
 - Naumov, M., Arsaev, M., Castonguay, P., et al. (2015). [AmgX: A library for
   GPU accelerated algebraic multigrid and preconditioned iterative
   methods](https://doi.org/10.1137/140980260). *SIAM Journal on Scientific
-  Computing*, 37(5), S602-S626.
+  Computing*, 37(5), S602-S626. The aggregation selector and l1-Jacobi V-cycle
+  used here follow the algorithms described there.

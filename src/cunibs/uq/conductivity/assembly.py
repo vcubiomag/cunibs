@@ -2,8 +2,8 @@
 
 K is linear in the per-tissue conductivities: ``K(σ).data = K_base.data + Σ_t σ_t·Kt.data`` on a
 fixed CSR sparsity pattern. Assembling each tissue's geometric contribution once turns the
-per-sample matrix build into a single GEMV over the nonzeros, and lets AMGx swap coefficients
-without re-analysing structure.
+per-sample matrix build into a single GEMV over the nonzeros, and lets the solver swap
+coefficients without re-analysing structure.
 """
 
 from __future__ import annotations
@@ -19,16 +19,15 @@ from cunibs.fem.assembly import (
     gradient_operator,
 )
 from cunibs.fem.solve import (
-    AMGX_PRECONDITIONER_CONFIG,
-    UQ_AMGX_CONFIG,
+    DEFAULT_MAX_ITERS,
+    DEFAULT_TOLERANCE,
     SolverContext,
-    _amgx_config_value,
     build_native_vcycle,
     ground_node_of,
     grounded_index,
     reduce_matrix,
 )
-from cunibs.solver import AMGXFloatSolver, AMGXSolver, NativeVCycle, PcgAmgSolver
+from cunibs.solver import NativeVCycle, PcgAmgSolver
 
 
 @dataclass
@@ -37,11 +36,11 @@ class ConductivityUQPrecompute:
 
     perturbed_tags: tuple[int, ...]
     idx: cp.ndarray  # grounded row/col index (drops the ground DOF)
-    indptr: cp.ndarray  # reduced CSR pattern (device pointers handed to AMGx once)
+    indptr: cp.ndarray  # reduced CSR pattern
     indices: cp.ndarray
     base_data: cp.ndarray  # (nnz,) f64 — non-perturbed tissues at nominal σ
     tissue_data: cp.ndarray  # (n_perturbed, nnz) f64 — per-tissue unit-σ contribution
-    precond: NativeVCycle  # fp32 V-cycle frozen at nominal σ (AMGx hierarchy exported once)
+    precond: NativeVCycle  # fp32 V-cycle frozen at nominal σ
     pcg: PcgAmgSolver  # fp64 outer PCG; matrix values swapped per sample
     tolerance: float
     max_iters: int
@@ -49,25 +48,23 @@ class ConductivityUQPrecompute:
     nominal_data: (
         cp.ndarray
     )  # (nnz,) f64 — reduced values at nominal σ (frozen-preconditioner point)
-    # nominal σ, structure_reuse; the mixed-solve fallback, built lazily on the rare extreme draw.
-    solver: AMGXSolver | None = None
 
     def combine(self, sigma: cp.ndarray) -> cp.ndarray:
         """Assemble the reduced matrix values for one conductivity sample."""
         return self.base_data + sigma @ self.tissue_data
 
-    def ensure_solver(self) -> AMGXSolver:
-        """Build the fp64 fallback AMGx solver on first non-convergent draw.
+    def preconditioner_for(self, sample_data: cp.ndarray) -> NativeVCycle:
+        """Build a throwaway V-cycle matched to one draw's conductivities.
 
-        Most ensembles never reach this path, so deferring it keeps a full double hierarchy off
-        the device unless a draw actually needs one. It is set up at nominal σ; each fallback
-        then re-uploads its own sample's coefficients.
+        Only for a draw the nominal-σ preconditioner fails to converge. The result is not
+        cached: draws are i.i.d. around nominal, so an extreme draw's hierarchy is no better a
+        default for the next draw than the nominal one.
         """
-        if self.solver is None:
-            solver = AMGXSolver(UQ_AMGX_CONFIG)
-            solver.setup(self.indptr, self.indices, self.nominal_data)
-            self.solver = solver
-        return self.solver
+        return build_native_vcycle(
+            self.indptr,
+            self.indices,
+            cp.ascontiguousarray(sample_data.astype(cp.float32)),
+        )
 
 
 def _reduced_data_for(
@@ -82,7 +79,7 @@ def _reduced_data_for(
     """Assemble a stiffness with conductivity ``cond``, ground it, and align to the pattern.
 
     ``template`` is a zero-valued CSR on the reference pattern; adding it forces the reference
-    ordering so every component's ``.data`` is index-aligned with ``base_data``/AMGx. ``sel``
+    ordering so every component's ``.data`` is index-aligned with ``base_data``. ``sel``
     restricts the assembly to a subset of tets so each component touches only its own tets; the
     subset pattern is ⊆ the reference, so the template still aligns it. ``g64``/``vols``/``tet_nodes``
     are subset by ``sel`` while ``cond`` is passed already subset.
@@ -140,16 +137,11 @@ def build_conductivity_uq_precompute(
     row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
     col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
 
-    # AMGx builds the aggregation hierarchy, the native V-cycle takes device copies of everything
-    # it needs, then the AMGx float solver is dropped (as in prepare_grounded_solver).
     nominal_f32 = cp.ascontiguousarray(nominal_data.astype(cp.float32))
-    amgx_precond = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
-    amgx_precond.setup(row_ptr, col_idx, nominal_f32)
-    precond = build_native_vcycle(amgx_precond, row_ptr, col_idx, nominal_f32)
-    del amgx_precond
+    precond = build_native_vcycle(row_ptr, col_idx, nominal_f32)
     pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data)
-    tolerance = float(_amgx_config_value(UQ_AMGX_CONFIG, "tolerance", "1e-6"))
-    max_iters = int(_amgx_config_value(UQ_AMGX_CONFIG, "max_iters", "2000"))
+    tolerance = DEFAULT_TOLERANCE
+    max_iters = DEFAULT_MAX_ITERS
 
     return ConductivityUQPrecompute(
         perturbed_tags=perturbed_tags,

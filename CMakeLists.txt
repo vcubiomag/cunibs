@@ -52,29 +52,6 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Default build type" FORCE)
 endif()
 
-set(AMGX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(AMGX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(AMGX_BUILD_STATIC OFF CACHE BOOL "" FORCE)
-set(AMGX_BUILD_SHARED ON  CACHE BOOL "" FORCE)
-set(AMGX_INSTALL OFF CACHE BOOL "" FORCE)
-set(CMAKE_NO_MPI ON CACHE BOOL "" FORCE)
-set(AMGX_ENABLE_COMPLEX OFF CACHE BOOL "" FORCE)
-set(AMGX_ENABLE_MIXED_PRECISION ON CACHE BOOL "" FORCE)
-set(AMGX_MINIMAL_SOLVERS ON CACHE BOOL "" FORCE)
-
-add_subdirectory(external/AMGX)
-
-target_compile_definitions(amgx_libs PUBLIC
-  AMGX_build_device_dDDI_dFFI
-  AMGX_build_host_hDDI_hFFI
-)
-
-target_compile_options(amgx_libs PRIVATE
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:GNU,Clang>>:-Xcompiler=-Wno-deprecated-declarations>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/wd4996>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang>>:-Wno-deprecated-declarations>
-  $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/wd4996>)
-
 execute_process(
   COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
   OUTPUT_STRIP_TRAILING_WHITESPACE OUTPUT_VARIABLE nanobind_ROOT)
@@ -85,6 +62,7 @@ nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/solver.cpp
   src/cunibs/solver/cast.cu
   src/cunibs/solver/vcycle.cu
+  src/cunibs/solver/aggregate.cu
   src/cunibs/solver/block_cg.cu
   src/cunibs/solver/dadt.cu
   src/cunibs/solver/dadt_element.cu
@@ -99,30 +77,19 @@ set_source_files_properties(src/cunibs/solver/dadt.cu PROPERTIES COMPILE_OPTIONS
 
 target_link_libraries(
   _solver_ext
-  PRIVATE CUDA::cudart CUDA::cublas AMGX::amgxsh
+  PRIVATE CUDA::cudart CUDA::cublas
 )
 
 set(_CUNIBS_INSTALL_RPATH "$ORIGIN")
 if(NOT CUNIBS_USE_SYSTEM_CUDA)
   list(APPEND _CUNIBS_INSTALL_RPATH "$ORIGIN/../../nvidia/cu13/lib")
 endif()
-set_target_properties(_solver_ext amgxsh PROPERTIES INSTALL_RPATH "${_CUNIBS_INSTALL_RPATH}")
+set_target_properties(_solver_ext PROPERTIES INSTALL_RPATH "${_CUNIBS_INSTALL_RPATH}")
 
-# AMGX turns on CMAKE_INSTALL_RPATH_USE_LINK_PATH in its own scope, which would
-# otherwise append this machine's CUDA library directories to libamgxsh.
-set_target_properties(amgxsh PROPERTIES INSTALL_RPATH_USE_LINK_PATH FALSE)
+target_link_options(_solver_ext PRIVATE
+  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wl,--disable-new-dtags>)
 
-foreach(_target IN ITEMS _solver_ext amgxsh)
-  target_link_options(${_target} PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wl,--disable-new-dtags>)
-endforeach()
-
-if(NOT WIN32)
-  get_target_property(_amgxsh_soversion amgxsh SOVERSION)
-  set_target_properties(amgxsh PROPERTIES VERSION ${_amgxsh_soversion})
-endif()
-
-install(TARGETS _solver_ext amgxsh
+install(TARGETS _solver_ext
   RUNTIME DESTINATION cunibs/solver
   LIBRARY DESTINATION cunibs/solver NAMELINK_SKIP
   ARCHIVE DESTINATION ${SKBUILD_NULL_DIR}

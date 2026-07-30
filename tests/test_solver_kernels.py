@@ -12,6 +12,8 @@ atomic-free with a fixed summation order, which is what makes the solver determi
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pytest
 
@@ -462,46 +464,69 @@ def test_place_transforms_batches_independently(cp, cube_subject, stream):
         np.testing.assert_array_equal(run(np.array([i]))[0], everything[i], err_msg=f"site {i}")
 
 
-# --- AMGX hierarchy export ----------------------------------------------------------------
+# --- native SIZE_4 aggregation ------------------------------------------------------------
 
 
 @pytest.mark.realmesh
-def test_amgx_float_solver_exports_a_usable_hierarchy(cp, patch_subject):
-    """``build_native_vcycle`` reads these three accessors; nothing else tests them.
+def test_native_aggregation_is_a_valid_partition(cp, patch_subject):
+    """Every level must map fine rows onto [0, n_coarse) with no empty aggregate.
 
-    The exported aggregate map must be a total function from fine rows onto the coarse rows
-    the next level declares — that surjectivity is what makes the boolean-P reconstruction
-    in ``build_native_vcycle`` valid.
+    An empty aggregate would give P a zero column, making the coarse Galerkin operator
+    singular and the dense coarse inverse meaningless.
     """
-    from cunibs.fem.solve import AMGX_PRECONDITIONER_CONFIG
-    from cunibs.solver import AMGXFloatSolver
+    from cunibs.fem.solve import aggregation_levels
 
     solver = patch_subject.context.solver
-    amgx = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
-    amgx.setup(
-        solver.row_ptr, solver.col_idx, cp.ascontiguousarray(solver.values.astype(cp.float32))
-    )
+    values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
 
-    n_levels = amgx.amg_num_levels()
-    assert n_levels >= 2, "the patch should coarsen at least once"
+    levels, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    assert levels, "the patch should coarsen at least once"
 
-    rows, nnz, _ = amgx.amg_level_dims(0)
-    assert rows == int(solver.idx.shape[0])
-    assert nnz == int(solver.col_idx.shape[0])
-
-    for level in range(n_levels - 1):
-        level_rows, level_nnz, n_coarse = amgx.amg_level_dims(level)
-        assert level_nnz >= level_rows
-        assert 0 < n_coarse < level_rows, f"level {level} did not coarsen"
-        # build_native_vcycle chains the levels by feeding n_coarse into the next Galerkin
-        # product and guards the mismatch with a RuntimeError; this is that invariant.
-        next_rows, _, _ = amgx.amg_level_dims(level + 1)
-        assert next_rows == n_coarse
-
-        agg = cp.empty(level_rows, dtype=cp.int32)
-        amgx.download_aggregates(level, agg)
+    for level, (_, agg, n_coarse) in enumerate(levels):
         agg_host = cp.asnumpy(agg)
-        assert agg_host.min() >= 0 and agg_host.max() < n_coarse
-        # Surjective onto the coarse rows: an empty aggregate would give P a zero column and
-        # make the boolean-P reconstruction singular.
-        assert np.unique(agg_host).size == n_coarse, "an aggregate is empty"
+        assert agg_host.min() >= 0, f"level {level} has a negative aggregate id"
+        assert agg_host.max() < n_coarse, f"level {level} exceeds the declared coarse size"
+        assert np.unique(agg_host).size == n_coarse, f"level {level} has an empty aggregate"
+
+
+@pytest.mark.realmesh
+def test_native_aggregation_is_deterministic(cp, patch_subject):
+    """One thread per row with fixed tie-breaks and no atomics: byte-identical across runs."""
+    from cunibs.fem.solve import aggregation_levels
+
+    solver = patch_subject.context.solver
+    values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
+
+    first, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    second, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+
+    assert len(first) == len(second)
+    for level, ((_, agg_a, nc_a), (_, agg_b, nc_b)) in enumerate(
+        zip(first, second, strict=True)
+    ):
+        assert nc_a == nc_b, f"level {level} aggregate count is not reproducible"
+        np.testing.assert_array_equal(
+            cp.asnumpy(agg_a), cp.asnumpy(agg_b), err_msg=f"level {level} is not reproducible"
+        )
+
+
+@pytest.mark.realmesh
+def test_native_hierarchy_level_sizes(cp, patch_subject):
+    """Pin the hierarchy shape on the committed patch fixture.
+
+    Catches an accidental change to the matching rules: resetting the carried-over
+    ``strongest``/``wsn`` state, for instance, drops the coarsening ratio from ~4.3 to ~3.7
+    and adds a level, which this notices immediately.
+    """
+    from cunibs.fem.solve import aggregation_levels
+
+    solver = patch_subject.context.solver
+    values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
+
+    levels, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    sizes = [int(solver.idx.shape[0])] + [int(n_coarse) for _, _, n_coarse in levels]
+    assert sizes == [8403, 1936, 457], f"hierarchy shape changed: {sizes}"
+
+    for level, (fine, coarse) in enumerate(itertools.pairwise(sizes)):
+        ratio = fine / coarse
+        assert 3.5 <= ratio <= 5.0, f"level {level} coarsening ratio {ratio:.2f} out of range"

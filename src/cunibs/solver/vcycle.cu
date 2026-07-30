@@ -105,8 +105,8 @@ __global__ void vc_postsweep_kernel(int n, const int* __restrict__ row_ptr,
     }
 }
 
-// One thread per row, sequential dot over the dense inverse row: deterministic and the
-// coarsest system is tiny (min_coarse_rows=32 scale), so efficiency is irrelevant.
+// One thread per row, sequential dot over the dense inverse row: deterministic, and the
+// coarsest system is a few hundred rows, so efficiency is irrelevant.
 __global__ void vc_coarse_gemv_kernel(int n, const float* __restrict__ ainv,
                                       const float* __restrict__ b, float* __restrict__ x) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;

@@ -194,35 +194,93 @@ def _force_fallback(ctx) -> None:
 
 
 @pytest.mark.realmesh
-def test_fp64_fallback_matches_mixed_solve(fresh_subject, patch_mesh, d70_coil, patch_sites):
-    """An unreachable tolerance drives every block column through the lazy fp64 AMGX path."""
+def test_unreachable_tolerance_rebuilds_then_raises_block(
+    fresh_subject, patch_mesh, d70_coil, patch_sites
+):
+    """An unreachable tolerance must rebuild the preconditioner once, then fail loudly.
+
+    Reporting a converged solve that did not converge is the one outcome worse than raising;
+    the fp64 fallback this replaced reported a residual of exactly 0.0 for a solve that had
+    only reached 1e-6.
+    """
+    from cunibs.fem import SolverConvergenceError
+
     subj = fresh_subject(patch_mesh)
     ctx = subj.context
     sites = patch_sites[:4]
-    reference = block(ctx, d70_coil, sites)
-    assert ctx.solver.amgx is None
+    block(ctx, d70_coil, sites)
 
     _force_fallback(ctx)
-    fallback = block(ctx, d70_coil, sites)
-    assert ctx.solver.amgx is not None
+    before = ctx.solver.precond
+    with pytest.raises(SolverConvergenceError) as excinfo:
+        block(ctx, d70_coil, sites)
 
-    for i, (f, r) in enumerate(zip(fallback, reference, strict=False)):
-        assert rel_l2(f["magnE"], r["magnE"]) <= PARITY, f"placement {i}"
-        assert rel_l2(f["v"], r["v"]) <= PARITY, f"placement {i}"
+    assert ctx.solver.precond is not before, "the preconditioner was not rebuilt"
+    assert excinfo.value.relative_residual > 0.0
+    assert excinfo.value.tolerance == 0.0
 
 
 @pytest.mark.realmesh
-def test_fp64_fallback_matches_serial_solve(fresh_subject, patch_mesh, d70_coil, patch_sites):
-    """The same fallback on the single-RHS path in ``solve_grounded``."""
+def test_unreachable_tolerance_rebuilds_then_raises_serial(
+    fresh_subject, patch_mesh, d70_coil, patch_sites
+):
+    """The same retry-then-raise on the single-RHS path in ``solve_grounded``."""
+    from cunibs.fem import SolverConvergenceError
+
+    subj = fresh_subject(patch_mesh)
+    ctx = subj.context
+    site = patch_sites[0]
+    serial(ctx, d70_coil, [site])
+
+    _force_fallback(ctx)
+    before = ctx.solver.precond
+    with pytest.raises(SolverConvergenceError):
+        serial(ctx, d70_coil, [site])
+    assert ctx.solver.precond is not before, "the preconditioner was not rebuilt"
+
+
+@pytest.mark.realmesh
+def test_rebuild_preconditioner_restores_the_full_hierarchy(
+    cp, fresh_subject, patch_mesh, d70_coil, patch_sites
+):
+    """Swapping the hierarchy changes only the rate; rebuilding restores the original exactly.
+
+    That the preconditioner cannot move the fixed point is what lets the retry path replace an
+    fp64 fallback solver: there is no more accurate solve to fall back to, only a faster one.
+
+    The substitute here is a one-level hierarchy. It converges in *fewer* iterations than the
+    production three-level one (its dense coarse solve is exact at 1936 rows rather than 457),
+    which is why production does not use it: the coarse inverse costs O(n_coarse^2) memory. So
+    this asserts the answer is unchanged, not that it is slower.
+    """
+    from cunibs.fem.solve import AggregationParams, build_native_vcycle
+
     subj = fresh_subject(patch_mesh)
     ctx = subj.context
     site = patch_sites[0]
     reference = serial(ctx, d70_coil, [site])[0]
+    good_iters = ctx.solver.last_iterations
+    good_levels = ctx.solver.precond.n_levels()
+    assert good_levels >= 2
 
-    _force_fallback(ctx)
-    fallback = serial(ctx, d70_coil, [site])[0]
-    assert ctx.solver.amgx is not None
-    assert ctx.solver.last_relative_residual == 0.0
-    # The fallback converges to AMGX's own 1e-6 relative tolerance, so the two independent
-    # solutions agree to roughly that, not to machine precision.
-    assert rel_l2(fallback["magnE"], reference["magnE"]) <= PARITY
+    other = build_native_vcycle(
+        ctx.solver.row_ptr,
+        ctx.solver.col_idx,
+        cp.ascontiguousarray(ctx.solver.values.astype(cp.float32)),
+        AggregationParams(max_levels=1),
+    )
+    assert other.n_levels() == 1
+    ctx.solver.precond = other
+
+    swapped = serial(ctx, d70_coil, [site])[0]
+    assert ctx.solver.precond is other, "the substitute should converge unaided"
+    assert ctx.solver.last_relative_residual <= ctx.solver.tolerance
+    assert rel_l2(swapped["magnE"], reference["magnE"]) <= PARITY
+
+    ctx.solver.rebuild_preconditioner()
+    assert ctx.solver.precond.n_levels() == good_levels
+    rebuilt = serial(ctx, d70_coil, [site])[0]
+    # Rebuilt from the same values by the same deterministic selector, so the hierarchy is
+    # identical and the solve must repeat exactly.
+    assert ctx.solver.last_iterations == good_iters
+    assert rel_l2(rebuilt["magnE"], reference["magnE"]) <= PARITY

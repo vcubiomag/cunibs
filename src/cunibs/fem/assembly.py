@@ -73,7 +73,7 @@ def assemble_stiffness(
     K_e[i,j] = vol_e · σ_e · (∇λ_i · ∇λ_j).
 
     Tiling limits temporary COO storage and the memory used to merge duplicate entries.
-    AMGx requires int32 indices.
+    The solver kernels index with int32.
     """
     scale = vols * cond
     n_tet = tet_nodes.shape[0]

@@ -1,21 +1,20 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
 #include <new>
 #include <stdexcept>
-#include <string>
 
+#include "aggregate.hpp"
 #include "kernels.hpp"
 #include "solver.hpp"
 #include "vcycle.hpp"
 
 namespace nb = nanobind;
 
-// Contiguity is required because these arrays are passed to CUDA and AMGx as raw pointers.
+// Contiguity is required because these arrays are passed to CUDA as raw pointers.
 using f64_cuda = nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 using f64_cuda_2d = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 using i32_cuda = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
@@ -26,67 +25,6 @@ using f32_cuda_3d = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cu
 using i32_cuda_2d = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 
 NB_MODULE(_solver_ext, m) {
-    nb::class_<AMGXSolver>(m, "AMGXSolver")
-        .def(nb::init<const std::string&>(), nb::arg("config"))
-        .def(
-            "setup",
-            [](AMGXSolver& self, i32_cuda row_ptr, i32_cuda col_idx, f64_cuda values) {
-                int n = static_cast<int>(row_ptr.shape(0)) - 1;
-                int nnz = static_cast<int>(values.shape(0));
-                self.setup(n, nnz, row_ptr.data(), col_idx.data(), values.data());
-            },
-            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
-            nb::arg("values").noconvert(),
-            "Upload the reduced CSR (device pointers) and build the AMG hierarchy once.")
-        .def(
-            "update_coefficients",
-            [](AMGXSolver& self, f64_cuda values) {
-                self.update_coefficients(static_cast<int>(values.shape(0)), values.data());
-            },
-            nb::arg("values").noconvert(),
-            "Replace matrix values (device pointer) keeping the sparsity pattern; no re-analysis.")
-        .def("resetup", &AMGXSolver::resetup,
-             "Rebuild the numeric AMG hierarchy for the current values (reuses structure per config).")
-        .def("iterations", &AMGXSolver::iterations,
-             "Return the iteration count from the most recent solve.")
-        .def(
-            "solve",
-            [](AMGXSolver& self, f64_cuda b, f64_cuda x, uintptr_t stream) {
-                int n = static_cast<int>(b.shape(0));
-                self.solve(n, b.data(), x.data(), reinterpret_cast<cudaStream_t>(stream));
-            },
-            nb::arg("b").noconvert(), nb::arg("x").noconvert(), nb::arg("stream"),
-            "Solve A x = b on device; x (length n) is overwritten with the solution.");
-
-    nb::class_<AMGXFloatSolver>(m, "AMGXFloatSolver")
-        .def(nb::init<const std::string&>(), nb::arg("config"))
-        .def(
-            "setup",
-            [](AMGXFloatSolver& self, i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values) {
-                int n = static_cast<int>(row_ptr.shape(0)) - 1;
-                int nnz = static_cast<int>(values.shape(0));
-                self.setup(n, nnz, row_ptr.data(), col_idx.data(), values.data());
-            },
-            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
-            nb::arg("values").noconvert())
-        .def("amg_num_levels", &AMGXFloatSolver::amg_num_levels,
-             "Number of levels in the AMG hierarchy built by the last setup().")
-        .def(
-            "amg_level_dims",
-            [](const AMGXFloatSolver& self, int level) {
-                int n_rows = 0, n_nz = 0, n_coarse = 0;
-                self.amg_level_dims(level, &n_rows, &n_nz, &n_coarse);
-                return nb::make_tuple(n_rows, n_nz, n_coarse);
-            },
-            nb::arg("level"), "Return (n_rows, n_nz, n_coarse) for one AMG level.")
-        .def(
-            "download_aggregates",
-            [](const AMGXFloatSolver& self, int level, i32_cuda out) {
-                self.download_aggregates(level, out.data());
-            },
-            nb::arg("level"), nb::arg("out").noconvert(),
-            "Copy the level's fine-row -> aggregate map into a device int32 array.");
-
     nb::class_<NativeVCycle>(m, "NativeVCycle")
         .def(nb::init<>())
         .def(
@@ -117,7 +55,27 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("ainv").noconvert(),
             "Set the dense (row-major) inverse of the coarsest matrix.")
         .def("finalize", &NativeVCycle::finalize,
-             "Validate level chain consistency; required before apply.");
+             "Validate level chain consistency; required before apply.")
+        .def("n_levels", &NativeVCycle::n_levels,
+             "Number of coarsening levels, excluding the coarsest (dense-inverse) one.");
+
+    m.def(
+        "select_size4",
+        [](i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values, i32_cuda aggregates,
+           uintptr_t stream) {
+            int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
+            int nnz = static_cast<int>(values.shape(0));
+            if (static_cast<int>(aggregates.shape(0)) != n_rows) {
+                throw std::invalid_argument("aggregates must have one entry per row");
+            }
+            return select_size4(n_rows, nnz, row_ptr.data(), col_idx.data(), values.data(),
+                                aggregates.data(), reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
+        nb::arg("values").noconvert(), nb::arg("aggregates").noconvert(),
+        nb::arg("stream") = 0,
+        "Unsmoothed pairwise aggregation (AMGx SIZE_4). Fills `aggregates` with a surjective "
+        "row -> aggregate map and returns the aggregate count. Synchronises the stream.");
 
     nb::class_<PcgAmgSolver>(m, "PcgAmgSolver")
         .def(

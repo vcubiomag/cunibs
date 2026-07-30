@@ -22,8 +22,6 @@ from cunibs.fem.placement import (
     compute_coil_transforms,
 )
 from cunibs.solver import (
-    AMGXFloatSolver,
-    AMGXSolver,
     NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
@@ -31,6 +29,7 @@ from cunibs.solver import (
     reconstruct_e_block,
     rhs_assemble_weighted,
     rhs_assemble_weighted_block,
+    select_size4,
     weighted_gradient,
 )
 
@@ -42,44 +41,19 @@ if TYPE_CHECKING:
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
 
-# PCG requires a symmetric preconditioner, so the smoother is l1-Jacobi rather than a
-# Gauss-Seidel or ILU variant.
-AMGX_CONFIG = (
-    "config_version=2, determinism_flag=1, solver=PCG, tolerance=1e-6, max_iters=2000, "
-    "norm=L2, convergence=RELATIVE_INI_CORE, monitor_residual=1, "
-    "preconditioner(amg)=AMG, amg:algorithm=AGGREGATION, amg:selector=SIZE_2, "
-    "amg:smoother=JACOBI_L1, amg:presweeps=1, amg:postsweeps=1, amg:max_iters=1, "
-    "amg:cycle=V, amg:coarse_solver=DENSE_LU_SOLVER, amg:min_coarse_rows=32, amg:max_levels=50"
-)
-
-# Reuse the aggregation graph across resetups when only the matrix values change (e.g. a
-# conductivity Monte Carlo). resetup then rebuilds only the Galerkin operators and smoothers.
-UQ_AMGX_CONFIG = AMGX_CONFIG + ", structure_reuse_levels=-1"
-
-AMGX_PRECONDITIONER_CONFIG = (
-    "config_version=2, determinism_flag=1, solver=AMG, max_iters=1, "
-    "monitor_residual=0, algorithm=AGGREGATION, selector=SIZE_4, "
-    "smoother=JACOBI_L1, presweeps=1, postsweeps=1, cycle=V, "
-    "coarse_solver=DENSE_LU_SOLVER, min_coarse_rows=32, max_levels=50"
-)
-
-
-def _amgx_config_value(config: str, key: str, default: str) -> str:
-    prefix = f"{key}="
-    for part in config.split(","):
-        item = part.strip()
-        if item.startswith(prefix):
-            return item[len(prefix) :]
-    return default
+# Stopping criterion of the mixed PCG: ||r||_2 / ||b||_2 <= DEFAULT_TOLERANCE. At 1e-6 the
+# field is accurate to ~1.4e-6 relative against a 1e-10 reference, at ~59 iterations.
+DEFAULT_TOLERANCE = 1e-6
+DEFAULT_MAX_ITERS = 2000
 
 
 def _l1_dinv(a: csp.csr_matrix, omega: float = 0.9) -> cp.ndarray:
-    """AMGx JACOBI_L1 smoother scaling: omega / d, d_i = sign(a_ii) * sum_j |a_ij|.
+    """l1-Jacobi smoother scaling: omega / d, with d_i = sign(a_ii) * sum_j |a_ij|.
 
-    The diagonal is included in the L1 norm and the sign is flipped for negative diagonals,
-    matching how AMGx builds its l1-Jacobi diagonal; ``omega`` is its relaxation factor. The
-    zero row guard cannot fire for the SPD reduced stiffness, but keeps the reciprocal finite
-    for any input.
+    The diagonal is included in the L1 norm and the sign follows the diagonal, which is what
+    keeps the smoother positive definite and so the whole V-cycle a valid PCG preconditioner.
+    ``omega`` is the relaxation factor. The zero-row guard cannot fire for the SPD reduced
+    stiffness, but keeps the reciprocal finite for any input.
     """
     abs_a = csp.csr_matrix((cp.abs(a.data), a.indices, a.indptr), shape=a.shape)
     d = abs_a.dot(cp.ones(a.shape[1], dtype=cp.float32))
@@ -88,58 +62,99 @@ def _l1_dinv(a: csp.csr_matrix, omega: float = 0.9) -> cp.ndarray:
     return cp.ascontiguousarray((cp.float32(omega) / d).astype(cp.float32))
 
 
-def build_native_vcycle(
-    float_preconditioner: AMGXFloatSolver,
+def _galerkin(a: csp.csr_matrix, agg: cp.ndarray, n_coarse: int) -> csp.csr_matrix:
+    """A_{l+1} = P^T A_l P, with P the boolean aggregate map of unsmoothed aggregation."""
+    p = csp.csr_matrix(
+        (
+            cp.ones(a.shape[0], dtype=cp.float32),
+            agg,
+            cp.arange(a.shape[0] + 1, dtype=cp.int32),
+        ),
+        shape=(a.shape[0], n_coarse),
+    )
+    coarse = (p.T.tocsr() @ a @ p).tocsr()
+    coarse.sum_duplicates()
+    coarse.sort_indices()
+    return coarse
+
+
+@dataclass(frozen=True)
+class AggregationParams:
+    """Hierarchy shape controls.
+
+    ``min_coarse_rows`` bounds the dense coarse solve, whose inverse costs O(n_coarse^2)
+    memory. It applies to the *next* level's size, so the coarsest level sits above it: 164
+    rows on sub-001, 457 on the test patch.
+    """
+
+    min_coarse_rows: int = 128
+    max_levels: int = 50
+
+
+def aggregation_levels(
     row_ptr: cp.ndarray,
     col_idx: cp.ndarray,
     values_f32: cp.ndarray,
-) -> NativeVCycle:
-    """Rebuild the AMGx preconditioner's V-cycle operators for the native apply.
+    params: AggregationParams | None = None,
+) -> tuple[list[tuple[csp.csr_matrix, cp.ndarray, int]], csp.csr_matrix]:
+    """Coarsen until the dense-solve floor; return the per-level operators and the coarsest.
 
-    AMGx contributes only the per-level aggregate maps (the hard part of setup); the
-    Galerkin products, l1-Jacobi diagonals, restriction ordering and the dense coarse
-    inverse are recomputed here. Unsmoothed aggregation makes P a boolean map, so
-    A_{l+1} = P^T A_l P and the restriction row order is the stable sort by aggregate.
+    Each entry is ``(A_l, aggregates_l, n_coarse_l)``, finest first. Coarsening stops when a
+    level cannot coarsen at all or the next level would undershoot ``min_coarse_rows``; that
+    level is discarded and its matrix becomes the coarsest.
     """
-    n_levels = int(float_preconditioner.amg_num_levels())
+    if params is None:
+        params = AggregationParams()
     n = int(row_ptr.shape[0]) - 1
     a = csp.csr_matrix((values_f32, col_idx, row_ptr), shape=(n, n))
-    vc = NativeVCycle()
-    for level in range(n_levels - 1):
-        n_rows, _, n_coarse = float_preconditioner.amg_level_dims(level)
-        if n_rows != a.shape[0]:
-            raise RuntimeError(
-                f"native V-cycle: level {level} has {n_rows} rows in AMGx but "
-                f"{a.shape[0]} in the recomputed Galerkin chain"
-            )
+    stream = cp.cuda.get_current_stream().ptr
+    levels: list[tuple[csp.csr_matrix, cp.ndarray, int]] = []
+    for _ in range(params.max_levels):
+        n_rows = a.shape[0]
+        if n_rows <= params.min_coarse_rows:
+            break
         agg = cp.empty(n_rows, dtype=cp.int32)
-        float_preconditioner.download_aggregates(level, agg)
+        n_coarse = select_size4(
+            cp.ascontiguousarray(a.indptr.astype(cp.int32)),
+            cp.ascontiguousarray(a.indices.astype(cp.int32)),
+            cp.ascontiguousarray(a.data.astype(cp.float32)),
+            agg,
+            stream,
+        )
+        if n_coarse == n_rows or n_coarse < params.min_coarse_rows:
+            break
+        levels.append((a, agg, n_coarse))
+        a = _galerkin(a, agg, n_coarse)
+    return levels, a
+
+
+def build_native_vcycle(
+    row_ptr: cp.ndarray,
+    col_idx: cp.ndarray,
+    values_f32: cp.ndarray,
+    params: AggregationParams | None = None,
+) -> NativeVCycle:
+    """Build the fp32 V-cycle preconditioner: aggregate, then upload each level's operators.
+
+    Unsmoothed aggregation makes P a boolean map, so the restriction row order is just the
+    stable sort by aggregate, which also fixes the reduction order inside the restrict kernel.
+    """
+    levels, coarse = aggregation_levels(row_ptr, col_idx, values_f32, params)
+    vc = NativeVCycle()
+    for a, agg, n_coarse in levels:
         order = cp.ascontiguousarray(cp.argsort(agg, kind="stable").astype(cp.int32))
-        counts = cp.bincount(agg, minlength=n_coarse)
         r_ptr = cp.zeros(n_coarse + 1, dtype=cp.int64)
-        cp.cumsum(counts, out=r_ptr[1:])
-        r_ptr = cp.ascontiguousarray(r_ptr.astype(cp.int32))
+        cp.cumsum(cp.bincount(agg, minlength=n_coarse), out=r_ptr[1:])
         vc.add_level(
             cp.ascontiguousarray(a.indptr.astype(cp.int32)),
             cp.ascontiguousarray(a.indices.astype(cp.int32)),
             cp.ascontiguousarray(a.data.astype(cp.float32)),
             _l1_dinv(a),
-            r_ptr,
+            cp.ascontiguousarray(r_ptr.astype(cp.int32)),
             order,
             agg,
         )
-        p = csp.csr_matrix(
-            (
-                cp.ones(n_rows, dtype=cp.float32),
-                agg,
-                cp.arange(n_rows + 1, dtype=cp.int32),
-            ),
-            shape=(n_rows, n_coarse),
-        )
-        a = (p.T.tocsr() @ a @ p).tocsr()
-        a.sum_duplicates()
-        a.sort_indices()
-    ainv = cp.linalg.inv(a.todense().astype(cp.float32))
+    ainv = cp.linalg.inv(coarse.todense().astype(cp.float32))
     vc.set_coarse(cp.ascontiguousarray(ainv.astype(cp.float32)))
     vc.finalize()
     return vc
@@ -164,6 +179,20 @@ def reduce_matrix(a: csp.csr_matrix, idx: cp.ndarray) -> csp.csr_matrix:
     return a_red
 
 
+class SolverConvergenceError(RuntimeError):
+    """The mixed PCG missed tolerance even after rebuilding the preconditioner."""
+
+    def __init__(self, iterations: int, relative_residual: float, tolerance: float) -> None:
+        super().__init__(
+            f"PCG did not converge: {iterations} iterations, relative residual "
+            f"{relative_residual:.3e} > tolerance {tolerance:.3e}, after rebuilding the "
+            f"preconditioner at the current matrix values"
+        )
+        self.iterations = iterations
+        self.relative_residual = relative_residual
+        self.tolerance = tolerance
+
+
 @dataclass
 class GroundedSolver:
     """Reduced SPD system with one grounded potential.
@@ -174,40 +203,41 @@ class GroundedSolver:
 
     n: int
     idx: cp.ndarray
-    # The fp32 apply inside solve_mixed: the native V-cycle rebuilt from the exported
-    # AMGx hierarchy (the AMGx float solver itself is dropped right after the export).
+    # The fp32 apply inside solve_mixed. Mutable: a solve that misses tolerance rebuilds it
+    # from the current values (see rebuild_preconditioner).
     precond: NativeVCycle
     pcg: PcgAmgSolver
     tolerance: float
     max_iters: int
-    # Retained to build the fp64 fallback lazily (see ``ensure_amgx``).
-    config: str
     row_ptr: cp.ndarray
     col_idx: cp.ndarray
     values: cp.ndarray
-    amgx: AMGXSolver | None = None
     last_iterations: int = 0
     last_relative_residual: float = 0.0
 
-    def ensure_amgx(self) -> AMGXSolver:
-        """Build the fp64 AMGx fallback solver on first use.
+    def rebuild_preconditioner(self) -> None:
+        """Rebuild the fp32 V-cycle from the solver's current fp64 values.
 
-        The fallback only runs when the mixed-precision PCG misses tolerance, so deferring it
-        keeps a second full double AMG hierarchy off the device for the subject's lifetime. The
-        reduced CSR is already resident, so this pays only the one-time AMGx setup, not a
-        reassembly.
+        Only reached when the mixed PCG misses tolerance, which in practice means the
+        hierarchy no longer matches the matrix. A preconditioner cannot change where fp64 PCG
+        converges, only how fast, so rebuilding it is the whole remedy: there is no more
+        accurate solver to fall back to. Installing a new NativeVCycle bumps its generation
+        and so invalidates PcgAmgSolver's captured CG graph.
         """
-        if self.amgx is None:
-            amgx = AMGXSolver(self.config)
-            amgx.setup(self.row_ptr, self.col_idx, self.values)
-            self.amgx = amgx
-        return self.amgx
+        self.precond = build_native_vcycle(
+            self.row_ptr,
+            self.col_idx,
+            cp.ascontiguousarray(self.values.astype(cp.float32)),
+        )
 
 
 def prepare_grounded_solver(
-    a: csp.csr_matrix, ground_node: int, config: str = AMGX_CONFIG
+    a: csp.csr_matrix,
+    ground_node: int,
+    tolerance: float = DEFAULT_TOLERANCE,
+    max_iters: int = DEFAULT_MAX_ITERS,
 ) -> GroundedSolver:
-    """Remove the ground DOF and build the mixed-precision solver (fp64 fallback built lazily)."""
+    """Remove the ground DOF and build the mixed-precision solver."""
     n = a.shape[0]
     idx = grounded_index(n, ground_node)
     a_red = reduce_matrix(a, idx)
@@ -215,16 +245,8 @@ def prepare_grounded_solver(
     col_idx = cp.ascontiguousarray(a_red.indices.astype(cp.int32))
     values = cp.ascontiguousarray(a_red.data.astype(cp.float64))
     values_f32 = cp.ascontiguousarray(values.astype(cp.float32))
-    # AMGx only builds the aggregation hierarchy; the export-derived native V-cycle owns
-    # device copies of everything it needs, so the AMGx float solver is dropped here,
-    # releasing its matrix and hierarchy.
-    amgx_precond = AMGXFloatSolver(AMGX_PRECONDITIONER_CONFIG)
-    amgx_precond.setup(row_ptr, col_idx, values_f32)
-    precond = build_native_vcycle(amgx_precond, row_ptr, col_idx, values_f32)
-    del amgx_precond
+    precond = build_native_vcycle(row_ptr, col_idx, values_f32)
     pcg = PcgAmgSolver(row_ptr, col_idx, values)
-    tolerance = float(_amgx_config_value(config, "tolerance", "1e-6"))
-    max_iters = int(_amgx_config_value(config, "max_iters", "2000"))
     return GroundedSolver(
         n=n,
         idx=idx,
@@ -232,7 +254,6 @@ def prepare_grounded_solver(
         pcg=pcg,
         tolerance=tolerance,
         max_iters=max_iters,
-        config=config,
         row_ptr=row_ptr,
         col_idx=col_idx,
         values=values,
@@ -240,24 +261,26 @@ def prepare_grounded_solver(
 
 
 def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
-    """Solve one RHS on the prepared hierarchy."""
+    """Solve one RHS on the prepared hierarchy.
+
+    A miss rebuilds the preconditioner and restarts from the failed iterate, so the second
+    attempt runs against a single fixed operator and CG's short recurrence stays valid.
+    """
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
     x_red = cp.empty(int(solver.idx.shape[0]), dtype=cp.float64)
+    stream = cp.cuda.get_current_stream().ptr
     iters, rel = solver.pcg.solve_mixed(
-        solver.precond,
-        b_red,
-        x_red,
-        solver.tolerance,
-        solver.max_iters,
-        cp.cuda.get_current_stream().ptr,
+        solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream
     )
+    if float(rel) > solver.tolerance:
+        solver.rebuild_preconditioner()
+        iters, rel = solver.pcg.solve_mixed(
+            solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
+        )
+        if float(rel) > solver.tolerance:
+            raise SolverConvergenceError(int(iters), float(rel), solver.tolerance)
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(rel)
-    if solver.last_relative_residual > solver.tolerance:
-        amgx = solver.ensure_amgx()
-        amgx.solve(b_red, x_red, cp.cuda.get_current_stream().ptr)
-        solver.last_iterations = amgx.iterations()
-        solver.last_relative_residual = 0.0
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x_red
     return v
@@ -306,31 +329,39 @@ def _warm_x0(
 def _solve_grounded_block_mat(
     solver: GroundedSolver, B: cp.ndarray, k: int, x0: cp.ndarray | None = None
 ) -> cp.ndarray:
-    """Block-solve a padded (n_red, k_pad) RHS matrix; returns X with fallbacks applied.
+    """Block-solve a padded (n_red, k_pad) RHS matrix; returns X with retries applied.
 
     Each of the k chains is numerically independent (per-column reductions), they just
-    share every stiffness/hierarchy matrix read. Columns whose lockstep residual misses
-    tolerance are re-solved individually by the fp64 AMGx fallback.
+    share every stiffness/hierarchy matrix read. If any column misses tolerance the
+    preconditioner is rebuilt once, then only the offending columns are re-solved singly.
     """
     X = cp.empty_like(B)
+    stream = cp.cuda.get_current_stream().ptr
     iters, rels = solver.pcg.solve_mixed_block(
-        solver.precond,
-        B,
-        X,
-        solver.tolerance,
-        solver.max_iters,
-        cp.cuda.get_current_stream().ptr,
-        x0,
+        solver.precond, B, X, solver.tolerance, solver.max_iters, stream, x0
     )
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(max(rels[:k]))
-    for c in range(k):
-        if rels[c] > solver.tolerance:
-            amgx = solver.ensure_amgx()
+
+    missed = [c for c in range(k) if rels[c] > solver.tolerance]
+    if missed:
+        solver.rebuild_preconditioner()
+        worst = 0.0
+        for c in missed:
             b_red = cp.ascontiguousarray(B[:, c])
-            x_red = cp.empty(int(B.shape[0]), dtype=cp.float64)
-            amgx.solve(b_red, x_red, cp.cuda.get_current_stream().ptr)
+            x_red = cp.ascontiguousarray(X[:, c])
+            retry_iters, rel = solver.pcg.solve_mixed(
+                solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
+            )
+            if float(rel) > solver.tolerance:
+                raise SolverConvergenceError(int(retry_iters), float(rel), solver.tolerance)
             X[:, c] = x_red
+            solver.last_iterations = max(solver.last_iterations, int(retry_iters))
+            worst = max(worst, float(rel))
+        # The retried columns now bound the block: every other column already met tolerance.
+        solver.last_relative_residual = max(
+            worst, max((rels[c] for c in range(k) if c not in missed), default=0.0)
+        )
     return X
 
 

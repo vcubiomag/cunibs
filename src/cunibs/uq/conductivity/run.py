@@ -11,6 +11,7 @@ import cupyx.scipy.sparse as csp
 from cunibs import metrics
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
+from cunibs.fem.solve import SolverConvergenceError
 from cunibs.solver import (
     accumulate_moments,
     dadt_node_to_element,
@@ -88,7 +89,7 @@ def run_conductivity_uq(
     built once. Each sample re-weights the matrix and RHS by the sampled conductivities (two small
     GEMVs), then solves against a preconditioner built once at the nominal (ensemble-centre) σ,
     which the i.i.d. samples stay clustered around. A draw that misses tolerance falls back to a
-    per-sample fp64 AMGx solve, so accuracy never depends on the preconditioner tracking the
+    per-draw preconditioner rebuild, so accuracy never depends on the preconditioner tracking the
     sample.
 
     Every draw's gray-matter peak ``|E|``, focality, and peak location are recorded — the
@@ -109,8 +110,8 @@ def run_conductivity_uq(
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
     b_base, b_tissue = _placement_rhs(ctx, pre, dadt_elm)
 
-    # The fp64 AMGx solver is the mixed-solve fallback, built lazily on the first extreme draw
-    # (``pre.ensure_solver()``), so most ensembles never allocate it.
+    # The preconditioner stays frozen at nominal σ for every draw; a draw that misses tolerance
+    # builds a matched one for itself (``pre.preconditioner_for``) and throws it away.
     pcg = pre.pcg
     precond = pre.precond
 
@@ -191,13 +192,15 @@ def run_conductivity_uq(
             precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
         )
         if rel > pre.tolerance:
-            # Rare extreme draw: the frozen preconditioner missed tolerance, so match a full fp64
-            # AMGx hierarchy to this sample and solve exactly. Each fallback uploads its own
-            # coefficients and re-setups, so there is no nominal state to restore afterwards.
-            solver = pre.ensure_solver()
-            solver.update_coefficients(sample_data)
-            solver.resetup()
-            solver.solve(b_red, x_red, stream)
+            # Rare extreme draw: the nominal-σ preconditioner missed tolerance, so build one
+            # matched to this sample, restart from the failed iterate, and discard it. pre.precond
+            # stays at nominal for the following draws.
+            draw_precond = pre.preconditioner_for(sample_data)
+            retry_iters, rel = pcg.solve_mixed(
+                draw_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x_red
+            )
+            if rel > pre.tolerance:
+                raise SolverConvergenceError(int(retry_iters), float(rel), pre.tolerance)
 
         if recycle and recycle_w is None:
             d_basis[:, k] = x_red - x_nominal

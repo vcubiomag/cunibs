@@ -141,13 +141,19 @@ def test_patch_solve_converged(patch_subject, patch_placement, d70_coil):
 
 
 @pytest.mark.realmesh
-def test_patch_mixed_pcg_matches_amgx(cp, fresh_subject, patch_mesh, patch_placement, d70_coil):
-    """The native V-cycle preconditioner against an independent fp64 AMGX solve.
+def test_patch_multilevel_solve_true_residual(
+    cp, fresh_subject, patch_mesh, patch_placement, d70_coil
+):
+    """A multi-level V-cycle solve, checked against a freshly computed ``b - Ax``.
 
-    ``NativeVCycle`` exposes no ``apply`` binding, so it cannot be unit-tested directly; a
-    full solve through ``AMGXSolver`` on the same reduced system is the only independent
-    oracle available for ``build_native_vcycle`` + ``PcgAmgSolver``.
+    ``solve_mixed`` returns the residual carried by the CG recurrence, not one recomputed from
+    the operator, so a converged-looking result is not self-evidently converged. The cube
+    fixture in ``test_solver.py`` already compares against a dense solve, but it is small
+    enough that the hierarchy has no coarse levels at all; this is the same guarantee at a
+    size where the V-cycle actually runs.
     """
+    import cupyx.scipy.sparse as csp
+
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
     from cunibs.fem.solve import (
         _assemble_rhs_weighted_kernel,
@@ -167,16 +173,21 @@ def test_patch_mixed_pcg_matches_amgx(cp, fresh_subject, patch_mesh, patch_place
         dadt_elm, ctx.wg, ctx.node2corner_ptr, ctx.node2corner_idx, ctx.n_nodes
     )
 
-    mixed = cp.asnumpy(solve_grounded(ctx.solver, b))
-
     solver = ctx.solver
-    b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
-    x_red = cp.empty(int(solver.idx.shape[0]), dtype=cp.float64)
-    solver.ensure_amgx().solve(b_red, x_red, cp.cuda.get_current_stream().ptr)
-    direct = np.zeros(solver.n)
-    direct[cp.asnumpy(solver.idx)] = cp.asnumpy(x_red)
+    v = solve_grounded(solver, b)
 
-    assert np.linalg.norm(mixed - direct) / np.linalg.norm(direct) <= 1e-5
+    n_red = int(solver.idx.shape[0])
+    a_red = csp.csr_matrix(
+        (solver.values, solver.col_idx, solver.row_ptr), shape=(n_red, n_red)
+    )
+    b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
+    x_red = cp.ascontiguousarray(v[solver.idx])
+    true_residual = float(cp.linalg.norm(b_red - a_red @ x_red) / cp.linalg.norm(b_red))
+    assert true_residual <= solver.tolerance
+
+    # Guard the premise: if the hierarchy ever collapsed to a single level this would silently
+    # become a re-test of the trivial case.
+    assert solver.precond.n_levels() >= 2, "the patch hierarchy should have coarse levels"
 
 
 @pytest.mark.realmesh

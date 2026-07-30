@@ -1,8 +1,6 @@
 #pragma once
-#include <string>
 #include <vector>
 
-#include <amgx_c.h>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
@@ -16,59 +14,6 @@ struct PcgResult {
 struct PcgBlockResult {
     int iterations = 0;                     // lockstep iterations run
     std::vector<double> relative_residual;  // per-column final relative residual
-};
-
-class AMGXSolver {
-public:
-    explicit AMGXSolver(const std::string& config);
-    ~AMGXSolver();
-
-    AMGXSolver(const AMGXSolver&) = delete;
-    AMGXSolver& operator=(const AMGXSolver&) = delete;
-
-    void setup(int n, int nnz, const int* row_ptr, const int* col_idx, const double* values);
-
-    // Swap only the matrix values (fixed sparsity); resetup() then rebuilds the numeric
-    // hierarchy. The aggregation graph is reused when the config sets structure_reuse_levels,
-    // so the pair is far cheaper than setup().
-    void update_coefficients(int nnz, const double* values);
-    void resetup();
-
-    void solve(int n, const double* b, double* x, cudaStream_t stream);
-    int iterations() const;
-
-private:
-    int n_ = 0;
-    AMGX_config_handle cfg_ = nullptr;
-    AMGX_matrix_handle A_ = nullptr;
-    AMGX_vector_handle b_ = nullptr;
-    AMGX_vector_handle x_ = nullptr;
-    AMGX_solver_handle solver_ = nullptr;
-};
-
-// Builds an AMGx aggregation hierarchy and exports its per-level aggregate maps, which is all
-// that build_native_vcycle needs to reconstruct the V-cycle operators itself.
-class AMGXFloatSolver {
-public:
-    explicit AMGXFloatSolver(const std::string& config);
-    ~AMGXFloatSolver();
-
-    AMGXFloatSolver(const AMGXFloatSolver&) = delete;
-    AMGXFloatSolver& operator=(const AMGXFloatSolver&) = delete;
-
-    void setup(int n, int nnz, const int* row_ptr, const int* col_idx, const float* values);
-
-    // cuNIBS fork extension: aggregation-hierarchy export for the native V-cycle rebuild.
-    int amg_num_levels() const;
-    void amg_level_dims(int level, int* n_rows, int* n_nz, int* n_coarse) const;
-    void download_aggregates(int level, int* aggregates) const;
-
-private:
-    AMGX_config_handle cfg_ = nullptr;
-    AMGX_matrix_handle A_ = nullptr;
-    AMGX_vector_handle b_ = nullptr;
-    AMGX_vector_handle x_ = nullptr;
-    AMGX_solver_handle solver_ = nullptr;
 };
 
 class PcgAmgSolver {

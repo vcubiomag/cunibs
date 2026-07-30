@@ -377,26 +377,49 @@ def test_uq_recycling_path_does_not_change_the_answer(two_tissue_subject):
     np.testing.assert_allclose(small.peak_samples, large.peak_samples[:8], rtol=1e-6)
 
 
-def test_uq_fp64_fallback_matches(cp, fresh_subject, two_tissue_cube_mesh):
-    """An unreachable tolerance sends every draw through the lazily built fp64 AMGX solver."""
+def test_uq_unreachable_tolerance_rebuilds_then_raises(fresh_subject, two_tissue_cube_mesh):
+    """An unreachable tolerance makes each draw build a matched preconditioner, then fail loudly."""
     from cunibs import ConductivityUQConfig
+    from cunibs.fem import SolverConvergenceError
 
     subj = fresh_subject(two_tissue_cube_mesh)
     cfg = ConductivityUQConfig(n_samples=16, tissue_cov={2: 0.2, 3: 0.3}, seed=10)
     kw = {"config": cfg, "moments": True}
 
-    reference = subj.simulate_conductivity_uq(_coil(), _placement(), **kw)
+    subj.simulate_conductivity_uq(_coil(), _placement(), **kw)
     pre = subj._conductivity_uq_precompute(cfg)
-    assert pre.solver is None
 
     pre.tolerance = 0.0
     pre.max_iters = 5
-    fallback = subj.simulate_conductivity_uq(_coil(), _placement(), **kw)
-    assert pre.solver is not None
+    with pytest.raises(SolverConvergenceError):
+        subj.simulate_conductivity_uq(_coil(), _placement(), **kw)
 
-    ref = cp.asnumpy(reference.mean_magnE).astype(np.float64)
-    got = cp.asnumpy(fallback.mean_magnE).astype(np.float64)
-    assert np.linalg.norm(got - ref) / np.linalg.norm(ref) <= 1e-5
+
+def test_uq_draw_preconditioner_solves_its_own_sample(cp, fresh_subject, two_tissue_cube_mesh):
+    """``preconditioner_for`` must produce a working hierarchy for an off-nominal draw.
+
+    This is the retry path's payload, and it is never exercised by a converging ensemble.
+    """
+    from cunibs import ConductivityUQConfig
+
+    subj = fresh_subject(two_tissue_cube_mesh)
+    cfg = ConductivityUQConfig(n_samples=4, tissue_cov={2: 0.2, 3: 0.3}, seed=10)
+    subj.simulate_conductivity_uq(_coil(), _placement(), config=cfg, moments=True)
+    pre = subj._conductivity_uq_precompute(cfg)
+
+    extreme = cp.ascontiguousarray(pre.nominal_sigma * 5.0)
+    sample_data = cp.ascontiguousarray(pre.combine(extreme))
+    precond = pre.preconditioner_for(sample_data)
+
+    n_red = int(pre.idx.shape[0])
+    rng = cp.random.default_rng(0)
+    b = cp.ascontiguousarray(rng.standard_normal(n_red, dtype=cp.float64))
+    x = cp.empty(n_red, dtype=cp.float64)
+    pre.pcg.update_values(sample_data, cp.cuda.get_current_stream().ptr)
+    _, rel = pre.pcg.solve_mixed(
+        precond, b, x, pre.tolerance, pre.max_iters, cp.cuda.get_current_stream().ptr
+    )
+    assert rel <= pre.tolerance
 
 
 def test_uq_result_save_load(tmp_path, two_tissue_cube):

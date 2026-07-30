@@ -3,10 +3,10 @@
 
 #include <vector>
 
-// Native replication of the AMGx AGGREGATION/JACOBI_L1/V/DENSE_LU preconditioner apply
-// (one zero-initial-guess V-cycle). The hierarchy operators are built outside (Galerkin
-// products, l1-Jacobi diagonals, restriction order, dense coarse inverse) from the
-// aggregate maps exported by the AMGx fork; this class owns device copies of everything
+// One zero-initial-guess aggregation-AMG V-cycle: l1-Jacobi smoothing, unsmoothed
+// (piecewise-constant) transfers, dense coarse solve. The hierarchy operators are built
+// outside in build_native_vcycle (aggregation, Galerkin products, l1-Jacobi diagonals,
+// restriction order, dense coarse inverse); this class owns device copies of everything
 // it touches so a captured CUDA graph stays valid for the object's lifetime.
 //
 // Per level l (finest = 0, all but the coarsest): A_l as fp32 CSR, dinv_l = omega /
@@ -39,6 +39,8 @@ public:
     // first (warm-up) call.
     void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
     int generation() const { return generation_; }
+    // Coarsening levels, excluding the coarsest (dense-inverse) one.
+    int n_levels() const { return static_cast<int>(levels_.size()); }
 
 private:
     void ensure_block_buffers(int k);
