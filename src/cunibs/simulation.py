@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -158,6 +159,11 @@ class Subject:
         self._host_metrics: _HostMetricInputs | None = None
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
+        # Guards every lazy field above: under the free-threaded build two threads sharing a
+        # subject would otherwise each build a solver context, and free() could clear one out
+        # from under a reader mid-sweep. Reentrant because _region_slice and
+        # _host_metric_inputs both go through `context`.
+        self._lock = threading.RLock()
 
     @classmethod
     def from_mesh(cls, mesh_file: str | Path) -> Subject:
@@ -171,10 +177,11 @@ class Subject:
         rebuilt lazily on the next call. Also available via the context manager:
         ``with Subject.from_mesh(path) as subject: ...``.
         """
-        self._conductivity_uq_pre.clear()
-        self._ctx = None
-        self._host_metrics = None
-        self._region_slices.clear()
+        with self._lock:
+            self._conductivity_uq_pre.clear()
+            self._ctx = None
+            self._host_metrics = None
+            self._region_slices.clear()
         cp.get_default_memory_pool().free_all_blocks()
 
     def __enter__(self) -> Self:
@@ -189,9 +196,10 @@ class Subject:
 
     @property
     def context(self) -> SolverContext:
-        if self._ctx is None:
-            self._ctx = build_context(self._mesh)
-        return self._ctx
+        with self._lock:
+            if self._ctx is None:
+                self._ctx = build_context(self._mesh)
+            return self._ctx
 
     def roi(
         self,
@@ -244,9 +252,10 @@ class Subject:
             tags = tuple(sorted(int(t) for t in config.perturbed_tags))
         else:
             tags = tuple(int(t) for t in cp.asnumpy(cp.unique(ctx.tet_tags)))
-        if tags not in self._conductivity_uq_pre:
-            self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
-        return self._conductivity_uq_pre[tags]
+        with self._lock:
+            if tags not in self._conductivity_uq_pre:
+                self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
+            return self._conductivity_uq_pre[tags]
 
     def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
         """The field-independent half of a summary, gathered once per region.
@@ -255,26 +264,28 @@ class Subject:
         builds it once and reuses it for every placement it solves. Call it first outside any
         scratch allocator: filling the cache inside one would tie it to that pool's lifetime.
         """
-        cached = self._region_slices.get(region)
-        if cached is None:
-            ctx = self.context
-            cached = metrics.region_slice(
-                ctx.vols, cp.asarray(self._mesh.tet_barycenters_mm), ctx.tet_tags, region
-            )
-            self._region_slices[region] = cached
-        return cached
+        with self._lock:
+            cached = self._region_slices.get(region)
+            if cached is None:
+                ctx = self.context
+                cached = metrics.region_slice(
+                    ctx.vols, cp.asarray(self._mesh.tet_barycenters_mm), ctx.tet_tags, region
+                )
+                self._region_slices[region] = cached
+            return cached
 
     @property
     def _host_metric_inputs(self) -> _HostMetricInputs:
         """Host ``(vols, tet_tags, barycenters_mm)``, built once and shared by every result."""
-        if self._host_metrics is None:
-            ctx = self.context
-            self._host_metrics = (
-                cp.asnumpy(ctx.vols),
-                cp.asnumpy(ctx.tet_tags),
-                np.asarray(self._mesh.tet_barycenters_mm),
-            )
-        return self._host_metrics
+        with self._lock:
+            if self._host_metrics is None:
+                ctx = self.context
+                self._host_metrics = (
+                    cp.asnumpy(ctx.vols),
+                    cp.asnumpy(ctx.tet_tags),
+                    np.asarray(self._mesh.tet_barycenters_mm),
+                )
+            return self._host_metrics
 
     def _reduce_chunk(
         self,

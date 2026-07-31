@@ -292,6 +292,10 @@ class HeadMesh:
     def n_nodes(self) -> int:
         return self.nodes_mm.shape[0]
 
+    # cached_property holds no lock as of 3.12, so under the free-threaded build two threads
+    # racing on either of these can both compute it. Both are pure functions of the arrays
+    # above, so the loser's result is identical and the dict store that publishes it is atomic.
+    # A lock would buy nothing here and would make HeadMesh unpicklable.
     @cached_property
     def skin_triangle_normals(self) -> npt.NDArray[np.float64]:
         return _skin_smoothed_triangle_normals(self.nodes_mm, self.skin_tris)
