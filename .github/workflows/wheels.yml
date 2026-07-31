@@ -27,6 +27,10 @@ jobs:
         platform:
           - { tag: manylinux_x86_64, runs-on: ubuntu-24.04 }
           - { tag: win_amd64, runs-on: windows-2025 }
+        exclude:
+          # cupy has no free-threaded wheels for Windows, only linux.
+          - python: cp314t
+            platform: { tag: win_amd64, runs-on: windows-2025 }
 
     steps:
       - uses: actions/checkout@v7.0.0
