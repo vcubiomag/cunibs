@@ -92,6 +92,7 @@ private:
     int block_captured_k_ = 0;
 };
 
+// Single-RHS CG launchers (block_cg.cu, the K = 1 instantiation).
 void launch_double_to_float(const double* in, float* out, int n, cudaStream_t stream);
 void launch_float_to_double(const float* in, double* out, int n, cudaStream_t stream);
 void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double* neg_alpha,

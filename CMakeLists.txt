@@ -67,7 +67,6 @@ find_package(nanobind CONFIG REQUIRED)
 nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/bindings.cpp
   src/cunibs/solver/solver.cpp
-  src/cunibs/solver/cast.cu
   src/cunibs/solver/vcycle.cu
   src/cunibs/solver/aggregate.cu
   src/cunibs/solver/block_cg.cu
