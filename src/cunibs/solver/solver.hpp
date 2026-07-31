@@ -4,8 +4,8 @@
 #include <vector>
 
 #include <cublas_v2.h>
-#include <cuda_runtime.h>
 
+#include "common.hpp"
 #include "vcycle.hpp"
 
 struct PcgResult {

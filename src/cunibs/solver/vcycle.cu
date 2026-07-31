@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
 
 namespace {
@@ -16,17 +15,7 @@ namespace {
 template <typename T>
 using Buffer = vcycle_detail::DeviceBuffer<T>;
 
-constexpr int kBlock = 256;
-constexpr int kWarp = 32;
-
-static_assert(kBlock % kWarp == 0, "a block must be a whole number of warps");
-
-void check_cuda(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("vcycle CUDA error (") + what +
-                                 "): " + cudaGetErrorString(err));
-    }
-}
+void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "vcycle", what); }
 
 template <typename T>
 Buffer<T> device_alloc(std::size_t count, const char* what) {
@@ -40,13 +29,6 @@ Buffer<T> device_clone(const T* src, std::size_t count, const char* what) {
     Buffer<T> buf = device_alloc<T>(count, what);
     check_cuda(cudaMemcpy(buf.get(), src, count * sizeof(T), cudaMemcpyDeviceToDevice), what);
     return buf;
-}
-
-// Rows times threads-per-row overflows int before gridDim.x runs out, so size the grid in
-// 64 bits. An empty level launches nothing: a grid of zero blocks is a launch error.
-unsigned grid_for(std::int64_t threads) {
-    if (threads <= 0) return 0;
-    return static_cast<unsigned>((threads + kBlock - 1) / kBlock);
 }
 
 // Threads per row for the SpMV-shaped kernels. A_0 has ~14 nnz/row (P1 tets) and the
@@ -253,15 +235,7 @@ void launch_coarse_gemv(int n, const float* ainv, const float* b, float* x,
     }
 }
 
-template <typename F>
-void dispatch_block_k(int k, F&& f) {
-    switch (k) {
-        case 2: f(std::integral_constant<int, 2>{}); break;
-        case 4: f(std::integral_constant<int, 4>{}); break;
-        case 8: f(std::integral_constant<int, 8>{}); break;
-        default: throw std::invalid_argument("V-cycle block apply supports k in {2, 4, 8}");
-    }
-}
+constexpr const char* kBadK = "V-cycle block apply supports k in {2, 4, 8}";
 
 std::atomic<int> g_vcycle_generation{0};
 
@@ -399,7 +373,7 @@ void NativeVCycle::apply(int n, const float* b, float* x, cudaStream_t stream) {
 void NativeVCycle::apply_block(int n, int k, const float* B, float* X, cudaStream_t stream) {
     check_ready(n, "apply_block");
     // Dispatch before allocating so an unsupported k costs nothing.
-    dispatch_block_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         ensure_block_buffers(K);
         run_cycle<K>(B, X, stream);

@@ -1,6 +1,6 @@
+#include "device_math.cuh"
 #include "kernels.hpp"
 
-#include <cuda_runtime.h>
 #include <cfloat>
 
 // Batched coil placement: for each target centre, find the closest point on the scalp surface
@@ -10,16 +10,10 @@
 
 namespace {
 
-constexpr int kBlock = 256;
-
 // Smallest sin^2 of the angle between the handle direction and the scalp tangent plane that
 // still defines an in-plane axis: (1e-6 rad)^2. Below it the tangential component is numerical
 // noise and the coil's rotation about the normal is arbitrary.
 constexpr double kMinSin2 = 1e-12;
-
-__device__ inline double dot3(const double* u, const double* v) {
-    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
-}
 
 // Closest point q on triangle (a,b,c) to p; returns squared distance. Full Ericson ordering:
 // vertex A, vertex B, edge AB, vertex C, edge AC, edge BC, interior.
@@ -182,6 +176,9 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
 void launch_place(const double* centers, const double* handles, const double* dists,
                   const double* a, const double* b, const double* c, const double* tnorm,
                   double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream) {
-    place_kernel<<<n_pl, kBlock, 0, stream>>>(centers, handles, dists, a, b, c, tnorm, out,
-                                              degenerate, n_pl, n_tri);
+    // One block per placement; threads inside it stride over triangles.
+    if (const unsigned blocks = grid_for(n_pl, 1)) {
+        place_kernel<<<blocks, kBlock, 0, stream>>>(centers, handles, dists, a, b, c, tnorm, out,
+                                                    degenerate, n_pl, n_tri);
+    }
 }

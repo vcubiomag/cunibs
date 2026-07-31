@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda_runtime.h>
+#include "common.hpp"
 
 // Unsmoothed pairwise aggregation, a port of the AMGx SIZE_4 selector
 // (aggregation/selectors/size4_selector.cu) for the scalar, single-GPU, deterministic case.

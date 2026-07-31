@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda_runtime.h>
+#include "common.hpp"
 
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
                  int n_dip, int n_nodes, float didt, float mu0_4pi, cudaStream_t stream);
@@ -38,12 +38,7 @@ void launch_place(const double* centers, const double* handles, const double* di
                   const double* a, const double* b, const double* c, const double* tnorm,
                   double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream);
 
-// Block (k <= 8 placements per chunk) variants of the per-placement stages: the shared
-// mesh arrays (tet_nodes, wg, node2corner, g) are read once per chunk rather than once
-// per placement. Per-placement arrays stay separate contiguous buffers, passed as
-// pointer packs, so the per-placement result layout is the same as the serial path's.
-constexpr int kMaxStageBlock = 8;
-
+// Block variants of the per-placement stages; see kMaxStageBlock in common.hpp.
 // b_block is row-major (n_nodes, k) float32 — the layout the block solver consumes.
 void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, const int* ptr,
                                const int* idx, float* b_block, int n_nodes, int n_tet, int k,

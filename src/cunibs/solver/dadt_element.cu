@@ -1,10 +1,6 @@
 #include "kernels.hpp"
 
-#include <cuda_runtime.h>
-
 namespace {
-
-constexpr int kBlock = 256;
 
 __global__ void dadt_element_average_kernel(const float* __restrict__ dadt_nodes,
                                             const int* __restrict__ tet_nodes,
@@ -26,11 +22,12 @@ __global__ void dadt_element_average_kernel(const float* __restrict__ dadt_nodes
         0.25f * (dadt_nodes[n0 + 2] + dadt_nodes[n1 + 2] + dadt_nodes[n2 + 2] + dadt_nodes[n3 + 2]);
 }
 
-}
+}  // namespace
 
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
                                  int n_tet, cudaStream_t stream) {
-    const int blocks = (n_tet + kBlock - 1) / kBlock;
-    dadt_element_average_kernel<<<blocks, kBlock, 0, stream>>>(dadt_nodes, tet_nodes, dadt_elm,
-                                                               n_tet);
+    if (const unsigned blocks = grid_for(n_tet)) {
+        dadt_element_average_kernel<<<blocks, kBlock, 0, stream>>>(dadt_nodes, tet_nodes,
+                                                                   dadt_elm, n_tet);
+    }
 }

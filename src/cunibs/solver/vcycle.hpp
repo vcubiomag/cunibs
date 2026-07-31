@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda_runtime.h>
+#include "common.hpp"
 
 #include <utility>
 #include <vector>

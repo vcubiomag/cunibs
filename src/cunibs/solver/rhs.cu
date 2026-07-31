@@ -1,6 +1,5 @@
+#include "device_math.cuh"
 #include "kernels.hpp"
-
-#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -9,8 +8,6 @@
 // ``neg_vc[e] = -vols[e] * cond[e]`` is precomputed because it does not change by placement.
 
 namespace {
-
-constexpr int kBlock = 256;
 
 __global__ void rhs_kernel(const float* __restrict__ dadt_elm, const float* __restrict__ g,
                            const float* __restrict__ neg_vc, const int* __restrict__ ptr,
@@ -66,13 +63,9 @@ __global__ void weighted_gradient_kernel(const float* __restrict__ g,
     wg[i] = g[i] * neg_vc[i / 12];
 }
 
-struct RhsInPack {
-    const float* p[kMaxStageBlock];
-};
-
 // Block corner pass: wg[c] (the 189 MB shared read) is loaded once for all k
 // placements; q_block is row-major (n_corner, k).
-__global__ void rhs_corner_block_kernel(RhsInPack dadt_elm, const float* __restrict__ wg,
+__global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __restrict__ wg,
                                         float* __restrict__ q_block, int n_corner, int k) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n_corner) return;
@@ -112,8 +105,9 @@ __global__ void rhs_gather_block_kernel(const float* __restrict__ q_block,
 
 void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
                 const int* idx, float* b, int n_nodes, cudaStream_t stream) {
-    const int blocks = (n_nodes + kBlock - 1) / kBlock;
-    rhs_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, g, neg_vc, ptr, idx, b, n_nodes);
+    if (const unsigned blocks = grid_for(n_nodes)) {
+        rhs_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, g, neg_vc, ptr, idx, b, n_nodes);
+    }
 }
 
 void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr, const int* idx,
@@ -123,32 +117,38 @@ void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr,
     // Safe here because the RHS build runs outside the solver's CUDA-graph capture; cudaMallocAsync
     // would be illegal inside a captured region.
     cudaMallocAsync(&q, static_cast<size_t>(n_corner) * sizeof(float), stream);
-    rhs_corner_kernel<<<(n_corner + kBlock - 1) / kBlock, kBlock, 0, stream>>>(dadt_elm, wg, q,
-                                                                               n_corner);
-    rhs_gather_kernel<<<(n_nodes + kBlock - 1) / kBlock, kBlock, 0, stream>>>(q, ptr, idx, b,
-                                                                              n_nodes);
+    if (const unsigned blocks = grid_for(n_corner)) {
+        rhs_corner_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, wg, q, n_corner);
+    }
+    if (const unsigned blocks = grid_for(n_nodes)) {
+        rhs_gather_kernel<<<blocks, kBlock, 0, stream>>>(q, ptr, idx, b, n_nodes);
+    }
     cudaFreeAsync(q, stream);
 }
 
 void launch_weighted_gradient(const float* g, const float* neg_vc, float* wg, int n_tet,
                               cudaStream_t stream) {
     const int n = n_tet * 12;
-    const int blocks = (n + kBlock - 1) / kBlock;
-    weighted_gradient_kernel<<<blocks, kBlock, 0, stream>>>(g, neg_vc, wg, n);
+    if (const unsigned blocks = grid_for(n)) {
+        weighted_gradient_kernel<<<blocks, kBlock, 0, stream>>>(g, neg_vc, wg, n);
+    }
 }
 
 void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, const int* ptr,
                                const int* idx, float* b_block, int n_nodes, int n_tet, int k,
                                cudaStream_t stream) {
-    RhsInPack in{};
+    ConstPtrPack in{};
     for (int i = 0; i < k; ++i) in.p[i] = dadt_elm[i];
     const int n_corner = 4 * n_tet;
     float* q_block = nullptr;
     // Outside any CUDA-graph capture (same constraint as launch_rhs_weighted).
     cudaMallocAsync(&q_block, static_cast<size_t>(n_corner) * k * sizeof(float), stream);
-    rhs_corner_block_kernel<<<(n_corner + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
-        in, wg, q_block, n_corner, k);
-    rhs_gather_block_kernel<<<(n_nodes + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
-        q_block, ptr, idx, b_block, n_nodes, k);
+    if (const unsigned blocks = grid_for(n_corner)) {
+        rhs_corner_block_kernel<<<blocks, kBlock, 0, stream>>>(in, wg, q_block, n_corner, k);
+    }
+    if (const unsigned blocks = grid_for(n_nodes)) {
+        rhs_gather_block_kernel<<<blocks, kBlock, 0, stream>>>(q_block, ptr, idx, b_block,
+                                                               n_nodes, k);
+    }
     cudaFreeAsync(q_block, stream);
 }

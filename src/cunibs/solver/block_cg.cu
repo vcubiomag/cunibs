@@ -4,14 +4,10 @@
 // columns. Every reduction is a fixed-order two-stage tree per column, so results are
 // run-to-run deterministic and each column's arithmetic is independent of its neighbours.
 #include <cstdint>
-#include <stdexcept>
-#include <type_traits>
 
 #include "solver.hpp"
 
 namespace {
-
-constexpr int kBlock = 256;
 
 // Best threads-per-row shifts down as the per-thread register footprint grows with K.
 template <int K>
@@ -64,15 +60,15 @@ template <int K>
 __device__ __forceinline__ void bcg_block_reduce_cols(double (&local)[K],
                                                       double* __restrict__ partials,
                                                       int n_blocks) {
-    constexpr int kWarps = kBlock / 32;
+    constexpr int kWarps = kBlock / kWarp;
     __shared__ double s[kWarps][K];
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x % kWarp;
+    const int warp = threadIdx.x / kWarp;
 #pragma unroll
     for (int c = 0; c < K; ++c) {
         double v = local[c];
 #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
+        for (int off = kWarp / 2; off > 0; off >>= 1) {
             v += __shfl_down_sync(0xffffffffu, v, off);
         }
         if (lane == 0) s[warp][c] = v;
@@ -236,34 +232,27 @@ __global__ void bcg_residual_kernel(std::int64_t n_total, const double* __restri
     if (i < n_total) r[i] = b[i] - ap[i];
 }
 
-template <typename F>
-void dispatch_k(int k, F&& f) {
-    switch (k) {
-        case 2: f(std::integral_constant<int, 2>{}); break;
-        case 4: f(std::integral_constant<int, 4>{}); break;
-        case 8: f(std::integral_constant<int, 8>{}); break;
-        default: throw std::invalid_argument("block CG supports k in {2, 4, 8}");
-    }
-}
+constexpr const char* kBadK = "block CG supports k in {2, 4, 8}";
 
 }  // namespace
 
-int bcg_partials_blocks(int n) { return (n + kBlock - 1) / kBlock; }
+int bcg_partials_blocks(int n) { return static_cast<int>(grid_for(n)); }
 
 void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
                              const double* vals, const double* x, double* y,
                              cudaStream_t stream) {
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        const int blocks = (n * spmv_tpr<K>() + kBlock - 1) / kBlock;
-        bcsrmv_f64_kernel<K><<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * spmv_tpr<K>())) {
+            bcsrmv_f64_kernel<K><<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+        }
     });
 }
 
 void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,
                     double* out, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, true>
             <<<n_blocks, kBlock, 0, stream>>>(n, x, y, partials, n_blocks);
@@ -274,7 +263,7 @@ void launch_bcg_dot(int n, int k, const double* x, const double* y, double* part
 void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
                       cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, false>
             <<<n_blocks, kBlock, 0, stream>>>(n, x, nullptr, partials, n_blocks);
@@ -292,7 +281,7 @@ void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* 
                                float* rf, double* partials, double* norms,
                                cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_update_xr_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, alpha, neg_alpha, p, ap, x,
                                                                  r, rf, partials, n_blocks);
@@ -304,7 +293,7 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, double* beta,
                               cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
     });
@@ -314,7 +303,7 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
     });
@@ -323,25 +312,29 @@ void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
 
 void launch_bcg_update_p(int n, int k, const double* beta, const float* zf, double* p,
                          cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    dispatch_k(k, [&](auto kc) {
+    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        bcg_update_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, beta, zf, p);
+        if (const unsigned blocks = grid_for(n)) {
+            bcg_update_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, beta, zf, p);
+        }
     });
 }
 
 void launch_bcg_f2d(std::int64_t n_total, const float* in, double* out, cudaStream_t stream) {
-    const std::int64_t blocks = (n_total + kBlock - 1) / kBlock;
-    bcg_f2d_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, in, out);
+    if (const unsigned blocks = grid_for(n_total)) {
+        bcg_f2d_kernel<<<blocks, kBlock, 0, stream>>>(n_total, in, out);
+    }
 }
 
 void launch_bcg_d2f(std::int64_t n_total, const double* in, float* out, cudaStream_t stream) {
-    const std::int64_t blocks = (n_total + kBlock - 1) / kBlock;
-    bcg_d2f_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, in, out);
+    if (const unsigned blocks = grid_for(n_total)) {
+        bcg_d2f_kernel<<<blocks, kBlock, 0, stream>>>(n_total, in, out);
+    }
 }
 
 void launch_bcg_residual(std::int64_t n_total, const double* b, const double* ap, double* r,
                          cudaStream_t stream) {
-    const std::int64_t blocks = (n_total + kBlock - 1) / kBlock;
-    bcg_residual_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(n_total, b, ap, r);
+    if (const unsigned blocks = grid_for(n_total)) {
+        bcg_residual_kernel<<<blocks, kBlock, 0, stream>>>(n_total, b, ap, r);
+    }
 }

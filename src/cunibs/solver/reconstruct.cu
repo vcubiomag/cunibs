@@ -1,6 +1,5 @@
+#include "device_math.cuh"
 #include "kernels.hpp"
-
-#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -12,8 +11,6 @@
 
 namespace {
 
-constexpr int kBlock = 256;
-
 __global__ void reconstruct_kernel(const double* __restrict__ v, const int* __restrict__ tet_nodes,
                                    const float* __restrict__ g, const float* __restrict__ dadt_elm,
                                    float* __restrict__ e_out, float* __restrict__ magn_out,
@@ -21,39 +18,23 @@ __global__ void reconstruct_kernel(const double* __restrict__ v, const int* __re
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    double gx = 0.0, gy = 0.0, gz = 0.0;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const double vi = v[tet_nodes[e * 4 + i]];
-        const int base = (e * 4 + i) * 3;
-        gx += vi * static_cast<double>(g[base + 0]);
-        gy += vi * static_cast<double>(g[base + 1]);
-        gz += vi * static_cast<double>(g[base + 2]);
-    }
-    const double ex = -gx - static_cast<double>(dadt_elm[e * 3 + 0]);
-    const double ey = -gy - static_cast<double>(dadt_elm[e * 3 + 1]);
-    const double ez = -gz - static_cast<double>(dadt_elm[e * 3 + 2]);
+    const Vec3d grad = tet_grad4(v, tet_nodes, g, e);
+    const double ex = -grad.x - static_cast<double>(dadt_elm[e * 3 + 0]);
+    const double ey = -grad.y - static_cast<double>(dadt_elm[e * 3 + 1]);
+    const double ez = -grad.z - static_cast<double>(dadt_elm[e * 3 + 2]);
     e_out[e * 3 + 0] = static_cast<float>(ex);
     e_out[e * 3 + 1] = static_cast<float>(ey);
     e_out[e * 3 + 2] = static_cast<float>(ez);
     magn_out[e] = static_cast<float>(sqrt(ex * ex + ey * ey + ez * ez));
 }
 
-struct ReconInPack {
-    const float* p[kMaxStageBlock];
-};
-struct ReconOutPack {
-    float* p[kMaxStageBlock];
-};
-
 // Block variant: tet_nodes (63 MB) and g (189 MB) are read once for all k placements.
 // v_block is row-major (n_nodes, k) float64; the fp64 gradient accumulation per column
 // matches the single-RHS kernel exactly.
 __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
                                          const int* __restrict__ tet_nodes,
-                                         const float* __restrict__ g, ReconInPack dadt_elm,
-                                         ReconOutPack e_out, ReconOutPack magn_out, int n_tet,
-                                         int k) {
+                                         const float* __restrict__ g, ConstPtrPack dadt_elm,
+                                         PtrPack e_out, PtrPack magn_out, int n_tet, int k) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
@@ -94,23 +75,25 @@ __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,
                         cudaStream_t stream) {
-    const int blocks = (n_tet + kBlock - 1) / kBlock;
-    reconstruct_kernel<<<blocks, kBlock, 0, stream>>>(v, tet_nodes, g, dadt_elm, e_out, magn_out,
-                                                      n_tet);
+    if (const unsigned blocks = grid_for(n_tet)) {
+        reconstruct_kernel<<<blocks, kBlock, 0, stream>>>(v, tet_nodes, g, dadt_elm, e_out,
+                                                          magn_out, n_tet);
+    }
 }
 
 void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const float* g,
                               const float* const* dadt_elm, float* const* e_out,
                               float* const* magn_out, int n_tet, int k, cudaStream_t stream) {
-    ReconInPack in{};
-    ReconOutPack eo{};
-    ReconOutPack mo{};
+    ConstPtrPack in{};
+    PtrPack eo{};
+    PtrPack mo{};
     for (int c = 0; c < k; ++c) {
         in.p[c] = dadt_elm[c];
         eo.p[c] = e_out[c];
         mo.p[c] = magn_out[c];
     }
-    const int blocks = (n_tet + kBlock - 1) / kBlock;
-    reconstruct_block_kernel<<<blocks, kBlock, 0, stream>>>(v_block, tet_nodes, g, in, eo, mo,
-                                                            n_tet, k);
+    if (const unsigned blocks = grid_for(n_tet)) {
+        reconstruct_block_kernel<<<blocks, kBlock, 0, stream>>>(v_block, tet_nodes, g, in, eo, mo,
+                                                                n_tet, k);
+    }
 }

@@ -6,8 +6,6 @@
 
 namespace {
 
-constexpr int kBlock = 256;
-constexpr int kWarp = 32;
 constexpr int kWarpsPerBlock = kBlock / kWarp;
 
 // AMGx defaults (core.cu:465-466). Fixed rather than exposed: nothing in the pipeline varies
@@ -15,15 +13,7 @@ constexpr int kWarpsPerBlock = kBlock / kWarp;
 constexpr int kMaxMatchingIterations = 15;
 constexpr float kMaxUnassignedFraction = 0.05f;
 
-void check_cuda(cudaError_t err, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("aggregate CUDA error (") + what +
-                                 "): " + cudaGetErrorString(err));
-    }
-}
-
-// Written this way to avoid the overflow (n + per - 1) has for n near INT_MAX.
-constexpr int grid_for(int n, int per) { return n / per + (n % per != 0); }
+void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "aggregate", what); }
 
 __device__ __forceinline__ unsigned int agg_hash(unsigned int a, unsigned int seed) {
     a ^= seed;
@@ -461,8 +451,9 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     if (n_rows <= 0) return 0;
     if (nnz < 0) throw std::invalid_argument("aggregate: nnz must not be negative");
 
-    const int blocks = grid_for(n_rows, kBlock);
-    const int scan_tiles = grid_for(n_rows, kScanTile);
+    // Both are nonzero: n_rows > 0 above, and grid_for only returns 0 for an empty range.
+    const unsigned blocks = grid_for(n_rows, kBlock);
+    const unsigned scan_tiles = grid_for(n_rows, kScanTile);
 
     Bump sizing(nullptr);
     lay_out(sizing, n_rows, nnz, scan_tiles);
@@ -547,8 +538,8 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
                "memset used");
     agg_mark_used_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.used);
     agg_scan_tile_sums_kernel<<<scan_tiles, kBlock, 0, stream>>>(n_rows, s.used, s.tile_sum);
-    agg_scan_tile_offsets_kernel<<<1, kBlock, 0, stream>>>(scan_tiles, s.tile_sum,
-                                                           s.excl + n_rows);
+    agg_scan_tile_offsets_kernel<<<1, kBlock, 0, stream>>>(static_cast<int>(scan_tiles),
+                                                           s.tile_sum, s.excl + n_rows);
     agg_scan_write_kernel<<<scan_tiles, kBlock, 0, stream>>>(n_rows, s.used, s.tile_sum, s.excl);
     agg_relabel_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.excl);
     check_cuda(cudaGetLastError(), "renumber launch");

@@ -1,6 +1,6 @@
 #include "kernels.hpp"
 
-#include <cuda_runtime.h>
+#include <cstdint>
 
 // Evaluate dA/dt without storing the node-by-dipole weight matrix.
 // Each thread accumulates:
@@ -11,9 +11,13 @@
 
 namespace {
 
-constexpr int kBlock = 128;
+// Local block size: this kernel is register-bound and wants a narrower block than the
+// shared kBlock. Named apart from it so nothing here silently shadows the shared constant.
+constexpr int kDadtBlock = 128;
 constexpr int kDipTile = 128;
-constexpr int kNodes = 4;
+// Nodes each thread carries, not a node count: the register tiling that lets one dipole
+// tile load amortize over K nodes.
+constexpr int kNodesPerThread = 4;
 
 template <int K>
 __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict__ mp,
@@ -48,9 +52,9 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
     for (int base = 0; base < n_dip; base += kDipTile) {
         const int tile = min(kDipTile, n_dip - base);
         // Flat copies make adjacent lanes read adjacent values.
-        for (int i = threadIdx.x; i < tile * 3; i += kBlock) s_s[i] = s[base * 3 + i];
-        for (int i = threadIdx.x; i < tile * 6; i += kBlock) s_mp[i] = mp[base * 6 + i];
-        for (int i = threadIdx.x; i < tile; i += kBlock) s_sn[i] = sn[base + i];
+        for (int i = threadIdx.x; i < tile * 3; i += kDadtBlock) s_s[i] = s[base * 3 + i];
+        for (int i = threadIdx.x; i < tile * 6; i += kDadtBlock) s_mp[i] = mp[base * 6 + i];
+        for (int i = threadIdx.x; i < tile; i += kDadtBlock) s_sn[i] = sn[base + i];
         __syncthreads();
 
 #pragma unroll 4
@@ -97,8 +101,9 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
 
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
                  int n_dip, int n_nodes, float didt, float mu0_4pi, cudaStream_t stream) {
-    const int threads = (n_nodes + kNodes - 1) / kNodes;
-    const int blocks = (threads + kBlock - 1) / kBlock;
-    dadt_kernel<kNodes>
-        <<<blocks, kBlock, 0, stream>>>(s, mp, sn, r, out, n_dip, n_nodes, didt, mu0_4pi);
+    const std::int64_t threads = grid_for(n_nodes, kNodesPerThread);
+    if (const unsigned blocks = grid_for(threads, kDadtBlock)) {
+        dadt_kernel<kNodesPerThread><<<blocks, kDadtBlock, 0, stream>>>(s, mp, sn, r, out, n_dip,
+                                                                        n_nodes, didt, mu0_4pi);
+    }
 }

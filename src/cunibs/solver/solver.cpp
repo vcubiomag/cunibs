@@ -12,11 +12,7 @@
 
 namespace {
 
-void check_cuda(cudaError_t rc, const char* what) {
-    if (rc != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA ") + what + ": " + cudaGetErrorString(rc));
-    }
-}
+void check_cuda(cudaError_t rc, const char* what) { ::check_cuda(rc, "solver", what); }
 
 void check_cublas(cublasStatus_t rc, const char* what) {
     if (rc != CUBLAS_STATUS_SUCCESS) {

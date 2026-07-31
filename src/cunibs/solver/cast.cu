@@ -2,8 +2,6 @@
 
 namespace {
 
-constexpr int kBlock = 256;
-
 __global__ void double_to_float_kernel(const double* __restrict__ in, float* __restrict__ out,
                                        int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -132,16 +130,18 @@ __global__ void csrmv_f64_kernel(int n, const int* __restrict__ row_ptr,
     if (row < n && lane == 0) y[row] = sum;
 }
 
-}
+}  // namespace
 
 void launch_double_to_float(const double* in, float* out, int n, cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    double_to_float_kernel<<<blocks, kBlock, 0, stream>>>(in, out, n);
+    if (const unsigned blocks = grid_for(n)) {
+        double_to_float_kernel<<<blocks, kBlock, 0, stream>>>(in, out, n);
+    }
 }
 
 void launch_float_to_double(const float* in, double* out, int n, cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    float_to_double_kernel<<<blocks, kBlock, 0, stream>>>(in, out, n);
+    if (const unsigned blocks = grid_for(n)) {
+        float_to_double_kernel<<<blocks, kBlock, 0, stream>>>(in, out, n);
+    }
 }
 
 void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double* neg_alpha,
@@ -151,30 +151,36 @@ void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double*
 
 void launch_cg_update_p(const double* beta, const float* zf, double* p, int n,
                         cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    cg_update_p_kernel<<<blocks, kBlock, 0, stream>>>(beta, zf, p, n);
+    if (const unsigned blocks = grid_for(n)) {
+        cg_update_p_kernel<<<blocks, kBlock, 0, stream>>>(beta, zf, p, n);
+    }
 }
 
 void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
                       const double* x, double* y, cudaStream_t stream) {
-    const int blocks = (n * kSpmvTpr + kBlock - 1) / kBlock;
-    csrmv_f64_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kSpmvTpr)) {
+        csrmv_f64_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+    }
 }
 
-int cg_partials_size(int n) { return (n + kBlock - 1) / kBlock; }
+int cg_partials_size(int n) { return static_cast<int>(grid_for(n)); }
 
 void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, const double* p,
                               const double* ap, double* x, double* r, float* rf,
                               double* partials, double* norm_sq, int n, cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    cg_update_xr_norm_kernel<<<blocks, kBlock, 0, stream>>>(alpha, neg_alpha, p, ap, x, r, rf,
-                                                            partials, n);
-    cg_reduce_norm_kernel<<<1, kBlock, 0, stream>>>(partials, blocks, norm_sq);
+    if (const unsigned blocks = grid_for(n)) {
+        cg_update_xr_norm_kernel<<<blocks, kBlock, 0, stream>>>(alpha, neg_alpha, p, ap, x, r, rf,
+                                                                partials, n);
+        cg_reduce_norm_kernel<<<1, kBlock, 0, stream>>>(partials, static_cast<int>(blocks),
+                                                        norm_sq);
+    }
 }
 
 void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials,
                              double* rz, double* beta, int n, cudaStream_t stream) {
-    const int blocks = (n + kBlock - 1) / kBlock;
-    cg_cast_dot_kernel<<<blocks, kBlock, 0, stream>>>(zf, r, partials, n);
-    cg_reduce_beta_kernel<<<1, kBlock, 0, stream>>>(partials, blocks, rz, beta);
+    if (const unsigned blocks = grid_for(n)) {
+        cg_cast_dot_kernel<<<blocks, kBlock, 0, stream>>>(zf, r, partials, n);
+        cg_reduce_beta_kernel<<<1, kBlock, 0, stream>>>(partials, static_cast<int>(blocks), rz,
+                                                        beta);
+    }
 }
