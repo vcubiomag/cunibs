@@ -372,9 +372,9 @@ uq_result = subject.simulate_conductivity_uq(
     coil, placement, config, didt=1.0e6, record_rois={"M1": m1}
 )
 
-uq_result.roi_samples["M1"]      # (n_samples,) per-draw ROI mean |E| (V/m)
-uq_result.peak_samples           # (n_samples,) per-draw gray-matter peak |E|
-uq_result.focality_samples       # (n_samples,) per-draw stimulated volume (m^3)
+uq_result.roi_samples["M1"]  # (n_samples,) per-draw ROI mean |E| (V/m)
+uq_result.peak_samples  # (n_samples,) per-draw gray-matter peak |E|
+uq_result.focality_samples  # (n_samples,) per-draw stimulated volume (m^3)
 uq_result.peak_location_samples  # (n_samples, 3) per-draw peak location (mm)
 uq_result.tissue_sensitivity("peak")  # first-order variance share per tissue tag
 ```
@@ -421,9 +421,9 @@ centers = np.array([[x, y, 80.0] for x in range(-30, 31, 5) for y in range(-30, 
 
 result = adm.optimize(subject.context, coil, target, centers)
 
-print(result.best_objective)     # peak |E| at the target (V/m)
-print(result.best_center_mm)     # optimal scalp position
-print(result.best_angle_rad)     # optimal in-plane rotation
+print(result.best_objective)  # peak |E| at the target (V/m)
+print(result.best_center_mm)  # optimal scalp position
+print(result.best_angle_rad)  # optimal in-plane rotation
 ```
 
 The in-plane rotation is optimized in closed form: the target E-field is a rigid
@@ -436,7 +436,7 @@ over a distribution of placements, build the reciprocity field once and reuse it
 
 ```python
 recip = adm.build_reciprocity(subject.context, coil, target, centers)
-E = adm.evaluate(recip, coil, placements, didt=1.0e6)   # (P, D) target E-vectors
+E = adm.evaluate(recip, coil, placements, didt=1.0e6)  # (P, D) target E-vectors
 ```
 
 ## Reproducibility
