@@ -3,6 +3,8 @@ from cunibs.solver import _cuda_preload
 
 try:
     from cunibs.solver._solver_ext import (
+        BLOCK_SIZES,
+        MAX_STAGE_BLOCK,
         NativeVCycle,
         PcgAmgSolver,
         accumulate_moments,
@@ -23,6 +25,8 @@ except ImportError as exc:
     raise ImportError(_cuda_preload.describe_failure(exc)) from exc
 
 __all__ = [
+    "BLOCK_SIZES",
+    "MAX_STAGE_BLOCK",
     "NativeVCycle",
     "PcgAmgSolver",
     "accumulate_moments",

@@ -22,6 +22,9 @@ from cunibs.fem.placement import (
     compute_coil_transforms,
 )
 from cunibs.solver import (
+    BLOCK_SIZES as _BLOCK_SIZES,
+)
+from cunibs.solver import (
     NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
@@ -288,7 +291,8 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
 
 # Compiled block widths of the k-RHS solve kernels; smaller batches pad up by
 # replicating the last column. The padded column costs bandwidth but no extra matrix reads.
-BLOCK_SIZES = (2, 4, 8)
+# Read from the extension rather than restated, so adding a width is a one-place change.
+BLOCK_SIZES = _BLOCK_SIZES
 MAX_BLOCK = BLOCK_SIZES[-1]
 
 

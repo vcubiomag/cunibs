@@ -562,3 +562,29 @@ def test_solve_mixed_block_rejects_mismatched_operands(cp, cube_subject):
     X = cp.ascontiguousarray(cp.empty((n, 2), dtype=cp.float64))
     with pytest.raises(ValueError, match=r"\(n, k\)"):
         solver.pcg.solve_mixed_block(solver.precond, B, X, 1e-6, 10, stream)
+
+
+def test_exported_block_widths_are_the_ones_the_solver_accepts(cp, cube_subject):
+    """BLOCK_SIZES is the extension's own list; check it against dispatch_k's real behaviour.
+
+    The C++ side spells the widths twice: once as ``kBlockWidths`` (which this exports) and
+    once as ``dispatch_k`` template arguments in block_cg.cu and vcycle.cu. Adding a width to
+    only one of them would otherwise surface as a runtime error on a user's mesh.
+    """
+    from cunibs.solver import BLOCK_SIZES, MAX_STAGE_BLOCK
+
+    solver = cube_subject.context.solver
+    n = int(solver.row_ptr.shape[0]) - 1
+    stream = cp.cuda.get_current_stream().ptr
+    accepted = []
+    for k in range(1, MAX_STAGE_BLOCK + 1):
+        B = cp.ascontiguousarray(cp.ones((n, k), dtype=cp.float64))
+        X = cp.ascontiguousarray(cp.empty((n, k), dtype=cp.float64))
+        try:
+            solver.pcg.solve_mixed_block(solver.precond, B, X, 1e-6, 1, stream)
+        except ValueError as exc:
+            if "supports k in" in str(exc):
+                continue
+            raise
+        accepted.append(k)
+    assert tuple(accepted) == tuple(BLOCK_SIZES)

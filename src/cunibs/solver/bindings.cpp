@@ -25,6 +25,12 @@ using f32_cuda_3d = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cu
 using i32_cuda_2d = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 
 NB_MODULE(_solver_ext, m) {
+    // Compiled-in limits, exported so the Python layer never restates them.
+    m.attr("MAX_STAGE_BLOCK") = kMaxStageBlock;
+    nb::list widths;
+    for (int w : kBlockWidths) widths.append(w);
+    m.attr("BLOCK_SIZES") = nb::tuple(widths);
+
     nb::class_<NativeVCycle>(m, "NativeVCycle")
         .def(nb::init<>())
         .def(

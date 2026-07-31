@@ -1,7 +1,7 @@
 #include "solver.hpp"
 
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
+#include "cg_kernels.hpp"
+#include "vcycle.hpp"
 
 #include <cmath>
 #include <cstdint>

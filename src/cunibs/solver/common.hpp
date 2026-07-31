@@ -21,6 +21,15 @@ static_assert(kBlock % kWarp == 0, "a block must be a whole number of warps");
 // pointer packs, so the per-placement result layout is the same as the serial path's.
 constexpr int kMaxStageBlock = 8;
 
+// Compiled widths of the k-RHS CG and V-cycle kernels, increasing. The dispatch_k call sites
+// in block_cg.cu and vcycle.cu enumerate the same set as template arguments; this is what the
+// bindings export, so the Python layer derives its BLOCK_SIZES rather than restating it.
+inline constexpr int kBlockWidths[] = {2, 4, 8};
+inline constexpr int kNumBlockWidths = 3;
+
+static_assert(kBlockWidths[kNumBlockWidths - 1] <= kMaxStageBlock,
+              "a solve width wider than a staging chunk could never be fed");
+
 inline void check_cuda(cudaError_t err, const char* origin, const char* what) {
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string(origin) + " CUDA error (" + what +

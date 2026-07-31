@@ -7,7 +7,7 @@
 // independent of its neighbours.
 #include <cstdint>
 
-#include "solver.hpp"
+#include "cg_kernels.hpp"
 
 namespace {
 
