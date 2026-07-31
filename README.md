@@ -176,10 +176,14 @@ the GPU without ever copying a full-volume array to the host.
 
 Placements are solved in blocks that share a single stiffness / hierarchy read
 per block via a lockstep block CG. The block width defaults to the hardware sweet
-spot; tune it per GPU with `block_k` (`1` restores the serial per-placement
-path). Because a block is solved as a unit, `block_k` also caps peak memory when
-fields are retained. The default `block_k` of 8 is likely sufficent for most modern
-GPUs:
+spot; tune it per GPU with `block_k` (`1` solves one placement at a time).
+Because a block is solved as a unit, `block_k` also caps peak memory when fields
+are retained. The default `block_k` of 8 is likely sufficent for most modern
+GPUs.
+
+`block_k` is a throughput and memory knob only. It does not move results: the
+same placement returns the same field at every width, bit for bit. See
+[Reproducibility](#reproducibility).
 
 ```python
 for result in subject.iter_simulate(coil, placements, didt=1.0e6, block_k=4):
@@ -441,10 +445,24 @@ E = adm.evaluate(recip, coil, placements, didt=1.0e6)  # (P, D) target E-vectors
 
 ## Reproducibility
 
-Every solver kernel is deterministic by construction: the aggregation runs one
-thread per row with fixed tie-breaks and no atomics, and the reductions and the
-right-hand-side assembly use fixed summation orders. Floating-point results can still vary across
-GPU architectures, CUDA versions, compiler versions, and dependency versions.
+A placement's field is a function of the mesh, the coil, the placement, `didt`
+and the solve tolerance, and of nothing else. It does not depend on `block_k`, on
+which other placements shared its block, or on where it fell in the sweep, and
+repeating a run reproduces it bitwise. Splitting a sweep across calls, resuming
+an interrupted one, or retuning `block_k` for a different GPU all leave the
+numbers unchanged.
+
+Four things enforce that. Stiffness assembly and the right-hand side accumulate
+in a fixed per-node order. Each column of a block solve stops on its own residual
+rather than the block's, so a placement batched with a slower-converging
+neighbour is not carried past the point where it would have stopped alone. Every
+block width shares one summation order, in the fp64 operator and in its
+reductions. The aggregation runs one thread per row with a symmetric tie-break,
+and the only atomics anywhere in the solver are integer counters.
+
+Floating-point results can still vary across GPU architectures, CUDA versions,
+compiler versions, and dependency versions.
+
 The ADM adjoint solves use a tighter tolerance (`1e-9`) than the forward solve
 because their near-point-source right-hand side is more sensitive.
 
