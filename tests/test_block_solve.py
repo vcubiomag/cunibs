@@ -76,8 +76,12 @@ def block(ctx, coil, sites):
     return solve_placements_block(ctx, coil.positions_m, coil.moments, sites, DIDT)
 
 
-def test_block_k1_delegates_to_serial(cube_subject, synthetic_coil):
-    """k == 1 forwards straight to ``solve_placement``, so the arrays are bitwise identical."""
+def test_block_k1_matches_serial(cube_subject, synthetic_coil):
+    """k == 1 runs the block kernels at width 1 and matches ``solve_placement`` bit for bit.
+
+    Two separate implementations over the same operator, agreeing because both reduce in the
+    same order.
+    """
     import cupy as cp
 
     sites = cube_sites(1)
@@ -85,6 +89,31 @@ def test_block_k1_delegates_to_serial(cube_subject, synthetic_coil):
     ref = serial(cube_subject.context, synthetic_coil, sites)[0]
     for key in ("E", "magnE", "v"):
         np.testing.assert_array_equal(cp.asnumpy(got[key]), cp.asnumpy(ref[key]), err_msg=key)
+
+
+@pytest.mark.realmesh
+def test_single_and_block_solvers_share_one_order(cp, fresh_subject, patch_mesh):
+    """``solve_mixed`` and ``solve_mixed_block`` at k=1 must agree bit for bit.
+
+    Both are reachable for the same placement: the block path solves it, and the retry path
+    re-solves a column that missed tolerance through the single-RHS one. If the two reduced in
+    different orders, a placement's field would depend on whether it converged first time.
+    """
+    solver = fresh_subject(patch_mesh).context.solver
+    n = int(solver.idx.shape[0])
+    b = cp.sin(cp.arange(n, dtype=cp.float64) * 0.5) + 2.0
+    stream = cp.cuda.get_current_stream().ptr
+
+    x_single = cp.empty(n, dtype=cp.float64)
+    solver.pcg.solve_mixed(
+        solver.precond, b, x_single, solver.tolerance, solver.max_iters, stream
+    )
+    b_block = cp.ascontiguousarray(b.reshape(n, 1))
+    x_block = cp.empty_like(b_block)
+    solver.pcg.solve_mixed_block(
+        solver.precond, b_block, x_block, solver.tolerance, solver.max_iters, stream
+    )
+    np.testing.assert_array_equal(cp.asnumpy(x_block[:, 0]), cp.asnumpy(x_single))
 
 
 @pytest.mark.parametrize("k", [2, 4, 8])

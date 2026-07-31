@@ -1,27 +1,10 @@
 #pragma once
 #include "common.hpp"
 
-// Launchers for the mixed-precision CG kernels (block_cg.cu). All dense operands are
-// row-major (n, k); the single-RHS set below is the K = 1 instantiation of the same kernels,
-// so the two groups differ in signature only.
+// Launchers for the mixed-precision CG kernels (block_cg.cu), for k in {1, 2, 4, 8}. All dense
+// operands are row-major (n, k). k = 1 is a compiled width like any other, so the single-RHS
+// solve runs the same kernels in the same summation order as a wider block.
 
-// --- single RHS ----------------------------------------------------------------------------
-void launch_double_to_float(const double* in, float* out, int n, cudaStream_t stream);
-void launch_float_to_double(const float* in, double* out, int n, cudaStream_t stream);
-void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double* neg_alpha,
-                     cudaStream_t stream);
-void launch_cg_update_p(const double* beta, const float* zf, double* p, int n,
-                        cudaStream_t stream);
-void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
-                      const double* x, double* y, cudaStream_t stream);
-int cg_partials_size(int n);
-void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, const double* p,
-                              const double* ap, double* x, double* r, float* rf,
-                              double* partials, double* norm_sq, int n, cudaStream_t stream);
-void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials,
-                             double* rz, double* beta, int n, cudaStream_t stream);
-
-// --- k in {2, 4, 8} --------------------------------------------------------------------------
 int bcg_partials_blocks(int n);
 void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
                              const double* vals, const double* x, double* y,

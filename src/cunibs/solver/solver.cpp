@@ -56,7 +56,7 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     rf_ = alloc<float>(n_, "rf");
     zf_ = alloc<float>(n_, "zf");
     scalars_ = alloc<double>(6, "scalars");
-    partials_ = alloc<double>(static_cast<size_t>(cg_partials_size(n_)), "partials");
+    partials_ = alloc<double>(static_cast<size_t>(bcg_partials_blocks(n_)), "partials");
     h_norm_ = pinned_alloc<double>(1, "solver", "norm");
 
     cudaStream_t stream = nullptr;
@@ -221,9 +221,20 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     float* const zf = zf_.get();
     double* const partials = partials_.get();
 
-    // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
-    // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
-    // small initial residual. Setup uses host-pointer mode since it runs outside the captured loop.
+    // Every reduction here runs the same k = 1 block kernels solve_mixed_block does, so the two
+    // paths sum in the same order: a column that misses tolerance and is retried through this
+    // solver has to come back with the numbers the block path would have produced. That rules
+    // out substituting a vendor BLAS dot or norm, whose association order is unspecified.
+    auto host_norm = [&](const double* v, const char* what) {
+        launch_bcg_norm2(n_, 1, v, partials, d_norm, s);
+        check_cuda(
+            cudaMemcpyAsync(h_norm_.get(), d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
+            what);
+        check_cuda(cudaStreamSynchronize(s), what);
+        return std::sqrt(*h_norm_.get());
+    };
+
+    // The axpy below takes its scalar from the host.
     check_cublas(cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_HOST), "set_pointer_mode(host)");
     // The loop works on the solver-owned x_int_ (not the caller's x) so the captured graph contains
     // no per-call pointers and can be replayed across solves; the result is copied out at the end.
@@ -234,8 +245,10 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
                    "memset(x_int)");
     }
     check_cublas(cublasDcopy(blas, n_, b, 1, r, 1), "copy(b,r)");
-    double norm_ref = 0.0;
-    check_cublas(cublasDnrm2(blas, n_, b, 1, &norm_ref), "nrm2(b)");
+    // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
+    // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
+    // small initial residual.
+    const double norm_ref = host_norm(b, "setup:norm(b)");
     if (norm_ref == 0.0) {
         check_cuda(cudaMemsetAsync(x, 0, static_cast<size_t>(n_) * sizeof(double), s),
                    "memset(x_out)");
@@ -244,11 +257,11 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     }
     if (x0 != nullptr) {
         // r0 = b - A x0
-        launch_csrmv_f64(n_, row_ptr_.get(), col_idx_.get(), values_.get(), x_int, ap, s);
+        launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), x_int, ap,
+                                s);
         const double neg_one = -1.0;
         check_cublas(cublasDaxpy(blas, n_, &neg_one, ap, 1, r, 1), "axpy(r0)");
-        double norm_r0 = 0.0;
-        check_cublas(cublasDnrm2(blas, n_, r, 1, &norm_r0), "nrm2(r0)");
+        const double norm_r0 = host_norm(r, "setup:norm(r0)");
         if (norm_r0 / norm_ref <= tolerance) {
             check_cuda(cudaMemcpyAsync(x, x_int, static_cast<size_t>(n_) * sizeof(double),
                                        cudaMemcpyDeviceToDevice, s),
@@ -257,34 +270,31 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
             return {0, norm_r0 / norm_ref};
         }
     }
-    // The captured loop needs device-pointer mode so its reductions land in scalars_.
-    check_cublas(cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_DEVICE), "set_pointer_mode(device)");
-
-    launch_double_to_float(r, rf, n_, s);
+    launch_bcg_d2f(n_, r, rf, s);
     preconditioner.apply(n_, rf, zf, s);
     // p0 = z0 = (double)zf directly; the fp64 z vector is never materialized (the loop
     // consumes zf on the fly in cast_dot_beta and update_p).
-    launch_float_to_double(zf, p, n_, s);
-    check_cublas(cublasDdot(blas, n_, r, 1, p, 1, d_rz), "dot(r,z)");
+    launch_bcg_f2d(n_, zf, p, s);
+    launch_bcg_cast_dot_init(n_, 1, zf, r, partials, d_rz, s);
 
     // Identical every iteration (fixed buffers updated in place), so it is captured once and
     // replayed; the residual readback is inside the body but the host convergence test stays outside.
     auto run_body = [&]() {
-        // p·(Ap) stays a separate cuBLAS pass: folding it into the SpMV epilogue makes the
-        // block-wide reduction tree stall the SpMV's memory pipeline.
-        launch_csrmv_f64(n_, row_ptr_.get(), col_idx_.get(), values_.get(), p, ap, s);
-        check_cublas(cublasDdot(blas, n_, p, 1, ap, 1, d_pap), "dot(p,ap)");
-        launch_cg_alpha(d_rz, d_pap, d_alpha, d_neg_alpha, s);
+        // p·(Ap) stays a separate pass: folding it into the SpMV epilogue makes the block-wide
+        // reduction tree stall the SpMV's memory pipeline.
+        launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), p, ap, s);
+        launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
+        launch_bcg_alpha(1, d_rz, d_pap, d_alpha, d_neg_alpha, s);
         // x += α p; r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)
-        launch_cg_update_xr_norm(d_alpha, d_neg_alpha, p, ap, x_int, r, rf, partials, d_norm, n_,
-                                 s);
+        launch_bcg_update_xr_norm(n_, 1, d_alpha, d_neg_alpha, p, ap, x_int, r, rf, partials,
+                                  d_norm, s);
         check_cuda(
             cudaMemcpyAsync(h_norm_.get(), d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
             "copy(norm)");
         preconditioner.apply(n_, rf, zf, s);
         // rz' = r·(double)zf; beta = rz'/rz; rz <- rz' (no fp64 z vector)
-        launch_cg_cast_dot_beta(zf, r, partials, d_rz, d_beta, n_, s);
-        launch_cg_update_p(d_beta, zf, p, n_, s);  // p = β p + (double)zf
+        launch_bcg_cast_dot_beta(n_, 1, zf, r, partials, d_rz, d_beta, s);
+        launch_bcg_update_p(n_, 1, d_beta, zf, p, s);  // p = β p + (double)zf
     };
 
     // The body references only solver-owned buffers plus the preconditioner's hierarchy, so a graph

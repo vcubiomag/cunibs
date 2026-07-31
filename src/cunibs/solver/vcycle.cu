@@ -616,7 +616,7 @@ void NativeVCycle::apply(int n, const float* b, float* x, cudaStream_t stream) {
 void NativeVCycle::apply_block(int n, int k, const float* B, float* X, cudaStream_t stream) {
     check_ready(n, "apply_block");
     // Dispatch before allocating so an unsupported k costs nothing.
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         ensure_block_buffers(K);
         run_cycle<K>(B, X, stream);

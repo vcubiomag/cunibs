@@ -705,16 +705,12 @@ def solve_placements_block(
     large placement-independent arrays (scalp projection, tet connectivity, weighted
     gradients, node2corner, g) run once per chunk rather than once per placement, and the
     linear solve shares every stiffness/hierarchy read across the k columns.
+
+    k = 1 runs the width-1 block kernels rather than routing to ``solve_placement``, so that
+    every block_k a caller can pick reaches the same arithmetic.
     """
     k = len(sites)
     solver = ctx.solver
-    if k == 1:
-        center_mm, pos_ydir_mm, distance_mm = sites[0]
-        return [
-            solve_placement(
-                ctx, dip_pos_m, dip_moment, center_mm, pos_ydir_mm, distance_mm, didt
-            )
-        ]
     if k > MAX_BLOCK:
         raise ValueError(f"solve_placements_block: k={k} exceeds MAX_BLOCK={MAX_BLOCK}")
     stream = cp.cuda.get_current_stream().ptr

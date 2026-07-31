@@ -16,12 +16,12 @@ namespace {
 // operator; vcycle.cu tunes its fp32 counterpart separately and lands on 4 for every K.
 constexpr int kTpr = 8;
 
-// Blocks-per-SM floor, which is what bounds the register budget ptxas will spend. Only K = 1
-// and K = 2 reach the strided kernel and both are purely bandwidth-bound, so they want the
-// residency for latency hiding: asking for six gets them 40 registers. Left to a floor of 2,
-// ptxas unrolls into whatever it is given -- measured in registers per thread on sm_120, K=1
-// took 80 and K=2 took 126, the latter capping the kernel at two blocks per SM and making the
-// k=2 block SpMV slower than two scalar passes.
+// Blocks-per-SM floor for both fp64 SpMV kernels, which is what bounds the register budget
+// ptxas will spend. Both are purely bandwidth-bound and want the residency for latency hiding;
+// six buys the strided kernel 40 registers per thread. Left to the default floor ptxas unrolls
+// until a wide instantiation fits only two blocks per SM, which costs more than the unrolling
+// wins. The column-lane kernel needs the floor just as much, since it holds kTpr fp64 partials
+// per thread where the strided one spreads them across lanes.
 constexpr int kSpmvMinBlocks = 6;
 
 template <int K>
@@ -70,12 +70,13 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 // lanes, and turns the gather into one coalesced wavefront. Below K = 4 the strided form still
 // wins, because two lanes per row cannot hide the row loop.
 //
-// Each lane owns its column outright, so no cross-lane reduction is needed and the row sum runs
-// sequentially in column-index order rather than as a strided split plus a shuffle tree. Both
-// orders are fixed, so results stay run-to-run deterministic; they are simply not bitwise equal
-// across the two kernels.
+// A lane owns its column outright, so no cross-lane reduction is needed, but it still carries the
+// strided kernel's kTpr accumulators and combines them with the same tree. The summation order is
+// part of the answer: which kernel runs is a throughput choice, and block_k must not move a
+// result. Holding the partials in registers rather than across lanes costs kTpr doubles per
+// thread and changes nothing about the loads.
 template <int K>
-__global__ void __launch_bounds__(kBlock)
+__global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     bcsrmv_f64_collane_kernel(int n, const int* __restrict__ row_ptr,
                               const int* __restrict__ col_idx, const double* __restrict__ vals,
                               const double* __restrict__ x, double* __restrict__ y) {
@@ -84,61 +85,69 @@ __global__ void __launch_bounds__(kBlock)
     const int row = static_cast<int>(tid / K);
     if (row >= n) return;
     const int c = static_cast<int>(tid % K);
-    double sum = 0.0;
+    double part[kTpr];
+#pragma unroll
+    for (int l = 0; l < kTpr; ++l) part[l] = 0.0;
+
+    // Walk the row in groups of kTpr so the accumulator index stays a compile-time constant;
+    // a running index would spill `part` to local memory. Group g slot l is nonzero
+    // row_s + kTpr*g + l, which is exactly the strided kernel's lane-l subsequence.
+    const int row_s = row_ptr[row];
     const int row_e = row_ptr[row + 1];
-    for (int j = row_ptr[row]; j < row_e; ++j) {
-        sum += vals[j] * x[static_cast<std::int64_t>(col_idx[j]) * K + c];
+    int j = row_s;
+    for (; j + kTpr <= row_e; j += kTpr) {
+#pragma unroll
+        for (int l = 0; l < kTpr; ++l) {
+            part[l] += vals[j + l] * x[static_cast<std::int64_t>(col_idx[j + l]) * K + c];
+        }
     }
-    y[static_cast<std::int64_t>(row) * K + c] = sum;
+#pragma unroll
+    for (int l = 0; l < kTpr; ++l) {
+        if (j + l < row_e) {
+            part[l] += vals[j + l] * x[static_cast<std::int64_t>(col_idx[j + l]) * K + c];
+        }
+    }
+
+    // The same pairing __shfl_down_sync performs above, so both kernels land on
+    // ((p0+p4)+(p2+p6)) + ((p1+p5)+(p3+p7)).
+#pragma unroll
+    for (int off = kTpr / 2; off > 0; off >>= 1) {
+#pragma unroll
+        for (int l = 0; l < off; ++l) part[l] += part[l + off];
+    }
+    y[static_cast<std::int64_t>(row) * K + c] = part[0];
 }
 
-// Per-block reduction of K register accumulators into one partial per (column, block).
+// Per-block reduction of K register accumulators into one partial per (column, block): warp
+// shuffles, one cross-warp pass through shared memory, a single __syncthreads(). Keeping it to
+// one barrier matters because the streaming kernels that embed it are bandwidth-bound.
 //
-// The two orders are deliberate, not an accident of history. Each is what its path has
-// always used, and each stays exactly what it was: a reduction order is part of the answer
-// here, so sharing these kernels across K must not quietly re-associate either sum.
+// The order is the shuffle tree within each warp, then a sequential sum over the kBlock/kWarp
+// warp results. It does not depend on K, which is what makes the same placement solved at
+// block_k=1 and block_k=8 come back bitwise identical.
 template <int K>
 __device__ __forceinline__ void bcg_block_reduce_cols(double (&local)[K],
                                                       double* __restrict__ partials,
                                                       int n_blocks) {
-    if constexpr (K == 1) {
-        // Single RHS: a fixed-order tree over the whole block. One column cannot fill the
-        // warp-shuffle path's registers, and the extra barriers cost nothing that matters
-        // when there is only one accumulator in flight.
-        (void)n_blocks;  // column 0 starts at offset 0, so the stride never comes up
-        __shared__ double sdata[kBlock];
-        sdata[threadIdx.x] = local[0];
-        __syncthreads();
-        for (int off = kBlock / 2; off > 0; off >>= 1) {
-            if (threadIdx.x < off) sdata[threadIdx.x] += sdata[threadIdx.x + off];
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) partials[blockIdx.x] = sdata[0];
-    } else {
-        // Multiple RHS: warp shuffles, one cross-warp pass through shared memory, a single
-        // __syncthreads(). Keeping it to one barrier matters because the streaming kernels
-        // that embed it are bandwidth-bound. Fixed order: shuffle tree within each warp,
-        // then a sequential sum over the kBlock/kWarp warp results.
-        constexpr int kWarps = kBlock / kWarp;
-        __shared__ double s[kWarps][K];
-        const int lane = threadIdx.x % kWarp;
-        const int warp = threadIdx.x / kWarp;
+    constexpr int kWarps = kBlock / kWarp;
+    __shared__ double s[kWarps][K];
+    const int lane = threadIdx.x % kWarp;
+    const int warp = threadIdx.x / kWarp;
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            double v = local[c];
+    for (int c = 0; c < K; ++c) {
+        double v = local[c];
 #pragma unroll
-            for (int off = kWarp / 2; off > 0; off >>= 1) {
-                v += __shfl_down_sync(0xffffffffu, v, off);
-            }
-            if (lane == 0) s[warp][c] = v;
+        for (int off = kWarp / 2; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffffu, v, off);
         }
-        __syncthreads();
-        if (threadIdx.x < K) {
-            double v = 0.0;
+        if (lane == 0) s[warp][c] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < K) {
+        double v = 0.0;
 #pragma unroll
-            for (int w = 0; w < kWarps; ++w) v += s[w][threadIdx.x];
-            partials[static_cast<std::int64_t>(threadIdx.x) * n_blocks + blockIdx.x] = v;
-        }
+        for (int w = 0; w < kWarps; ++w) v += s[w][threadIdx.x];
+        partials[static_cast<std::int64_t>(threadIdx.x) * n_blocks + blockIdx.x] = v;
     }
 }
 
@@ -292,7 +301,7 @@ __global__ void bcg_residual_kernel(std::int64_t n_total, const double* __restri
     if (i < n_total) r[i] = b[i] - ap[i];
 }
 
-constexpr const char* kBadK = "block CG supports k in {2, 4, 8}";
+constexpr const char* kBadK = "block CG supports k in {1, 2, 4, 8}";
 
 }  // namespace
 
@@ -301,7 +310,7 @@ int bcg_partials_blocks(int n) { return static_cast<int>(grid_for(n)); }
 void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
                              const double* vals, const double* x, double* y,
                              cudaStream_t stream) {
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         constexpr int kThreadsPerRow = (K >= 4) ? K : kTpr;
         if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kThreadsPerRow)) {
@@ -319,7 +328,7 @@ void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_id
 void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,
                     double* out, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, true>
             <<<n_blocks, kBlock, 0, stream>>>(n, x, y, partials, n_blocks);
@@ -330,7 +339,7 @@ void launch_bcg_dot(int n, int k, const double* x, const double* y, double* part
 void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
                       cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, false>
             <<<n_blocks, kBlock, 0, stream>>>(n, x, nullptr, partials, n_blocks);
@@ -348,7 +357,7 @@ void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* 
                                float* rf, double* partials, double* norms,
                                cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_update_xr_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, alpha, neg_alpha, p, ap, x,
                                                                  r, rf, partials, n_blocks);
@@ -360,7 +369,7 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, double* beta,
                               cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
     });
@@ -370,7 +379,7 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
     });
@@ -379,7 +388,7 @@ void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
 
 void launch_bcg_update_p(int n, int k, const double* beta, const float* zf, double* p,
                          cudaStream_t stream) {
-    dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         if (const unsigned blocks = grid_for(n)) {
             bcg_update_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, beta, zf, p);
@@ -403,63 +412,5 @@ void launch_bcg_residual(std::int64_t n_total, const double* b, const double* ap
                          cudaStream_t stream) {
     if (const unsigned blocks = grid_for(n_total)) {
         bcg_residual_kernel<<<blocks, kBlock, 0, stream>>>(n_total, b, ap, r);
-    }
-}
-
-// --- single-RHS entry points -------------------------------------------------------------
-//
-// The scalar CG path is the K = 1 instantiation of the kernels above. These name K at the
-// call site rather than going through dispatch_k, so the block launchers' supported widths
-// stay {2, 4, 8} and the scalar path costs no runtime switch. Everything a k=1 solve
-// touches -- the SpMV's eight threads per row, the shared-memory reduction order, the
-// (n, 1) addressing that collapses to plain indexing -- is what cast.cu did before these
-// were shared, so solve_mixed's arithmetic is unchanged.
-
-int cg_partials_size(int n) { return bcg_partials_blocks(n); }
-
-void launch_double_to_float(const double* in, float* out, int n, cudaStream_t stream) {
-    launch_bcg_d2f(n, in, out, stream);
-}
-
-void launch_float_to_double(const float* in, double* out, int n, cudaStream_t stream) {
-    launch_bcg_f2d(n, in, out, stream);
-}
-
-void launch_cg_alpha(const double* rz, const double* pap, double* alpha, double* neg_alpha,
-                     cudaStream_t stream) {
-    launch_bcg_alpha(1, rz, pap, alpha, neg_alpha, stream);
-}
-
-void launch_cg_update_p(const double* beta, const float* zf, double* p, int n,
-                        cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        bcg_update_p_kernel<1><<<blocks, kBlock, 0, stream>>>(n, beta, zf, p);
-    }
-}
-
-void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
-                      const double* x, double* y, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
-        bcsrmv_f64_kernel<1><<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
-    }
-}
-
-void launch_cg_update_xr_norm(const double* alpha, const double* neg_alpha, const double* p,
-                              const double* ap, double* x, double* r, float* rf,
-                              double* partials, double* norm_sq, int n, cudaStream_t stream) {
-    if (const unsigned n_blocks = grid_for(n)) {
-        const int nb = static_cast<int>(n_blocks);
-        bcg_update_xr_kernel<1>
-            <<<n_blocks, kBlock, 0, stream>>>(n, alpha, neg_alpha, p, ap, x, r, rf, partials, nb);
-        bcg_reduce_kernel<<<1, kBlock, 0, stream>>>(partials, nb, norm_sq);
-    }
-}
-
-void launch_cg_cast_dot_beta(const float* zf, const double* r, double* partials, double* rz,
-                             double* beta, int n, cudaStream_t stream) {
-    if (const unsigned n_blocks = grid_for(n)) {
-        const int nb = static_cast<int>(n_blocks);
-        bcg_cast_dot_kernel<1><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, nb);
-        bcg_reduce_beta_kernel<<<1, kBlock, 0, stream>>>(partials, nb, rz, beta);
     }
 }
