@@ -1,10 +1,9 @@
 # Synthesize MSVC import libraries for the CUDA wheel DLLs.
 #
-# The Windows wheels ship no usable link-time artifacts: cuBLAS and cuBLASLt have no
-# import library at all, and the cudart.lib that is shipped imports from the driver-side
-# nvcudart_hybrid64.dll rather than from the cudart64_*.dll in the wheel. Linking against
-# what the wheels provide would therefore resolve to a DLL we never load, so derive the
-# import libraries from the DLLs themselves instead.
+# The Windows wheels ship no usable link-time artifact: the cudart.lib they contain imports
+# from the driver-side nvcudart_hybrid64.dll rather than from the cudart64_*.dll in the wheel,
+# so linking against it would resolve to a DLL we never load. Derive the import libraries from
+# the DLLs themselves instead.
 
 function(cunibs_generate_cuda_implibs)
   cmake_parse_arguments(arg "" "" "LIBS" ${ARGN})

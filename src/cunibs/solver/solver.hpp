@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <vector>
 
-#include <cublas_v2.h>
-
 #include "common.hpp"
 
 // Only ever held by reference or pointer here; solver.cpp includes vcycle.hpp for the calls.
@@ -148,13 +146,6 @@ public:
 private:
     void ensure_block_buffers(int k);
 
-    struct BlasHandle {
-        cublasHandle_t h = nullptr;
-        ~BlasHandle() {
-            if (h) cublasDestroy(h);
-        }
-    };
-
     int n_ = 0;
     int nnz_ = 0;
     DeviceBuffer<int> row_ptr_;
@@ -166,13 +157,12 @@ private:
     DeviceBuffer<double> x_int_;
     DeviceBuffer<float> rf_;
     DeviceBuffer<float> zf_;
-    // CG scalars kept on-device (device-pointer-mode cuBLAS): [rz, pap, alpha, neg_alpha, norm,
-    // beta]. Only the residual norm is copied back, into pinned host memory, once/iter.
+    // CG scalars kept on-device: [rz, pap, alpha, neg_alpha, norm, beta]. Only the residual norm
+    // is copied back, into pinned host memory, once/iter.
     DeviceBuffer<double> scalars_;
     // Per-block partial sums for the fused deterministic reductions (‖r‖², r·z).
     DeviceBuffer<double> partials_;
     PinnedBuffer<double> h_norm_;
-    BlasHandle blas_;
     // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
     // un-capturable legacy default stream; b/x are handed off via join_event_. The iteration body
     // only touches solver-owned buffers (x_int_, not the caller's x), so the captured graph is

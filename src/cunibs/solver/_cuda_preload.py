@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from cuda.pathfinder import DynamicLibNotFoundError, load_nvidia_dynamic_lib
 
-CUDA_LIBNAMES = ("cudart", "cublas")
+CUDA_LIBNAMES = ("cudart",)
 
 
 def _preload() -> dict[str, str]:
@@ -25,7 +25,6 @@ def describe_failure(exc: ImportError) -> str:
     detail = "".join(f"\n  {name}: {reason}" for name, reason in _FAILURES.items())
     return (
         f"cunibs could not load its solver extension: {exc}\n"
-        "Install the CUDA toolkit with `pip install "
-        "'cuda-toolkit[cudart,cublas,cusparse,cusolver]'`, or point CUDA_HOME at an "
-        f"existing CUDA 13 toolkit.{detail}"
+        "Install the CUDA toolkit with `pip install 'cuda-toolkit[cudart]'`, or point "
+        f"CUDA_HOME at an existing CUDA 13 toolkit.{detail}"
     )

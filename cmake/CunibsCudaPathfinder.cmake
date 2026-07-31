@@ -88,10 +88,4 @@ function(cunibs_seed_cuda_toolkit)
   # FindCUDAToolkit derives CUDAToolkit_LIBRARY_DIR from. Distinct from
   # CUDA_cudart_LIBRARY above.
   set(CUDA_CUDART "${${_link_var}cudart}" CACHE FILEPATH "CUDA toolkit anchor" ${_force})
-
-  # FindCUDAToolkit's dependency edge, minus culibos: it is a static library
-  # that the wheels do not ship, so leaving it to FindCUDAToolkit means linking
-  # a copy from whatever system toolkit happens to be installed.
-  set_property(TARGET CUDA::cublas APPEND PROPERTY
-    INTERFACE_LINK_LIBRARIES CUDA::cublasLt)
 endfunction()

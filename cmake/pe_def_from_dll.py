@@ -23,9 +23,9 @@ IMAGE_SCN_MEM_EXECUTE = 0x20000000
 # Data directory 0 is the export table, at this offset into a PE32+ optional header.
 EXPORT_DIRECTORY_OFFSET = 112
 
-# Only plain C identifiers become .def entries. cublasLt additionally exports
-# mangled C++ internals ("?Foo@bar@@YA..."); those are not public API, and '?'
-# and '@' collide with the ordinal syntax of a .def file.
+# Only plain C identifiers become .def entries. A DLL that also exports mangled C++
+# internals ("?Foo@bar@@YA...") is not offering public API there, and '?' and '@'
+# collide with the ordinal syntax of a .def file.
 _C_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -124,8 +124,8 @@ def read_exports(buf: bytes) -> tuple[str, list[Export]]:
 
 def render_def(dll_name: str, exports: list[Export]) -> str:
     # LIBRARY stamps the imported DLL name into the .lib. Without it lib.exe derives
-    # the name from the .lib basename, so cublas.lib would import from a nonexistent
-    # cublas.dll.
+    # the name from the .lib basename, so cudart.lib would import from a nonexistent
+    # cudart.dll rather than from cudart64_13.dll.
     lines = [f"LIBRARY {dll_name}", "EXPORTS"]
     for export in sorted(exports, key=lambda e: e.name):
         if not _C_IDENT.fullmatch(export.name):

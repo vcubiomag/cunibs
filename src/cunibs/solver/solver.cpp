@@ -6,24 +6,12 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
-#include <string>
 #include <utility>
 #include <vector>
 
 namespace {
 
 void check_cuda(cudaError_t rc, const char* what) { ::check_cuda(rc, "solver", what); }
-
-void check_cublas(cublasStatus_t rc, const char* what) {
-    if (rc != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string("cuBLAS ") + what + ": status " +
-                                 std::to_string(rc));
-    }
-}
-
-}  // namespace
-
-namespace {
 
 template <typename T>
 DeviceBuffer<T> alloc(std::size_t count, const char* what) {
@@ -45,7 +33,6 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     if (n_ <= 0) throw std::invalid_argument("PcgAmgSolver: n must be positive");
     if (nnz_ < 0) throw std::invalid_argument("PcgAmgSolver: nnz must not be negative");
 
-    check_cublas(cublasCreate(&blas_.h), "create");
     row_ptr_ = clone(row_ptr, static_cast<size_t>(n_) + 1, "row_ptr");
     col_idx_ = clone(col_idx, static_cast<size_t>(nnz_), "col_idx");
     values_ = clone(values, static_cast<size_t>(nnz_), "values");
@@ -211,10 +198,8 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     // back to direct execution.
     if (max_iters <= 0) throw std::invalid_argument("solve_mixed: max_iters must be > 0");
     cudaStream_t s = solve_stream_.get();
-    cublasHandle_t blas = blas_.h;
     check_cuda(cudaEventRecord(join_event_.get(), stream), "graph:record_in");
     check_cuda(cudaStreamWaitEvent(s, join_event_.get(), 0), "graph:wait_in");
-    check_cublas(cublasSetStream(blas, s), "set_stream(blas)");
     double* const d_rz = scalars_.get() + 0;
     double* const d_pap = scalars_.get() + 1;
     double* const d_alpha = scalars_.get() + 2;
@@ -242,17 +227,6 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
         return std::sqrt(*h_norm_.get());
     };
 
-    // The axpy below takes its scalar from the host.
-    check_cublas(cublasSetPointerMode(blas, CUBLAS_POINTER_MODE_HOST), "set_pointer_mode(host)");
-    // The loop works on the solver-owned x_int_ (not the caller's x) so the captured graph contains
-    // no per-call pointers and can be replayed across solves; the result is copied out at the end.
-    if (x0 != nullptr) {
-        check_cublas(cublasDcopy(blas, n_, x0, 1, x_int, 1), "copy(x0,x_int)");
-    } else {
-        check_cuda(cudaMemsetAsync(x_int, 0, static_cast<size_t>(n_) * sizeof(double), s),
-                   "memset(x_int)");
-    }
-    check_cublas(cublasDcopy(blas, n_, b, 1, r, 1), "copy(b,r)");
     // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
     // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
     // small initial residual.
@@ -263,12 +237,16 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
         check_cuda(cudaStreamSynchronize(s), "sync(x_out0)");
         return {0, 0.0};
     }
+    // The loop works on the solver-owned x_int_ (not the caller's x) so the captured graph contains
+    // no per-call pointers and can be replayed across solves; the result is copied out at the end.
     if (x0 != nullptr) {
+        check_cuda(cudaMemcpyAsync(x_int, x0, static_cast<size_t>(n_) * sizeof(double),
+                                   cudaMemcpyDeviceToDevice, s),
+                   "copy(x0,x_int)");
         // r0 = b - A x0
         launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), x_int, ap,
                                 s);
-        const double neg_one = -1.0;
-        check_cublas(cublasDaxpy(blas, n_, &neg_one, ap, 1, r, 1), "axpy(r0)");
+        launch_bcg_residual(n_, b, ap, r, s);
         const double norm_r0 = host_norm(r, "setup:norm(r0)");
         if (norm_r0 / norm_ref <= tolerance) {
             check_cuda(cudaMemcpyAsync(x, x_int, static_cast<size_t>(n_) * sizeof(double),
@@ -277,6 +255,12 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
             check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
             return {0, norm_r0 / norm_ref};
         }
+    } else {
+        check_cuda(cudaMemsetAsync(x_int, 0, static_cast<size_t>(n_) * sizeof(double), s),
+                   "memset(x_int)");
+        check_cuda(cudaMemcpyAsync(r, b, static_cast<size_t>(n_) * sizeof(double),
+                                   cudaMemcpyDeviceToDevice, s),
+                   "copy(b,r)");
     }
     launch_bcg_d2f(n_, r, rf, s);
     preconditioner.apply(n_, rf, zf, s);

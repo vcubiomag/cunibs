@@ -12,7 +12,7 @@ find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 
 option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the CUDA wheels" OFF)
 
-set(CUNIBS_CUDA_LIBS cudart cublasLt cublas)
+set(CUNIBS_CUDA_LIBS cudart)
 
 if(NOT CUNIBS_USE_SYSTEM_CUDA)
   include(CunibsCudaPathfinder)
@@ -103,7 +103,7 @@ endif()
 
 target_link_libraries(
   _solver_ext
-  PRIVATE CUDA::cudart CUDA::cublas
+  PRIVATE CUDA::cudart
 )
 
 if(NOT WIN32)
