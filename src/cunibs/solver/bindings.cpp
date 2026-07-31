@@ -33,6 +33,10 @@ NB_MODULE(_solver_ext, m) {
 
     nb::class_<NativeVCycle>(m, "NativeVCycle")
         .def(nb::init<>())
+        .def("set_smoother", &NativeVCycle::set_smoother, nb::arg("degree"),
+             nb::arg("lower_ratio"),
+             "Set the Chebyshev degree and the lower end of its interval, as a divisor of the "
+             "smoother's spectral upper bound. Must precede the first add_level.")
         .def(
             "add_level",
             [](NativeVCycle& self, i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values,

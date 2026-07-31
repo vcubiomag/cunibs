@@ -113,7 +113,11 @@ def test_reduce_matrix_drops_row_and_col(cp, cube_mesh):
 
 
 def test_l1_dinv_matches_dense_reference(cp, cube_subject):
-    """The JACOBI_L1 scaling is ω / (sign(aᵢᵢ) · Σⱼ|aᵢⱼ|) with ω = 0.9, diagonal included."""
+    """The JACOBI_L1 scaling is 1 / (sign(aᵢᵢ) · Σⱼ|aᵢⱼ|), diagonal included.
+
+    Also pins the bound the Chebyshev interval rests on: with the diagonal in the row sum,
+    D − A is weakly diagonally dominant with a non-negative diagonal, so ρ(D⁻¹A) ≤ 1.
+    """
     import cupyx.scipy.sparse as csp
 
     from cunibs.fem.solve import _l1_dinv
@@ -125,7 +129,11 @@ def test_l1_dinv_matches_dense_reference(cp, cube_subject):
     )
     dense = cp.asnumpy(a32.toarray()).astype(np.float64)
     d = np.abs(dense).sum(axis=1) * np.sign(np.diag(dense))
-    np.testing.assert_allclose(cp.asnumpy(_l1_dinv(a32)), 0.9 / d, rtol=1e-6)
+    np.testing.assert_allclose(cp.asnumpy(_l1_dinv(a32)), 1.0 / d, rtol=1e-6)
+
+    dinv = cp.asnumpy(_l1_dinv(a32)).astype(np.float64)
+    rho = np.max(np.abs(np.linalg.eigvals(dinv[:, None] * dense)))
+    assert rho <= 1.0 + 1e-6, f"rho(D^-1 A) = {rho} breaks the smoother interval's upper bound"
 
 
 def test_solve_grounded_matches_dense_solve(cp, cube_subject):
@@ -152,6 +160,65 @@ def test_solve_grounded_matches_dense_solve(cp, cube_subject):
     # times the system's conditioning, not by machine precision.
     got = cp.asnumpy(v[solver.idx])
     assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3, 4])
+def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degree):
+    """Every Chebyshev degree must converge, and to the same place.
+
+    The preconditioner is a pure function of A, so it cannot move the fixed point, only the rate.
+
+    This is also the sharpest available check on the recurrence itself. A degree-d sweep is d
+    out-of-place writes alternating between the level's two work buffers, so the degree's parity
+    decides which buffer the result lands in and which one the next stage reads; every step from
+    the second on also writes the buffer it reads x_prev from. Get any of that wrong and the
+    cycle silently returns a corrupted correction, which shows up here as a wrong answer or a
+    blown iteration count rather than as a crash.
+    """
+    import cupyx.scipy.sparse as csp
+
+    from cunibs.fem.solve import (
+        BLOCK_SIZES,
+        SmootherParams,
+        _solve_grounded_block_mat,
+        build_native_vcycle,
+        solve_grounded,
+    )
+
+    solver = cube_subject.context.solver
+    n_red = int(solver.idx.shape[0])
+    a_red = csp.csr_matrix(
+        (solver.values, solver.col_idx, solver.row_ptr), shape=(n_red, n_red)
+    )
+    rng = np.random.default_rng(0)
+    b = cp.asarray(rng.standard_normal(solver.n))
+    x_ref = np.linalg.solve(
+        cp.asnumpy(a_red.toarray()), cp.asnumpy(b[solver.idx]).astype(np.float64)
+    )
+
+    solver.precond = build_native_vcycle(
+        solver.row_ptr,
+        solver.col_idx,
+        cp.ascontiguousarray(solver.values.astype(cp.float32)),
+        smoother=SmootherParams(degree=degree),
+    )
+    got = cp.asnumpy(solve_grounded(solver, b)[solver.idx])
+
+    assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
+    # A broken sweep still converges eventually on a problem this small, so gate the rate too.
+    assert solver.last_iterations < solver.max_iters // 4
+
+    # Every compiled block width, not just the scalar path. The aliasing between a step's
+    # output and its x_prev is per-column, so a K-wide bug can leave some columns exact and
+    # others NaN at one width and one degree only, which the scalar path above cannot see.
+    b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
+    for k in BLOCK_SIZES:
+        B = cp.ascontiguousarray(cp.tile(b_red[:, None], (1, k)))
+        X = _solve_grounded_block_mat(solver, B, k)
+        assert bool(cp.isfinite(X).all()), f"block_k={k}, degree={degree}: non-finite solve"
+        for c in range(k):
+            err = np.linalg.norm(cp.asnumpy(X[:, c]) - x_ref) / np.linalg.norm(x_ref)
+            assert err <= 1e-6, f"block_k={k}, column {c}, degree={degree}: rel {err:.3e}"
 
 
 def test_solve_placement_is_linear_in_didt(cp, cube_subject, synthetic_coil):

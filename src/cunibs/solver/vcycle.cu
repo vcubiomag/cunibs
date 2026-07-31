@@ -114,9 +114,9 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
 template <int K>
 __global__ void __launch_bounds__(kBlock)
     vc_jacobi_zero_kernel(std::uint64_t n_total, const float* __restrict__ dinv,
-                          const float* __restrict__ b, float* __restrict__ x) {
+                          const float* __restrict__ b, float alpha, float* __restrict__ x) {
     const std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n_total) x[i] = dinv[i / K] * b[i];
+    if (i < n_total) x[i] = alpha * dinv[i / K] * b[i];
 }
 
 template <int K>
@@ -213,25 +213,53 @@ __global__ void __launch_bounds__(kBlock)
     for (int c = 0; c < K; ++c) x_fine[out + c] += sum[c];
 }
 
-// Fused post-sweep: x_out = x_in + dinv * (b - A x_in). Out-of-place because rows gather
-// x_in across the whole vector.
+// One Chebyshev step, fused with the residual it needs:
+//     x_out = c_cur * x_cur + c_prev * x_prev + alpha * dinv * (b - A x_cur).
+//
+// Out-of-place in x_cur, because rows gather it across the whole vector. x_prev is read only
+// at the row this thread owns, so x_out is allowed to alias x_prev, and from the second step of
+// a sweep on it always does: that is what lets any degree run on the level's two existing
+// buffers with no third one.
+//
+// x_prev and x_out therefore must NOT be __restrict__, however tempting it looks next to the
+// pointers that are: restrict on x_out would promise the compiler it aliases nothing, which is
+// exactly the promise this call pattern breaks, and it would be free to hoist the K stores
+// above the x_prev loads. The row's values are staged into registers first so the read/write
+// order is explicit rather than resting on alias analysis at all. x_cur keeps its restrict: it
+// is the gather's hot pointer, and x_out is never the buffer it reads.
+//
+// A zero c_prev does not excuse passing a pointer at unwritten memory, because 0 * NaN is NaN.
+// See the caller.
+//
+// The coefficients also cover the degenerate case (c_cur, 0, alpha), the first recurrence step
+// of a zero-initial-guess sweep, so this is the only smoother kernel there is.
 template <int K>
 __global__ void __launch_bounds__(kBlock)
-    vc_postsweep_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
-                        const __half* __restrict__ vals, const float* __restrict__ row_scale,
-                        const float* __restrict__ dinv, const float* __restrict__ b,
-                        const float* __restrict__ x_in, float* __restrict__ x_out) {
+    vc_cheby_step_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
+                         const __half* __restrict__ vals, const float* __restrict__ row_scale,
+                         const float* __restrict__ dinv, const float* __restrict__ b,
+                         const float* __restrict__ x_cur, const float* x_prev, float c_cur,
+                         float c_prev, float alpha, float* x_out) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = static_cast<int>(threadIdx.x) % kTpr;
     float sum[K];
-    row_spmv<K>(n, row_ptr, col_idx, vals, x_in, row, lane, sum);
+    row_spmv<K>(n, row_ptr, col_idx, vals, x_cur, row, lane, sum);
     if (row < n && lane == 0) {
-        const float d = dinv[row];
+        const float d = alpha * dinv[row];
         const float s = row_scale[row];
         const std::int64_t base = static_cast<std::int64_t>(row) * K;
+        float cur[K];
+        float prev[K];
+        float rhs[K];
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            x_out[base + c] = x_in[base + c] + d * (b[base + c] - s * sum[c]);
+            cur[c] = x_cur[base + c];
+            prev[c] = x_prev[base + c];
+            rhs[c] = b[base + c];
+        }
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+            x_out[base + c] = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
         }
     }
 }
@@ -265,12 +293,12 @@ __global__ void __launch_bounds__(kBlock)
 // could report surfaces at its next synchronize. Grid dimensions are checked here instead,
 // which is the only launch failure this code can cause on its own.
 template <int K>
-void launch_jacobi_zero(int n, const float* dinv, const float* b, float* x,
+void launch_jacobi_zero(int n, const float* dinv, const float* b, float alpha, float* x,
                         cudaStream_t stream) {
     const std::int64_t total = static_cast<std::int64_t>(n) * K;
     if (const unsigned blocks = grid_for(total)) {
         vc_jacobi_zero_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            static_cast<std::uint64_t>(total), dinv, b, x);
+            static_cast<std::uint64_t>(total), dinv, b, alpha, x);
     }
 }
 
@@ -304,12 +332,14 @@ void launch_prolongate(int n, const int* p_row_ptr, const int* p_col_idx, const 
 }
 
 template <int K>
-void launch_postsweep(int n, const int* row_ptr, const int* col_idx, const __half* values,
-                      const float* row_scale, const float* dinv, const float* b,
-                      const float* x_in, float* x_out, cudaStream_t stream) {
+void launch_cheby_step(int n, const int* row_ptr, const int* col_idx, const __half* values,
+                       const float* row_scale, const float* dinv, const float* b,
+                       const float* x_cur, const float* x_prev, float c_cur, float c_prev,
+                       float alpha, float* x_out, cudaStream_t stream) {
     if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
-        vc_postsweep_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            n, row_ptr, col_idx, values, row_scale, dinv, b, x_in, x_out);
+        vc_cheby_step_kernel<K><<<blocks, kBlock, 0, stream>>>(
+            n, row_ptr, col_idx, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
+            alpha, x_out);
     }
 }
 
@@ -342,11 +372,59 @@ __global__ void __launch_bounds__(kBlock)
 
 constexpr const char* kBadK = "V-cycle block apply supports k in {2, 4, 8}";
 
+// Smoother shape before any set_smoother call: a single relaxed Jacobi sweep.
+constexpr int kDefaultDegree = 1;
+constexpr float kDefaultLowerRatio = 4.0f;
+
 std::atomic<int> g_vcycle_generation{0};
 
 }  // namespace
 
-NativeVCycle::NativeVCycle() : generation_(++g_vcycle_generation) {}
+NativeVCycle::NativeVCycle() : generation_(++g_vcycle_generation) {
+    set_smoother(kDefaultDegree, kDefaultLowerRatio);
+}
+
+// Chebyshev over [1 / lower_ratio, 1], rewritten from the usual d-recurrence into the
+// x-recurrence the step kernel takes:
+//     x_{i+1} = (1 + beta_i) x_i - beta_i x_{i-1} + alpha_i D^-1 (b - A x_i).
+//
+// The interval's top is 1 because dinv carries the l1 diagonal, for which rho(D^-1 A) <= 1
+// holds analytically on any SPD operator (D - A is weakly diagonally dominant with a
+// non-negative diagonal, hence PSD). That is a bound, not an estimate, so alpha0 = 2r/(r+1) < 2
+// can never reach 2/rho: the smoother is A-convergent and the cycle SPD on every level and
+// every mesh, with nothing to tune and nothing to seed. A cheap power-iteration estimate would
+// be the footgun here, since it lands under the true rho and an under-estimate over-relaxes the
+// smoother badly enough to stall the cycle.
+void NativeVCycle::set_smoother(int degree, float lower_ratio) {
+    if (!levels_.empty()) {
+        throw std::runtime_error("NativeVCycle: set_smoother after add_level");
+    }
+    if (degree < 1 || degree > kMaxSmootherDegree) {
+        throw std::invalid_argument("NativeVCycle: smoother degree out of range");
+    }
+    // At ratio 1 the interval collapses to a point, delta is 0 and sigma is infinite.
+    if (!(lower_ratio > 1.0f)) {
+        throw std::invalid_argument("NativeVCycle: smoother lower_ratio must exceed 1");
+    }
+
+    constexpr float hi = 1.0f;
+    const float lo = hi / lower_ratio;
+    const float theta = 0.5f * (hi + lo);
+    const float delta = 0.5f * (hi - lo);
+    const float sigma = theta / delta;
+    cheby_ = Cheby{};
+    cheby_.alpha0 = 1.0f / theta;
+    float rho = 1.0f / sigma;
+    for (int j = 0; j + 1 < degree; ++j) {
+        const float rho_next = 1.0f / (2.0f * sigma - rho);
+        const float beta = rho_next * rho;
+        cheby_.c_cur[j] = 1.0f + beta;
+        cheby_.c_prev[j] = -beta;
+        cheby_.alpha[j] = 2.0f * rho_next / delta;
+        rho = rho_next;
+    }
+    degree_ = degree;
+}
 
 void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const int* row_ptr,
                              const int* col_idx, const float* values, const float* dinv,
@@ -456,11 +534,60 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         return;
     }
 
+    // One Chebyshev sweep of degree_ steps, returning the buffer the result landed in. Each
+    // step gathers x_cur across the whole vector, so it cannot write what it reads: writes
+    // alternate between `first` and `other`. From the second step on the output is the buffer
+    // that held x_{i-1}, which is legal because x_prev is read only at the row being written.
+    //
+    // x0 == nullptr is a zero initial guess. That drops the first step's SpMV altogether and
+    // zeroes the first recurrence step's x_prev coefficient, so `other` is never read before
+    // it is written and no zeroed buffer is needed to multiply by.
+    //
+    // final_out, when set, takes the last step in place of the alternating buffers. Only level
+    // 0 on the up-sweep uses it, to write the caller's x directly.
+    const auto smooth = [&](Level& lvl, const float* bi, const float* x0, float* first,
+                            float* other, float* final_out) {
+        const auto target = [&](int s) {
+            if (s + 1 == degree_ && final_out) return final_out;
+            return (s % 2) ? other : first;
+        };
+        if (x0 == nullptr) {
+            launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, cheby_.alpha0, target(0), stream);
+        } else {
+            launch_cheby_step<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
+                                 lvl.row_scale.get(), lvl.dinv.get(), bi, x0, x0, 1.0f, 0.0f,
+                                 cheby_.alpha0, target(0), stream);
+        }
+        float* cur = target(0);
+        // From a zero initial guess the first recurrence step has no x_{-1}, and its c_prev is
+        // 0 to match. That zero does NOT make the pointer irrelevant: `other` has not been
+        // written yet this cycle, and 0 * NaN is NaN, so pointing at it poisons the result with
+        // whatever the allocator last left there. Recycled fp64 buffers are the bad case, since
+        // reading a double's high word as a float is usually a NaN pattern. Point at `cur`
+        // instead: it is finite, it was just written, and its coefficient is zero.
+        float* prev = (x0 == nullptr) ? cur : other;
+        for (int s = 1; s < degree_; ++s) {
+            float* out = target(s);
+            const float c_prev = (s == 1 && x0 == nullptr) ? 0.0f : cheby_.c_prev[s - 1];
+            launch_cheby_step<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
+                                 lvl.row_scale.get(), lvl.dinv.get(), bi, cur, prev,
+                                 cheby_.c_cur[s - 1], c_prev, cheby_.alpha[s - 1], out, stream);
+            prev = cur;
+            cur = out;
+        }
+        return cur;
+    };
+
     const int n_levels = static_cast<int>(levels_.size());
+    // The pre-sweep has to land in x, because the up-sweep prolongates the coarse correction
+    // onto it; a degree-d sweep alternates d times, so that fixes which buffer it starts in.
+    // r then stays free for the residual restriction reads.
+    const bool odd = (degree_ % 2) != 0;
     for (int i = 0; i < n_levels; ++i) {
         Level& lvl = levels_[i];
         const float* bi = (i == 0) ? b : level_b(lvl);
-        launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, level_x(lvl), stream);
+        smooth(lvl, bi, nullptr, odd ? level_x(lvl) : level_r(lvl),
+               odd ? level_r(lvl) : level_x(lvl), nullptr);
         launch_residual<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
                            lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl), stream);
         float* next_b = (i + 1 < n_levels) ? level_b(levels_[i + 1]) : coarse_b;
@@ -470,17 +597,14 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
 
     launch_coarse_gemv<K>(coarse_n_, coarse_ainv_.get(), coarse_b, coarse_x, stream);
 
+    // xc is the coarser level's smoothed correction, wherever its sweep left it.
+    const float* xc = coarse_x;
     for (int i = n_levels - 1; i >= 0; --i) {
         Level& lvl = levels_[i];
         const float* bi = (i == 0) ? b : level_b(lvl);
-        // Below the top of the up-sweep, a level's final smoothed x was written into its
-        // r buffer by the out-of-place post-sweep.
-        const float* xc = (i + 1 < n_levels) ? level_r(levels_[i + 1]) : coarse_x;
         launch_prolongate<K>(lvl.n, lvl.p_row_ptr.get(), lvl.p_col_idx.get(),
                              lvl.p_values.get(), xc, level_x(lvl), stream);
-        float* out = (i == 0) ? x : level_r(lvl);
-        launch_postsweep<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
-                            lvl.row_scale.get(), lvl.dinv.get(), bi, level_x(lvl), out, stream);
+        xc = smooth(lvl, bi, level_x(lvl), level_r(lvl), level_x(lvl), (i == 0) ? x : nullptr);
     }
 }
 
