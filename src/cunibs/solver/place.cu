@@ -76,20 +76,22 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
                              const double* __restrict__ dists, const double* __restrict__ av,
                              const double* __restrict__ bv, const double* __restrict__ cv,
                              const double* __restrict__ tnorm, double* __restrict__ out,
-                             int* __restrict__ degenerate, int n_pl, int n_tri) {
+                             int* __restrict__ degenerate, int n_tri) {
     __shared__ double sdist[kBlock];
     __shared__ int stri[kBlock];
 
     const int p = blockIdx.x;
-    if (p >= n_pl) return;
     const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
 
+    // A thread's own candidates arrive in increasing j, so a later tie can never win here
+    // and only strict improvement is tested. Ties across threads are broken in the block
+    // reduction below, which is what matches cupy's argmin.
     double best = DBL_MAX;
     int btri = -1;
     double q[3];
     for (int j = threadIdx.x; j < n_tri; j += kBlock) {
         double d2 = closest_on_tri(center, &av[j * 3], &bv[j * 3], &cv[j * 3], q);
-        if (d2 < best || (d2 == best && j < btri)) {
+        if (d2 < best) {
             best = d2;
             btri = j;
         }
@@ -179,6 +181,6 @@ void launch_place(const double* centers, const double* handles, const double* di
     // One block per placement; threads inside it stride over triangles.
     if (const unsigned blocks = grid_for(n_pl, 1)) {
         place_kernel<<<blocks, kBlock, 0, stream>>>(centers, handles, dists, a, b, c, tnorm, out,
-                                                    degenerate, n_pl, n_tri);
+                                                    degenerate, n_tri);
     }
 }

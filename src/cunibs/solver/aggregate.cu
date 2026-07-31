@@ -8,8 +8,8 @@ namespace {
 
 constexpr int kWarpsPerBlock = kBlock / kWarp;
 
-// AMGx defaults (core.cu:465-466). Fixed rather than exposed: nothing in the pipeline varies
-// them, and round 1 must not apply kMaxUnassignedFraction at all (see select_size4).
+// AMGx defaults (core.cu). Fixed rather than exposed: nothing in the pipeline varies them,
+// and round 1 must not apply kMaxUnassignedFraction at all (see select_size4).
 constexpr int kMaxMatchingIterations = 15;
 constexpr float kMaxUnassignedFraction = 0.05f;
 
@@ -94,7 +94,7 @@ __global__ __launch_bounds__(kBlock) void agg_diag_kernel(int n, const int* __re
 }
 
 // w_ij = |a_ij| / max(|a_ii|, |a_jj|), then AMGx's uniform-weight perturbation
-// (common_selector.h:123-125), which is unconditional upstream. Dropping it costs
+// (common_selector.h), which is unconditional upstream. Dropping it costs
 // bit-exactness at scale: sub-001 lands on 208827 aggregates instead of 208828.
 //
 // The entries the matching skips, the diagonal and the columns past the row count, are set
@@ -522,7 +522,7 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
         check_cuda(cudaGetLastError(), "leftover merge launch");
     }
 
-    // Order-preserving dense renumbering (agg_selector.cu:20-44): mark the labels in use,
+    // Order-preserving dense renumbering (agg_selector.cu): mark the labels in use,
     // exclusive-scan the flags, and gather. Surjective by construction.
     check_cuda(cudaMemsetAsync(s.used, 0, static_cast<size_t>(n_rows) * sizeof(int), stream),
                "memset used");
