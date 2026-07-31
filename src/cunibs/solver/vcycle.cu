@@ -15,8 +15,6 @@ namespace {
 template <typename T>
 using Buffer = DeviceBuffer<T>;
 
-void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "vcycle", what); }
-
 template <typename T>
 Buffer<T> device_alloc(std::size_t count, const char* what) {
     return ::device_alloc<T>(count, "vcycle", what);

@@ -89,6 +89,15 @@ if(MSVC)
   target_compile_options(_solver_ext PRIVATE
     "$<$<COMPILE_LANGUAGE:CXX>:${_msvc_flags}>"
     "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_msvc_flags_nvcc}>")
+else()
+  # -Xcompiler only reaches the host half of a .cu, which is where the unused-parameter and
+  # sign-compare classes live. Device-side mistakes and ignored CUDA return codes are not
+  # covered by this and still have to be caught by hand.
+  set(_warn_flags -Wall -Wextra)
+  list(JOIN _warn_flags "," _warn_flags_nvcc)
+  target_compile_options(_solver_ext PRIVATE
+    "$<$<COMPILE_LANGUAGE:CXX>:${_warn_flags}>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_warn_flags_nvcc}>")
 endif()
 
 target_link_libraries(
