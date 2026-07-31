@@ -218,3 +218,29 @@ def test_weighted_quantiles_are_repeatable(cp):
         np.testing.assert_array_equal(
             cp.asnumpy(metrics.weighted_quantiles(values, weights, qs)), first
         )
+
+
+@pytest.mark.gpu
+def test_reused_region_slice_matches_a_per_call_summary(cp):
+    """Reusing one RegionSlice across fields is an optimisation, so it may not move a value."""
+    rng = np.random.default_rng(5)
+    n = 50_000
+    vols = cp.asarray(rng.random(n) + 0.1, dtype=cp.float32)
+    bary = cp.asarray(rng.standard_normal((n, 3)))
+    tags = cp.asarray(rng.choice(np.array([2, 3, 5], np.int32), n))
+    fields = [cp.asarray(rng.random(n), dtype=cp.float32) for _ in range(3)]
+
+    region = metrics.region_slice(vols, bary, tags, "gray_matter")
+    for magn in fields:
+        reused = region.summarize(magn)
+        direct = metrics.compute_metrics(magn, vols, bary, tags, region="gray_matter")
+
+        assert reused["region"] == direct["region"] == "gray_matter"
+        assert reused["peak_magnE"] == direct["peak_magnE"]
+        assert reused["region_volume_m3"] == direct["region_volume_m3"]
+        np.testing.assert_array_equal(reused["peak_location_mm"], direct["peak_location_mm"])
+        np.testing.assert_array_equal(
+            reused["center_of_gravity_mm"], direct["center_of_gravity_mm"]
+        )
+        assert reused["distribution"] == direct["distribution"]
+        assert reused["focality_m3"] == direct["focality_m3"]

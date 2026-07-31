@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, TypedDict
 
 import cupy as cp
@@ -98,12 +99,40 @@ def peak_magnitude(magnE: ArrayT, mask: ArrayT) -> float:
     return float(magnE[mask].max())
 
 
+# The helpers below take a region's values and weights already gathered. Both the mask-taking
+# functions and RegionSlice.summarize route through them, so each metric is defined once.
+
+
+def _percentile(m: ArrayT, w: ArrayT, percentile: float) -> float:
+    xp = cp.get_array_module(m)
+    q = xp.asarray([percentile / 100.0], dtype=m.dtype)
+    return float(cp.asnumpy(weighted_quantiles(m, w, q))[0])
+
+
+def _stimulated(m: ArrayT, w: ArrayT, threshold: float) -> float:
+    return float(w[m >= threshold].sum())
+
+
+def _center_of_gravity_mm(m: ArrayT, w: ArrayT, bary: ArrayT) -> npt.NDArray[np.float64]:
+    ww = w * m
+    return cp.asnumpy((ww[:, None] * bary).sum(0) / ww.sum())
+
+
+def _distribution(m: ArrayT, w: ArrayT, percentiles: tuple[float, ...]) -> dict[str, float]:
+    xp = cp.get_array_module(m)
+    wsum = w.sum()
+    mean = float((w * m).sum() / wsum)
+    var = float((w * (m - mean) ** 2).sum() / wsum)
+    qs = xp.asarray([p / 100.0 for p in percentiles], dtype=m.dtype)
+    pvals = cp.asnumpy(weighted_quantiles(m, w, qs))
+    out = {"mean": mean, "std": float(np.sqrt(var))}
+    out.update({f"p{p:g}": float(val) for p, val in zip(percentiles, pvals, strict=False)})
+    return out
+
+
 def percentile_magnitude(magnE: ArrayT, vols: ArrayT, mask: ArrayT, percentile: float) -> float:
     """Volume-weighted percentile of |E| in the region."""
-    xp = cp.get_array_module(magnE)
-    m = magnE[mask]
-    q = xp.asarray([percentile / 100.0], dtype=m.dtype)
-    return float(cp.asnumpy(weighted_quantiles(m, vols[mask], q))[0])
+    return _percentile(magnE[mask], vols[mask], percentile)
 
 
 def peak_location_mm(
@@ -141,9 +170,7 @@ def center_of_gravity_mm(
     magnE: ArrayT, vols: ArrayT, barycenters_mm: ArrayT, mask: ArrayT
 ) -> npt.NDArray[np.float64]:
     """Volume·|E|-weighted centroid (mm) of the field in the region."""
-    w = vols[mask] * magnE[mask]
-    cog = (w[:, None] * barycenters_mm[mask]).sum(0) / w.sum()
-    return cp.asnumpy(cog)
+    return _center_of_gravity_mm(magnE[mask], vols[mask], barycenters_mm[mask])
 
 
 def distribution(
@@ -153,17 +180,78 @@ def distribution(
     percentiles: tuple[float, ...] = _SUMMARY_PERCENTILES,
 ) -> dict[str, float]:
     """Volume-weighted mean/std and percentiles of |E| in the region."""
-    xp = cp.get_array_module(magnE)
-    m = magnE[mask]
-    w = vols[mask]
-    wsum = w.sum()
-    mean = float((w * m).sum() / wsum)
-    var = float((w * (m - mean) ** 2).sum() / wsum)
-    qs = xp.asarray([p / 100.0 for p in percentiles], dtype=m.dtype)
-    pvals = cp.asnumpy(weighted_quantiles(m, w, qs))
-    out = {"mean": mean, "std": float(np.sqrt(var))}
-    out.update({f"p{p:g}": float(val) for p, val in zip(percentiles, pvals, strict=False)})
-    return out
+    return _distribution(magnE[mask], vols[mask], percentiles)
+
+
+@dataclass(frozen=True)
+class RegionSlice:
+    """The field-independent half of a region summary, gathered once.
+
+    Holds the compacted element index, volumes and barycentres for one region, so a sweep pays
+    the mask and the gathers once rather than once per metric per placement. On a 3.9M-tetrahedron
+    mesh the gray matter slice is 1.16M elements.
+
+    Build with :func:`region_slice`, outside any scratch allocator whose lifetime is shorter
+    than the sweep.
+    """
+
+    region: Region
+    index: ArrayT
+    vols: ArrayT
+    barycenters_mm: ArrayT
+    volume_m3: float
+
+    def summarize(
+        self,
+        magnE: ArrayT,
+        *,
+        focality_fracs: tuple[float, ...] = _SUMMARY_FOCALITY_FRACS,
+        percentiles: tuple[float, ...] = _SUMMARY_PERCENTILES,
+    ) -> FieldMetrics:
+        """All E-field metrics for the region, reading one gathered copy of ``magnE``.
+
+        ``peak_magnE`` is the true maximum; the focality volumes are measured against
+        :data:`FOCALITY_ANCHOR_PERCENTILE` of |E| instead (see :func:`focality`).
+        """
+        xp = cp.get_array_module(magnE)
+        m = magnE[self.index]
+        w = self.vols
+        dist = _distribution(m, w, percentiles)
+        # Reuse the percentile the distribution already sorted for, and share the one anchor
+        # across every fraction.
+        anchor_key = f"p{FOCALITY_ANCHOR_PERCENTILE:g}"
+        anchor = (
+            dist[anchor_key]
+            if anchor_key in dist
+            else _percentile(m, w, FOCALITY_ANCHOR_PERCENTILE)
+        )
+        return {
+            "region": self.region,
+            "peak_magnE": float(m.max()),
+            "peak_location_mm": cp.asnumpy(self.barycenters_mm[xp.argmax(m)]),
+            "center_of_gravity_mm": _center_of_gravity_mm(m, w, self.barycenters_mm),
+            "region_volume_m3": self.volume_m3,
+            "focality_m3": {
+                f"{frac:g}": _stimulated(m, w, frac * anchor) for frac in focality_fracs
+            },
+            "distribution": dist,
+        }
+
+
+def region_slice(
+    vols: ArrayT, barycenters_mm: ArrayT, tet_tags: ArrayT, region: Region = "gray_matter"
+) -> RegionSlice:
+    """Gather the field-independent arrays for ``region`` once."""
+    xp = cp.get_array_module(vols)
+    index = xp.where(region_mask(tet_tags, region))[0]
+    v = vols[index]
+    return RegionSlice(
+        region=region,
+        index=index,
+        vols=v,
+        barycenters_mm=barycenters_mm[index],
+        volume_m3=float(v.sum()),
+    )
 
 
 def compute_metrics(
@@ -178,29 +266,9 @@ def compute_metrics(
 ) -> FieldMetrics:
     """Compute all E-field metrics for one tissue region.
 
-    ``peak_magnE`` is the true maximum; the focality volumes are measured against
-    :data:`FOCALITY_ANCHOR_PERCENTILE` of |E| instead (see :func:`focality`).
+    Builds a :class:`RegionSlice` per call. To summarise many fields over the same region, build
+    one with :func:`region_slice` and call :meth:`RegionSlice.summarize` instead.
     """
-    mask = region_mask(tet_tags, region)
-    peak = peak_magnitude(magnE, mask)
-    dist = distribution(magnE, vols, mask, percentiles)
-    # Reuse the percentile the distribution already sorted for, and share the one anchor
-    # across every fraction.
-    anchor_key = f"p{FOCALITY_ANCHOR_PERCENTILE:g}"
-    anchor = (
-        dist[anchor_key]
-        if anchor_key in dist
-        else percentile_magnitude(magnE, vols, mask, FOCALITY_ANCHOR_PERCENTILE)
+    return region_slice(vols, barycenters_mm, tet_tags, region).summarize(
+        magnE, focality_fracs=focality_fracs, percentiles=percentiles
     )
-    return {
-        "region": region,
-        "peak_magnE": peak,
-        "peak_location_mm": peak_location_mm(magnE, barycenters_mm, mask),
-        "center_of_gravity_mm": center_of_gravity_mm(magnE, vols, barycenters_mm, mask),
-        "region_volume_m3": float(vols[mask].sum()),
-        "focality_m3": {
-            f"{frac:g}": stimulated_volume(magnE, vols, mask, frac * anchor)
-            for frac in focality_fracs
-        },
-        "distribution": dist,
-    }

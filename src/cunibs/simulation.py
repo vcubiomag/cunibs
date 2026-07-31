@@ -156,6 +156,7 @@ class Subject:
         self._mesh = mesh
         self._ctx: SolverContext | None = None
         self._host_metrics: _HostMetricInputs | None = None
+        self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
 
     @classmethod
@@ -173,6 +174,7 @@ class Subject:
         self._conductivity_uq_pre.clear()
         self._ctx = None
         self._host_metrics = None
+        self._region_slices.clear()
         cp.get_default_memory_pool().free_all_blocks()
 
     def __enter__(self) -> Self:
@@ -246,6 +248,22 @@ class Subject:
             self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
         return self._conductivity_uq_pre[tags]
 
+    def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
+        """The field-independent half of a summary, gathered once per region.
+
+        Building it uploads the mesh barycentres, 94.6 MB on a 3.9M-tetrahedron mesh, so a sweep
+        builds it once and reuses it for every placement it solves. Call it first outside any
+        scratch allocator: filling the cache inside one would tie it to that pool's lifetime.
+        """
+        cached = self._region_slices.get(region)
+        if cached is None:
+            ctx = self.context
+            cached = metrics.region_slice(
+                ctx.vols, cp.asarray(self._mesh.tet_barycenters_mm), ctx.tet_tags, region
+            )
+            self._region_slices[region] = cached
+        return cached
+
     @property
     def _host_metric_inputs(self) -> _HostMetricInputs:
         """Host ``(vols, tet_tags, barycenters_mm)``, built once and shared by every result."""
@@ -265,26 +283,18 @@ class Subject:
         coil: Coil,
         didt: float,
         retain: _Retain,
+        region: metrics.RegionSlice,
     ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
         Runs inside the scratch pool, so nothing it returns may be device-backed.
-        ``compute_metrics`` satisfies that: it returns Python floats and host arrays even
+        ``RegionSlice.summarize`` satisfies that: it returns Python floats and host arrays even
         when every input is on the device.
         """
-        ctx = self.context
-        # Pool-owned: freed with the chunk, so it is re-uploaded rather than cached.
-        barycenters_mm = cp.asarray(self._mesh.tet_barycenters_mm)
         host = self._host_metric_inputs if retain.magnitude else None
         return [
             FieldResult(
-                summary=metrics.compute_metrics(
-                    out["magnE"],
-                    ctx.vols,
-                    barycenters_mm,
-                    ctx.tet_tags,
-                    region=_DEFAULT_REGION,
-                ),
+                summary=region.summarize(out["magnE"]),
                 magnE=cp.asnumpy(out["magnE"]) if retain.magnitude else None,
                 E=cp.asnumpy(out["E"]) if retain.vectors else None,
                 v=cp.asnumpy(out["v"]) if retain.potential else None,
@@ -317,6 +327,7 @@ class Subject:
         # Held across chunks, so these are allocated outside the scratch pool.
         dip_pos_m = cp.asarray(coil.positions_m)
         dip_moment = cp.asarray(coil.moments)
+        region = self._region_slice(_DEFAULT_REGION)
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
@@ -327,7 +338,7 @@ class Subject:
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
                 with cp.cuda.using_allocator(temp_pool.malloc):
                     outs = solve_placements_block(ctx, dip_pos_m, dip_moment, site_args, didt)
-                    batch = self._reduce_chunk(chunk, outs, coil, didt, retain)
+                    batch = self._reduce_chunk(chunk, outs, coil, didt, retain, region)
                     del outs
                 yield from batch
         finally:
