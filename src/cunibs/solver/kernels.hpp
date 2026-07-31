@@ -29,6 +29,14 @@ void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, co
                                const int* idx, float* b_block, int n_nodes, int n_tet, int k,
                                cudaStream_t stream);
 
+// --- stiffness.cu: conductivity stiffness values over a prebuilt CSR pattern ----------------
+// indptr/indices must have sorted column indices per row and cover every (i, j) the tets touch;
+// a contribution whose column is missing lands in a neighbouring slot rather than faulting.
+// data is overwritten. scale[e] = vols[e] * cond[e]. ptr/idx are rhs.cu's node2corner map.
+void launch_stiffness_rows(const double* g, const double* scale, const int* tet_nodes,
+                           const int* ptr, const int* idx, const int* indptr, const int* indices,
+                           double* data, int n_rows, cudaStream_t stream);
+
 // --- reconstruct.cu: E = -grad(v) - dA/dt --------------------------------------------------
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,

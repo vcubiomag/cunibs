@@ -17,6 +17,7 @@ namespace nb = nanobind;
 // Contiguity is required because these arrays are passed to CUDA as raw pointers.
 using f64_cuda = nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 using f64_cuda_2d = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+using f64_cuda_3d = nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
 using i32_cuda = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 
 using f32_cuda_1d = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
@@ -212,6 +213,20 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("dadt_elm").noconvert(), nb::arg("wg").noconvert(), nb::arg("ptr").noconvert(),
         nb::arg("idx").noconvert(), nb::arg("b").noconvert(), nb::arg("stream"),
         "Deterministic node-centric RHS assembly with preweighted gradients.");
+
+    m.def(
+        "assemble_stiffness_values",
+        [](f64_cuda_3d g, f64_cuda scale, i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx,
+           i32_cuda indptr, i32_cuda indices, f64_cuda data, uintptr_t stream) {
+            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
+            launch_stiffness_rows(g.data(), scale.data(), tet_nodes.data(), ptr.data(), idx.data(),
+                                  indptr.data(), indices.data(), data.data(), n_rows,
+                                  reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("g").noconvert(), nb::arg("scale").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("indptr").noconvert(),
+        nb::arg("indices").noconvert(), nb::arg("data").noconvert(), nb::arg("stream"),
+        "Fill a CSR pattern's values with the stiffness matrix, one thread per row.");
 
     m.def(
         "rhs_assemble_weighted_block",

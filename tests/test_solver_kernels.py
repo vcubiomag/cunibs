@@ -490,6 +490,39 @@ def test_native_aggregation_is_a_valid_partition(cp, patch_subject):
 
 
 @pytest.mark.realmesh
+def test_stiffness_assembly_is_reproducible(cp, patch_mesh):
+    """Assembling the same mesh repeatedly must give byte-identical values.
+
+    The aggregation below is only deterministic given deterministic values to aggregate, and
+    the hierarchy it selects can turn on a tie. Summing each entry's element contributions in
+    a fixed per-row order is what makes the matrix itself a function of the mesh.
+    """
+    from cunibs.fem.assembly import (
+        assemble_stiffness,
+        conductivity_per_tet,
+        gradient_operator,
+    )
+
+    nodes_m = cp.asarray(patch_mesh.nodes_mm, dtype=cp.float64) * 1e-3
+    tet_nodes = cp.asarray(patch_mesh.tet_nodes)
+    cond = conductivity_per_tet(cp.asarray(patch_mesh.tet_tags))
+    g, vols = gradient_operator(nodes_m, tet_nodes)
+
+    first = assemble_stiffness(g, vols, cond, patch_mesh.n_nodes, tet_nodes)
+    for attempt in range(1, 4):
+        again = assemble_stiffness(g, vols, cond, patch_mesh.n_nodes, tet_nodes)
+        np.testing.assert_array_equal(
+            cp.asnumpy(again.indptr), cp.asnumpy(first.indptr), err_msg=f"indptr {attempt}"
+        )
+        np.testing.assert_array_equal(
+            cp.asnumpy(again.indices), cp.asnumpy(first.indices), err_msg=f"indices {attempt}"
+        )
+        np.testing.assert_array_equal(
+            cp.asnumpy(again.data), cp.asnumpy(first.data), err_msg=f"data {attempt}"
+        )
+
+
+@pytest.mark.realmesh
 def test_native_aggregation_is_deterministic(cp, patch_subject):
     """One thread per row with fixed tie-breaks and no atomics: byte-identical across runs."""
     from cunibs.fem.solve import aggregation_levels

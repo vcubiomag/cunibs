@@ -174,6 +174,20 @@ def test_block_width_invariance(patch_subject, d70_coil, patch_sites):
 
 
 @pytest.mark.realmesh
+def test_repeated_subjects_agree_bitwise(fresh_subject, patch_mesh, d70_coil, patch_sites):
+    """The same mesh built into three subjects must give the same field.
+
+    This is the end-to-end cover for stiffness assembly: an ULP of drift in a few percent of
+    the nonzeros reaches |E| at ~1e-9 relative. Nothing about a placement changes between these
+    runs, so nothing about its field may.
+    """
+    placements = [Placement(*patch_sites[0])]
+    fields = [_magn(fresh_subject(patch_mesh), d70_coil, placements, 8)[0] for _ in range(3)]
+    for i, got in enumerate(fields[1:], 1):
+        np.testing.assert_array_equal(got, fields[0], err_msg=f"subject {i}")
+
+
+@pytest.mark.realmesh
 def test_simulate_block_k_matches_serial(patch_subject, d70_coil, patch_sites):
     """Through the public API: the default block path agrees with block_k=1."""
     placements = [Placement(c, h, d) for c, h, d in patch_sites] * 2
