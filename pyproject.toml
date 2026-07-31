@@ -85,10 +85,8 @@ cache-keys = [
 [tool.ruff]
 line-length = 96
 target-version = "py312"
-exclude = ["external"]
 
 [tool.ruff.lint]
-exclude = ["external"]
 extend-select = [
     "I",
     "B",
