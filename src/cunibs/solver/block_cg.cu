@@ -11,32 +11,24 @@
 
 namespace {
 
-// Threads cooperating on one row. The reduced stiffness has ~14 nnz/row (P1 tets), so eight
-// threads cover a row in a couple of strided steps. The best width shifts down as the
-// per-thread register footprint grows with K. This is the fp64 outer operator; vcycle.cu
-// tunes its fp32 counterpart separately and lands on 4 for every K.
-template <int K>
-__host__ __device__ constexpr int spmv_tpr() {
-    return K >= 4 ? 4 : 8;
-}
+// Threads cooperating on one row in the strided SpMV. The reduced stiffness has ~14 nnz/row
+// (P1 tets), so eight threads cover a row in a couple of strided steps. This is the fp64 outer
+// operator; vcycle.cu tunes its fp32 counterpart separately and lands on 4 for every K.
+constexpr int kTpr = 8;
 
-// Blocks-per-SM floor, which is what bounds the register budget ptxas will spend. Only K=8
-// genuinely needs a lower floor -- its eight accumulators spill below 4. Everything narrower
-// is purely bandwidth-bound and wants the residency for latency hiding, so it asks for six and
-// gets 40 registers. Left to a floor of 2, ptxas unrolls into whatever it is given: measured
-// in registers per thread on sm_120, K=1 took 80 and K=2 took 126, the latter capping the
-// kernel at two blocks per SM and making the k=2 block SpMV slower than two scalar passes.
-template <int K>
-__host__ __device__ constexpr int spmv_min_blocks() {
-    return K == 8 ? 4 : 6;
-}
+// Blocks-per-SM floor, which is what bounds the register budget ptxas will spend. Only K = 1
+// and K = 2 reach the strided kernel and both are purely bandwidth-bound, so they want the
+// residency for latency hiding: asking for six gets them 40 registers. Left to a floor of 2,
+// ptxas unrolls into whatever it is given -- measured in registers per thread on sm_120, K=1
+// took 80 and K=2 took 126, the latter capping the kernel at two blocks per SM and making the
+// k=2 block SpMV slower than two scalar passes.
+constexpr int kSpmvMinBlocks = 6;
 
 template <int K>
-__global__ void __launch_bounds__(kBlock, spmv_min_blocks<K>())
+__global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     bcsrmv_f64_kernel(int n, const int* __restrict__ row_ptr,
                       const int* __restrict__ col_idx, const double* __restrict__ vals,
                       const double* __restrict__ x, double* __restrict__ y) {
-    constexpr int kTpr = spmv_tpr<K>();
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = threadIdx.x % kTpr;
     double sum[K];
@@ -63,6 +55,41 @@ __global__ void __launch_bounds__(kBlock, spmv_min_blocks<K>())
 #pragma unroll
         for (int c = 0; c < K; ++c) y[base + c] = sum[c];
     }
+}
+
+// One thread per (row, column), which is what K >= 4 uses.
+//
+// The strided form above gives each thread a K-wide accumulator, so it issues K separate
+// eight-byte loads at x[col * K + c] per nonzero, to addresses unrelated to its warp
+// neighbours'. A warp then generates up to 32 distinct wavefronts for data occupying eight, and
+// the kernel saturates L1 request throughput well before DRAM: 91% of the STREAM ceiling at
+// k=1 against 39% at k=8. Morton ordering cannot rescue it, having been tuned so the k=1 gather
+// is cache-resident while the per-row working set here is K times larger.
+//
+// Giving each lane one column instead makes col_idx[j] and vals[j] broadcasts across a row's K
+// lanes, and turns the gather into one coalesced wavefront. Below K = 4 the strided form still
+// wins, because two lanes per row cannot hide the row loop.
+//
+// Each lane owns its column outright, so no cross-lane reduction is needed and the row sum runs
+// sequentially in column-index order rather than as a strided split plus a shuffle tree. Both
+// orders are fixed, so results stay run-to-run deterministic; they are simply not bitwise equal
+// across the two kernels.
+template <int K>
+__global__ void __launch_bounds__(kBlock)
+    bcsrmv_f64_collane_kernel(int n, const int* __restrict__ row_ptr,
+                              const int* __restrict__ col_idx, const double* __restrict__ vals,
+                              const double* __restrict__ x, double* __restrict__ y) {
+    const std::int64_t tid =
+        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int row = static_cast<int>(tid / K);
+    if (row >= n) return;
+    const int c = static_cast<int>(tid % K);
+    double sum = 0.0;
+    const int row_e = row_ptr[row + 1];
+    for (int j = row_ptr[row]; j < row_e; ++j) {
+        sum += vals[j] * x[static_cast<std::int64_t>(col_idx[j]) * K + c];
+    }
+    y[static_cast<std::int64_t>(row) * K + c] = sum;
 }
 
 // Per-block reduction of K register accumulators into one partial per (column, block).
@@ -276,8 +303,15 @@ void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_id
                              cudaStream_t stream) {
     dispatch_k<2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * spmv_tpr<K>())) {
-            bcsrmv_f64_kernel<K><<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+        constexpr int kThreadsPerRow = (K >= 4) ? K : kTpr;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kThreadsPerRow)) {
+            if constexpr (K >= 4) {
+                bcsrmv_f64_collane_kernel<K>
+                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+            } else {
+                bcsrmv_f64_kernel<K>
+                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+            }
         }
     });
 }
@@ -405,7 +439,7 @@ void launch_cg_update_p(const double* beta, const float* zf, double* p, int n,
 
 void launch_csrmv_f64(int n, const int* row_ptr, const int* col_idx, const double* vals,
                       const double* x, double* y, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * spmv_tpr<1>())) {
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
         bcsrmv_f64_kernel<1><<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
     }
 }
