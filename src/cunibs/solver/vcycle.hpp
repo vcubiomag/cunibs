@@ -1,7 +1,44 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include <utility>
 #include <vector>
+
+namespace vcycle_detail {
+
+// Move-only owner of one cudaMalloc'd block. Level setup takes a dozen allocations in a
+// row, so wrapping them keeps a failure part way through from leaking the earlier ones.
+template <typename T>
+class DeviceBuffer {
+public:
+    DeviceBuffer() = default;
+    explicit DeviceBuffer(T* ptr) noexcept : ptr_(ptr) {}
+    ~DeviceBuffer() { reset(); }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.release()) {}
+    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+        if (this != &other) reset(other.release());
+        return *this;
+    }
+
+    T* get() const noexcept { return ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+    T* release() noexcept { return std::exchange(ptr_, nullptr); }
+
+    void reset(T* ptr = nullptr) noexcept {
+        // A free during interpreter teardown, after the context is gone, reports an error
+        // there is nothing useful to do with.
+        if (ptr_ != nullptr) cudaFree(ptr_);
+        ptr_ = ptr;
+    }
+
+private:
+    T* ptr_ = nullptr;
+};
+
+}  // namespace vcycle_detail
 
 // One zero-initial-guess aggregation-AMG V-cycle: l1-Jacobi smoothing, unsmoothed
 // (piecewise-constant) transfers, dense coarse solve. The hierarchy operators are built
@@ -21,12 +58,12 @@
 class NativeVCycle {
 public:
     NativeVCycle();
-    ~NativeVCycle();
 
     NativeVCycle(const NativeVCycle&) = delete;
     NativeVCycle& operator=(const NativeVCycle&) = delete;
 
     // All pointers are device memory; contents are copied into solver-owned buffers.
+    // Each fine row belongs to exactly one aggregate, so r_col_idx holds n_rows entries.
     void add_level(int n_rows, int nnz, int n_coarse, const int* row_ptr, const int* col_idx,
                    const float* values, const float* dinv, const int* r_row_ptr,
                    const int* r_col_idx, const int* aggregates);
@@ -35,75 +72,53 @@ public:
     void finalize();
 
     void apply(int n, const float* b, float* x, cudaStream_t stream);
-    // Block variant: B and X are row-major (n, k). Must be graph-capturable after a
-    // first (warm-up) call.
+    // Block variant: B and X are row-major (n, k), k in {2, 4, 8}. Must be graph-capturable
+    // after a first (warm-up) call.
     void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
     int generation() const { return generation_; }
     // Coarsening levels, excluding the coarsest (dense-inverse) one.
     int n_levels() const { return static_cast<int>(levels_.size()); }
 
 private:
-    void ensure_block_buffers(int k);
+    template <typename T>
+    using Buffer = vcycle_detail::DeviceBuffer<T>;
 
     struct Level {
         int n = 0;
         int n_coarse = 0;
-        int* row_ptr = nullptr;
-        int* col_idx = nullptr;
-        float* values = nullptr;
-        float* dinv = nullptr;
-        int* r_row_ptr = nullptr;
-        int* r_col_idx = nullptr;
-        int* aggregates = nullptr;
-        float* b = nullptr;  // level RHS (restricted residual); unused at level 0
-        float* x = nullptr;  // pre-smoothed iterate, then corrected in place
-        float* r = nullptr;  // residual on the way down; the Jacobi post-sweep is
-                             // out-of-place, so on the way up this holds the level's
-                             // final smoothed x (level 0 writes the caller's x instead)
+        Buffer<int> row_ptr;
+        Buffer<int> col_idx;
+        Buffer<float> values;
+        Buffer<float> dinv;
+        Buffer<int> r_row_ptr;
+        Buffer<int> r_col_idx;
+        Buffer<int> aggregates;
+        Buffer<float> b;  // level RHS (restricted residual); null at level 0, which reads
+                          // the caller's b directly
+        Buffer<float> x;  // pre-smoothed iterate, then corrected in place
+        Buffer<float> r;  // residual on the way down; the Jacobi post-sweep is
+                          // out-of-place, so on the way up this holds the level's
+                          // final smoothed x (level 0 writes the caller's x instead)
         // (n, k) row-major work buffers for apply_block, sized for block_k_.
-        float* bk = nullptr;
-        float* xk = nullptr;
-        float* rk = nullptr;
+        Buffer<float> bk;
+        Buffer<float> xk;
+        Buffer<float> rk;
     };
+
+    void ensure_block_buffers(int k);
+    void check_ready(int n, const char* what) const;
+    // K = 1 walks the single-RHS buffers, K > 1 the (n, K) row-major ones.
+    template <int K>
+    void run_cycle(const float* b, float* x, cudaStream_t stream);
 
     std::vector<Level> levels_;
     int coarse_n_ = 0;
-    float* coarse_ainv_ = nullptr;
-    float* coarse_b_ = nullptr;
-    float* coarse_x_ = nullptr;
-    float* coarse_bk_ = nullptr;
-    float* coarse_xk_ = nullptr;
+    Buffer<float> coarse_ainv_;
+    Buffer<float> coarse_b_;
+    Buffer<float> coarse_x_;
+    Buffer<float> coarse_bk_;
+    Buffer<float> coarse_xk_;
     int block_k_ = 0;
     int generation_ = 0;
     bool finalized_ = false;
 };
-
-void launch_vc_jacobi_zero(int n, const float* dinv, const float* b, float* x,
-                           cudaStream_t stream);
-void launch_vc_residual(int n, const int* row_ptr, const int* col_idx, const float* values,
-                        const float* x, const float* b, float* r, cudaStream_t stream);
-void launch_vc_restrict(int n_coarse, const int* r_row_ptr, const int* r_col_idx,
-                        const float* r_fine, float* b_coarse, cudaStream_t stream);
-void launch_vc_prolongate(int n, const int* aggregates, const float* x_coarse, float* x_fine,
-                          cudaStream_t stream);
-void launch_vc_postsweep(int n, const int* row_ptr, const int* col_idx, const float* values,
-                         const float* dinv, const float* b, const float* x_in, float* x_out,
-                         cudaStream_t stream);
-void launch_vc_coarse_gemv(int n, const float* ainv, const float* b, float* x,
-                           cudaStream_t stream);
-
-// Block (k-RHS, row-major (n, k)) variants; k in {2, 4, 8}.
-void launch_vc_jacobi_zero_block(int n, int k, const float* dinv, const float* b, float* x,
-                                 cudaStream_t stream);
-void launch_vc_residual_block(int n, int k, const int* row_ptr, const int* col_idx,
-                              const float* values, const float* x, const float* b, float* r,
-                              cudaStream_t stream);
-void launch_vc_restrict_block(int n_coarse, int k, const int* r_row_ptr, const int* r_col_idx,
-                              const float* r_fine, float* b_coarse, cudaStream_t stream);
-void launch_vc_prolongate_block(int n, int k, const int* aggregates, const float* x_coarse,
-                                float* x_fine, cudaStream_t stream);
-void launch_vc_postsweep_block(int n, int k, const int* row_ptr, const int* col_idx,
-                               const float* values, const float* dinv, const float* b,
-                               const float* x_in, float* x_out, cudaStream_t stream);
-void launch_vc_coarse_gemv_block(int n, int k, const float* ainv, const float* b, float* x,
-                                 cudaStream_t stream);
