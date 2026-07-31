@@ -197,3 +197,24 @@ def test_metrics_cupy_numpy_parity(cp):
         assert value == pytest.approx(dev["distribution"][key], rel=1e-12), key
     for key, value in host["focality_m3"].items():
         assert value == pytest.approx(dev["focality_m3"][key], rel=1e-12), key
+
+
+@pytest.mark.gpu
+def test_weighted_quantiles_are_repeatable(cp):
+    """The same call must return the same number, every time.
+
+    A decoupled-lookback scan associates its float adds in an order that follows block
+    scheduling rather than the data, and ties decide which weight lands in which prefix-sum
+    slot, so the array here carries many of both.
+    """
+    rng = cp.random.default_rng(0)
+    values = cp.round(cp.asarray(rng.random(200_000), dtype=cp.float32), 3)
+    weights = cp.asarray(rng.random(200_000), dtype=cp.float32)
+    qs = cp.asarray([0.5, 0.95, 0.999], dtype=cp.float64)
+    assert int(cp.unique(values).size) < values.size, "the tie path must be exercised"
+
+    first = cp.asnumpy(metrics.weighted_quantiles(values, weights, qs))
+    for _ in range(6):
+        np.testing.assert_array_equal(
+            cp.asnumpy(metrics.weighted_quantiles(values, weights, qs)), first
+        )

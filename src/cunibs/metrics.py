@@ -49,13 +49,39 @@ def region_mask(tet_tags: ArrayT, region: Region) -> ArrayT:
     return tet_tags == tag
 
 
+def _prefix_sum(w: ArrayT, tile: int = 1024) -> ArrayT:
+    """Inclusive prefix sum in float64, with an association order fixed by size.
+
+    cupy's ``cumsum`` is a decoupled-lookback scan, so which partial sums combine with which
+    follows block scheduling rather than the data, and one array can yield several distinct
+    totals across calls. Splitting into fixed-size tiles pins the order: each tile is scanned
+    independently, and the tile offsets are scanned the same way, recursing until one tile
+    covers the array. Accumulating in float64 also bounds the drift over a million adds.
+    """
+    xp = cp.get_array_module(w)
+    a = w.astype(xp.float64, copy=False)
+    n = int(a.size)
+    # numpy's cumsum is sequential, so it is already both fixed-order and float64 here.
+    if xp is np or n <= tile:
+        return xp.cumsum(a)
+    pad = (-n) % tile
+    if pad:
+        a = xp.concatenate([a, xp.zeros(pad, a.dtype)])
+    within = xp.cumsum(a.reshape(-1, tile), axis=1)
+    totals = within[:, -1]
+    offsets = _prefix_sum(totals, tile) - totals
+    return (within + offsets[:, None]).ravel()[:n]
+
+
 def weighted_quantiles(values: ArrayT, weights: ArrayT, qs: ArrayT) -> ArrayT:
     """Volume-weighted quantiles of ``values`` (``qs`` in [0, 1])."""
     xp = cp.get_array_module(values)
-    order = xp.argsort(values)
+    # Stable so that ties in |E|, of which a million tetrahedra have tens of thousands, always
+    # send the same weight to the same slot of the prefix sum.
+    order = xp.argsort(values, kind="stable")
     v = values[order]
     w = weights[order]
-    cw = xp.cumsum(w)
+    cw = _prefix_sum(w)
     # Midpoint positions prevent a single element from spanning its full weight interval.
     pos = (cw - 0.5 * w) / cw[-1]
     # Evaluate at pos's precision: in float32 a tail quantile like 0.999 lands ~1e-8 off, and
