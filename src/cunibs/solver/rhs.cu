@@ -116,14 +116,15 @@ void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr,
     float* q = nullptr;
     // Safe here because the RHS build runs outside the solver's CUDA-graph capture; cudaMallocAsync
     // would be illegal inside a captured region.
-    cudaMallocAsync(&q, static_cast<size_t>(n_corner) * sizeof(float), stream);
+    check_cuda(cudaMallocAsync(&q, static_cast<size_t>(n_corner) * sizeof(float), stream), "rhs",
+               "mallocAsync(q)");
     if (const unsigned blocks = grid_for(n_corner)) {
         rhs_corner_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, wg, q, n_corner);
     }
     if (const unsigned blocks = grid_for(n_nodes)) {
         rhs_gather_kernel<<<blocks, kBlock, 0, stream>>>(q, ptr, idx, b, n_nodes);
     }
-    cudaFreeAsync(q, stream);
+    check_cuda(cudaFreeAsync(q, stream), "rhs", "freeAsync(q)");
 }
 
 void launch_weighted_gradient(const float* g, const float* neg_vc, float* wg, int n_tet,
@@ -142,7 +143,9 @@ void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, co
     const int n_corner = 4 * n_tet;
     float* q_block = nullptr;
     // Outside any CUDA-graph capture (same constraint as launch_rhs_weighted).
-    cudaMallocAsync(&q_block, static_cast<size_t>(n_corner) * k * sizeof(float), stream);
+    check_cuda(cudaMallocAsync(&q_block, static_cast<size_t>(n_corner) * k * sizeof(float),
+                               stream),
+               "rhs", "mallocAsync(q_block)");
     if (const unsigned blocks = grid_for(n_corner)) {
         rhs_corner_block_kernel<<<blocks, kBlock, 0, stream>>>(in, wg, q_block, n_corner, k);
     }
@@ -150,5 +153,5 @@ void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, co
         rhs_gather_block_kernel<<<blocks, kBlock, 0, stream>>>(q_block, ptr, idx, b_block,
                                                                n_nodes, k);
     }
-    cudaFreeAsync(q_block, stream);
+    check_cuda(cudaFreeAsync(q_block, stream), "rhs", "freeAsync(q_block)");
 }

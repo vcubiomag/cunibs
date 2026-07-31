@@ -90,6 +90,9 @@ NB_MODULE(_solver_ext, m) {
         .def(
             "update_values",
             [](PcgAmgSolver& self, f64_cuda values, uintptr_t stream) {
+                if (static_cast<int>(values.shape(0)) != self.nnz()) {
+                    throw std::invalid_argument("values must have one entry per nonzero");
+                }
                 self.update_values(values.data(), reinterpret_cast<cudaStream_t>(stream));
             },
             nb::arg("values").noconvert(), nb::arg("stream"))
@@ -97,6 +100,11 @@ NB_MODULE(_solver_ext, m) {
             "solve_mixed",
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda b, f64_cuda x,
                double tolerance, int max_iters, uintptr_t stream, std::optional<f64_cuda> x0) {
+                const int n = self.n();
+                if (static_cast<int>(b.shape(0)) != n || static_cast<int>(x.shape(0)) != n ||
+                    (x0.has_value() && static_cast<int>(x0->shape(0)) != n)) {
+                    throw std::invalid_argument("b, x and x0 must have one entry per row");
+                }
                 PcgResult result = self.solve_mixed(
                     preconditioner, b.data(), x.data(), tolerance, max_iters,
                     reinterpret_cast<cudaStream_t>(stream), x0.has_value() ? x0->data() : nullptr);
@@ -110,7 +118,16 @@ NB_MODULE(_solver_ext, m) {
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
                double tolerance, int max_iters, uintptr_t stream,
                std::optional<f64_cuda_2d> X0) {
-                int k = static_cast<int>(B.shape(1));
+                const int k = static_cast<int>(B.shape(1));
+                const int n = self.n();
+                const bool shaped = static_cast<int>(B.shape(0)) == n &&
+                                    static_cast<int>(X.shape(0)) == n &&
+                                    static_cast<int>(X.shape(1)) == k &&
+                                    (!X0.has_value() || (static_cast<int>(X0->shape(0)) == n &&
+                                                         static_cast<int>(X0->shape(1)) == k));
+                if (!shaped) {
+                    throw std::invalid_argument("B, X and X0 must all be (n, k)");
+                }
                 PcgBlockResult result = self.solve_mixed_block(
                     preconditioner, B.data(), X.data(), k, tolerance, max_iters,
                     reinterpret_cast<cudaStream_t>(stream),

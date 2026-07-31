@@ -530,3 +530,35 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
     for level, (fine, coarse) in enumerate(itertools.pairwise(sizes)):
         ratio = fine / coarse
         assert 3.5 <= ratio <= 5.0, f"level {level} coarsening ratio {ratio:.2f} out of range"
+
+
+# --- PcgAmgSolver argument validation ------------------------------------------------------
+
+
+def test_update_values_rejects_a_wrong_nonzero_count(cp, cube_subject):
+    """A short ``values`` would otherwise be read past its end on the device."""
+    pcg = cube_subject.context.solver.pcg
+    short = cp.ascontiguousarray(cube_subject.context.solver.values[:-1])
+    with pytest.raises(ValueError, match="one entry per nonzero"):
+        pcg.update_values(short, cp.cuda.get_current_stream().ptr)
+
+
+def test_solve_mixed_rejects_a_wrong_row_count(cp, cube_subject):
+    solver = cube_subject.context.solver
+    n = int(solver.row_ptr.shape[0]) - 1
+    stream = cp.cuda.get_current_stream().ptr
+    b = cp.zeros(n - 1, dtype=cp.float64)
+    x = cp.empty(n - 1, dtype=cp.float64)
+    with pytest.raises(ValueError, match="one entry per row"):
+        solver.pcg.solve_mixed(solver.precond, b, x, 1e-6, 10, stream)
+
+
+def test_solve_mixed_block_rejects_mismatched_operands(cp, cube_subject):
+    """``k`` is taken from ``B``, so an ``X`` of a different width has to be rejected."""
+    solver = cube_subject.context.solver
+    n = int(solver.row_ptr.shape[0]) - 1
+    stream = cp.cuda.get_current_stream().ptr
+    B = cp.ascontiguousarray(cp.zeros((n, 4), dtype=cp.float64))
+    X = cp.ascontiguousarray(cp.empty((n, 2), dtype=cp.float64))
+    with pytest.raises(ValueError, match=r"\(n, k\)"):
+        solver.pcg.solve_mixed_block(solver.precond, B, X, 1e-6, 10, stream)

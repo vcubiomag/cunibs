@@ -102,15 +102,26 @@ void PcgAmgSolver::update_values(const double* values, cudaStream_t stream) {
 
 void PcgAmgSolver::ensure_block_buffers(int k) {
     if (block_k_ >= k) return;
-    cudaFree(R_blk_);
-    cudaFree(P_blk_);
-    cudaFree(AP_blk_);
-    cudaFree(X_int_blk_);
-    cudaFree(RF_blk_);
-    cudaFree(ZF_blk_);
-    cudaFree(scalars_blk_);
-    cudaFree(partials_blk_);
-    if (h_norms_blk_) cudaFreeHost(h_norms_blk_);
+    // Drop the width before freeing: if an allocation below throws, the buffers this owns are
+    // gone and a retry at the same k must not take the early-out above and solve on them.
+    // Each pointer is nulled as it is freed for the same reason -- the destructor runs next.
+    block_k_ = 0;
+    const auto release = [](auto*& p) {
+        cudaFree(p);
+        p = nullptr;
+    };
+    release(R_blk_);
+    release(P_blk_);
+    release(AP_blk_);
+    release(X_int_blk_);
+    release(RF_blk_);
+    release(ZF_blk_);
+    release(scalars_blk_);
+    release(partials_blk_);
+    if (h_norms_blk_) {
+        cudaFreeHost(h_norms_blk_);
+        h_norms_blk_ = nullptr;
+    }
     const size_t nk = static_cast<size_t>(n_) * k;
     check_cuda(cudaMalloc(&R_blk_, nk * sizeof(double)), "malloc(R_blk)");
     check_cuda(cudaMalloc(&P_blk_, nk * sizeof(double)), "malloc(P_blk)");

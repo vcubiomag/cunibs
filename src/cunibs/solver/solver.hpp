@@ -26,6 +26,10 @@ public:
     PcgAmgSolver(const PcgAmgSolver&) = delete;
     PcgAmgSolver& operator=(const PcgAmgSolver&) = delete;
 
+    // Dimensions of the matrix this was built on, so callers can validate their arrays.
+    int n() const { return n_; }
+    int nnz() const { return nnz_; }
+
     void update_values(const double* values, cudaStream_t stream);
     PcgResult solve_mixed(NativeVCycle& preconditioner, const double* b, double* x,
                           double tolerance, int max_iters, cudaStream_t stream,

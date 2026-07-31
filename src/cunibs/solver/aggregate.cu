@@ -242,20 +242,15 @@ __global__ __launch_bounds__(kBlock) void agg_merge_existing_kernel(
     cand[tid] = (best.col != -1) ? agg[best.col] : tid;
 }
 
+// Every row agg_merge_existing_kernel considers gets a candidate (its own index if no
+// aggregated neighbour), so this assigns all of them and no row can survive to a second pass.
 __global__ __launch_bounds__(kBlock) void agg_join_existing_kernel(
-    int n, int* __restrict__ agg, int* __restrict__ aggregated, const int* __restrict__ cand,
-    int* __restrict__ remaining) {
+    int n, int* __restrict__ agg, int* __restrict__ aggregated, const int* __restrict__ cand) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int unassigned = 0;
     if (tid < n && aggregated[tid] == -1) {
-        if (cand[tid] != -1) {
-            agg[tid] = cand[tid];
-            aggregated[tid] = 1;
-        } else {
-            unassigned = 1;
-        }
+        agg[tid] = cand[tid];
+        aggregated[tid] = 1;
     }
-    count_block(unassigned, remaining);
 }
 
 // Rows of the same aggregate race to store here, but they all store 1, and the memory model
@@ -515,21 +510,16 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
         }
     }
 
-    // Leftovers join their strongest aggregated neighbour. `cand` is always assigned, so this
-    // converges in one pass; the cap only guards against an unforeseen input.
-    constexpr int kMaxMergePasses = 20;
-    for (int pass = 0; unassigned != 0; ++pass) {
-        if (pass >= kMaxMergePasses) {
-            throw std::runtime_error("aggregate: leftover merge did not terminate");
-        }
-        check_cuda(cudaMemsetAsync(s.counter, 0, sizeof(int), stream), "memset counter");
+    // Leftovers join their strongest aggregated neighbour. One pass assigns all of them:
+    // agg_merge_existing_kernel gives every remaining row a candidate, falling back to the row
+    // itself, so there is nothing for a second pass to do and no counter to read back.
+    if (unassigned != 0) {
         agg_merge_existing_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, row_ptr, col_idx, s.w,
                                                                  aggregates, s.aggregated,
                                                                  s.cand);
         agg_join_existing_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.aggregated,
-                                                                s.cand, s.counter);
+                                                                s.cand);
         check_cuda(cudaGetLastError(), "leftover merge launch");
-        unassigned = read_counter(s.counter, stream);
     }
 
     // Order-preserving dense renumbering (agg_selector.cu:20-44): mark the labels in use,
