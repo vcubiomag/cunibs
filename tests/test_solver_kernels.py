@@ -482,11 +482,11 @@ def test_native_aggregation_is_a_valid_partition(cp, patch_subject):
     levels, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
     assert levels, "the patch should coarsen at least once"
 
-    for level, (_, agg, n_coarse) in enumerate(levels):
-        agg_host = cp.asnumpy(agg)
-        assert agg_host.min() >= 0, f"level {level} has a negative aggregate id"
-        assert agg_host.max() < n_coarse, f"level {level} exceeds the declared coarse size"
-        assert np.unique(agg_host).size == n_coarse, f"level {level} has an empty aggregate"
+    for i, level in enumerate(levels):
+        agg = cp.asnumpy(level.aggregates)
+        assert agg.min() >= 0, f"level {i} has a negative aggregate id"
+        assert agg.max() < level.n_coarse, f"level {i} exceeds the declared coarse size"
+        assert np.unique(agg).size == level.n_coarse, f"level {i} has an empty aggregate"
 
 
 @pytest.mark.realmesh
@@ -501,12 +501,12 @@ def test_native_aggregation_is_deterministic(cp, patch_subject):
     second, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
 
     assert len(first) == len(second)
-    for level, ((_, agg_a, nc_a), (_, agg_b, nc_b)) in enumerate(
-        zip(first, second, strict=True)
-    ):
-        assert nc_a == nc_b, f"level {level} aggregate count is not reproducible"
+    for i, (a, b) in enumerate(zip(first, second, strict=True)):
+        assert a.n_coarse == b.n_coarse, f"level {i} aggregate count is not reproducible"
         np.testing.assert_array_equal(
-            cp.asnumpy(agg_a), cp.asnumpy(agg_b), err_msg=f"level {level} is not reproducible"
+            cp.asnumpy(a.aggregates),
+            cp.asnumpy(b.aggregates),
+            err_msg=f"level {i} is not reproducible",
         )
 
 
@@ -515,8 +515,11 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
     """Pin the hierarchy shape on the committed patch fixture.
 
     Catches an accidental change to the matching rules: resetting the carried-over
-    ``strongest``/``wsn`` state, for instance, drops the coarsening ratio from ~4.3 to ~3.7
-    and adds a level, which this notices immediately.
+    ``strongest``/``wsn`` state, for instance, drops the per-pass coarsening ratio and adds a
+    level, which this notices immediately.
+
+    The ratio is ~18 rather than a single pairwise pass's ~4.3 because a level composes two of
+    them (see ``_aggregate``).
     """
     from cunibs.fem.solve import aggregation_levels
 
@@ -524,12 +527,12 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
     values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
 
     levels, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
-    sizes = [int(solver.idx.shape[0])] + [int(n_coarse) for _, _, n_coarse in levels]
-    assert sizes == [8403, 1936, 457], f"hierarchy shape changed: {sizes}"
+    sizes = [int(solver.idx.shape[0])] + [level.n_coarse for level in levels]
+    assert sizes == [8403, 465], f"hierarchy shape changed: {sizes}"
 
     for level, (fine, coarse) in enumerate(itertools.pairwise(sizes)):
         ratio = fine / coarse
-        assert 3.5 <= ratio <= 5.0, f"level {level} coarsening ratio {ratio:.2f} out of range"
+        assert 14.0 <= ratio <= 22.0, f"level {level} coarsening ratio {ratio:.2f} out of range"
 
 
 # --- PcgAmgSolver argument validation ------------------------------------------------------

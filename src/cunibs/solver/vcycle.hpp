@@ -6,17 +6,16 @@
 #include <utility>
 #include <vector>
 
-// One zero-initial-guess aggregation-AMG V-cycle: l1-Jacobi smoothing, unsmoothed
-// (piecewise-constant) transfers, dense coarse solve. The hierarchy operators are built
-// outside in build_native_vcycle (aggregation, Galerkin products, l1-Jacobi diagonals,
-// restriction order, dense coarse inverse); this class owns device copies of everything
-// it touches so a captured CUDA graph stays valid for the object's lifetime.
+// One zero-initial-guess aggregation-AMG V-cycle: l1-Jacobi smoothing, smoothed-aggregation
+// transfers, dense coarse solve. The hierarchy operators are built outside in
+// build_native_vcycle (aggregation, Galerkin products, l1-Jacobi diagonals, prolongators,
+// dense coarse inverse); this class owns device copies of everything it touches so a captured
+// CUDA graph stays valid for the object's lifetime.
 //
 // Per level l (finest = 0, all but the coarsest): A_l as fp16 CSR with a per-row fp32 scale,
 // dinv_l = omega / guard(d_l) with the l1 diagonal d and the smoother relaxation factor
-// already folded in, the restriction CSR (coarse row -> fine indices in stable-sorted order),
-// and the fine->aggregate map for prolongation. The coarsest level is only the precomputed
-// dense inverse.
+// already folded in, and the smoothed prolongator P_l with its transpose R_l, both fp32 CSR.
+// The coarsest level is only the precomputed dense inverse.
 //
 // The operator is stored as a_ij / max_j|a_ij| in fp16, and the row total is scaled back up
 // after the reduction. Halving the widest array in the two SpMV-shaped kernels is worth ~10%
@@ -36,10 +35,11 @@ public:
     NativeVCycle& operator=(const NativeVCycle&) = delete;
 
     // All pointers are device memory; contents are copied into solver-owned buffers.
-    // Each fine row belongs to exactly one aggregate, so r_col_idx holds n_rows entries.
-    void add_level(int n_rows, int nnz, int n_coarse, const int* row_ptr, const int* col_idx,
-                   const float* values, const float* dinv, const int* r_row_ptr,
-                   const int* r_col_idx, const int* aggregates);
+    // P is (n_rows, n_coarse) CSR and R is P^T, so both hold p_nnz entries.
+    void add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const int* row_ptr,
+                   const int* col_idx, const float* values, const float* dinv,
+                   const int* p_row_ptr, const int* p_col_idx, const float* p_values,
+                   const int* r_row_ptr, const int* r_col_idx, const float* r_values);
     // ainv is the dense inverse of the coarsest-level matrix, row-major (n x n).
     void set_coarse(int n, const float* ainv);
     void finalize();
@@ -64,9 +64,14 @@ private:
         Buffer<__half> values;    // a_ij / row_scale[i]
         Buffer<float> row_scale;  // max_j |a_ij|, or 1 for an empty row
         Buffer<float> dinv;
+        // P (n, n_coarse) and R = P^T (n_coarse, n), both CSR with indices sorted at setup so
+        // the transfer kernels' row sums have a fixed order.
+        Buffer<int> p_row_ptr;
+        Buffer<int> p_col_idx;
+        Buffer<float> p_values;
         Buffer<int> r_row_ptr;
         Buffer<int> r_col_idx;
-        Buffer<int> aggregates;
+        Buffer<float> r_values;
         Buffer<float> b;  // level RHS (restricted residual); null at level 0, which reads
                           // the caller's b directly
         Buffer<float> x;  // pre-smoothed iterate, then corrected in place

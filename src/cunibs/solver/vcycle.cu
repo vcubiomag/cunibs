@@ -137,38 +137,80 @@ __global__ void __launch_bounds__(kBlock)
     }
 }
 
-// One thread per coarse row; the restriction row lists its fine indices in stable-sorted
-// order, so the sequential sum is deterministic.
+// Threads per coarse row in the restriction. R = P^T has by far the widest rows in the
+// hierarchy and the fewest of them: on sub-004 a level-0 coarse row collects ~85 fine rows
+// against A's ~14, rising to ~740 at level 2 where there are only 138 rows in total. A whole
+// warp per row is what keeps the coarse end from starving for parallelism and the fine end
+// from walking each row alone. Unlike kTpr there is no locality argument against going wide
+// here: consecutive entries of a restriction row are consecutive fine indices.
+constexpr int kRestrictTpr = 32;
+
+static_assert(kWarp % kRestrictTpr == 0, "shuffle width must divide the warp");
+static_assert(kBlock % kRestrictTpr == 0, "a block must hold a whole number of rows");
+
+// b_coarse = R r_fine. R is sorted by column index at setup, and each lane takes a fixed
+// strided slice reduced in a fixed shuffle order, so the sum order is pinned by the sizes alone
+// and the apply stays deterministic. Threads past the last row still reach the shuffle with
+// zero accumulators, which is why the mask is the full warp.
 template <int K>
 __global__ void __launch_bounds__(kBlock)
     vc_restrict_kernel(int n_coarse, const int* __restrict__ r_row_ptr,
-                       const int* __restrict__ r_col_idx, const float* __restrict__ r_fine,
-                       float* __restrict__ b_coarse) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= n_coarse) return;
-    const int row_e = r_row_ptr[row + 1];
+                       const int* __restrict__ r_col_idx, const float* __restrict__ r_vals,
+                       const float* __restrict__ r_fine, float* __restrict__ b_coarse) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kRestrictTpr;
+    const int lane = static_cast<int>(threadIdx.x) % kRestrictTpr;
     float sum[K];
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
-    for (int j = r_row_ptr[row]; j < row_e; ++j) {
-        const std::int64_t base = static_cast<std::int64_t>(r_col_idx[j]) * K;
+    if (row < n_coarse) {
+        const int row_e = r_row_ptr[row + 1];
+        for (int j = r_row_ptr[row] + lane; j < row_e; j += kRestrictTpr) {
+            const float v = r_vals[j];
+            const std::int64_t base = static_cast<std::int64_t>(r_col_idx[j]) * K;
+            float xv[K];
+            gather_k<K>(r_fine + base, xv);
 #pragma unroll
-        for (int c = 0; c < K; ++c) sum[c] += r_fine[base + c];
+            for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
+        }
+    }
+#pragma unroll
+    for (int off = kRestrictTpr / 2; off > 0; off >>= 1) {
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+            sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kRestrictTpr);
+        }
+    }
+    if (row < n_coarse && lane == 0) {
+        const std::int64_t out = static_cast<std::int64_t>(row) * K;
+#pragma unroll
+        for (int c = 0; c < K; ++c) b_coarse[out + c] = sum[c];
+    }
+}
+
+// x_fine += P x_coarse, one thread per fine row. A smoothed P holds a handful of nonzeros per
+// row, one per aggregate that row's neighbourhood reaches.
+template <int K>
+__global__ void __launch_bounds__(kBlock)
+    vc_prolongate_kernel(int n, const int* __restrict__ p_row_ptr,
+                         const int* __restrict__ p_col_idx, const float* __restrict__ p_vals,
+                         const float* __restrict__ x_coarse, float* __restrict__ x_fine) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= n) return;
+    const int row_e = p_row_ptr[row + 1];
+    float sum[K];
+#pragma unroll
+    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    for (int j = p_row_ptr[row]; j < row_e; ++j) {
+        const float v = p_vals[j];
+        const std::int64_t base = static_cast<std::int64_t>(p_col_idx[j]) * K;
+        float xv[K];
+        gather_k<K>(x_coarse + base, xv);
+#pragma unroll
+        for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
     }
     const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll
-    for (int c = 0; c < K; ++c) b_coarse[out + c] = sum[c];
-}
-
-template <int K>
-__global__ void __launch_bounds__(kBlock)
-    vc_prolongate_kernel(std::uint64_t n_total, const int* __restrict__ aggregates,
-                         const float* __restrict__ x_coarse, float* __restrict__ x_fine) {
-    const std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= n_total) return;
-    const std::int64_t src =
-        static_cast<std::int64_t>(aggregates[i / K]) * K + static_cast<int>(i % K);
-    x_fine[i] += __ldg(x_coarse + src);
+    for (int c = 0; c < K; ++c) x_fine[out + c] += sum[c];
 }
 
 // Fused post-sweep: x_out = x_in + dinv * (b - A x_in). Out-of-place because rows gather
@@ -244,20 +286,20 @@ void launch_residual(int n, const int* row_ptr, const int* col_idx, const __half
 
 template <int K>
 void launch_restrict(int n_coarse, const int* r_row_ptr, const int* r_col_idx,
-                     const float* r_fine, float* b_coarse, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_coarse)) {
-        vc_restrict_kernel<K>
-            <<<blocks, kBlock, 0, stream>>>(n_coarse, r_row_ptr, r_col_idx, r_fine, b_coarse);
+                     const float* r_vals, const float* r_fine, float* b_coarse,
+                     cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n_coarse) * kRestrictTpr)) {
+        vc_restrict_kernel<K><<<blocks, kBlock, 0, stream>>>(n_coarse, r_row_ptr, r_col_idx,
+                                                             r_vals, r_fine, b_coarse);
     }
 }
 
 template <int K>
-void launch_prolongate(int n, const int* aggregates, const float* x_coarse, float* x_fine,
-                       cudaStream_t stream) {
-    const std::int64_t total = static_cast<std::int64_t>(n) * K;
-    if (const unsigned blocks = grid_for(total)) {
-        vc_prolongate_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            static_cast<std::uint64_t>(total), aggregates, x_coarse, x_fine);
+void launch_prolongate(int n, const int* p_row_ptr, const int* p_col_idx, const float* p_vals,
+                       const float* x_coarse, float* x_fine, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(n)) {
+        vc_prolongate_kernel<K><<<blocks, kBlock, 0, stream>>>(n, p_row_ptr, p_col_idx, p_vals,
+                                                               x_coarse, x_fine);
     }
 }
 
@@ -306,12 +348,13 @@ std::atomic<int> g_vcycle_generation{0};
 
 NativeVCycle::NativeVCycle() : generation_(++g_vcycle_generation) {}
 
-void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, const int* row_ptr,
+void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const int* row_ptr,
                              const int* col_idx, const float* values, const float* dinv,
+                             const int* p_row_ptr, const int* p_col_idx, const float* p_values,
                              const int* r_row_ptr, const int* r_col_idx,
-                             const int* aggregates) {
+                             const float* r_values) {
     if (finalized_) throw std::runtime_error("NativeVCycle: add_level after finalize");
-    if (n_rows <= 0 || n_coarse <= 0 || nnz < 0) {
+    if (n_rows <= 0 || n_coarse <= 0 || nnz < 0 || p_nnz < 0) {
         throw std::invalid_argument("NativeVCycle: level dimensions must be positive");
     }
 
@@ -330,10 +373,14 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, const int* row_p
         check_cuda(cudaDeviceSynchronize(), "vcycle", "pack values");
     }
     lvl.dinv = device_clone(dinv, static_cast<std::size_t>(n_rows), "level dinv");
+    lvl.p_row_ptr =
+        device_clone(p_row_ptr, static_cast<std::size_t>(n_rows) + 1, "level P ptr");
+    lvl.p_col_idx = device_clone(p_col_idx, static_cast<std::size_t>(p_nnz), "level P idx");
+    lvl.p_values = device_clone(p_values, static_cast<std::size_t>(p_nnz), "level P val");
     lvl.r_row_ptr =
         device_clone(r_row_ptr, static_cast<std::size_t>(n_coarse) + 1, "level R ptr");
-    lvl.r_col_idx = device_clone(r_col_idx, static_cast<std::size_t>(n_rows), "level R idx");
-    lvl.aggregates = device_clone(aggregates, static_cast<std::size_t>(n_rows), "level agg");
+    lvl.r_col_idx = device_clone(r_col_idx, static_cast<std::size_t>(p_nnz), "level R idx");
+    lvl.r_values = device_clone(r_values, static_cast<std::size_t>(p_nnz), "level R val");
     // The finest level reads the caller's b in place, so it needs no RHS of its own.
     if (!levels_.empty()) {
         lvl.b = device_alloc<float>(static_cast<std::size_t>(n_rows), "level b");
@@ -417,8 +464,8 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         launch_residual<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
                            lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl), stream);
         float* next_b = (i + 1 < n_levels) ? level_b(levels_[i + 1]) : coarse_b;
-        launch_restrict<K>(lvl.n_coarse, lvl.r_row_ptr.get(), lvl.r_col_idx.get(), level_r(lvl),
-                           next_b, stream);
+        launch_restrict<K>(lvl.n_coarse, lvl.r_row_ptr.get(), lvl.r_col_idx.get(),
+                           lvl.r_values.get(), level_r(lvl), next_b, stream);
     }
 
     launch_coarse_gemv<K>(coarse_n_, coarse_ainv_.get(), coarse_b, coarse_x, stream);
@@ -429,7 +476,8 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         // Below the top of the up-sweep, a level's final smoothed x was written into its
         // r buffer by the out-of-place post-sweep.
         const float* xc = (i + 1 < n_levels) ? level_r(levels_[i + 1]) : coarse_x;
-        launch_prolongate<K>(lvl.n, lvl.aggregates.get(), xc, level_x(lvl), stream);
+        launch_prolongate<K>(lvl.n, lvl.p_row_ptr.get(), lvl.p_col_idx.get(),
+                             lvl.p_values.get(), xc, level_x(lvl), stream);
         float* out = (i == 0) ? x : level_r(lvl);
         launch_postsweep<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
                             lvl.row_scale.get(), lvl.dinv.get(), bi, level_x(lvl), out, stream);

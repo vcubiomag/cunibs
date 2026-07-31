@@ -264,10 +264,12 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     That the preconditioner cannot move the fixed point is what lets the retry path replace an
     fp64 fallback solver: there is no more accurate solve to fall back to, only a faster one.
 
-    The substitute here is a one-level hierarchy. It converges in *fewer* iterations than the
-    production three-level one (its dense coarse solve is exact at 1936 rows rather than 457),
-    which is why production does not use it: the coarse inverse costs O(n_coarse^2) memory. So
-    this asserts the answer is unchanged, not that it is slower.
+    The substitute is a hierarchy built from single pairwise passes rather than the composed
+    pairs production uses, so on the patch it coarsens 8403 -> 1936 -> 465 where production goes
+    straight to 465. Two coarsening levels against one, over the same matrix and down to the
+    same dense coarse solve: a different rate reaching the same answer, which is the property
+    under test. It also covers the multi-level recursion, which the patch's own hierarchy does
+    not reach.
     """
     from cunibs.fem.solve import AggregationParams, build_native_vcycle
 
@@ -277,15 +279,15 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     reference = serial(ctx, d70_coil, [site])[0]
     good_iters = ctx.solver.last_iterations
     good_levels = ctx.solver.precond.n_levels()
-    assert good_levels >= 2
+    assert good_levels >= 1
 
     other = build_native_vcycle(
         ctx.solver.row_ptr,
         ctx.solver.col_idx,
         cp.ascontiguousarray(ctx.solver.values.astype(cp.float32)),
-        AggregationParams(max_levels=1),
+        AggregationParams(rounds=1),
     )
-    assert other.n_levels() == 1
+    assert other.n_levels() > good_levels, "the substitute must be a different hierarchy"
     ctx.solver.precond = other
 
     swapped = serial(ctx, d70_coil, [site])[0]

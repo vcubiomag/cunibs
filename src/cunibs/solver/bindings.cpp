@@ -36,20 +36,30 @@ NB_MODULE(_solver_ext, m) {
         .def(
             "add_level",
             [](NativeVCycle& self, i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values,
-               f32_cuda_1d dinv, i32_cuda r_row_ptr, i32_cuda r_col_idx, i32_cuda aggregates) {
+               f32_cuda_1d dinv, i32_cuda p_row_ptr, i32_cuda p_col_idx, f32_cuda_1d p_values,
+               i32_cuda r_row_ptr, i32_cuda r_col_idx, f32_cuda_1d r_values) {
                 int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
                 int nnz = static_cast<int>(values.shape(0));
                 int n_coarse = static_cast<int>(r_row_ptr.shape(0)) - 1;
-                self.add_level(n_rows, nnz, n_coarse, row_ptr.data(), col_idx.data(),
-                               values.data(), dinv.data(), r_row_ptr.data(), r_col_idx.data(),
-                               aggregates.data());
+                int p_nnz = static_cast<int>(p_values.shape(0));
+                if (static_cast<int>(r_values.shape(0)) != p_nnz) {
+                    throw std::invalid_argument("R must be the transpose of P");
+                }
+                if (static_cast<int>(p_row_ptr.shape(0)) - 1 != n_rows) {
+                    throw std::invalid_argument("P must have one row per fine row");
+                }
+                self.add_level(n_rows, nnz, n_coarse, p_nnz, row_ptr.data(), col_idx.data(),
+                               values.data(), dinv.data(), p_row_ptr.data(), p_col_idx.data(),
+                               p_values.data(), r_row_ptr.data(), r_col_idx.data(),
+                               r_values.data());
             },
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
             nb::arg("values").noconvert(), nb::arg("dinv").noconvert(),
-            nb::arg("r_row_ptr").noconvert(), nb::arg("r_col_idx").noconvert(),
-            nb::arg("aggregates").noconvert(),
-            "Append one non-coarsest level (fp32 CSR, omega/guard(d), restriction CSR, "
-            "fine->aggregate map); device arrays are copied into solver-owned buffers.")
+            nb::arg("p_row_ptr").noconvert(), nb::arg("p_col_idx").noconvert(),
+            nb::arg("p_values").noconvert(), nb::arg("r_row_ptr").noconvert(),
+            nb::arg("r_col_idx").noconvert(), nb::arg("r_values").noconvert(),
+            "Append one non-coarsest level (fp32 CSR, 1/guard(d), prolongator CSR and its "
+            "transpose); device arrays are copied into solver-owned buffers.")
         .def(
             "set_coarse",
             [](NativeVCycle& self, f32_cuda_2d ainv) {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, TypedDict
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
@@ -57,6 +57,10 @@ def _l1_dinv(a: csp.csr_matrix, omega: float = 0.9) -> cp.ndarray:
     keeps the smoother positive definite and so the whole V-cycle a valid PCG preconditioner.
     ``omega`` is the relaxation factor. The zero-row guard cannot fire for the SPD reduced
     stiffness, but keeps the reciprocal finite for any input.
+
+    Including the diagonal in the row sum also bounds the unrelaxed operator's spectrum. For
+    SPD ``a``, ``D - A`` is weakly diagonally dominant with a non-negative diagonal, hence PSD,
+    so ``rho(D^-1 A) <= 1``, which is the bound the prolongator damping rests on.
     """
     abs_a = csp.csr_matrix((cp.abs(a.data), a.indices, a.indptr), shape=a.shape)
     d = abs_a.dot(cp.ones(a.shape[1], dtype=cp.float32))
@@ -65,16 +69,48 @@ def _l1_dinv(a: csp.csr_matrix, omega: float = 0.9) -> cp.ndarray:
     return cp.ascontiguousarray((cp.float32(omega) / d).astype(cp.float32))
 
 
-def _galerkin(a: csp.csr_matrix, agg: cp.ndarray, n_coarse: int) -> csp.csr_matrix:
-    """A_{l+1} = P^T A_l P, with P the boolean aggregate map of unsmoothed aggregation."""
-    p = csp.csr_matrix(
-        (
-            cp.ones(a.shape[0], dtype=cp.float32),
-            agg,
-            cp.arange(a.shape[0] + 1, dtype=cp.int32),
-        ),
-        shape=(a.shape[0], n_coarse),
+# Damping for the prolongator smoother: 4 / (3 rho) minimises the largest eigenvalue the
+# smoothed basis leaves behind over [0, rho], and rho <= 1 by the bound in _l1_dinv.
+_SA_DAMPING = 4.0 / 3.0
+
+
+def _tentative_prolongator(agg: cp.ndarray, n_coarse: int) -> csp.csr_matrix:
+    """Piecewise-constant P over the aggregates, columns normalised to unit 2-norm.
+
+    The near-nullspace of a conductivity operator is the constant, so one column per aggregate
+    carrying the constant over it is the coarse basis to build from. Normalising rescales the
+    coarse unknowns rather than changing the space they span, and keeps the Galerkin operator's
+    rows on one scale when aggregates differ in size.
+    """
+    n = int(agg.shape[0])
+    counts = cp.bincount(agg, minlength=n_coarse).astype(cp.float32)
+    scale = cp.reciprocal(cp.sqrt(counts))
+    return csp.csr_matrix(
+        (scale[agg], agg, cp.arange(n + 1, dtype=cp.int32)), shape=(n, n_coarse)
     )
+
+
+def _smooth_prolongator(
+    a: csp.csr_matrix, p_tent: csp.csr_matrix, dinv: cp.ndarray
+) -> csp.csr_matrix:
+    """One damped Jacobi pass on the tentative prolongator: P = (I - (4/3) D^-1 A) P_tent.
+
+    Smoothing gives each coarse basis function support that overlaps its neighbours' and a
+    smooth profile across it, so the coarse space can represent the error the smoother leaves
+    behind. It costs fill, in P and again in the Galerkin product built from it.
+    """
+    ap = a @ p_tent
+    scaled = csp.csr_matrix(
+        (ap.data * cp.repeat(dinv, cp.diff(ap.indptr)), ap.indices, ap.indptr), shape=ap.shape
+    )
+    p = (p_tent - cp.float32(_SA_DAMPING) * scaled).tocsr()
+    p.sum_duplicates()
+    p.sort_indices()
+    return p
+
+
+def _galerkin(a: csp.csr_matrix, p: csp.csr_matrix) -> csp.csr_matrix:
+    """A_{l+1} = P^T A_l P."""
     coarse = (p.T.tocsr() @ a @ p).tocsr()
     coarse.sum_duplicates()
     coarse.sort_indices()
@@ -86,12 +122,74 @@ class AggregationParams:
     """Hierarchy shape controls.
 
     ``min_coarse_rows`` bounds the dense coarse solve, whose inverse costs O(n_coarse^2)
-    memory. It applies to the *next* level's size, so the coarsest level sits above it: 164
-    rows on sub-001, 457 on the test patch.
+    memory. It applies to the *next* level's size, so the coarsest level sits above it: 465
+    rows on the test patch.
     """
 
     min_coarse_rows: int = 128
     max_levels: int = 50
+    # Pairwise passes composed into one level's aggregation. See _aggregate: smoothed
+    # aggregation over a single pass does not fit in memory on a head mesh.
+    rounds: int = 2
+
+
+def _select_once(a: csp.csr_matrix, stream: int) -> tuple[cp.ndarray, int]:
+    """One pairwise pass of the AMGx SIZE_4 selector over ``a``."""
+    agg = cp.empty(a.shape[0], dtype=cp.int32)
+    n_coarse = select_size4(
+        cp.ascontiguousarray(a.indptr.astype(cp.int32)),
+        cp.ascontiguousarray(a.indices.astype(cp.int32)),
+        cp.ascontiguousarray(a.data.astype(cp.float32)),
+        agg,
+        stream,
+    )
+    return agg, n_coarse
+
+
+def _aggregate(
+    a: csp.csr_matrix, params: AggregationParams, stream: int
+) -> tuple[cp.ndarray | None, int]:
+    """Compose ``params.rounds`` pairwise passes into one level's aggregate map.
+
+    SIZE_4 already pairs twice, so a single pass gives aggregates of ~4 and a coarsening ratio
+    of ~4.2, which is far too fine for smoothed aggregation in 3D: a fine row's ~14 neighbours
+    land in ~8 distinct aggregates, so the smoothed P carries ~8 nonzeros per row against a
+    coarse space only 4.2x smaller, and the Galerkin product densifies until a head mesh runs
+    out of memory one level down.
+
+    Composing passes fixes it from both ends. Bigger aggregates mean a row's neighbours fall
+    into fewer of them, so P gets *sparser* per row as the coarse space shrinks faster. The
+    intermediate operators exist only to aggregate on, so they are built with the cheap
+    tentative P and thrown away.
+
+    Returns ``(None, n_rows)`` when the level cannot coarsen.
+    """
+    cur = a
+    agg: cp.ndarray | None = None
+    n_coarse = a.shape[0]
+    for round_i in range(params.rounds):
+        if cur.shape[0] <= params.min_coarse_rows:
+            break
+        step, nc = _select_once(cur, stream)
+        if nc == cur.shape[0] or nc < params.min_coarse_rows:
+            break
+        agg = step if agg is None else step[agg]
+        n_coarse = nc
+        if round_i + 1 < params.rounds:
+            cur = _galerkin(cur, _tentative_prolongator(step, nc))
+    return agg, n_coarse
+
+
+class AggregationLevel(NamedTuple):
+    """One coarsening step of the hierarchy."""
+
+    a: csp.csr_matrix
+    aggregates: cp.ndarray
+    p: csp.csr_matrix
+
+    @property
+    def n_coarse(self) -> int:
+        return int(self.p.shape[1])
 
 
 def aggregation_levels(
@@ -99,35 +197,35 @@ def aggregation_levels(
     col_idx: cp.ndarray,
     values_f32: cp.ndarray,
     params: AggregationParams | None = None,
-) -> tuple[list[tuple[csp.csr_matrix, cp.ndarray, int]], csp.csr_matrix]:
+) -> tuple[list[AggregationLevel], csp.csr_matrix]:
     """Coarsen until the dense-solve floor; return the per-level operators and the coarsest.
 
-    Each entry is ``(A_l, aggregates_l, n_coarse_l)``, finest first. Coarsening stops when a
-    level cannot coarsen at all or the next level would undershoot ``min_coarse_rows``; that
-    level is discarded and its matrix becomes the coarsest.
+    Levels come out finest first. Coarsening stops when a level cannot coarsen at all or the
+    next level would undershoot ``min_coarse_rows``; that level is discarded and its matrix
+    becomes the coarsest.
+
+    Each level's prolongator is built here rather than by the caller because the next level's
+    operator is the Galerkin product over it, so the transfer and the coarse operator have to
+    agree.
     """
     if params is None:
         params = AggregationParams()
     n = int(row_ptr.shape[0]) - 1
     a = csp.csr_matrix((values_f32, col_idx, row_ptr), shape=(n, n))
     stream = cp.cuda.get_current_stream().ptr
-    levels: list[tuple[csp.csr_matrix, cp.ndarray, int]] = []
+    levels: list[AggregationLevel] = []
     for _ in range(params.max_levels):
         n_rows = a.shape[0]
         if n_rows <= params.min_coarse_rows:
             break
-        agg = cp.empty(n_rows, dtype=cp.int32)
-        n_coarse = select_size4(
-            cp.ascontiguousarray(a.indptr.astype(cp.int32)),
-            cp.ascontiguousarray(a.indices.astype(cp.int32)),
-            cp.ascontiguousarray(a.data.astype(cp.float32)),
-            agg,
-            stream,
-        )
-        if n_coarse == n_rows or n_coarse < params.min_coarse_rows:
+        agg, n_coarse = _aggregate(a, params, stream)
+        if agg is None or n_coarse == n_rows or n_coarse < params.min_coarse_rows:
             break
-        levels.append((a, agg, n_coarse))
-        a = _galerkin(a, agg, n_coarse)
+        p = _smooth_prolongator(
+            a, _tentative_prolongator(agg, n_coarse), _l1_dinv(a, omega=1.0)
+        )
+        levels.append(AggregationLevel(a, agg, p))
+        a = _galerkin(a, p)
     return levels, a
 
 
@@ -139,23 +237,26 @@ def build_native_vcycle(
 ) -> NativeVCycle:
     """Build the fp32 V-cycle preconditioner: aggregate, then upload each level's operators.
 
-    Unsmoothed aggregation makes P a boolean map, so the restriction row order is just the
-    stable sort by aggregate, which also fixes the reduction order inside the restrict kernel.
+    P and R = P^T both go up as CSR. ``sort_indices`` on each is what fixes the summation order
+    inside the prolongate and restrict kernels, which walk their rows in index order.
     """
     levels, coarse = aggregation_levels(row_ptr, col_idx, values_f32, params)
     vc = NativeVCycle()
-    for a, agg, n_coarse in levels:
-        order = cp.ascontiguousarray(cp.argsort(agg, kind="stable").astype(cp.int32))
-        r_ptr = cp.zeros(n_coarse + 1, dtype=cp.int64)
-        cp.cumsum(cp.bincount(agg, minlength=n_coarse), out=r_ptr[1:])
+    for level in levels:
+        a, p = level.a, level.p
+        r = p.T.tocsr()
+        r.sort_indices()
         vc.add_level(
             cp.ascontiguousarray(a.indptr.astype(cp.int32)),
             cp.ascontiguousarray(a.indices.astype(cp.int32)),
             cp.ascontiguousarray(a.data.astype(cp.float32)),
             _l1_dinv(a),
-            cp.ascontiguousarray(r_ptr.astype(cp.int32)),
-            order,
-            agg,
+            cp.ascontiguousarray(p.indptr.astype(cp.int32)),
+            cp.ascontiguousarray(p.indices.astype(cp.int32)),
+            cp.ascontiguousarray(p.data.astype(cp.float32)),
+            cp.ascontiguousarray(r.indptr.astype(cp.int32)),
+            cp.ascontiguousarray(r.indices.astype(cp.int32)),
+            cp.ascontiguousarray(r.data.astype(cp.float32)),
         )
     ainv = cp.linalg.inv(coarse.todense().astype(cp.float32))
     vc.set_coarse(cp.ascontiguousarray(ainv.astype(cp.float32)))
