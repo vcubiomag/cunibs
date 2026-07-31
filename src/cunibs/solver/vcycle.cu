@@ -13,22 +13,18 @@
 namespace {
 
 template <typename T>
-using Buffer = vcycle_detail::DeviceBuffer<T>;
+using Buffer = DeviceBuffer<T>;
 
 void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "vcycle", what); }
 
 template <typename T>
 Buffer<T> device_alloc(std::size_t count, const char* what) {
-    T* ptr = nullptr;
-    check_cuda(cudaMalloc(&ptr, count * sizeof(T)), what);
-    return Buffer<T>(ptr);
+    return ::device_alloc<T>(count, "vcycle", what);
 }
 
 template <typename T>
 Buffer<T> device_clone(const T* src, std::size_t count, const char* what) {
-    Buffer<T> buf = device_alloc<T>(count, what);
-    check_cuda(cudaMemcpy(buf.get(), src, count * sizeof(T), cudaMemcpyDeviceToDevice), what);
-    return buf;
+    return ::device_clone<T>(src, count, "vcycle", what);
 }
 
 // Threads per row for the SpMV-shaped kernels. A_0 has ~14 nnz/row (P1 tets) and the

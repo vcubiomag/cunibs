@@ -4,42 +4,6 @@
 #include <utility>
 #include <vector>
 
-namespace vcycle_detail {
-
-// Move-only owner of one cudaMalloc'd block. Level setup takes a dozen allocations in a
-// row, so wrapping them keeps a failure part way through from leaking the earlier ones.
-template <typename T>
-class DeviceBuffer {
-public:
-    DeviceBuffer() = default;
-    explicit DeviceBuffer(T* ptr) noexcept : ptr_(ptr) {}
-    ~DeviceBuffer() { reset(); }
-
-    DeviceBuffer(const DeviceBuffer&) = delete;
-    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.release()) {}
-    DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
-        if (this != &other) reset(other.release());
-        return *this;
-    }
-
-    T* get() const noexcept { return ptr_; }
-    explicit operator bool() const noexcept { return ptr_ != nullptr; }
-    T* release() noexcept { return std::exchange(ptr_, nullptr); }
-
-    void reset(T* ptr = nullptr) noexcept {
-        // A free during interpreter teardown, after the context is gone, reports an error
-        // there is nothing useful to do with.
-        if (ptr_ != nullptr) cudaFree(ptr_);
-        ptr_ = ptr;
-    }
-
-private:
-    T* ptr_ = nullptr;
-};
-
-}  // namespace vcycle_detail
-
 // One zero-initial-guess aggregation-AMG V-cycle: l1-Jacobi smoothing, unsmoothed
 // (piecewise-constant) transfers, dense coarse solve. The hierarchy operators are built
 // outside in build_native_vcycle (aggregation, Galerkin products, l1-Jacobi diagonals,
@@ -81,7 +45,7 @@ public:
 
 private:
     template <typename T>
-    using Buffer = vcycle_detail::DeviceBuffer<T>;
+    using Buffer = DeviceBuffer<T>;
 
     struct Level {
         int n = 0;
