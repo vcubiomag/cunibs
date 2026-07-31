@@ -18,18 +18,6 @@ from cunibs.simulation import Placement
 pytestmark = pytest.mark.gpu
 
 PARITY = 2e-5
-# What block width may move, expressed as a multiple of the solve tolerance because that is what
-# actually bounds it. A fixed gate would be wrong: it would pass on any mesh whose placements all
-# converge in the same number of iterations, which the patch does, and fail on a real head mesh
-# where they do not.
-#
-# Two mechanisms, and the larger one is the stopping test rather than arithmetic. Lockstep
-# termination runs every column until the *worst* one converges, so a column that would have
-# stopped an iteration earlier on its own lands further inside the tolerance ball than the same
-# placement solved serially. That is over-convergence, never under, and it is bounded by the
-# tolerance the caller asked for. Underneath it sits the reduction order of the per-column dots
-# (shared-memory tree at K=1, warp shuffles at K>1), which is four orders smaller.
-WIDTH_INVARIANCE_TOL_MULTIPLE = 5.0
 DIDT = 1e6
 
 
@@ -170,36 +158,49 @@ def _magn(subject, coil, placements, block_k):
 
 
 @pytest.mark.realmesh
-def test_batch_composition_does_not_change_results(patch_subject, d70_coil, patch_sites):
-    """Splitting a sweep across calls must be bitwise invisible.
+@pytest.mark.parametrize("cut", [1, 2, 3, 5])
+def test_batch_composition_does_not_change_results(patch_subject, d70_coil, patch_sites, cut):
+    """Regrouping a sweep into different blocks must be bitwise invisible.
 
-    Every chunk solves from x0 = 0 against a matrix no other chunk touches, so at a fixed width
-    the grouping cannot reach the answer. This is what lets a caller batch however they like,
+    The cuts are deliberately misaligned with the width. Splitting eight placements at four
+    with ``block_k=4`` rebuilds the same two chunks and so tests nothing; cutting at three
+    puts placements 3..6 in a block that no chunk of the whole sweep contains, and leaves
+    placement 7 alone in a block of one. This is what lets a caller batch however they like,
     or resume an interrupted sweep, without their numbers moving.
     """
     placements = [Placement(c, h, d) for c, h, d in patch_sites]
     whole = _magn(patch_subject, d70_coil, placements, 4)
-    split = _magn(patch_subject, d70_coil, placements[:4], 4)
-    split += _magn(patch_subject, d70_coil, placements[4:], 4)
+    split = _magn(patch_subject, d70_coil, placements[:cut], 4)
+    split += _magn(patch_subject, d70_coil, placements[cut:], 4)
     for i, (w, s) in enumerate(zip(whole, split, strict=True)):
-        np.testing.assert_array_equal(s, w, err_msg=f"placement {i}")
+        np.testing.assert_array_equal(s, w, err_msg=f"cut={cut}, placement {i}")
 
 
 @pytest.mark.realmesh
-def test_block_width_invariance(patch_subject, d70_coil, patch_sites):
+def test_sweep_position_invariance(patch_subject, d70_coil, patch_sites):
+    """The same placement gives the same field at the head and at the tail of a sweep."""
+    first, rest = patch_sites[0], patch_sites[1:]
+    head = [Placement(*first)] + [Placement(*s) for s in rest]
+    tail = [Placement(*s) for s in rest] + [Placement(*first)]
+    got_head = _magn(patch_subject, d70_coil, head, 4)[0]
+    got_tail = _magn(patch_subject, d70_coil, tail, 4)[-1]
+    np.testing.assert_array_equal(got_tail, got_head)
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_block_width_invariance(patch_subject, d70_coil, patch_sites, k):
     """block_k is a throughput and memory knob, never an accuracy one.
 
-    It may move a result within the tolerance the caller asked for, and never outside it, so
-    two runs at different widths agree to whatever accuracy was requested. See the comment on
-    WIDTH_INVARIANCE_TOL_MULTIPLE for which mechanism contributes what.
+    Every compiled width shares one fp64 summation order and every column stops on its own
+    residual, so the width cannot reach the answer at all -- not even in the last bits. A
+    researcher who retunes block_k for a different GPU gets the same numbers.
     """
-    bound = WIDTH_INVARIANCE_TOL_MULTIPLE * patch_subject.context.solver.tolerance
     placements = [Placement(c, h, d) for c, h, d in patch_sites]
     ref = _magn(patch_subject, d70_coil, placements, 1)
-    for k in (2, 4, 8):
-        got = _magn(patch_subject, d70_coil, placements, k)
-        for i, (g, r) in enumerate(zip(got, ref, strict=True)):
-            assert rel_l2(g, r) <= bound, f"block_k={k}, placement {i}"
+    got = _magn(patch_subject, d70_coil, placements, k)
+    for i, (g, r) in enumerate(zip(got, ref, strict=True)):
+        np.testing.assert_array_equal(g, r, err_msg=f"block_k={k}, placement {i}")
 
 
 @pytest.mark.realmesh
@@ -226,6 +227,49 @@ def test_simulate_block_k_matches_serial(patch_subject, d70_coil, patch_sites):
     for b, s in zip(blocked, serialized, strict=False):
         assert b.peak_magnE() == pytest.approx(s.peak_magnE(), rel=1e-5)
         np.testing.assert_allclose(b.peak_location_mm(), s.peak_location_mm(), atol=1e-9)
+
+
+def _solve_two(solver, cp, left, right):
+    """Solve a k=2 block and return its columns plus the block's iteration count."""
+    b = cp.ascontiguousarray(cp.stack([left, right], axis=1))
+    x = cp.empty_like(b)
+    iters, _ = solver.pcg.solve_mixed_block(
+        solver.precond,
+        b,
+        x,
+        solver.tolerance,
+        solver.max_iters,
+        cp.cuda.get_current_stream().ptr,
+    )
+    return x, int(iters)
+
+
+@pytest.mark.realmesh
+def test_a_column_stops_on_its_own_residual(cp, fresh_subject, patch_mesh):
+    """A column's answer may not depend on how fast its block-mates converge.
+
+    A column carried past its own tolerance by a slower block-mate lands further inside the
+    tolerance ball. That is over-convergence rather than error, but it makes the field a
+    function of who else was in the batch, which a caller can neither control nor reproduce.
+
+    Every placement on the patch converges in the same 11 iterations, so composition alone
+    cannot show this. Two synthetic right-hand sides with different spectra can: the sine
+    needs 12 iterations and the two-point source 10, and the extra steps move the fast column
+    by ~3e-7, two orders above anything the arithmetic contributes.
+    """
+    solver = fresh_subject(patch_mesh).context.solver
+    n = int(solver.idx.shape[0])
+
+    fast = cp.zeros(n, dtype=cp.float64)
+    fast[n // 3] = 1.0
+    fast[2 * n // 3] = -1.0
+    slow = cp.sin(cp.arange(n, dtype=cp.float64) * (2 * np.pi / n))
+
+    with_twin, twin_iters = _solve_two(solver, cp, fast, fast)
+    with_slow, slow_iters = _solve_two(solver, cp, fast, slow)
+    assert slow_iters > twin_iters, "the companion must actually take longer"
+
+    np.testing.assert_array_equal(cp.asnumpy(with_slow[:, 0]), cp.asnumpy(with_twin[:, 0]))
 
 
 def test_simulate_block_k_is_clamped(cube_subject, synthetic_coil):

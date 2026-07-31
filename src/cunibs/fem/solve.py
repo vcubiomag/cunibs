@@ -466,9 +466,11 @@ MAX_BLOCK = BLOCK_SIZES[-1]
 def _solve_grounded_block_mat(solver: GroundedSolver, B: cp.ndarray, k: int) -> cp.ndarray:
     """Block-solve a padded (n_red, k_pad) RHS matrix; returns X with retries applied.
 
-    Each of the k chains is numerically independent (per-column reductions), they just
-    share every stiffness/hierarchy matrix read. If any column misses tolerance the
-    preconditioner is rebuilt once, then only the offending columns are re-solved singly.
+    Each of the k chains is numerically independent: per-column reductions, and a column that
+    reaches tolerance freezes rather than being carried along to the block's slowest one, so it
+    stops exactly where it would have solved alone. They share only the stiffness and hierarchy
+    reads. If any column misses tolerance the preconditioner is rebuilt once, then only the
+    offending columns are re-solved singly.
     """
     X = cp.empty_like(B)
     stream = cp.cuda.get_current_stream().ptr

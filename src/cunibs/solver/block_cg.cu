@@ -189,12 +189,42 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
     if (threadIdx.x == 0) out[c] = sdata[0];
 }
 
+// A column freezes at the iteration its own residual first meets tolerance, rather than at the
+// one the block's worst column reaches it. Both alpha and beta go to zero, which leaves x, r and
+// rz untouched and pins p at the preconditioned residual, so the column contributes nothing
+// further and its answer is the one it would have had solved on its own.
+//
+// Freezing on the device rather than by skipping launches on the host is what keeps the CG body
+// replayable as a captured graph: the kernels are the same every iteration and only the mask's
+// contents change. A null mask means no column is frozen, which is what the single-RHS solve
+// passes.
+__device__ __forceinline__ bool frozen(const double* __restrict__ converged, int c) {
+    return converged != nullptr && converged[c] != 0.0;
+}
+
+__global__ void bcg_mark_converged_kernel(int k, const double* __restrict__ norm_sq,
+                                          const double* __restrict__ ref_sq, double tolerance,
+                                          double* __restrict__ converged) {
+    const int c = threadIdx.x;
+    if (c < k) {
+        // Deliberately the same expression the host stopping test uses, rather than the cheaper
+        // comparison of squares. fp64 sqrt and divide are both correctly rounded, so the two
+        // sides agree bit for bit on the same inputs. If they could disagree by an ulp at the
+        // boundary, a column the device had frozen but the host still called unconverged would
+        // stop improving and run the block to max_iters.
+        converged[c] = (sqrt(norm_sq[c]) / sqrt(ref_sq[c]) <= tolerance) ? 1.0 : 0.0;
+    }
+}
+
 __global__ void bcg_alpha_kernel(int k, const double* __restrict__ rz,
-                                 const double* __restrict__ pap, double* __restrict__ alpha,
+                                 const double* __restrict__ pap,
+                                 const double* __restrict__ converged, double* __restrict__ alpha,
                                  double* __restrict__ neg_alpha) {
     const int c = threadIdx.x;
     if (c < k) {
-        const double a = rz[c] / pap[c];
+        // Branch rather than multiply by the mask: a column frozen at an exactly zero residual
+        // has rz = pap = 0, and 0/0 * 0 would poison x with a NaN instead of leaving it alone.
+        const double a = frozen(converged, c) ? 0.0 : rz[c] / pap[c];
         alpha[c] = a;
         neg_alpha[c] = -a;
     }
@@ -249,6 +279,7 @@ __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
 }
 
 __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int n_blocks,
+                                       const double* __restrict__ converged,
                                        double* __restrict__ rz, double* __restrict__ beta) {
     __shared__ double sdata[kBlock];
     const int c = blockIdx.x;
@@ -264,7 +295,9 @@ __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int 
     }
     if (threadIdx.x == 0) {
         const double total = sdata[0];
-        beta[c] = total / rz[c];
+        // beta = 0 on a frozen column pins p at zf. Left at total/rz it would be 1, since r has
+        // not moved, and p would grow by zf every remaining iteration for no purpose.
+        beta[c] = frozen(converged, c) ? 0.0 : total / rz[c];
         rz[c] = total;
     }
 }
@@ -347,9 +380,14 @@ void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* o
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
 }
 
-void launch_bcg_alpha(int k, const double* rz, const double* pap, double* alpha,
-                      double* neg_alpha, cudaStream_t stream) {
-    bcg_alpha_kernel<<<1, k, 0, stream>>>(k, rz, pap, alpha, neg_alpha);
+void launch_bcg_alpha(int k, const double* rz, const double* pap, const double* converged,
+                      double* alpha, double* neg_alpha, cudaStream_t stream) {
+    bcg_alpha_kernel<<<1, k, 0, stream>>>(k, rz, pap, converged, alpha, neg_alpha);
+}
+
+void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_sq,
+                               double tolerance, double* converged, cudaStream_t stream) {
+    bcg_mark_converged_kernel<<<1, k, 0, stream>>>(k, norm_sq, ref_sq, tolerance, converged);
 }
 
 void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* neg_alpha,
@@ -366,14 +404,14 @@ void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* 
 }
 
 void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
-                              double* partials, double* rz, double* beta,
+                              const double* converged, double* partials, double* rz, double* beta,
                               cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
     });
-    bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rz, beta);
+    bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, converged, rz, beta);
 }
 
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,

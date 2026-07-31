@@ -13,14 +13,19 @@ void launch_bcg_dot(int n, int k, const double* x, const double* y, double* part
                     double* out, cudaStream_t stream);
 void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
                       cudaStream_t stream);
-void launch_bcg_alpha(int k, const double* rz, const double* pap, double* alpha,
-                      double* neg_alpha, cudaStream_t stream);
+// converged is a k-wide 0/1 device mask the caller starts all-zero and mark_converged rewrites
+// each iteration; a null pointer means no column is frozen. A frozen column gets
+// alpha = beta = 0, which leaves its x and r exactly where they were.
+void launch_bcg_alpha(int k, const double* rz, const double* pap, const double* converged,
+                      double* alpha, double* neg_alpha, cudaStream_t stream);
+void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_sq,
+                               double tolerance, double* converged, cudaStream_t stream);
 void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* neg_alpha,
                                const double* p, const double* ap, double* x, double* r,
                                float* rf, double* partials, double* norms,
                                cudaStream_t stream);
 void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
-                              double* partials, double* rz, double* beta,
+                              const double* converged, double* partials, double* rz, double* beta,
                               cudaStream_t stream);
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, cudaStream_t stream);

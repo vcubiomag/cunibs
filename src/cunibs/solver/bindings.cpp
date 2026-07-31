@@ -161,7 +161,9 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
             nb::arg("X0").noconvert() = nb::none(),
             "Lockstep k-RHS mixed-precision PCG over row-major (n, k) operands; returns "
-            "(iterations, per-column relative residuals). k in {2, 4, 8}.");
+            "(block iterations, per-column relative residuals). A column freezes once its own "
+            "residual meets tolerance, so it stops where it would have solved alone. "
+            "k in {1, 2, 4, 8}.");
 
     m.def(
         "dadt_nbody",

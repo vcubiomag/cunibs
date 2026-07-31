@@ -16,7 +16,7 @@ struct PcgResult {
 };
 
 struct PcgBlockResult {
-    int iterations = 0;                     // lockstep iterations run
+    int iterations = 0;                     // iterations the block ran, i.e. its slowest column
     std::vector<double> relative_residual;  // per-column final relative residual
 };
 
@@ -136,10 +136,11 @@ public:
     PcgResult solve_mixed(NativeVCycle& preconditioner, const double* b, double* x,
                           double tolerance, int max_iters, cudaStream_t stream,
                           const double* x0 = nullptr);
-    // Block solve: k independent CG chains in lockstep over row-major (n, k) operands,
-    // sharing every stiffness-matrix read (block SpMV + block V-cycle). Stops when the
-    // worst column reaches tolerance; per-column residuals are reported so callers can
-    // fall back per column. k in {2, 4, 8}.
+    // Block solve: k independent CG chains in lockstep over row-major (n, k) operands, sharing
+    // every stiffness-matrix read (block SpMV + block V-cycle). The block runs until its worst
+    // column reaches tolerance, but each column freezes at its own, so a column's answer does
+    // not depend on who it was batched with. Per-column residuals are reported so callers can
+    // fall back per column. k in {1, 2, 4, 8}.
     PcgBlockResult solve_mixed_block(NativeVCycle& preconditioner, const double* B, double* X,
                                      int k, double tolerance, int max_iters,
                                      cudaStream_t stream, const double* X0 = nullptr);
@@ -187,7 +188,7 @@ private:
     DeviceBuffer<double> x_int_blk_;
     DeviceBuffer<float> rf_blk_;
     DeviceBuffer<float> zf_blk_;
-    // Layout: [rz | pap | alpha | neg_alpha | norm | beta], each k wide.
+    // Layout: [rz | pap | alpha | neg_alpha | norm | beta | ref_sq | converged], each k wide.
     DeviceBuffer<double> scalars_blk_;
     DeviceBuffer<double> partials_blk_;
     PinnedBuffer<double> h_norms_blk_;  // pinned, k residual norms + k reference norms

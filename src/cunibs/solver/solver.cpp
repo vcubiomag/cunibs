@@ -87,7 +87,7 @@ void PcgAmgSolver::ensure_block_buffers(int k) {
     x_int_blk_ = alloc<double>(nk, "X_int_blk");
     rf_blk_ = alloc<float>(nk, "RF_blk");
     zf_blk_ = alloc<float>(nk, "ZF_blk");
-    scalars_blk_ = alloc<double>(static_cast<size_t>(6) * k, "scalars_blk");
+    scalars_blk_ = alloc<double>(static_cast<size_t>(8) * k, "scalars_blk");
     partials_blk_ =
         alloc<double>(static_cast<size_t>(k) * bcg_partials_blocks(n_), "partials_blk");
     h_norms_blk_ = pinned_alloc<double>(static_cast<size_t>(2) * k, "solver", "norms_blk");
@@ -115,6 +115,8 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     double* const d_neg_alpha = scalars + 3 * k;
     double* const d_norm = scalars + 4 * k;
     double* const d_beta = scalars + 5 * k;
+    double* const d_ref_sq = scalars + 6 * k;
+    double* const d_converged = scalars + 7 * k;
     double* const h_norm = h_norms_blk_.get();
     double* const h_ref = h_norms_blk_.get() + k;
     double* const partials = partials_blk_.get();
@@ -125,9 +127,11 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     float* const RF = rf_blk_.get();
     float* const ZF = zf_blk_.get();
 
-    // Reference norms ‖b_c‖ (convergence is measured against b, matching solve_mixed).
-    launch_bcg_norm2(n_, k, B, partials, d_norm, s);
-    check_cuda(cudaMemcpyAsync(h_ref, d_norm, static_cast<size_t>(k) * sizeof(double),
+    // Reference norms ‖b_c‖ (convergence is measured against b, matching solve_mixed). The
+    // squares stay on the device for the per-column freeze; the host copy drives the block's
+    // stopping test and the reported residuals.
+    launch_bcg_norm2(n_, k, B, partials, d_ref_sq, s);
+    check_cuda(cudaMemcpyAsync(h_ref, d_ref_sq, static_cast<size_t>(k) * sizeof(double),
                                cudaMemcpyDeviceToHost, s),
                "block:copy(ref_norms)");
     check_cuda(cudaStreamSynchronize(s), "block:sync(ref_norms)");
@@ -138,6 +142,9 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
             throw std::invalid_argument("solve_mixed_block: zero RHS column");
         }
     }
+    // No column starts frozen; the mask is recomputed at the end of each iteration body.
+    check_cuda(cudaMemsetAsync(d_converged, 0, static_cast<size_t>(k) * sizeof(double), s),
+               "block:memset(converged)");
 
     if (X0 != nullptr) {
         check_cuda(cudaMemcpyAsync(X_int, X0, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
@@ -159,14 +166,15 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     auto run_body = [&]() {
         launch_bcsrmv_f64_block(n_, k, row_ptr_.get(), col_idx_.get(), values_.get(), P, AP, s);
         launch_bcg_dot(n_, k, P, AP, partials, d_pap, s);
-        launch_bcg_alpha(k, d_rz, d_pap, d_alpha, d_neg_alpha, s);
+        launch_bcg_alpha(k, d_rz, d_pap, d_converged, d_alpha, d_neg_alpha, s);
         launch_bcg_update_xr_norm(n_, k, d_alpha, d_neg_alpha, P, AP, X_int, R, RF, partials,
                                   d_norm, s);
+        launch_bcg_mark_converged(k, d_norm, d_ref_sq, tolerance, d_converged, s);
         check_cuda(cudaMemcpyAsync(h_norm, d_norm, static_cast<size_t>(k) * sizeof(double),
                                    cudaMemcpyDeviceToHost, s),
                    "block:copy(norms)");
         preconditioner.apply_block(n_, k, RF, ZF, s);
-        launch_bcg_cast_dot_beta(n_, k, ZF, R, partials, d_rz, d_beta, s);
+        launch_bcg_cast_dot_beta(n_, k, ZF, R, d_converged, partials, d_rz, d_beta, s);
         launch_bcg_update_p(n_, k, d_beta, ZF, P, s);
     };
 
@@ -284,7 +292,7 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
         // reduction tree stall the SpMV's memory pipeline.
         launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), p, ap, s);
         launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
-        launch_bcg_alpha(1, d_rz, d_pap, d_alpha, d_neg_alpha, s);
+        launch_bcg_alpha(1, d_rz, d_pap, nullptr, d_alpha, d_neg_alpha, s);
         // x += α p; r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)
         launch_bcg_update_xr_norm(n_, 1, d_alpha, d_neg_alpha, p, ap, x_int, r, rf, partials,
                                   d_norm, s);
@@ -293,7 +301,7 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
             "copy(norm)");
         preconditioner.apply(n_, rf, zf, s);
         // rz' = r·(double)zf; beta = rz'/rz; rz <- rz' (no fp64 z vector)
-        launch_bcg_cast_dot_beta(n_, 1, zf, r, partials, d_rz, d_beta, s);
+        launch_bcg_cast_dot_beta(n_, 1, zf, r, nullptr, partials, d_rz, d_beta, s);
         launch_bcg_update_p(n_, 1, d_beta, zf, p, s);  // p = β p + (double)zf
     };
 
