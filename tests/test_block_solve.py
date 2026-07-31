@@ -1,9 +1,9 @@
 """Block-CG parity: ``Subject.simulate``'s default path against the serial solve.
 
 ``simulate`` batches placements through ``solve_placements_block`` at ``block_k=MAX_BLOCK``
-by default, so the lockstep k-RHS kernels, the RHS padding, and the warm start are what
-almost every caller actually runs. The oracle throughout is the one-placement-at-a-time
-``solve_placement`` path, held to the same 2e-5 relative-L2 gate the block probe uses.
+by default, so the lockstep k-RHS kernels and the RHS padding are what almost every caller
+actually runs. The oracle throughout is the one-placement-at-a-time ``solve_placement`` path,
+held to the same 2e-5 relative-L2 gate the block probe uses.
 """
 
 from __future__ import annotations
@@ -12,12 +12,24 @@ import numpy as np
 import pytest
 
 from cunibs.fem import solve_placement, solve_placements_block
-from cunibs.fem.solve import MAX_BLOCK, BlockWarmStart
+from cunibs.fem.solve import MAX_BLOCK
 from cunibs.simulation import Placement
 
 pytestmark = pytest.mark.gpu
 
 PARITY = 2e-5
+# What block width may move, expressed as a multiple of the solve tolerance because that is what
+# actually bounds it. A fixed gate would be wrong: it would pass on any mesh whose placements all
+# converge in the same number of iterations, which the patch does, and fail on a real head mesh
+# where they do not.
+#
+# Two mechanisms, and the larger one is the stopping test rather than arithmetic. Lockstep
+# termination runs every column until the *worst* one converges, so a column that would have
+# stopped an iteration earlier on its own lands further inside the tolerance ball than the same
+# placement solved serially. That is over-convergence, never under, and it is bounded by the
+# tolerance the caller asked for. Underneath it sits the reduction order of the per-column dots
+# (shared-memory tree at K=1, warp shuffles at K>1), which is four orders smaller.
+WIDTH_INVARIANCE_TOL_MULTIPLE = 5.0
 DIDT = 1e6
 
 
@@ -60,8 +72,8 @@ def serial(ctx, coil, sites):
     ]
 
 
-def block(ctx, coil, sites, warm=None):
-    return solve_placements_block(ctx, coil.positions_m, coil.moments, sites, DIDT, warm)
+def block(ctx, coil, sites):
+    return solve_placements_block(ctx, coil.positions_m, coil.moments, sites, DIDT)
 
 
 def test_block_k1_delegates_to_serial(cube_subject, synthetic_coil):
@@ -121,40 +133,44 @@ def test_block_k_above_max_raises(cube_subject, synthetic_coil):
         block(cube_subject.context, synthetic_coil, cube_sites(MAX_BLOCK + 1))
 
 
-@pytest.mark.realmesh
-def test_warm_start_does_not_change_solution(patch_subject, d70_coil, patch_sites):
-    """The stopping test is ‖r‖/‖b‖, not ‖r‖/‖r₀‖, so a seeded x0 may only change iterations."""
-    ctx = patch_subject.context
-    first, second = patch_sites[:4], patch_sites[4:]
-
-    warm = BlockWarmStart()
-    block(ctx, d70_coil, first, warm)
-    assert warm.centers is not None and warm.centers.shape == (4, 3)
-    assert warm.x_red is not None and warm.x_red.shape[1] == 4
-
-    warmed = block(ctx, d70_coil, second, warm)
-    cold = block(ctx, d70_coil, second, None)
-    for i, (w, c) in enumerate(zip(warmed, cold, strict=False)):
-        assert rel_l2(w["magnE"], c["magnE"]) <= 2e-6, f"placement {i}"
-        assert rel_l2(w["v"], c["v"]) <= 2e-6, f"placement {i}"
+def _magn(subject, coil, placements, block_k):
+    return [
+        r.magnE
+        for r in subject.iter_simulate(coil, placements, DIDT, magnitude=True, block_k=block_k)
+    ]
 
 
 @pytest.mark.realmesh
-def test_warm_start_reduces_iterations(patch_subject, d70_coil, patch_sites):
-    """Re-solving near-identical placements from a warm x0 must not cost more iterations."""
-    ctx = patch_subject.context
-    sites = patch_sites[:4]
-    nudged = [(c + 0.05, h + 0.05, d) for c, h, d in sites]
+def test_batch_composition_does_not_change_results(patch_subject, d70_coil, patch_sites):
+    """Splitting a sweep across calls must be bitwise invisible.
 
-    warm = BlockWarmStart()
-    block(ctx, d70_coil, sites, warm)
-    block(ctx, d70_coil, nudged, warm)
-    warm_iters = ctx.solver.last_iterations
+    Every chunk solves from x0 = 0 against a matrix no other chunk touches, so at a fixed width
+    the grouping cannot reach the answer. This is what lets a caller batch however they like,
+    or resume an interrupted sweep, without their numbers moving.
+    """
+    placements = [Placement(c, h, d) for c, h, d in patch_sites]
+    whole = _magn(patch_subject, d70_coil, placements, 4)
+    split = _magn(patch_subject, d70_coil, placements[:4], 4)
+    split += _magn(patch_subject, d70_coil, placements[4:], 4)
+    for i, (w, s) in enumerate(zip(whole, split, strict=True)):
+        np.testing.assert_array_equal(s, w, err_msg=f"placement {i}")
 
-    block(ctx, d70_coil, nudged, None)
-    cold_iters = ctx.solver.last_iterations
 
-    assert 0 < warm_iters <= cold_iters
+@pytest.mark.realmesh
+def test_block_width_invariance(patch_subject, d70_coil, patch_sites):
+    """block_k is a throughput and memory knob, never an accuracy one.
+
+    It may move a result within the tolerance the caller asked for, and never outside it, so
+    two runs at different widths agree to whatever accuracy was requested. See the comment on
+    WIDTH_INVARIANCE_TOL_MULTIPLE for which mechanism contributes what.
+    """
+    bound = WIDTH_INVARIANCE_TOL_MULTIPLE * patch_subject.context.solver.tolerance
+    placements = [Placement(c, h, d) for c, h, d in patch_sites]
+    ref = _magn(patch_subject, d70_coil, placements, 1)
+    for k in (2, 4, 8):
+        got = _magn(patch_subject, d70_coil, placements, k)
+        for i, (g, r) in enumerate(zip(got, ref, strict=True)):
+            assert rel_l2(g, r) <= bound, f"block_k={k}, placement {i}"
 
 
 @pytest.mark.realmesh

@@ -15,7 +15,6 @@ import numpy.typing as npt
 from cunibs import metrics
 from cunibs.fem import (
     MAX_BLOCK,
-    BlockWarmStart,
     PlacementResult,
     SolverContext,
     build_context,
@@ -321,16 +320,13 @@ class Subject:
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
-        warm = BlockWarmStart()
         temp_pool = cp.cuda.MemoryPool()
         try:
             for start in range(0, len(sites), chunk_k):
                 chunk = sites[start : start + chunk_k]
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
                 with cp.cuda.using_allocator(temp_pool.malloc):
-                    outs = solve_placements_block(
-                        ctx, dip_pos_m, dip_moment, site_args, didt, warm
-                    )
+                    outs = solve_placements_block(ctx, dip_pos_m, dip_moment, site_args, didt)
                     batch = self._reduce_chunk(chunk, outs, coil, didt, retain)
                     del outs
                 yield from batch

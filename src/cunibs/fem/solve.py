@@ -340,43 +340,7 @@ BLOCK_SIZES = _BLOCK_SIZES
 MAX_BLOCK = BLOCK_SIZES[-1]
 
 
-@dataclass
-class BlockWarmStart:
-    """Carry the previous chunk's solutions to warm-start the next chunk.
-
-    One instance per batched simulate call; solve_placements_block updates it in place.
-    """
-
-    centers: np.ndarray | None = None  # (k_prev, 3) placement centers
-    x_red: cp.ndarray | None = None  # (n_red, k_prev) f64 reduced solutions
-
-
-def _warm_x0(
-    carry: BlockWarmStart | None, centers: np.ndarray, n_red: int, k: int, k_pad: int
-) -> cp.ndarray | None:
-    """Build the (n_red, k_pad) initial guess from the nearest prior placements.
-
-    The solver's stopping criterion is ||r||/||b|| <= tol, measured against ||b|| rather than
-    the initial residual, so seeding x0 changes only the iteration count and not the accuracy
-    of the returned field.
-    """
-    if carry is None or carry.centers is None:
-        return None
-    assert carry.x_red is not None
-    nearest = np.linalg.norm(centers[:, None, :] - carry.centers[None, :, :], axis=2).argmin(
-        axis=1
-    )
-    x0 = cp.empty((n_red, k_pad), dtype=cp.float64)
-    for c in range(k):
-        x0[:, c] = carry.x_red[:, int(nearest[c])]
-    for c in range(k, k_pad):
-        x0[:, c] = x0[:, k - 1]
-    return cp.ascontiguousarray(x0)
-
-
-def _solve_grounded_block_mat(
-    solver: GroundedSolver, B: cp.ndarray, k: int, x0: cp.ndarray | None = None
-) -> cp.ndarray:
+def _solve_grounded_block_mat(solver: GroundedSolver, B: cp.ndarray, k: int) -> cp.ndarray:
     """Block-solve a padded (n_red, k_pad) RHS matrix; returns X with retries applied.
 
     Each of the k chains is numerically independent (per-column reductions), they just
@@ -386,7 +350,7 @@ def _solve_grounded_block_mat(
     X = cp.empty_like(B)
     stream = cp.cuda.get_current_stream().ptr
     iters, rels = solver.pcg.solve_mixed_block(
-        solver.precond, B, X, solver.tolerance, solver.max_iters, stream, x0
+        solver.precond, B, X, solver.tolerance, solver.max_iters, stream
     )
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(max(rels[:k]))
@@ -611,7 +575,6 @@ def solve_placements_block(
     dip_moment: npt.ArrayLike,
     sites: Sequence[tuple[npt.ArrayLike, npt.ArrayLike, float]],
     didt: float,
-    warm: BlockWarmStart | None = None,
 ) -> list[PlacementResult]:
     """Solve up to MAX_BLOCK placements with block kernels end to end.
 
@@ -666,12 +629,7 @@ def solve_placements_block(
 
     B = cp.ascontiguousarray(b_block[solver.idx, :].astype(cp.float64))
     B_pad = _pad_block(B, k)
-    centers = np.asarray([np.asarray(s[0], dtype=np.float64).reshape(3) for s in sites])
-    x0 = _warm_x0(warm, centers, int(B.shape[0]), k, int(B_pad.shape[1]))
-    X = _solve_grounded_block_mat(solver, B_pad, k, x0)
-    if warm is not None:
-        warm.centers = centers
-        warm.x_red = X[:, :k]
+    X = _solve_grounded_block_mat(solver, B_pad, k)
 
     v_block = cp.zeros((solver.n, k), dtype=cp.float64)
     v_block[solver.idx, :] = X[:, :k]
