@@ -20,21 +20,15 @@ __host__ __device__ constexpr int spmv_tpr() {
     return K >= 4 ? 4 : 8;
 }
 
-// Blocks-per-SM floor, which is what bounds the register budget ptxas will spend. The K
-// accumulators dominate the footprint, so the floor has to fall as K rises: at K=8 the
-// accumulators spill without a floor of 4, while K=1 has the headroom to keep six blocks
-// resident and, being purely bandwidth-bound, wants them for latency hiding. Measured in
-// registers per thread on sm_120: K=1 takes 40 at 6, but 80 at 2 -- half the occupancy for
-// a kernel that has nothing to do with the extra registers.
+// Blocks-per-SM floor, which is what bounds the register budget ptxas will spend. Only K=8
+// genuinely needs a lower floor -- its eight accumulators spill below 4. Everything narrower
+// is purely bandwidth-bound and wants the residency for latency hiding, so it asks for six and
+// gets 40 registers. Left to a floor of 2, ptxas unrolls into whatever it is given: measured
+// in registers per thread on sm_120, K=1 took 80 and K=2 took 126, the latter capping the
+// kernel at two blocks per SM and making the k=2 block SpMV slower than two scalar passes.
 template <int K>
 __host__ __device__ constexpr int spmv_min_blocks() {
-    if constexpr (K == 8) {
-        return 4;
-    } else if constexpr (K == 1) {
-        return 6;
-    } else {
-        return 2;
-    }
+    return K == 8 ? 4 : 6;
 }
 
 template <int K>
