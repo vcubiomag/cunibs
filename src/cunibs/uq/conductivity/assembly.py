@@ -24,8 +24,8 @@ from cunibs.fem.solve import (
     SolverContext,
     build_native_vcycle,
     ground_node_of,
-    grounded_index,
     reduce_matrix,
+    solve_ordering,
 )
 from cunibs.solver import NativeVCycle, PcgAmgSolver
 
@@ -35,7 +35,7 @@ class ConductivityUQPrecompute:
     """Reusable state for conductivity UQ on one mesh, amortised across placements/samples."""
 
     perturbed_tags: tuple[int, ...]
-    idx: cp.ndarray  # grounded row/col index (drops the ground DOF)
+    idx: cp.ndarray  # grounded row/col index (drops the ground DOF, Morton-ordered)
     indptr: cp.ndarray  # reduced CSR pattern
     indices: cp.ndarray
     base_data: cp.ndarray  # (nnz,) f64 — non-perturbed tissues at nominal σ
@@ -101,7 +101,9 @@ def build_conductivity_uq_precompute(
     """Assemble the reference pattern, per-tissue components, and the nominal-σ preconditioner."""
     g64, vols = gradient_operator(ctx.nodes_mm * 1e-3, ctx.tet_nodes)
     ground_node = ground_node_of(ctx.nodes_mm)
-    idx = grounded_index(ctx.n_nodes, ground_node)
+    # Must match prepare_grounded_solver's ordering, or this frozen CSR pattern would not be
+    # the one the forward solver's hierarchy was built on.
+    idx = solve_ordering(ctx.nodes_mm, ground_node)
 
     cond_nom = conductivity_per_tet(ctx.tet_tags)
     k_ref = _reduced_data_for(ctx, g64, vols, cond_nom, idx, template=None)

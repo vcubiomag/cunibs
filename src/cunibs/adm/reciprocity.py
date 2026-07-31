@@ -58,7 +58,7 @@ def build_adjoint_solver(
     cond = conductivity_per_tet(ctx.tet_tags)
     stiffness = assemble_stiffness(g64, vols, cond, ctx.n_nodes, ctx.tet_nodes)
     ground_node = int(cp.argmin(ctx.nodes_mm[:, 2]))
-    solver = prepare_grounded_solver(stiffness, ground_node, tolerance, max_iters)
+    solver = prepare_grounded_solver(stiffness, ctx.nodes_mm, ground_node, tolerance, max_iters)
     del stiffness, g64, vols, cond
     return solver
 

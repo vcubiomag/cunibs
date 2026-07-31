@@ -28,9 +28,11 @@ from cunibs.fem.solve import (
     build_context,
     ground_node_of,
     grounded_index,
+    morton_order,
     prepare_grounded_solver,
     reduce_matrix,
     solve_grounded,
+    solve_ordering,
     solve_placement,
     solve_placements_block,
 )
@@ -59,9 +61,11 @@ __all__ = [
     "gradient_operator",
     "ground_node_of",
     "grounded_index",
+    "morton_order",
     "prepare_grounded_solver",
     "reduce_matrix",
     "solve_grounded",
+    "solve_ordering",
     "solve_placement",
     "solve_placements_block",
 ]

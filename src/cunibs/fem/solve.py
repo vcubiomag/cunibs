@@ -175,6 +175,49 @@ def grounded_index(n: int, ground_node: int) -> cp.ndarray:
     return idx
 
 
+# Morton keys quantise to a 2^21 grid per axis, which is the most that fits three ways into a
+# 64-bit key and is far finer than any mesh's node spacing.
+_MORTON_BITS = 21
+
+
+def _spread3(v: cp.ndarray) -> cp.ndarray:
+    """Insert two zero bits between each of the low 21 bits of ``v``."""
+    v = v & cp.uint64(0x1FFFFF)
+    v = (v | (v << cp.uint64(32))) & cp.uint64(0x1F00000000FFFF)
+    v = (v | (v << cp.uint64(16))) & cp.uint64(0x1F0000FF0000FF)
+    v = (v | (v << cp.uint64(8))) & cp.uint64(0x100F00F00F00F00F)
+    v = (v | (v << cp.uint64(4))) & cp.uint64(0x10C30C30C30C30C3)
+    return (v | (v << cp.uint64(2))) & cp.uint64(0x1249249249249249)
+
+
+def morton_order(points_mm: cp.ndarray) -> cp.ndarray:
+    """Order rows along a 3-D Morton (Z-order) curve over the points' bounding box."""
+    lo = points_mm.min(axis=0)
+    span = cp.maximum(points_mm.max(axis=0) - lo, 1e-12)
+    q = ((points_mm - lo) / span * float((1 << _MORTON_BITS) - 1)).astype(cp.uint64)
+    key = cp.zeros(int(points_mm.shape[0]), dtype=cp.uint64)
+    for axis in range(3):
+        key |= _spread3(q[:, axis]) << cp.uint64(axis)
+    return cp.argsort(key, kind="stable").astype(cp.int32)
+
+
+def solve_ordering(nodes_mm: cp.ndarray, ground_node: int) -> cp.ndarray:
+    """Reduced-system row index: drop the ground DOF, then renumber along a Morton curve.
+
+    Gmsh node order bears no relation to position, so the SpMV gather over ``x`` lands
+    anywhere in the vector: on a 703k-DOF head mesh the mean |i-j| over nonzeros is ~193k and
+    only a quarter of the nonzeros sit within a 4096-column window. Renumbering spatially takes
+    that to ~4.8k and 92%, which is worth ~16% of the solve because it is what separates the
+    fp32 V-cycle kernels from the memory ceiling the fp64 SpMV already reaches.
+
+    This composes into the index every caller already gathers through, so it costs nothing at
+    solve time. It does change the reduction order of every kernel, so results move within the
+    solver tolerance rather than staying bit-identical to an unordered build.
+    """
+    idx = grounded_index(int(nodes_mm.shape[0]), ground_node)
+    return cp.ascontiguousarray(idx[morton_order(nodes_mm[idx])])
+
+
 def reduce_matrix(a: csp.csr_matrix, idx: cp.ndarray) -> csp.csr_matrix:
     """Remove the grounded DOF and canonicalise the reduced CSR."""
     a_red = a[idx][:, idx].tocsr()
@@ -236,13 +279,14 @@ class GroundedSolver:
 
 def prepare_grounded_solver(
     a: csp.csr_matrix,
+    nodes_mm: cp.ndarray,
     ground_node: int,
     tolerance: float = DEFAULT_TOLERANCE,
     max_iters: int = DEFAULT_MAX_ITERS,
 ) -> GroundedSolver:
     """Remove the ground DOF and build the mixed-precision solver."""
     n = a.shape[0]
-    idx = grounded_index(n, ground_node)
+    idx = solve_ordering(nodes_mm, ground_node)
     a_red = reduce_matrix(a, idx)
     row_ptr = cp.ascontiguousarray(a_red.indptr.astype(cp.int32))
     col_idx = cp.ascontiguousarray(a_red.indices.astype(cp.int32))
@@ -479,7 +523,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     cond = conductivity_per_tet(tet_tags)
     stiffness = assemble_stiffness(g, vols, cond, mesh.n_nodes, tet_nodes)
     ground_node = ground_node_of(nodes_mm)
-    solver = prepare_grounded_solver(stiffness, ground_node)
+    solver = prepare_grounded_solver(stiffness, nodes_mm, ground_node)
     del stiffness
 
     g = cp.ascontiguousarray(g.astype(RESIDENT_G_DTYPE))
