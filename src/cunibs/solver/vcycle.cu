@@ -39,10 +39,16 @@ static_assert(kBlock % kTpr == 0, "a block must hold a whole number of rows");
 // fixed-order shuffle reduction leaving the row total in lane 0. Threads whose row is past
 // the end still reach the shuffle with zero accumulators, which is why the mask is the full
 // warp. The fixed order is what keeps an apply run-to-run deterministic.
+//
+// The fp16 values are read one at a time. Pairing them into aligned __half2 loads, to stop a
+// kTpr-wide group from asking for an eight-byte slice of a two-byte type, measured 1% *slower*
+// on sm_120: consecutive steps of this loop walk the same 32-byte sector, so L1 was already
+// serving what the wider load would have fetched, and the masking a pair needs at the row
+// boundary costs more than the conversions it saves.
 template <int K>
 __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
                                          const int* __restrict__ col_idx,
-                                         const float* __restrict__ vals,
+                                         const __half* __restrict__ vals,
                                          const float* __restrict__ x, int row, int lane,
                                          float (&sum)[K]) {
 #pragma unroll
@@ -50,7 +56,7 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
     if (row < n) {
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += kTpr) {
-            const float v = vals[j];
+            const float v = __half2float(vals[j]);
             const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * __ldg(x + base + c);
@@ -76,16 +82,18 @@ __global__ void __launch_bounds__(kBlock)
 template <int K>
 __global__ void __launch_bounds__(kBlock)
     vc_residual_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
-                       const float* __restrict__ vals, const float* __restrict__ x,
-                       const float* __restrict__ b, float* __restrict__ r) {
+                       const __half* __restrict__ vals, const float* __restrict__ row_scale,
+                       const float* __restrict__ x, const float* __restrict__ b,
+                       float* __restrict__ r) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = static_cast<int>(threadIdx.x) % kTpr;
     float sum[K];
     row_spmv<K>(n, row_ptr, col_idx, vals, x, row, lane, sum);
     if (row < n && lane == 0) {
+        const float s = row_scale[row];
         const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
-        for (int c = 0; c < K; ++c) r[base + c] = b[base + c] - sum[c];
+        for (int c = 0; c < K; ++c) r[base + c] = b[base + c] - s * sum[c];
     }
 }
 
@@ -128,19 +136,20 @@ __global__ void __launch_bounds__(kBlock)
 template <int K>
 __global__ void __launch_bounds__(kBlock)
     vc_postsweep_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
-                        const float* __restrict__ vals, const float* __restrict__ dinv,
-                        const float* __restrict__ b, const float* __restrict__ x_in,
-                        float* __restrict__ x_out) {
+                        const __half* __restrict__ vals, const float* __restrict__ row_scale,
+                        const float* __restrict__ dinv, const float* __restrict__ b,
+                        const float* __restrict__ x_in, float* __restrict__ x_out) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = static_cast<int>(threadIdx.x) % kTpr;
     float sum[K];
     row_spmv<K>(n, row_ptr, col_idx, vals, x_in, row, lane, sum);
     if (row < n && lane == 0) {
         const float d = dinv[row];
+        const float s = row_scale[row];
         const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            x_out[base + c] = x_in[base + c] + d * (b[base + c] - sum[c]);
+            x_out[base + c] = x_in[base + c] + d * (b[base + c] - s * sum[c]);
         }
     }
 }
@@ -184,11 +193,12 @@ void launch_jacobi_zero(int n, const float* dinv, const float* b, float* x,
 }
 
 template <int K>
-void launch_residual(int n, const int* row_ptr, const int* col_idx, const float* values,
-                     const float* x, const float* b, float* r, cudaStream_t stream) {
+void launch_residual(int n, const int* row_ptr, const int* col_idx, const __half* values,
+                     const float* row_scale, const float* x, const float* b, float* r,
+                     cudaStream_t stream) {
     if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
         vc_residual_kernel<K>
-            <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, values, x, b, r);
+            <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, values, row_scale, x, b, r);
     }
 }
 
@@ -212,12 +222,12 @@ void launch_prolongate(int n, const int* aggregates, const float* x_coarse, floa
 }
 
 template <int K>
-void launch_postsweep(int n, const int* row_ptr, const int* col_idx, const float* values,
-                      const float* dinv, const float* b, const float* x_in, float* x_out,
-                      cudaStream_t stream) {
+void launch_postsweep(int n, const int* row_ptr, const int* col_idx, const __half* values,
+                      const float* row_scale, const float* dinv, const float* b,
+                      const float* x_in, float* x_out, cudaStream_t stream) {
     if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
-        vc_postsweep_kernel<K><<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, values, dinv,
-                                                              b, x_in, x_out);
+        vc_postsweep_kernel<K><<<blocks, kBlock, 0, stream>>>(
+            n, row_ptr, col_idx, values, row_scale, dinv, b, x_in, x_out);
     }
 }
 
@@ -227,6 +237,25 @@ void launch_coarse_gemv(int n, const float* ainv, const float* b, float* x,
     if (const unsigned blocks = grid_for(n)) {
         vc_coarse_gemv_kernel<K><<<blocks, kBlock, 0, stream>>>(n, ainv, b, x);
     }
+}
+
+// Setup-only: one thread per row takes the row's max |a_ij| as its scale, then rewrites the
+// row as a_ij / scale in fp16. Reading the row twice costs nothing here and keeps the scale
+// out of shared memory. An all-zero row keeps a scale of 1 so the reciprocal stays finite.
+__global__ void __launch_bounds__(kBlock)
+    vc_pack_values_kernel(int n, const int* __restrict__ row_ptr,
+                          const float* __restrict__ src, __half* __restrict__ dst,
+                          float* __restrict__ row_scale) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= n) return;
+    const int row_b = row_ptr[row];
+    const int row_e = row_ptr[row + 1];
+    float scale = 0.0f;
+    for (int j = row_b; j < row_e; ++j) scale = fmaxf(scale, fabsf(src[j]));
+    if (!(scale > 0.0f)) scale = 1.0f;
+    row_scale[row] = scale;
+    const float inv = 1.0f / scale;
+    for (int j = row_b; j < row_e; ++j) dst[j] = __float2half(src[j] * inv);
 }
 
 constexpr const char* kBadK = "V-cycle block apply supports k in {2, 4, 8}";
@@ -251,7 +280,15 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, const int* row_p
     lvl.n_coarse = n_coarse;
     lvl.row_ptr = device_clone(row_ptr, static_cast<std::size_t>(n_rows) + 1, "level row_ptr");
     lvl.col_idx = device_clone(col_idx, static_cast<std::size_t>(nnz), "level col_idx");
-    lvl.values = device_clone(values, static_cast<std::size_t>(nnz), "level values");
+    lvl.values = device_alloc<__half>(static_cast<std::size_t>(nnz), "level values");
+    lvl.row_scale = device_alloc<float>(static_cast<std::size_t>(n_rows), "level row_scale");
+    if (const unsigned blocks = grid_for(n_rows)) {
+        vc_pack_values_kernel<<<blocks, kBlock>>>(n_rows, lvl.row_ptr.get(), values,
+                                                  lvl.values.get(), lvl.row_scale.get());
+        check_cuda(cudaGetLastError(), "vcycle", "pack values");
+        // Setup only, and it is what lets the caller drop its fp32 values on return.
+        check_cuda(cudaDeviceSynchronize(), "vcycle", "pack values");
+    }
     lvl.dinv = device_clone(dinv, static_cast<std::size_t>(n_rows), "level dinv");
     lvl.r_row_ptr =
         device_clone(r_row_ptr, static_cast<std::size_t>(n_coarse) + 1, "level R ptr");
@@ -338,7 +375,7 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         const float* bi = (i == 0) ? b : level_b(lvl);
         launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, level_x(lvl), stream);
         launch_residual<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
-                           level_x(lvl), bi, level_r(lvl), stream);
+                           lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl), stream);
         float* next_b = (i + 1 < n_levels) ? level_b(levels_[i + 1]) : coarse_b;
         launch_restrict<K>(lvl.n_coarse, lvl.r_row_ptr.get(), lvl.r_col_idx.get(), level_r(lvl),
                            next_b, stream);
@@ -355,7 +392,7 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         launch_prolongate<K>(lvl.n, lvl.aggregates.get(), xc, level_x(lvl), stream);
         float* out = (i == 0) ? x : level_r(lvl);
         launch_postsweep<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
-                            lvl.dinv.get(), bi, level_x(lvl), out, stream);
+                            lvl.row_scale.get(), lvl.dinv.get(), bi, level_x(lvl), out, stream);
     }
 }
 

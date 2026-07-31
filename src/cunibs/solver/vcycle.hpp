@@ -1,6 +1,8 @@
 #pragma once
 #include "common.hpp"
 
+#include <cuda_fp16.h>
+
 #include <utility>
 #include <vector>
 
@@ -10,11 +12,18 @@
 // restriction order, dense coarse inverse); this class owns device copies of everything
 // it touches so a captured CUDA graph stays valid for the object's lifetime.
 //
-// Per level l (finest = 0, all but the coarsest): A_l as fp32 CSR, dinv_l = omega /
-// guard(d_l) with the l1 diagonal d and the smoother relaxation factor already folded
-// in, the restriction CSR (coarse row -> fine indices in stable-sorted order), and the
-// fine->aggregate map for prolongation.
-// The coarsest level is only the precomputed dense inverse.
+// Per level l (finest = 0, all but the coarsest): A_l as fp16 CSR with a per-row fp32 scale,
+// dinv_l = omega / guard(d_l) with the l1 diagonal d and the smoother relaxation factor
+// already folded in, the restriction CSR (coarse row -> fine indices in stable-sorted order),
+// and the fine->aggregate map for prolongation. The coarsest level is only the precomputed
+// dense inverse.
+//
+// The operator is stored as a_ij / max_j|a_ij| in fp16, and the row total is scaled back up
+// after the reduction. Halving the widest array in the two SpMV-shaped kernels is worth ~10%
+// of a CG iteration, and those kernels are the ones sitting on the memory ceiling. The row
+// scale is not optional: plain fp16 costs 14% more iterations on some meshes because the
+// stiffness spans more dynamic range than fp16 covers, while the scaled form is
+// iteration-neutral. Callers still hand over fp32; add_level converts.
 //
 // apply() is stream-ordered and CUDA-graph-capturable (no allocations, no host syncs).
 // generation() keys PcgAmgSolver's cached CG graph, which embeds pointers into the buffers
@@ -52,7 +61,8 @@ private:
         int n_coarse = 0;
         Buffer<int> row_ptr;
         Buffer<int> col_idx;
-        Buffer<float> values;
+        Buffer<__half> values;    // a_ij / row_scale[i]
+        Buffer<float> row_scale;  // max_j |a_ij|, or 1 for an empty row
         Buffer<float> dinv;
         Buffer<int> r_row_ptr;
         Buffer<int> r_col_idx;
