@@ -6,8 +6,10 @@
 // Two rounds of handshaking matching: round 1 forms pairs, round 2 merges pairs into quads,
 // then leftovers join their strongest aggregated neighbour.
 //
-// Every kernel launches one thread per row and writes only its own index, so the result is
-// independent of block and grid geometry and reproducible run to run. There are no atomics.
+// Every row's entry is written by a single thread, from candidates combined under an
+// associative rule, so the map is independent of block and grid geometry and reproducible run
+// to run. The only atomics are the integer counters driving the convergence checks, and
+// integer addition is associative, so the arrival order of the blocks does not matter either.
 //
 // The reduced stiffness is exactly symmetric, so the edge weight collapses from AMGx's
 // 0.5*(|a_ij| + |a_ji|)/max(|a_ii|,|a_jj|) to |a_ij|/max(|a_ii|,|a_jj|), dropping the
