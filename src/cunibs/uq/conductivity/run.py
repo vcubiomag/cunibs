@@ -11,7 +11,7 @@ import cupyx.scipy.sparse as csp
 from cunibs import metrics
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-from cunibs.fem.solve import SolverConvergenceError
+from cunibs.fem.solve import MAX_BLOCK, SolverConvergenceError, _pad_block
 from cunibs.solver import (
     accumulate_moments,
     dadt_node_to_element,
@@ -32,6 +32,17 @@ if TYPE_CHECKING:
 
 
 _NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
+
+# Ensemble size below which the subspace projection is not worth its setup. The basis costs P
+# solves up front and then saves ~3.7 iterations on every draw, so it pays from about 50 draws
+# and is a clear win by a few hundred.
+_PROJECTION_MIN_SAMPLES = 64
+
+# Tolerance for the sensitivity solves that span the projection basis. Deliberately far looser
+# than the draw tolerance: the basis only has to point in the right directions for an initial
+# guess that CG then refines to `pre.tolerance` anyway, so its accuracy sets the rate and never
+# the answer. At 1e-3 the basis is iteration-neutral against a 1e-6 one and costs half as much.
+_SENSITIVITY_TOL = 1e-3
 
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
@@ -69,6 +80,109 @@ def _placement_rhs(
     neg_vc0 = cp.ascontiguousarray(-(ctx.vols * base_cond.astype(cp.float32)))
     rhs_assemble(dadt_elm, ctx.g, neg_vc0, ptr, idx, b_base, stream)
     return b_base, b_tissue
+
+
+def _solve_columns(
+    pre: ConductivityUQPrecompute, rhs: cp.ndarray, tolerance: float, stream: int
+) -> cp.ndarray:
+    """Solve the frozen nominal system against each column of ``rhs``, in block widths.
+
+    The columns are independent, so they go through the block solver purely to share the
+    stiffness and hierarchy reads: at k=8 that is ~2x per column against solving them one by one.
+    """
+    n, k = rhs.shape
+    out = cp.empty((n, k), dtype=cp.float64)
+    for start in range(0, k, MAX_BLOCK):
+        width = min(MAX_BLOCK, k - start)
+        b = _pad_block(cp.ascontiguousarray(rhs[:, start : start + width]), width)
+        x = cp.empty_like(b)
+        pre.pcg.solve_mixed_block(pre.precond, b, x, tolerance, pre.max_iters, stream)
+        out[:, start : start + width] = x[:, :width]
+    return out
+
+
+def _sensitivity_basis(
+    pre: ConductivityUQPrecompute,
+    b_tissue: cp.ndarray,
+    ax_tissue: cp.ndarray,
+    stream: int,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Orthonormal basis for the span of dx/dsigma at the ensemble centre, and its frozen E^-1.
+
+    Both the matrix and the RHS are linear in sigma, so differentiating ``A(s)x(s) = b(s)`` at
+    nominal sigma gives one system per perturbed tissue:
+
+        A_nom * dx/ds_t = b_t - A_t * x_nom.
+
+    That is the subspace a draw's correction lives in, to first order, and it is P-dimensional
+    for P perturbed tissues. Both right-hand sides are already to hand: ``b_t`` is a row of the
+    per-tissue RHS decomposition, and ``A_t x_nom`` is the same product the per-draw residual
+    shortcut needs.
+
+    The SVD drops directions two tissues share; ``keep`` is P in the normal case.
+    """
+    n_red = int(pre.idx.shape[0])
+    rhs = cp.ascontiguousarray(
+        b_tissue[:, pre.idx].astype(cp.float64).T - ax_tissue.T  # (n_red, P)
+    )
+    sens = _solve_columns(pre, rhs, _SENSITIVITY_TOL, stream)
+
+    q, s, _ = cp.linalg.svd(sens, full_matrices=False)
+    keep = int((s > 1e-8 * float(s[0])).sum())
+    w = cp.ascontiguousarray(q[:, :keep])
+    a_nom = csp.csr_matrix((pre.nominal_data, pre.indices, pre.indptr), shape=(n_red, n_red))
+    return w, cp.linalg.inv(w.T @ (a_nom @ w))
+
+
+class _InitialGuess:
+    """The x0 policy for the sampling loop.
+
+    Every draw starts from the solved ensemble-centre solution, and once the ensemble is big
+    enough to amortise the basis it additionally takes the Galerkin projection of its own
+    residual onto the sensitivity subspace:
+
+        x0 = x_nominal + W·E⁻¹·Wᵀ·r0,   r0 = b(σ) − A(σ)·x_nominal,   E = Wᵀ·A_nominal·W.
+
+    Both mechanisms only move the starting point of a solve that still runs to ``pre.tolerance``,
+    so neither can change where a draw converges; they decide how many iterations it takes. Both
+    are also pure functions of the mesh, the placement and the nominal conductivities, so a
+    draw's result does not depend on which other draws were solved, or on how many.
+    """
+
+    def __init__(
+        self,
+        pre: ConductivityUQPrecompute,
+        b_tissue: cp.ndarray,
+        x_nominal: cp.ndarray,
+        n_samples: int,
+        stream: int,
+    ) -> None:
+        self._x_nominal = x_nominal
+        self._project = n_samples >= _PROJECTION_MIN_SAMPLES
+        if not self._project:
+            return
+        n_red = int(pre.idx.shape[0])
+        shape = (n_red, n_red)
+        # r0 is linear in σ, so A_base·x_nom and each A_t·x_nom are formed once here rather
+        # than per draw; _sensitivity_basis needs the same products for its right-hand sides.
+        a_base = csp.csr_matrix((pre.base_data, pre.indices, pre.indptr), shape=shape)
+        self._ax_base = a_base @ x_nominal
+        self._ax_tissue = cp.stack(
+            [
+                csp.csr_matrix((data, pre.indices, pre.indptr), shape=shape) @ x_nominal
+                for data in pre.tissue_data
+            ]
+        )
+        self._w, self._einv = _sensitivity_basis(pre, b_tissue, self._ax_tissue, stream)
+        self._buf = cp.empty(n_red, dtype=cp.float64)
+
+    def for_draw(self, sigma: cp.ndarray, b_red: cp.ndarray) -> cp.ndarray:
+        """The initial guess for one draw."""
+        if not self._project:
+            return self._x_nominal
+        r0 = b_red - (self._ax_base + sigma @ self._ax_tissue)
+        self._buf[:] = self._x_nominal + self._w @ (self._einv @ (self._w.T @ r0))
+        return self._buf
 
 
 def run_conductivity_uq(
@@ -139,27 +253,7 @@ def run_conductivity_uq(
     )
     pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
 
-    # Subspace recycling: only P conductivities are perturbed, so x(σ)−x_nominal spans an ≈P-dim
-    # subspace. Build an A-orthonormal basis W from the first RECYCLE_BUILD draws, then Galerkin-
-    # project each later draw's initial guess onto it: x0 = x_nominal + W·E⁻¹·Wᵀr0, with
-    # r0 = b(σ)−A(σ)x_nominal and E = Wᵀ·A_nominal·W (frozen). Only a better x0 into the same solve.
-    RECYCLE_BUILD = 16
-    recycle = config.n_samples >= 2 * RECYCLE_BUILD
-    if recycle:
-        n_build = RECYCLE_BUILD
-        d_basis = cp.empty((n_red, n_build), dtype=cp.float64)
-        x0_buf = cp.empty(n_red, dtype=cp.float64)
-        recycle_w = None  # (n_red, k)
-        einv_nom = None  # (k, k)
-        # r0 = b − A(σ)x_nominal is linear in σ: precompute A_base·x_nom and each A_t·x_nom once.
-        a_base = csp.csr_matrix((pre.base_data, pre.indices, pre.indptr), shape=(n_red, n_red))
-        ax_base = a_base @ x_nominal
-        ax_tissue = cp.empty((len(pre.perturbed_tags), n_red), dtype=cp.float64)
-        for t in range(len(pre.perturbed_tags)):
-            a_t = csp.csr_matrix(
-                (pre.tissue_data[t], pre.indices, pre.indptr), shape=(n_red, n_red)
-            )
-            ax_tissue[t] = a_t @ x_nominal
+    guess = _InitialGuess(pre, b_tissue, x_nominal, config.n_samples, stream)
 
     gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
     vols_gm = ctx.vols[gm_idx].astype(cp.float64)
@@ -183,11 +277,7 @@ def run_conductivity_uq(
         pcg.update_values(sample_data, stream)
 
         b_red[:] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        x0 = x_nominal
-        if recycle and recycle_w is not None:
-            r0 = b_red - (ax_base + sigmas[k] @ ax_tissue)
-            x0_buf[:] = x_nominal + recycle_w @ (einv_nom @ (recycle_w.T @ r0))
-            x0 = x0_buf
+        x0 = guess.for_draw(sigmas[k], b_red)
         _, rel = pcg.solve_mixed(
             precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
         )
@@ -201,18 +291,6 @@ def run_conductivity_uq(
             )
             if rel > pre.tolerance:
                 raise SolverConvergenceError(int(retry_iters), float(rel), pre.tolerance)
-
-        if recycle and recycle_w is None:
-            d_basis[:, k] = x_red - x_nominal
-            if k == n_build - 1:
-                # A-orthonormal basis for the perturbation subspace; drop near-dependent directions.
-                q, s, _ = cp.linalg.svd(d_basis, full_matrices=False)
-                keep = int((s > 1e-8 * float(s[0])).sum())
-                recycle_w = cp.ascontiguousarray(q[:, :keep])
-                a_nom = csp.csr_matrix(
-                    (pre.nominal_data, pre.indices, pre.indptr), shape=(n_red, n_red)
-                )
-                einv_nom = cp.linalg.inv(recycle_w.T @ (a_nom @ recycle_w))
 
         v[pre.idx] = x_red
         reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)

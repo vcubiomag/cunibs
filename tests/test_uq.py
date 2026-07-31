@@ -356,13 +356,14 @@ def test_tissue_sensitivity_rejects_an_unrecorded_roi(two_tissue_subject):
         r.tissue_sensitivity("m1")
 
 
-def test_uq_recycling_path_does_not_change_the_answer(two_tissue_subject):
-    """n_samples ≥ 2·RECYCLE_BUILD enables subspace recycling; the seeded guess must not bias it.
+def test_uq_projection_path_does_not_change_the_answer(two_tissue_subject):
+    """Crossing ``_PROJECTION_MIN_SAMPLES`` turns the subspace projection on; it must not bias it.
 
     Both runs share a seed, so the first 8 draws are the same conductivities either way — only
-    the initial guess differs.
+    the initial guess differs, and an initial guess cannot move where a draw converges.
     """
     from cunibs import ConductivityUQConfig
+    from cunibs.uq.conductivity.run import _PROJECTION_MIN_SAMPLES
 
     def run(n):
         return two_tissue_subject.simulate_conductivity_uq(
@@ -372,9 +373,84 @@ def test_uq_recycling_path_does_not_change_the_answer(two_tissue_subject):
             moments=True,
         )
 
-    small, large = run(8), run(64)  # 8 < 32 → no recycling; 64 ≥ 32 → recycling
-    np.testing.assert_allclose(small.sigma_samples, large.sigma_samples[:8], rtol=0, atol=0)
-    np.testing.assert_allclose(small.peak_samples, large.peak_samples[:8], rtol=1e-6)
+    small_n, large_n = 8, max(64, _PROJECTION_MIN_SAMPLES)
+    assert small_n < _PROJECTION_MIN_SAMPLES <= large_n, "the run pair must straddle the gate"
+    small, large = run(small_n), run(large_n)
+    np.testing.assert_allclose(
+        small.sigma_samples, large.sigma_samples[:small_n], rtol=0, atol=0
+    )
+    np.testing.assert_allclose(small.peak_samples, large.peak_samples[:small_n], rtol=1e-6)
+
+
+def test_uq_sensitivity_basis_predicts_a_small_perturbation(cp, two_tissue_subject):
+    """The projection basis must actually be dx/dsigma at nominal sigma.
+
+    Nothing downstream would notice a sign slip or a mismatched tissue index: a wrong subspace
+    only makes the initial guess worse, and every draw still converges to the right answer, just
+    slower. This pins the derivation against the thing it claims to be — for a small step in one
+    tissue's conductivity, ``x(sigma_nom + d) ≈ x_nom + d · dx/dsigma_t``, with the error second
+    order in d.
+    """
+    import cupyx.scipy.sparse as csp
+
+    from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
+    from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
+    from cunibs.uq.conductivity.run import _dadt_node_to_elm, _placement_rhs, _sensitivity_basis
+
+    ctx = two_tissue_subject.context
+    pre = build_conductivity_uq_precompute(ctx, (2, 3))
+    n_pert = len(pre.perturbed_tags)
+    n_red = int(pre.idx.shape[0])
+    stream = cp.cuda.get_current_stream().ptr
+
+    # The real per-tissue RHS decomposition, so both terms of b_t - A_t x_nom are exercised.
+    placement = _placement()
+    transform = compute_coil_transform(
+        ctx, placement.center_mm, placement.handle_mm, placement.distance_mm
+    )
+    coil = _coil()
+    dadt_elm = _dadt_node_to_elm(
+        coil_dadt_at_nodes(coil.positions_m, coil.moments, transform, 1e6, ctx.nodes_mm),
+        ctx.tet_nodes,
+    )
+    b_base, b_tissue = _placement_rhs(ctx, pre, dadt_elm)
+
+    def solve_at(sigma):
+        b = cp.ascontiguousarray(
+            (b_base + sigma.astype(cp.float32) @ b_tissue)[pre.idx], dtype=cp.float64
+        )
+        pre.pcg.update_values(cp.ascontiguousarray(pre.combine(sigma)), stream)
+        x = cp.empty(n_red, dtype=cp.float64)
+        pre.pcg.solve_mixed(pre.precond, b, x, 1e-11, pre.max_iters, stream)
+        return x
+
+    x_nom = solve_at(pre.nominal_sigma)
+    ax_tissue = cp.stack(
+        [
+            csp.csr_matrix((data, pre.indices, pre.indptr), shape=(n_red, n_red)) @ x_nom
+            for data in pre.tissue_data
+        ]
+    )
+
+    w, einv = _sensitivity_basis(pre, b_tissue, ax_tissue, stream)
+    assert w.shape == (n_red, n_pert), "one basis direction per perturbed tissue"
+    assert einv.shape == (n_pert, n_pert)
+    # Orthonormal columns, so the frozen Galerkin operator is well conditioned by construction.
+    np.testing.assert_allclose(cp.asnumpy(w.T @ w), np.eye(n_pert), atol=1e-10)
+
+    # Step one tissue and check the move lands in the span the basis claims. A sign slip or a
+    # transposed tissue index leaves it pointing elsewhere and this fails outright.
+    for t in range(n_pert):
+        sigma = pre.nominal_sigma.copy()
+        sigma[t] *= 1.01
+        delta = solve_at(sigma) - x_nom
+        moved = float(cp.linalg.norm(delta))
+        out_of_span = float(cp.linalg.norm(delta - w @ (w.T @ delta)))
+        assert moved > 0, f"tissue {pre.perturbed_tags[t]} had no effect on the solution"
+        assert out_of_span <= 0.02 * moved, (
+            f"tissue {pre.perturbed_tags[t]}: {out_of_span:.3e} of a {moved:.3e} move fell "
+            f"outside the sensitivity basis"
+        )
 
 
 def test_uq_unreachable_tolerance_rebuilds_then_raises(fresh_subject, two_tissue_cube_mesh):
