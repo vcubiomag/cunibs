@@ -37,17 +37,22 @@ class FieldMetrics(TypedDict):
     distribution: dict[str, float]
 
 
-def region_mask(tet_tags: ArrayT, region: Region) -> ArrayT:
-    """Boolean per-tet mask for ``region`` (``"all"`` or any volume tissue label)."""
-    xp = cp.get_array_module(tet_tags)
-    if region == "all":
-        return xp.ones(tet_tags.shape[0], dtype=bool)
+def region_tag(region: Region) -> int:
+    """The volume tag a tissue label names. ``"all"`` names no single tag, so it raises."""
     tag = _LABEL_TO_TAG.get(region)
     if tag is None:
         raise ValueError(
-            f"Unknown region {region!r}; use 'all' or a tissue label: {sorted(_LABEL_TO_TAG)}."
+            f"Unknown region {region!r}; use a tissue label: {sorted(_LABEL_TO_TAG)}."
         )
-    return tet_tags == tag
+    return tag
+
+
+def region_mask(tet_tags: ArrayT, region: Region) -> ArrayT:
+    """Boolean per-tet mask for ``region`` (``"all"`` or any volume tissue label)."""
+    if region == "all":
+        xp = cp.get_array_module(tet_tags)
+        return xp.ones(tet_tags.shape[0], dtype=bool)
+    return tet_tags == region_tag(region)
 
 
 def _prefix_sum(w: ArrayT, tile: int = 1024) -> ArrayT:
