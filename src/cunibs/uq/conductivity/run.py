@@ -11,7 +11,13 @@ import cupyx.scipy.sparse as csp
 from cunibs import metrics
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-from cunibs.fem.solve import MAX_BLOCK, SolverConvergenceError, _pad_block
+from cunibs.fem.recovery import RecoveredField, RecoveryOperator, apply_recovery_into
+from cunibs.fem.solve import (
+    MAX_BLOCK,
+    SolverConvergenceError,
+    _check_operator,
+    _pad_block,
+)
 from cunibs.solver import (
     accumulate_moments,
     dadt_node_to_element,
@@ -194,6 +200,8 @@ def run_conductivity_uq(
     didt: float = 1e6,
     record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     focality_frac: float = 0.5,
+    *,
+    recovery: RecoveryOperator | None = None,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
 
@@ -211,7 +219,12 @@ def run_conductivity_uq(
     ``{name: ResolvedTarget}`` mapping, adds each draw's volume-weighted mean ``|E|`` per named
     ROI. The reductions run in-place into device-resident per-sample arrays, so they add no
     host sync inside the loop.
+
+    ``recovery`` post-processes each draw's field before any statistic is taken, so the moment
+    arrays and the per-draw scalars all describe the same field. It is a prebuilt operator from
+    :func:`~cunibs.fem.ensure_recovery`, or ``None`` for the raw per-tetrahedron field.
     """
+    _check_operator(ctx, recovery, False, "run_conductivity_uq")
     sigmas = sample_conductivities(config, pre.perturbed_tags)  # (N, P) f64
     sig_f32 = sigmas.astype(cp.float32)
 
@@ -235,10 +248,37 @@ def run_conductivity_uq(
     b_red = cp.empty(n_red, dtype=cp.float64)
     x_red = cp.empty(n_red, dtype=cp.float64)
     v = cp.zeros(ctx.n_nodes, dtype=cp.float64)
-    e_buf = cp.empty((n_tet, 3), dtype=cp.float32)
-    magn = cp.empty(n_tet, dtype=cp.float32)
     sum_e = cp.zeros(n_tet, dtype=cp.float64)
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
+
+    # Every buffer below is allocated once and rewritten in place per draw, like everything else
+    # in the loop, so the recovery call's arguments are loop-invariant too.
+    elements: list[cp.ndarray] | None = None
+    potential: cp.ndarray | None = None
+    dadt_nodal: list[cp.ndarray] | None = None
+    if recovery is None:
+        recover = None
+        e_buf = cp.empty((n_tet, 3), dtype=cp.float32)
+        magn = cp.empty(n_tet, dtype=cp.float32)
+        magn_stat = magn
+    else:
+        rec = RecoveredField.allocate(recovery, n_tet, 1)
+        # The operator and its buffers are consumed together, so they travel together.
+        recover = (recovery, rec)
+        # magn_stat is what every statistic below reads: binding it once is what keeps the
+        # moments and the per-draw scalars describing the same field.
+        magn_stat = rec.magnE[0]
+        if recovery.on_potential:
+            # Reads the nodal potential and the exact nodal dA/dt rather than the per-element
+            # field, so it allocates no raw buffer and skips the reconstruct on every one of the
+            # n_samples draws. v is rewritten in place each draw, so the column view holds.
+            e_buf = magn = None
+            potential = v.reshape(-1, 1)
+            dadt_nodal = [cp.ascontiguousarray(dadt_nodes)]
+        else:
+            e_buf = cp.empty((n_tet, 3), dtype=cp.float32)
+            magn = cp.empty(n_tet, dtype=cp.float32)
+            elements = [e_buf]
 
     # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
     # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
@@ -293,10 +333,15 @@ def run_conductivity_uq(
                 raise SolverConvergenceError(int(retry_iters), float(rel), pre.tolerance)
 
         v[pre.idx] = x_red
-        reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
-        accumulate_moments(magn, sum_e, sumsq_e, stream)
+        if e_buf is not None:
+            reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
+        if recover is not None:
+            apply_recovery_into(
+                *recover, elements=elements, potential=potential, dadt_nodes=dadt_nodal
+            )
+        accumulate_moments(magn_stat, sum_e, sumsq_e, stream)
 
-        magn_gm = magn[gm_idx]
+        magn_gm = magn_stat[gm_idx]
         peak_s[k] = magn_gm.max()
         # Same percentile anchor as metrics.focality, so a per-draw focality and the summary's
         # measure the same thing. Kept on device: reading the anchor would sync the loop.
@@ -304,7 +349,7 @@ def run_conductivity_uq(
         foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
         peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
         for j, (idx, w) in enumerate(probes):
-            roi_s[k, j] = (magn[idx].astype(cp.float64) * w).sum()
+            roi_s[k, j] = (magn_stat[idx].astype(cp.float64) * w).sum()
 
     n = config.n_samples
     mean = sum_e / n
@@ -325,6 +370,7 @@ def run_conductivity_uq(
         placement=placement,
         coil_name=coil.name,
         didt=didt,
+        recovery=recovery.mode if recovery is not None else "raw",
         peak_samples=cp.asnumpy(peak_s),
         focality_samples=cp.asnumpy(foc_s),
         peak_location_samples=cp.asnumpy(peakloc_s),

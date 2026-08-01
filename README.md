@@ -244,6 +244,85 @@ raise a message naming the flag to pass.
 Results are always NumPy. If you need device-resident fields, call
 `cunibs.fem.solve_placements_block` directly.
 
+### Field recovery
+
+The raw finite-element field is constant over each tetrahedron. `recovery=` post-processes it by
+fitting a local patch around each node and interpolating from there, which is what SimNIBS does
+before interpolating a field to a surface or a volume.
+
+```python
+result = subject.simulate(coil, placement, didt=1.0e6, magnitude=True)
+
+result.magnE  # |E| of the recovered field
+result.recovery  # "harmonic": provenance, and it round-trips through HDF5
+
+# Opt out for the per-tetrahedron field straight from the solve.
+raw = subject.simulate(coil, placement, didt=1.0e6, magnitude=True, recovery="raw")
+```
+
+`E`, `magnE` and `summary` all describe whichever field the mode selected; the raw field is not
+additionally retained, so nothing downstream has to decide which of two arrays it meant.
+
+| `recovery` | What it does |
+| --- | --- |
+| `"harmonic"` | Recovers the potential rather than the field and differentiates it, in the space of harmonic quadratics. **The default**, because it is the only mode that converges at a tissue interface. |
+| `"raw"` | The per-tetrahedron field straight from the solve. Its peak is set by whichever sliver element the mesh contains, so it reads high and moves with mesh resolution. |
+| `"spr_tissue"` | Zienkiewicz-Zhu superconvergent patch recovery with each patch restricted to one tissue. **This is what SimNIBS's surface and volume overlays report**, so it is the mode to use when comparing against them. |
+| `"spr_global"` | The same fit over patches spanning every incident tetrahedron regardless of tissue. Corresponds to SimNIBS's `continuous=True`. |
+
+`E` is genuinely discontinuous at a tissue boundary: `J_n = σE_n` is continuous, so the normal
+component of `E` jumps by the conductivity ratio. A patch spanning that jump fits a discontinuous
+function with a linear polynomial, and a single value per node cannot represent a two-valued
+field at all, so `"spr_global"` does not converge there however fine the mesh. On the reference
+head mesh 64% of nodes have a mixed-tissue patch and 91% of gray-matter tetrahedra touch one, so
+that is the common case rather than an edge case.
+
+`"harmonic"` exploits two properties of this particular problem. `∂A/∂t` is analytic and smooth,
+so every discontinuity in `E` lives in `∇v`; recovering the potential and adding the exact nodal
+`∂A/∂t` afterwards keeps the smooth part exact. And inside a region of constant `σ` the potential
+is *harmonic*, since `∇·(σ∇v) = -∇·(σ ∂A/∂t)` and a magnetic dipole's `A` is divergence-free away
+from its source. Restricting the fit to the nine harmonic quadratics rather than the full ten-term
+space therefore encodes the solution instead of merely regularising it, and it is also what makes
+the fit well posed at an interface, where the same-tissue patch is a half-ball that cannot
+determine the curvature normal to its flat side. That assumption is specific to the
+magneto-quasistatic TMS formulation; it would not carry to a problem with interior current
+sources.
+
+For a head-to-head against SimNIBS, note that a *default* SimNIBS run recovers nothing at all:
+`SESSION.fields` defaults to `"eE"` and `map_to_surf`, `map_to_fsavg`, `map_to_vol` and
+`map_to_MNI` all default to `False`, so it writes per-element data. When it does recover,
+`interpolate_to_surface` reaches `interpolate_scattered` with its default `continuous=False`,
+which crops the mesh to one tissue tag and runs `elm_data2node_data` on that single-tissue
+submesh, matching `"spr_tissue"`. SimNIBS additionally masks the *cropped* mesh's outer faces
+out of the fit, so inside a gray-matter crop every GM/WM and GM/CSF boundary node takes a
+volume-weighted average rather than a fit; cuNIBS masks only the true outer boundary of the
+volume.
+
+Recovery costs one extra pass over the mesh per placement, and its patch weights are built once
+per subject on first use and then reused across every placement, the same way the assembled
+system and the AMG hierarchy are.
+
+### Nodal fields
+
+A recovered field also exists on the mesh nodes, which is what interpolating onto a cortical
+surface needs:
+
+```python
+result = subject.simulate(coil, placement, magnitude=True, nodal=True)
+
+result.nodal_field()  # (n_nodes, 3) gray matter, NaN where it does not reach
+result.nodal_field("csf")  # the CSF-side value at the same nodes
+```
+
+For the tissue-restricted modes the field lives on (node, tissue) slots rather than nodes, since
+it is genuinely two-valued at a boundary. `nodal_field` resolves that: it returns one row per
+mesh node carrying the requested tissue's value, and NaN where that tissue does not reach. On
+the reference patch 13548 slots cover 8404 nodes, and the 1070 nodes carrying both a
+gray-matter and a CSF slot report different values for each. `region="all"` is rejected for
+those modes rather than silently picking one of the two.
+
+`E_slots`, `slot_node` and `slot_tag` expose the underlying slot arrays if you need them.
+
 `FieldResult` contains:
 
 | Attribute | Description | Units |
@@ -256,6 +335,11 @@ Results are always NumPy. If you need device-resident fields, call
 | `tet_tags` | Volume tissue tags | dimensionless |
 | `barycenters_mm` | Tetrahedron barycentres | mm |
 | `didt` | Coil current rate of change | A/s |
+| `recovery` | Which post-processing produced `E`/`magnE`/`summary` | dimensionless |
+| `E_slots` | Recovered field per slot, with `nodal=True` | V/m |
+| `slot_node` | Mesh node each slot belongs to, with `nodal=True` | dimensionless |
+| `slot_tag` | Tissue tag each slot belongs to, or `None` when slots are nodes | dimensionless |
+| `n_nodes` | Mesh node count, so `nodal_field` can size its output | dimensionless |
 
 The metric API reports the peak field, peak location, stimulated volume,
 field-weighted centre of gravity, and volume-weighted distribution statistics.
@@ -445,20 +529,23 @@ E = adm.evaluate(recip, coil, placements, didt=1.0e6)  # (P, D) target E-vectors
 
 ## Reproducibility
 
-A placement's field is a function of the mesh, the coil, the placement, `didt`
-and the solve tolerance, and of nothing else. It does not depend on `block_k`, on
-which other placements shared its block, or on where it fell in the sweep, and
-repeating a run reproduces it bitwise. Splitting a sweep across calls, resuming
-an interrupted one, or retuning `block_k` for a different GPU all leave the
-numbers unchanged.
+A placement's field is a function of the mesh, the coil, the placement, `didt`,
+the solve tolerance and the `recovery` mode, and of nothing else. It does not
+depend on `block_k`, on which other placements shared its block, or on where it
+fell in the sweep, and repeating a run reproduces it bitwise. Splitting a sweep
+across calls, resuming an interrupted one, or retuning `block_k` for a different
+GPU all leave the numbers unchanged.
 
-Four things enforce that. Stiffness assembly and the right-hand side accumulate
-in a fixed per-node order. Each column of a block solve stops on its own residual
+Five things enforce that. Stiffness assembly, the right-hand side and any
+recovery gather accumulate in a per-node order fixed by the stable sort that
+builds the map each walks. Each column of a block solve stops on its own residual
 rather than the block's, so a placement batched with a slower-converging
 neighbour is not carried past the point where it would have stopped alone. Every
 block width shares one summation order, in the fp64 operator and in its
 reductions. The aggregation runs one thread per row with a symmetric tie-break,
-and the only atomics anywhere in the solver are integer counters.
+and the only atomics anywhere in the solver are integer counters. The recovery
+weights are built once per mesh by a fixed-order kernel, so a recovered field is
+reproducible for the same reason the raw one is.
 
 Floating-point results can still vary across GPU architectures, CUDA versions,
 compiler versions, and dependency versions.

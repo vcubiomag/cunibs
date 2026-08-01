@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cupy as cp
 import h5py
@@ -22,6 +22,7 @@ from cunibs.simulation import (
 )
 
 if TYPE_CHECKING:
+    from cunibs.fem import Recovery
     from cunibs.metrics import ArrayT
 
 _FORMAT_VERSION = 1
@@ -106,6 +107,8 @@ class ConductivityUQResult:
     peak_location_samples: npt.NDArray[np.float64]  # (n_samples, 3) peak location (mm)
     roi_samples: dict[str, npt.NDArray[np.float64]]  # name -> (n_samples,) ROI mean |E|
     summary: ConductivityUQSummary | None = None
+    # Which post-processing every array above describes. Provenance, not a switch.
+    recovery: Recovery = "raw"
 
     def compute_summary(
         self, region: metrics.Region = _DEFAULT_REGION
@@ -209,6 +212,7 @@ class ConductivityUQResult:
             for name in ("peak_samples", "focality_samples", "peak_location_samples"):
                 h5f.create_dataset(name, data=np.asarray(getattr(self, name)))
             h5f.attrs["format_version"] = _FORMAT_VERSION
+            h5f.attrs["recovery"] = self.recovery
             h5f.attrs["n_samples"] = self.n_samples
             h5f.attrs["perturbed_tags"] = np.asarray(self.perturbed_tags, dtype=np.int32)
             h5f.attrs["coil_name"] = self.coil_name
@@ -239,6 +243,7 @@ class ConductivityUQResult:
                 ),
                 coil_name=str(h5f.attrs["coil_name"]),
                 didt=float(h5f.attrs["didt"]),
+                recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
                 summary=ConductivityUQSummary(
                     mean_field=_read_metrics(h5f["summary"]["mean_field"]),
                     max_local_cov=float(h5f["summary"].attrs["max_local_cov"]),

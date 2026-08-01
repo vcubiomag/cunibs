@@ -134,6 +134,127 @@ def two_tissue_cube_mesh() -> HeadMesh:
     )
 
 
+_CUBE_CORNERS_IDX = np.array(
+    [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]]
+)
+
+#: The conforming interface plane of ``two_region_mesh``, in mm.
+TWO_REGION_Z0 = 50.0
+
+
+def _boundary_faces(tets: np.ndarray, nodes: np.ndarray | None = None) -> np.ndarray:
+    """Faces owned by exactly one tetrahedron, i.e. the outer surface of the volume.
+
+    Pass ``nodes`` to wind them consistently outward. Unoriented faces are fine for asking which
+    nodes are on the boundary, but a mesh built from them has neighbouring triangle normals
+    pointing opposite ways, and the area-weighted smoothing in ``skin_triangle_normals`` then
+    cancels them to zero.
+    """
+    corners = tets[:, [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]].reshape(-1, 3)
+    opposite = tets[:, [3, 2, 1, 0]].reshape(-1)
+    _, inverse, counts = np.unique(
+        np.sort(corners, axis=1), axis=0, return_inverse=True, return_counts=True
+    )
+    keep = counts[inverse] == 1
+    faces, opposite = corners[keep], opposite[keep]
+    if nodes is None:
+        return faces
+    tri = nodes[faces]
+    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    inward = np.einsum("ij,ij->i", normal, nodes[opposite] - tri[:, 0]) > 0
+    faces[inward] = faces[inward][:, [0, 2, 1]]
+    return faces
+
+
+def _grid_tet_mesh(
+    cells: int,
+    *,
+    jitter: float = 0.25,
+    side_mm: float = 100.0,
+    keep_plane_z: float | None = None,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """A ``cells``-cubed grid of the 6-tet cube, with interior nodes jittered.
+
+    The 8-node ``cube_mesh`` has no interior node at all -- every one of its corners is on the
+    outer boundary -- so it can only ever exercise a recovery's boundary rule. This is the
+    smallest mesh that reaches the interior branch. Jittering breaks the grid symmetry that
+    would otherwise flatter a patch fit; boundary nodes stay put so the outer surface is planar,
+    and so do the nodes at ``keep_plane_z``, which keeps an interface plane flat and conforming.
+    """
+    rng = np.random.default_rng(seed)
+    gid = np.arange((cells + 1) ** 3).reshape((cells + 1,) * 3)
+    lin = np.linspace(0.0, side_mm, cells + 1)
+    nodes = np.stack(np.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
+    movable = np.ones((cells + 1,) * 3, dtype=bool)
+    movable[[0, -1], :, :] = movable[:, [0, -1], :] = movable[:, :, [0, -1]] = False
+    movable = movable.ravel()
+    if keep_plane_z is not None:
+        movable &= ~np.isclose(nodes[:, 2], keep_plane_z)
+    nodes[movable] += rng.uniform(-jitter, jitter, (int(movable.sum()), 3)) * (side_mm / cells)
+    tets = np.concatenate(
+        [
+            gid[
+                i + _CUBE_CORNERS_IDX[:, 0],
+                j + _CUBE_CORNERS_IDX[:, 1],
+                k + _CUBE_CORNERS_IDX[:, 2],
+            ][_CUBE_TETS]
+            for i in range(cells)
+            for j in range(cells)
+            for k in range(cells)
+        ]
+    )
+    return np.ascontiguousarray(nodes), np.ascontiguousarray(tets, dtype=np.int32)
+
+
+def _grid_head_mesh(nodes: np.ndarray, tets: np.ndarray, tags: np.ndarray) -> HeadMesh:
+    return HeadMesh(
+        nodes_mm=nodes,
+        tet_nodes=tets,
+        tet_tags=tags,
+        skin_tris=np.ascontiguousarray(_boundary_faces(tets, nodes), dtype=np.int32),
+    )
+
+
+@pytest.fixture(scope="session")
+def boundary_faces():
+    """The outer-surface faces of a tet mesh, for tests that need a reference set."""
+    return _boundary_faces
+
+
+@pytest.fixture(scope="session")
+def refined_cube_mesh() -> HeadMesh:
+    """A jittered 6-cubed all-gray-matter cube: 343 nodes, 1296 tets, 125 of them interior."""
+    nodes, tets = _grid_tet_mesh(cells=6)
+    return _grid_head_mesh(nodes, tets, np.full(tets.shape[0], 2, dtype=np.int32))
+
+
+@pytest.fixture(scope="session")
+def two_region_z0() -> float:
+    """The z of the conforming interface plane in ``two_region_mesh``, in mm."""
+    return TWO_REGION_Z0
+
+
+@pytest.fixture(scope="session")
+def two_region_mesh() -> HeadMesh:
+    """A cube split at ``TWO_REGION_Z0`` into gray matter below and CSF above.
+
+    The interface stays flat and conforming, so every tetrahedron lies wholly on one side. That
+    is what lets a test compare against a two-region analytic solution without also paying for
+    geometric error.
+    """
+    nodes, tets = _grid_tet_mesh(cells=12, keep_plane_z=TWO_REGION_Z0)
+    tags = np.where(nodes[tets].mean(axis=1)[:, 2] < TWO_REGION_Z0, 2, 3).astype(np.int32)
+    return _grid_head_mesh(nodes, tets, tags)
+
+
+@pytest.fixture(scope="session")
+def refined_cube_subject(refined_cube_mesh):
+    from cunibs import Subject
+
+    return Subject(refined_cube_mesh)
+
+
 @pytest.fixture(scope="session")
 def synthetic_coil():
     """A two-dipole coil in its local frame."""

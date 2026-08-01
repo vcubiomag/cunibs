@@ -23,6 +23,7 @@ pytestmark = pytest.mark.gpu
 
 # Pinned from a run of the committed fixture. Changing these means the pipeline changed.
 PATCH_PEAK_MAGNE = 0.556405
+PATCH_PEAK_MAGNE_HARMONIC = 0.447677
 PATCH_PEAK_LOCATION_MM = np.array([11.794, -1.125, 77.349])
 
 # Pinned from sub-001 at the same canonical placement.
@@ -113,13 +114,31 @@ def test_patch_stiffness_is_spd_after_grounding(cp, patch_subject):
 
 @pytest.mark.realmesh
 def test_patch_solve_peak_regression(patch_subject, patch_placement, d70_coil):
-    """End-to-end pin: real mesh, bundled MagStim D70, 1e6 A/s."""
+    """End-to-end pin: real mesh, bundled MagStim D70, 1e6 A/s.
+
+    Pinned on ``recovery="raw"`` so it stays a pin on the *solve*; recovery has its own coverage
+    in test_recovery.py.
+    """
     r = patch_subject.simulate(
-        d70_coil, patch_placement, 1e6, magnitude=True, vectors=True, potential=True
+        d70_coil,
+        patch_placement,
+        1e6,
+        magnitude=True,
+        vectors=True,
+        potential=True,
+        recovery="raw",
     )
     assert r.peak_magnE() == pytest.approx(PATCH_PEAK_MAGNE, rel=2e-3)
     np.testing.assert_allclose(r.peak_location_mm(), PATCH_PEAK_LOCATION_MM, atol=2.0)
     assert r.coil_name == d70_coil.name
+
+
+@pytest.mark.realmesh
+def test_patch_default_recovery_peak_regression(patch_subject, patch_placement, d70_coil):
+    """The same pin on the default path, which is harmonic recovery."""
+    r = patch_subject.simulate(d70_coil, patch_placement, 1e6, magnitude=True)
+    assert r.recovery == "harmonic"
+    assert r.peak_magnE() == pytest.approx(PATCH_PEAK_MAGNE_HARMONIC, rel=2e-3)
 
 
 @pytest.mark.realmesh

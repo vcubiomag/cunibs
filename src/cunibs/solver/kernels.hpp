@@ -47,6 +47,51 @@ void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const
                               const float* const* dadt_elm, float* const* e_out,
                               float* const* magn_out, int n_tet, int k, cudaStream_t stream);
 
+// --- recovery.cu: patch-recovery post-processing --------------------------------------------
+// A "slot" is what a patch is fitted around: a node in the global mode, a (node, tissue) pair in
+// the tissue-restricted ones. The SPR entry points take a corner CSR over slots, in the same
+// c = 4e + i encoding rhs.cu uses; the harmonic ones take a CSR of patch nodes. Either way the
+// per-slot reduction order is fixed by the CSR's build.
+
+// keys must hold 4 * n_tet entries. Writes one sorted-and-packed node triple per tet face; the
+// caller sorts them and passes them to launch_boundary_mark. Requires n_nodes <= 2^21.
+void launch_face_keys(const int* tet_nodes, std::uint64_t* keys, int n_tet, cudaStream_t stream);
+
+// keys must be sorted. Sets is_boundary[n] = 1 for every node of a face that only one tet owns;
+// entries for other nodes are left alone, so is_boundary arrives zeroed.
+void launch_boundary_mark(const std::uint64_t* keys, int n_keys, int* is_boundary,
+                          cudaStream_t stream);
+
+// One scalar weight per corner, from a linear least-squares fit over each slot's patch.
+// slot_node may be null when a slot is a node. is_boundary may be null to fit every slot.
+// n_fallback may be null; when given it counts slots that took the volume-weighted average.
+void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const float* vols,
+                        const int* ptr, const int* idx, const int* slot_node,
+                        const int* is_boundary, float* w, int* n_fallback, int n_slots,
+                        cudaStream_t stream);
+
+// e_slots[c] is (n_slots, 3); e_in[c] is (n_tet, 3). k <= kMaxStageBlock, every width compiled.
+void launch_recover_nodes(const float* const* e_in, const float* w, const int* ptr, const int* idx,
+                          float* const* e_slots, int n_slots, int k, cudaStream_t stream);
+
+// Harmonic-constrained potential recovery. pptr/pidx is a CSR of patch NODES per slot, not
+// corners, and w carries a 3-vector per entry: grad_v[s] = sum_m w[s,m] * v[m].
+// status[s] records which rung the fit took: 0 harmonic, 1 linear, 2 no gradient determined.
+void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
+                        const int* slot_node, float* w, int* status, int n_slots,
+                        cudaStream_t stream);
+
+// v_block is row-major (n_nodes, stride) float64; column c of each slot uses dadt_nodes[c].
+// stride is the block width the potential was solved at, which is k except on the serial path.
+void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
+                     const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
+                     int n_slots, int k, int stride, cudaStream_t stream);
+
+// slot_of_corner is (4 * n_tet,): the slot each corner reads back from.
+void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,
+                             float* const* e_out, float* const* magn_out, int n_tet, int k,
+                             cudaStream_t stream);
+
 // --- adm.cu: ADM reciprocity weights -------------------------------------------------------
 void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
                            const float* neg_vc, double* w_e, int n_tet, cudaStream_t stream);

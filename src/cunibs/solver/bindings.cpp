@@ -20,6 +20,8 @@ using f64_cuda_2d = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::c
 using f64_cuda_3d = nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
 using i32_cuda = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 
+using u64_cuda = nb::ndarray<uint64_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
+
 using f32_cuda_1d = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 using f32_cuda_2d = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 using f32_cuda_3d = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
@@ -305,6 +307,155 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("dadt_elm").noconvert(), nb::arg("e_out").noconvert(),
         nb::arg("magn_out").noconvert(), nb::arg("stream"),
         "Element-centric E/magnE reconstruction; writes into caller-allocated e_out/magn_out.");
+
+    m.def(
+        "face_keys",
+        [](i32_cuda_2d tet_nodes, u64_cuda keys, uintptr_t stream) {
+            const int n_tet = static_cast<int>(tet_nodes.shape(0));
+            if (keys.shape(0) != static_cast<size_t>(n_tet) * 4) {
+                throw std::invalid_argument("face_keys: keys must hold 4 * n_tet entries");
+            }
+            launch_face_keys(tet_nodes.data(), keys.data(), n_tet,
+                             reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("tet_nodes").noconvert(), nb::arg("keys").noconvert(), nb::arg("stream"),
+        "Packed, per-face sorted node triples for outer-boundary detection; needs "
+        "n_nodes <= 2^21.");
+
+    m.def(
+        "boundary_mark",
+        [](u64_cuda keys, i32_cuda is_boundary, uintptr_t stream) {
+            launch_boundary_mark(keys.data(), static_cast<int>(keys.shape(0)), is_boundary.data(),
+                                 reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("keys").noconvert(), nb::arg("is_boundary").noconvert(), nb::arg("stream"),
+        "Mark nodes of faces owned by exactly one tet. keys must be sorted; is_boundary is "
+        "only ever set, so it arrives zeroed.");
+
+    m.def(
+        "spr_weights",
+        [](f64_cuda_2d nodes_mm, i32_cuda_2d tet_nodes, f32_cuda_1d vols, i32_cuda ptr,
+           i32_cuda idx, std::optional<i32_cuda> slot_node, std::optional<i32_cuda> is_boundary,
+           f32_cuda_1d w, std::optional<i32_cuda> n_fallback, uintptr_t stream) {
+            const int n_slots = static_cast<int>(ptr.shape(0)) - 1;
+            if (w.shape(0) != idx.shape(0)) {
+                throw std::invalid_argument("spr_weights: w must have one entry per corner");
+            }
+            if (slot_node && static_cast<int>(slot_node->shape(0)) != n_slots) {
+                throw std::invalid_argument("spr_weights: slot_node must have one entry per slot");
+            }
+            launch_spr_weights(nodes_mm.data(), tet_nodes.data(), vols.data(), ptr.data(),
+                               idx.data(), slot_node ? slot_node->data() : nullptr,
+                               is_boundary ? is_boundary->data() : nullptr, w.data(),
+                               n_fallback ? n_fallback->data() : nullptr, n_slots,
+                               reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("vols").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("slot_node").noconvert(), nb::arg("is_boundary").noconvert(),
+        nb::arg("w").noconvert(), nb::arg("n_fallback").noconvert(), nb::arg("stream"),
+        "One scalar patch weight per corner. Pass slot_node=None when a slot is a node, "
+        "is_boundary=None to fit every slot, n_fallback=None to skip the counter.");
+
+    m.def(
+        "hpr_weights",
+        [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node,
+           f32_cuda_2d w, i32_cuda status, uintptr_t stream) {
+            const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
+            if (w.shape(0) != pidx.shape(0) || w.shape(1) != 3) {
+                throw std::invalid_argument("hpr_weights: w must be (nnz, 3)");
+            }
+            if (static_cast<int>(slot_node.shape(0)) != n_slots ||
+                static_cast<int>(status.shape(0)) != n_slots) {
+                throw std::invalid_argument("hpr_weights: slot_node/status must be per slot");
+            }
+            launch_hpr_weights(nodes_mm.data(), pptr.data(), pidx.data(), slot_node.data(),
+                               w.data(), status.data(), n_slots,
+                               reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("nodes_mm").noconvert(), nb::arg("pptr").noconvert(), nb::arg("pidx").noconvert(),
+        nb::arg("slot_node").noconvert(), nb::arg("w").noconvert(), nb::arg("status").noconvert(),
+        nb::arg("stream"),
+        "Harmonic-constrained potential-recovery weights: grad_v[s] = sum_m w[s,m] v[m]. "
+        "status is 0 harmonic, 1 linear fallback, 2 no gradient determined.");
+
+    m.def(
+        "hpr_grad",
+        [](f64_cuda_2d v_block, f32_cuda_2d w, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node,
+           std::vector<f32_cuda_2d> dadt_nodes, std::vector<f32_cuda_2d> e_slots,
+           uintptr_t stream) {
+            const int k = static_cast<int>(dadt_nodes.size());
+            if (k < 1 || k > kMaxStageBlock || e_slots.size() != dadt_nodes.size()) {
+                throw std::invalid_argument("hpr_grad: bad list sizes");
+            }
+            const int stride = static_cast<int>(v_block.shape(1));
+            if (stride < k) {
+                throw std::invalid_argument("hpr_grad: v_block has fewer columns than placements");
+            }
+            const float* da_ptrs[kMaxStageBlock];
+            float* out_ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                da_ptrs[c] = dadt_nodes[c].data();
+                out_ptrs[c] = e_slots[c].data();
+            }
+            const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
+            launch_hpr_grad(v_block.data(), w.data(), pptr.data(), pidx.data(), slot_node.data(),
+                            da_ptrs, out_ptrs, n_slots, k, stride,
+                            reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("v_block").noconvert(), nb::arg("w").noconvert(), nb::arg("pptr").noconvert(),
+        nb::arg("pidx").noconvert(), nb::arg("slot_node").noconvert(),
+        nb::arg("dadt_nodes").noconvert(), nb::arg("e_slots").noconvert(), nb::arg("stream"),
+        "Recovered E on slots from the nodal potential: E = -grad_v - dA/dt, with dA/dt taken "
+        "exactly at the node rather than averaged over an element.");
+
+    m.def(
+        "recover_nodes",
+        [](std::vector<f32_cuda_2d> e_in, f32_cuda_1d w, i32_cuda ptr, i32_cuda idx,
+           std::vector<f32_cuda_2d> e_slots, uintptr_t stream) {
+            const int k = static_cast<int>(e_in.size());
+            if (k < 1 || k > kMaxStageBlock || e_slots.size() != e_in.size()) {
+                throw std::invalid_argument("recover_nodes: bad list sizes");
+            }
+            const float* in_ptrs[kMaxStageBlock];
+            float* out_ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                in_ptrs[c] = e_in[c].data();
+                out_ptrs[c] = e_slots[c].data();
+            }
+            const int n_slots = static_cast<int>(ptr.shape(0)) - 1;
+            launch_recover_nodes(in_ptrs, w.data(), ptr.data(), idx.data(), out_ptrs, n_slots, k,
+                                 reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("e_in").noconvert(), nb::arg("w").noconvert(), nb::arg("ptr").noconvert(),
+        nb::arg("idx").noconvert(), nb::arg("e_slots").noconvert(), nb::arg("stream"),
+        "Patch gather E*[s] = sum_c w[c] E[c>>2] for <=8 placements; the operator is read once "
+        "for the whole block and each column matches its serial counterpart bitwise.");
+
+    m.def(
+        "recover_elements",
+        [](std::vector<f32_cuda_2d> e_slots, i32_cuda slot_of_corner,
+           std::vector<f32_cuda_2d> e_out, std::vector<f32_cuda_1d> magn_out, uintptr_t stream) {
+            const int k = static_cast<int>(e_slots.size());
+            if (k < 1 || k > kMaxStageBlock || e_out.size() != e_slots.size() ||
+                magn_out.size() != e_slots.size()) {
+                throw std::invalid_argument("recover_elements: bad list sizes");
+            }
+            const float* in_ptrs[kMaxStageBlock];
+            float* e_ptrs[kMaxStageBlock];
+            float* m_ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                in_ptrs[c] = e_slots[c].data();
+                e_ptrs[c] = e_out[c].data();
+                m_ptrs[c] = magn_out[c].data();
+            }
+            const int n_tet = static_cast<int>(slot_of_corner.shape(0)) / 4;
+            launch_recover_elements(in_ptrs, slot_of_corner.data(), e_ptrs, m_ptrs, n_tet, k,
+                                    reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("e_slots").noconvert(), nb::arg("slot_of_corner").noconvert(),
+        nb::arg("e_out").noconvert(), nb::arg("magn_out").noconvert(), nb::arg("stream"),
+        "Sample the recovered field back at the barycentres and take its magnitude.");
 
     m.def(
         "element_weight",

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, NamedTuple, TypedDict
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
@@ -20,6 +20,13 @@ from cunibs.fem.placement import (
     coil_dadt_at_nodes,
     compute_coil_transform,
     compute_coil_transforms,
+)
+from cunibs.fem.recovery import (
+    RecoveredField,
+    Recovery,
+    RecoveryOperator,
+    apply_recovery,
+    apply_recovery_into,
 )
 from cunibs.solver import (
     BLOCK_SIZES as _BLOCK_SIZES,
@@ -596,6 +603,9 @@ class SolverContext:
     skin_b: cp.ndarray
     skin_c: cp.ndarray
     skin_tri_normals: cp.ndarray
+    # Filled on first use by ensure_recovery, never by build_context, so a run that asks for no
+    # recovery pays neither the build nor the memory. Subject populates it under its own lock.
+    recovery: dict[Recovery, RecoveryOperator] = field(default_factory=dict)
 
 
 def build_context(mesh: HeadMesh) -> SolverContext:
@@ -650,13 +660,50 @@ def build_context(mesh: HeadMesh) -> SolverContext:
 
 
 class PlacementResult(TypedDict):
-    """Arrays produced for one placement."""
+    """Arrays produced for one placement.
+
+    ``E``/``magnE`` are whichever field the run's ``recovery`` mode asked for. ``E_slots`` is
+    present only when a recovery mode ran and the caller asked for it.
+    """
 
     transform: npt.NDArray[np.float64]
     dadt_elm: cp.ndarray
     E: cp.ndarray
     magnE: cp.ndarray
     v: cp.ndarray
+    E_slots: NotRequired[cp.ndarray]
+
+
+def _check_operator(
+    ctx: SolverContext, recovery: RecoveryOperator | None, nodal: bool, where: str
+) -> None:
+    """Validate a recovery operator handed to the FEM layer.
+
+    This layer takes a built operator rather than a mode name because building one costs a full
+    pass over the mesh and hundreds of megabytes of transient, so it must not happen inside a
+    caller's scratch allocator or under a lock it does not hold.
+    """
+    if isinstance(recovery, str):
+        raise TypeError(
+            f"{where} takes a prebuilt RecoveryOperator, not the mode name {recovery!r}. Call "
+            f"cunibs.fem.ensure_recovery(ctx, {recovery!r}) and pass the result, or use "
+            f"Subject.simulate(..., recovery={recovery!r}), which builds it for you."
+        )
+    if nodal and recovery is None:
+        raise ValueError(
+            "nodal=True needs a recovery operator: the raw per-tetrahedron field has no nodal "
+            "form. Pass one from cunibs.fem.ensure_recovery(ctx, 'harmonic')."
+        )
+    if recovery is None:
+        return
+    corners = int(recovery.slot_of_corner.shape[0])
+    expected = 4 * int(ctx.tet_nodes.shape[0])
+    if corners != expected:
+        raise ValueError(
+            f"recovery={recovery.mode!r} was built for a mesh with {corners // 4} tetrahedra "
+            f"but this context has {expected // 4}. Build the operator from the same context "
+            "you are solving on."
+        )
 
 
 def solve_placement(
@@ -667,8 +714,18 @@ def solve_placement(
     pos_ydir_mm: npt.ArrayLike,
     distance_mm: float,
     didt: float,
+    *,
+    recovery: RecoveryOperator | None = None,
+    nodal: bool = False,
 ) -> PlacementResult:
-    """Solve one placement and return device arrays plus the host transform."""
+    """Solve one placement and return device arrays plus the host transform.
+
+    ``recovery`` is a prebuilt operator from :func:`~cunibs.fem.ensure_recovery`, or ``None``
+    for the raw per-tetrahedron field; see :func:`_check_operator` for why this layer will not
+    build one. ``nodal`` additionally keeps the recovered field on its slots.
+    """
+    _check_operator(ctx, recovery, nodal, "solve_placement")
+
     transform = compute_coil_transform(ctx, center_mm, pos_ydir_mm, distance_mm)
     dadt_nodes = coil_dadt_at_nodes(dip_pos_m, dip_moment, transform, didt, ctx.nodes_mm)
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
@@ -683,15 +740,33 @@ def solve_placement(
 
     v = solve_grounded(ctx.solver, b)
 
-    e, magn_e = _reconstruct_e_kernel(v, ctx.tet_nodes, ctx.g, dadt_elm)
+    n_tet = int(ctx.tet_nodes.shape[0])
+    # The potential path never reads the raw field, so reconstructing it there would be a full
+    # mesh pass and an (n_tet, 3) + (n_tet,) transient thrown straight away.
+    on_potential = recovery is not None and recovery.on_potential
+    e = magn_e = slots = None
+    if not on_potential:
+        e, magn_e = _reconstruct_e_kernel(v, ctx.tet_nodes, ctx.g, dadt_elm)
+    if recovery is not None:
+        rec = apply_recovery(
+            recovery,
+            n_tet,
+            elements=None if on_potential else [e],
+            potential=cp.ascontiguousarray(v.reshape(-1, 1)) if on_potential else None,
+            dadt_nodes=[cp.ascontiguousarray(dadt_nodes)] if on_potential else None,
+        )
+        e, magn_e, slots = rec.E[0], rec.magnE[0], rec.E_slots[0]
 
-    return {
+    result: PlacementResult = {
         "transform": transform,
         "dadt_elm": dadt_elm,
         "E": e,
         "magnE": magn_e,
         "v": v,
     }
+    if nodal:
+        result["E_slots"] = slots
+    return result
 
 
 def solve_placements_block(
@@ -700,6 +775,9 @@ def solve_placements_block(
     dip_moment: npt.ArrayLike,
     sites: Sequence[tuple[npt.ArrayLike, npt.ArrayLike, float]],
     didt: float,
+    *,
+    recovery: RecoveryOperator | None = None,
+    nodal: bool = False,
 ) -> list[PlacementResult]:
     """Solve up to MAX_BLOCK placements with block kernels end to end.
 
@@ -710,11 +788,19 @@ def solve_placements_block(
 
     k = 1 runs the width-1 block kernels rather than routing to ``solve_placement``, so that
     every block_k a caller can pick reaches the same arithmetic.
+
+    ``recovery`` is a prebuilt operator from :func:`~cunibs.fem.ensure_recovery`, or ``None``
+    for the raw per-tetrahedron field; see :func:`_check_operator` for why this layer will not
+    build one. It is another placement-independent array read once per chunk, and its per-slot
+    reduction order does not depend on k, so a placement's recovered field is the same at every
+    block width.
     """
     k = len(sites)
     solver = ctx.solver
     if k > MAX_BLOCK:
         raise ValueError(f"solve_placements_block: k={k} exceeds MAX_BLOCK={MAX_BLOCK}")
+    _check_operator(ctx, recovery, nodal, "solve_placements_block")
+    on_potential = recovery is not None and recovery.on_potential
     stream = cp.cuda.get_current_stream().ptr
     n_tet = int(ctx.tet_nodes.shape[0])
 
@@ -731,11 +817,16 @@ def solve_placements_block(
     # nodal arrays at once and overflow L2, which costs more than the shared tet_nodes read
     # it would amortize.
     dadt_elms = []
+    # A potential-consuming operator adds dA/dt back at the nodes, where it is exact, so that
+    # path keeps the nodal field the others average away.
+    dadt_nodal: list[cp.ndarray] = []
     for i in range(k):
         dadt_nodes = coil_dadt_at_nodes(
             dip_pos_m, dip_moment, transforms[i], didt, ctx.nodes_mm
         )
         dadt_elms.append(_dadt_node_to_elm(dadt_nodes, ctx.tet_nodes))
+        if on_potential:
+            dadt_nodal.append(cp.ascontiguousarray(dadt_nodes))
         del dadt_nodes
 
     b_block = cp.empty((ctx.n_nodes, k), dtype=cp.float32)
@@ -756,9 +847,25 @@ def solve_placements_block(
     v_block[solver.idx, :] = X[:, :k]
     v_block = cp.ascontiguousarray(v_block)
 
-    es = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
-    magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(k)]
-    reconstruct_e_block(v_block, ctx.tet_nodes, ctx.g, dadt_elms, es, magns, stream)
+    # The potential path never reads the raw field, so it neither reconstructs nor allocates one.
+    es: list[cp.ndarray] = []
+    magns: list[cp.ndarray] = []
+    if not on_potential:
+        es = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
+        magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(k)]
+        reconstruct_e_block(v_block, ctx.tet_nodes, ctx.g, dadt_elms, es, magns, stream)
+
+    slots: list[cp.ndarray] = []
+    if recovery is not None:
+        rec = RecoveredField.allocate(recovery, n_tet, k)
+        apply_recovery_into(
+            recovery,
+            rec,
+            elements=None if on_potential else es,
+            potential=v_block,
+            dadt_nodes=dadt_nodal if on_potential else None,
+        )
+        slots, es, magns = rec.E_slots, rec.E, rec.magnE
 
     results: list[PlacementResult] = [
         {
@@ -770,5 +877,8 @@ def solve_placements_block(
         }
         for i in range(k)
     ]
+    if nodal:
+        for i, result in enumerate(results):
+            result["E_slots"] = slots[i]
 
     return results

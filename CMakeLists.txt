@@ -75,6 +75,7 @@ nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/rhs.cu
   src/cunibs/solver/stiffness.cu
   src/cunibs/solver/reconstruct.cu
+  src/cunibs/solver/recovery.cu
   src/cunibs/solver/adm.cu
   src/cunibs/solver/moments.cu
   src/cunibs/solver/place.cu

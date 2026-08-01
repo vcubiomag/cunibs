@@ -77,6 +77,58 @@ def test_fieldresult_hdf5_roundtrip(tmp_path):
     assert loaded.placement.distance_mm == 4.0
 
 
+def _make_nodal_result() -> FieldResult:
+    """A tissue-slot result: 4 nodes, one of which carries both a gray-matter and a CSF slot."""
+    r = _make_result()
+    return dataclasses.replace(
+        r,
+        recovery="harmonic",
+        n_nodes=4,
+        E_slots=np.arange(15, dtype=np.float32).reshape(5, 3),
+        slot_node=np.array([0, 1, 1, 2, 3], dtype=np.int32),
+        slot_tag=np.array([2, 2, 3, 3, 2], dtype=np.int32),
+    )
+
+
+def test_nodal_fields_survive_roundtrip(tmp_path):
+    r = _make_nodal_result()
+    path = tmp_path / "nodal.h5"
+    r.save(path)
+    loaded = FieldResult.load(path)
+
+    for name in ("E_slots", "slot_node", "slot_tag"):
+        np.testing.assert_array_equal(getattr(loaded, name), getattr(r, name), err_msg=name)
+    assert loaded.recovery == "harmonic"
+    assert loaded.n_nodes == 4
+    # The whole point of carrying the slot maps: the field survives as a per-node answer.
+    np.testing.assert_array_equal(
+        loaded.nodal_field("gray_matter"), r.nodal_field("gray_matter")
+    )
+
+
+def test_nodal_field_resolves_each_tissue_to_its_own_slot():
+    """Node 1 has a slot in each tissue, so the two regions must disagree there."""
+    r = _make_nodal_result()
+    gray = r.nodal_field("gray_matter")
+    csf = r.nodal_field("csf")
+    assert gray.shape == (4, 3)
+    np.testing.assert_array_equal(gray[1], r.E_slots[1])
+    np.testing.assert_array_equal(csf[1], r.E_slots[2])
+    # Node 0 is gray only, so CSF cannot reach it.
+    assert np.isnan(csf[0]).all()
+    assert not np.isnan(gray[0]).any()
+
+
+def test_recovery_defaults_to_raw_for_a_file_without_the_attribute(tmp_path):
+    """A file with no recovery attribute holds a raw field, whatever the current default is."""
+    r = _make_result()
+    path = tmp_path / "old.h5"
+    r.save(path)
+    with h5py.File(path, "r+") as h5f:
+        del h5f.attrs["recovery"]
+    assert FieldResult.load(path).recovery == "raw"
+
+
 def test_metrics_survive_roundtrip(tmp_path):
     r = _make_result()
     path = tmp_path / "result.h5"

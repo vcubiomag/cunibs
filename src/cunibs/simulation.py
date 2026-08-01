@@ -17,9 +17,13 @@ from cunibs import metrics
 from cunibs.fem import (
     MAX_BLOCK,
     PlacementResult,
+    Recovery,
+    RecoveryOperator,
     SolverContext,
     build_context,
+    ensure_recovery,
     solve_placements_block,
+    validate_recovery,
 )
 from cunibs.mesh import HeadMesh, load_mesh
 
@@ -110,6 +114,7 @@ class _Retain:
     magnitude: bool
     vectors: bool
     potential: bool
+    nodal: bool = False
 
 
 @dataclass(frozen=True, init=False)
@@ -157,6 +162,10 @@ class Subject:
         self._mesh = mesh
         self._ctx: SolverContext | None = None
         self._host_metrics: _HostMetricInputs | None = None
+        self._host_tets: npt.NDArray[np.int32] | None = None
+        self._host_slots: dict[
+            Recovery, tuple[npt.NDArray[np.int32], npt.NDArray[np.int32] | None]
+        ] = {}
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
         # Guards every lazy field above: under the free-threaded build two threads sharing a
@@ -179,8 +188,11 @@ class Subject:
         """
         with self._lock:
             self._conductivity_uq_pre.clear()
+            # The recovery operators hang off the context, so dropping it releases them too.
             self._ctx = None
             self._host_metrics = None
+            self._host_tets = None
+            self._host_slots.clear()
             self._region_slices.clear()
         cp.get_default_memory_pool().free_all_blocks()
 
@@ -287,6 +299,18 @@ class Subject:
                 )
             return self._host_metrics
 
+    def _recovery_operator(self, recovery: Recovery) -> RecoveryOperator | None:
+        """Build (and cache on the context) the patch weights for ``recovery``.
+
+        Held here rather than reached from inside a solve so the build is serialised against
+        other threads sharing this subject, and so it lands outside the caller's scratch
+        allocator -- the operator outlives the chunk that first asked for it.
+        """
+        if recovery == "raw":
+            return None
+        with self._lock:
+            return ensure_recovery(self.context, recovery)
+
     def _reduce_chunk(
         self,
         chunk: Sequence[Placement],
@@ -295,6 +319,8 @@ class Subject:
         didt: float,
         retain: _Retain,
         region: metrics.RegionSlice,
+        recovery: Recovery,
+        op: RecoveryOperator | None,
     ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
@@ -302,7 +328,14 @@ class Subject:
         ``RegionSlice.summarize`` satisfies that: it returns Python floats and host arrays even
         when every input is on the device.
         """
-        host = self._host_metric_inputs if retain.magnitude else None
+        # nodal_field resolves its region against tet_tags, so a nodal result needs the host
+        # metric inputs even without magnitude.
+        host = self._host_metric_inputs if (retain.magnitude or retain.nodal) else None
+        slot_node, slot_tag = self._host_slot_maps(op) if retain.nodal else (None, None)
+        # Only per-node slots need the connectivity to say which nodes a region touches; a
+        # (node, tissue) slot carries its own tag, so it skips 79 MB on a 5M-tet mesh.
+        tet_nodes = self._host_tet_nodes if retain.nodal and slot_tag is None else None
+        n_nodes = int(self.context.n_nodes) if retain.nodal else None
         return [
             FieldResult(
                 summary=region.summarize(out["magnE"]),
@@ -316,9 +349,43 @@ class Subject:
                 vols=host[0] if host else None,
                 tet_tags=host[1] if host else None,
                 barycenters_mm=host[2] if host else None,
+                recovery=recovery,
+                n_nodes=n_nodes,
+                E_slots=cp.asnumpy(out["E_slots"]) if retain.nodal else None,
+                slot_node=slot_node,
+                slot_tag=slot_tag,
+                tet_nodes=tet_nodes,
             )
             for site, out in zip(chunk, outs, strict=False)
         ]
+
+    @property
+    def _host_tet_nodes(self) -> npt.NDArray[np.int32]:
+        """Host connectivity, built once and shared by every result carrying a nodal field."""
+        with self._lock:
+            if self._host_tets is None:
+                self._host_tets = np.asarray(self._mesh.tet_nodes)
+            return self._host_tets
+
+    def _host_slot_maps(
+        self, op: RecoveryOperator | None
+    ) -> tuple[npt.NDArray[np.int32] | None, npt.NDArray[np.int32] | None]:
+        """Host ``(slot_node, slot_tag)`` for ``op``, shared by every result it produces.
+
+        Cached like :attr:`_host_tet_nodes`: a sweep would otherwise copy an n_slots-length
+        array off the device once per placement.
+        """
+        if op is None:
+            return None, None
+        with self._lock:
+            cached = self._host_slots.get(op.mode)
+            if cached is None:
+                cached = (
+                    cp.asnumpy(op.slot_node),
+                    None if op.slot_tag is None else cp.asnumpy(op.slot_tag),
+                )
+                self._host_slots[op.mode] = cached
+            return cached
 
     def _iter_reduced(
         self,
@@ -327,6 +394,7 @@ class Subject:
         didt: float,
         block_k: int | None,
         retain: _Retain,
+        recovery: Recovery,
     ) -> Iterator[FieldResult]:
         """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
 
@@ -339,6 +407,8 @@ class Subject:
         dip_pos_m = cp.asarray(coil.positions_m)
         dip_moment = cp.asarray(coil.moments)
         region = self._region_slice(_DEFAULT_REGION)
+        # Same reason: the patch weights outlive the chunk that first needs them.
+        op = self._recovery_operator(recovery)
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
@@ -348,8 +418,18 @@ class Subject:
                 chunk = sites[start : start + chunk_k]
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
                 with cp.cuda.using_allocator(temp_pool.malloc):
-                    outs = solve_placements_block(ctx, dip_pos_m, dip_moment, site_args, didt)
-                    batch = self._reduce_chunk(chunk, outs, coil, didt, retain, region)
+                    outs = solve_placements_block(
+                        ctx,
+                        dip_pos_m,
+                        dip_moment,
+                        site_args,
+                        didt,
+                        recovery=op,
+                        nodal=retain.nodal,
+                    )
+                    batch = self._reduce_chunk(
+                        chunk, outs, coil, didt, retain, region, recovery, op
+                    )
                     del outs
                 yield from batch
         finally:
@@ -364,6 +444,8 @@ class Subject:
         magnitude: bool = False,
         vectors: bool = False,
         potential: bool = False,
+        nodal: bool = False,
+        recovery: Recovery = "harmonic",
         block_k: int | None = None,
     ) -> Iterator[FieldResult]:
         """Stream one :class:`FieldResult` per placement, in the order given.
@@ -379,6 +461,16 @@ class Subject:
         answer: :meth:`FieldResult.summary_for` for a non-default region, and
         :meth:`FieldResult.focality` at an arbitrary fraction.
 
+        ``recovery`` selects how the reported field is derived from the solve, defaulting to
+        ``"harmonic"``, the only mode that converges at a tissue interface. ``E``, ``magnE`` and
+        ``summary`` all describe whichever field it selected; the raw field is not additionally
+        retained. See :data:`~cunibs.Recovery` for the modes and :mod:`cunibs.fem.recovery` for
+        the derivations.
+
+        ``nodal`` keeps the recovered field on its slots as well, which is what interpolating
+        to a surface needs; read it back per tissue with :meth:`FieldResult.nodal_field`. It
+        requires a recovery mode.
+
         Placements are solved in blocks of ``block_k`` that share a single stiffness and
         hierarchy read. It defaults to ``MAX_BLOCK`` and is clamped to ``[1, MAX_BLOCK]``.
         A block is solved and reduced as a unit, so it also caps peak memory: only
@@ -388,11 +480,18 @@ class Subject:
         instead.
         """
         # The loop lives in a separate generator so this stays a plain function: a `yield`
-        # here would defer the check below to the caller's first next(), surfacing the
+        # here would defer the checks below to the caller's first next(), surfacing the
         # error at the consumption site instead of where the bad argument was passed.
         sites = _sites(placements, "iter_simulate")
-        retain = _Retain(magnitude, vectors, potential)
-        return self._iter_reduced(coil, sites, didt, block_k, retain)
+        recovery = validate_recovery(recovery)
+        if nodal and recovery == "raw":
+            raise ValueError(
+                "nodal=True needs a recovery mode: the raw per-tetrahedron field has no nodal "
+                "form. Drop recovery='raw' to take the default, or name another mode from "
+                "cunibs.RECOVERY_MODES."
+            )
+        retain = _Retain(magnitude, vectors, potential, nodal)
+        return self._iter_reduced(coil, sites, didt, block_k, retain, recovery)
 
     def simulate(
         self,
@@ -403,6 +502,8 @@ class Subject:
         magnitude: bool = False,
         vectors: bool = False,
         potential: bool = False,
+        nodal: bool = False,
+        recovery: Recovery = "harmonic",
         block_k: int | None = None,
     ) -> FieldResult:
         """Solve a single placement, taking the same flags as :meth:`iter_simulate`.
@@ -423,6 +524,8 @@ class Subject:
             magnitude=magnitude,
             vectors=vectors,
             potential=potential,
+            nodal=nodal,
+            recovery=recovery,
             block_k=block_k,
         )
         return result
@@ -435,6 +538,7 @@ class Subject:
         didt: float,
         moments: bool,
         record_rois: Mapping[str, ResolvedTarget],
+        recovery: Recovery,
     ) -> Iterator[ConductivityUQResult]:
         """One Monte Carlo per placement, reduced inside a scratch pool and yielded outside.
 
@@ -445,12 +549,15 @@ class Subject:
 
         ctx = self.context
         pre = self._conductivity_uq_precompute(config)
+        # Outside the pool below, for the same reason the precompute is: the patch weights are
+        # cached on the context and outlive the placement that first asked for them.
+        op = self._recovery_operator(recovery)
         temp_pool = cp.cuda.MemoryPool()
         try:
             for site in sites:
                 with cp.cuda.using_allocator(temp_pool.malloc):
                     result = run_conductivity_uq(
-                        ctx, pre, coil, site, config, didt, record_rois
+                        ctx, pre, coil, site, config, didt, record_rois, recovery=op
                     )
                     # Summarised on the device before anything is copied back.
                     host = self._host_metric_inputs if moments else None
@@ -478,6 +585,7 @@ class Subject:
         *,
         moments: bool = False,
         record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        recovery: Recovery = "harmonic",
     ) -> Iterator[ConductivityUQResult]:
         """Stream a conductivity Monte Carlo per placement, in the order given.
 
@@ -493,12 +601,18 @@ class Subject:
         peak location. They are kilobytes, so there is no flag to enable them.
         ``record_rois``, a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` / ``resolve_target``,
         adds each draw's volume-weighted mean ``|E|`` per ROI (``result.roi_samples[name]``).
+
+        ``recovery`` takes the same values as :meth:`iter_simulate` and is applied to every
+        draw before any statistic is taken, so the moment arrays and the per-draw scalars all
+        describe the same field. There is no ``nodal`` flag: a result holds moments over draws
+        rather than a field. Use :meth:`simulate` for a nodal field.
         """
         # The loop lives in a separate generator so this stays a plain function: a `yield`
         # here would defer the check below to the caller's first next(), surfacing the error
         # at the consumption site instead of where the bad argument was passed.
         sites = _sites(placements, "iter_simulate_conductivity_uq")
-        return self._iter_uq_reduced(coil, sites, config, didt, moments, record_rois)
+        recovery = validate_recovery(recovery)
+        return self._iter_uq_reduced(coil, sites, config, didt, moments, record_rois, recovery)
 
     def simulate_conductivity_uq(
         self,
@@ -509,6 +623,7 @@ class Subject:
         *,
         moments: bool = False,
         record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        recovery: Recovery = "harmonic",
     ) -> ConductivityUQResult:
         """Run a conductivity Monte Carlo for a single placement.
 
@@ -523,7 +638,13 @@ class Subject:
             )
         # Unpacking drives the generator to exhaustion, so its scratch pool is released.
         (result,) = self.iter_simulate_conductivity_uq(
-            coil, [placement], config, didt, moments=moments, record_rois=record_rois
+            coil,
+            [placement],
+            config,
+            didt,
+            moments=moments,
+            record_rois=record_rois,
+            recovery=recovery,
         )
         return result
 
@@ -539,6 +660,16 @@ class FieldResult:
     ``vols``, ``tet_tags`` and ``barycenters_mm`` accompany ``magnE`` -- they are what the
     on-demand metrics need. Results from one subject share them, so treat them as
     read-only.
+
+    ``recovery`` records which post-processing produced ``E``/``magnE``/``summary``. It is
+    provenance, not a switch: a result carries one field, not several.
+
+    ``E_slots`` and the arrays that map it back to the mesh are present only when the run
+    passed ``nodal=True``. A *slot* is whatever the recovery fitted a patch around: a plain
+    node for ``"spr_global"``, a (node, tissue) pair for the tissue-restricted modes, where the
+    field is genuinely two-valued at a boundary. ``slot_node`` gives each slot's node and
+    ``slot_tag`` its tissue, or ``None`` when slots are nodes. Prefer :meth:`nodal_field`,
+    which resolves all of that.
     """
 
     summary: metrics.FieldMetrics
@@ -552,7 +683,53 @@ class FieldResult:
     vols: npt.NDArray[np.float32] | None
     tet_tags: npt.NDArray[np.int32] | None
     barycenters_mm: npt.NDArray[np.float64] | None
+    recovery: Recovery = "raw"
+    n_nodes: int | None = None
+    E_slots: npt.NDArray[np.float32] | None = None
+    slot_node: npt.NDArray[np.int32] | None = None
+    slot_tag: npt.NDArray[np.int32] | None = None
+    tet_nodes: npt.NDArray[np.int32] | None = None
     _summaries: dict[str, metrics.FieldMetrics] = field(default_factory=dict, repr=False)
+
+    def nodal_field(self, region: metrics.Region = _DEFAULT_REGION) -> npt.NDArray[np.float32]:
+        """The recovered field at the mesh nodes, on ``region``'s side of any boundary.
+
+        Returns ``(n_nodes, 3)`` with NaN at every node ``region`` does not reach, which is the
+        form an interpolation onto a cortical surface consumes.
+
+        For the tissue-restricted modes the recovered field lives on (node, tissue) slots
+        because ``E`` really is two-valued at a conductivity jump, and this picks ``region``'s
+        value. ``region="all"`` is rejected for those: a boundary node has no single value to
+        report, and silently choosing one of the two would be a quiet wrong answer.
+        """
+        if self.E_slots is None or self.slot_node is None or self.n_nodes is None:
+            raise ValueError(
+                "nodal_field needs the recovered nodal field, which this result did not "
+                "retain. Re-run with nodal=True."
+            )
+        if self.slot_tag is not None and region == "all":
+            raise ValueError(
+                f"nodal_field(region='all') is ambiguous for recovery={self.recovery!r}: its "
+                "field is two-valued at a tissue boundary, so a node there has one value per "
+                "tissue. Name a tissue label instead."
+            )
+        keep: npt.NDArray[np.bool_] | slice
+        if self.slot_tag is not None:
+            keep = self.slot_tag == metrics.region_tag(region)
+        elif region == "all":
+            keep = slice(None)
+        else:
+            if self.tet_nodes is None or self.tet_tags is None:
+                raise ValueError(
+                    "nodal_field for a specific region needs the mesh connectivity, which this "
+                    "result did not retain. Re-run with nodal=True and magnitude=True."
+                )
+            touched = np.zeros(self.n_nodes, dtype=bool)
+            touched[self.tet_nodes[metrics.region_mask(self.tet_tags, region)]] = True
+            keep = touched[self.slot_node]
+        out = np.full((self.n_nodes, 3), np.nan, dtype=np.float32)
+        out[self.slot_node[keep]] = self.E_slots[keep]
+        return out
 
     def _require_magnitude(self, what: str) -> npt.NDArray[np.float32]:
         if self.magnE is None:
@@ -616,7 +793,18 @@ class FieldResult:
         Arrays the run did not retain are absent from the file and load back as ``None``.
         """
         with h5py.File(Path(path), "w") as h5f:
-            for name in ("magnE", "E", "v", "vols", "tet_tags", "barycenters_mm"):
+            for name in (
+                "magnE",
+                "E",
+                "v",
+                "vols",
+                "tet_tags",
+                "barycenters_mm",
+                "E_slots",
+                "slot_node",
+                "slot_tag",
+                "tet_nodes",
+            ):
                 arr = getattr(self, name)
                 if arr is None:
                     continue
@@ -624,6 +812,9 @@ class FieldResult:
             h5f.create_dataset("transform", data=self.transform)
             _write_metrics(h5f.create_group("summary"), self.summary)
             h5f.attrs["format_version"] = _FORMAT_VERSION
+            h5f.attrs["recovery"] = self.recovery
+            if self.n_nodes is not None:
+                h5f.attrs["n_nodes"] = self.n_nodes
             h5f.attrs["coil_name"] = self.coil_name
             h5f.attrs["didt"] = self.didt
             h5f.attrs["placement_center_mm"] = self.placement.center_mm
@@ -651,4 +842,10 @@ class FieldResult:
                 vols=_opt_array(h5f, "vols"),
                 tet_tags=_opt_array(h5f, "tet_tags"),
                 barycenters_mm=_opt_array(h5f, "barycenters_mm"),
+                recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
+                n_nodes=int(h5f.attrs["n_nodes"]) if "n_nodes" in h5f.attrs else None,
+                E_slots=_opt_array(h5f, "E_slots"),
+                slot_node=_opt_array(h5f, "slot_node"),
+                slot_tag=_opt_array(h5f, "slot_tag"),
+                tet_nodes=_opt_array(h5f, "tet_nodes"),
             )

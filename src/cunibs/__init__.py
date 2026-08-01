@@ -5,6 +5,7 @@ from importlib.metadata import version
 from cunibs import adm, coil, metrics, uq
 from cunibs.adm import ResolvedTarget, Target, resolve_target
 from cunibs.coil import Coil
+from cunibs.fem import RECOVERY_MODES, Recovery
 from cunibs.mesh import HeadMesh, load_mesh
 from cunibs.simulation import FieldResult, Placement, Subject
 from cunibs.uq import ConductivityUQConfig, ConductivityUQResult, ConductivityUQSummary
@@ -12,6 +13,7 @@ from cunibs.uq import ConductivityUQConfig, ConductivityUQResult, ConductivityUQ
 __version__ = version("cunibs")
 
 __all__ = [
+    "RECOVERY_MODES",
     "Coil",
     "ConductivityUQConfig",
     "ConductivityUQResult",
@@ -19,6 +21,7 @@ __all__ = [
     "FieldResult",
     "HeadMesh",
     "Placement",
+    "Recovery",
     "ResolvedTarget",
     "Subject",
     "Target",
