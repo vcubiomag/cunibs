@@ -312,7 +312,11 @@ def test_full_mesh_load_counts(reference_mesh_path):
 @pytest.mark.reference
 @pytest.mark.slow
 def test_full_mesh_forward(cp, fresh_subject, reference_mesh_path, d70_coil):
-    """4.9M tetrahedra end to end: block-vs-serial parity and the peak field at scale."""
+    """4.9M tetrahedra end to end: block-vs-serial parity and the peak field at scale.
+
+    Pinned on ``recovery="raw"`` so it stays a pin on the *solve*; recovery has its own coverage
+    in test_recovery.py.
+    """
     from cunibs.simulation import Placement
 
     mesh = load_mesh(reference_mesh_path)
@@ -323,9 +327,11 @@ def test_full_mesh_forward(cp, fresh_subject, reference_mesh_path, d70_coil):
     top = coords[np.argmax(coords[:, 2])]
     placements = [Placement(top, top + [0.0, 50.0, 0.0], 4.0)] * 8
 
-    blocked = list(subj.iter_simulate(d70_coil, placements, 1e6))
+    blocked = list(subj.iter_simulate(d70_coil, placements, 1e6, recovery="raw"))
     assert blocked[0].peak_magnE() == pytest.approx(FULL_PEAK_MAGNE, rel=5e-3)
 
-    serialized = list(subj.iter_simulate(d70_coil, placements[:1], 1e6, block_k=1))
+    serialized = list(
+        subj.iter_simulate(d70_coil, placements[:1], 1e6, block_k=1, recovery="raw")
+    )
     assert blocked[0].peak_magnE() == pytest.approx(serialized[0].peak_magnE(), rel=2e-5)
     assert cp.get_default_memory_pool().used_bytes() < 4e9
