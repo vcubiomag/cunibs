@@ -91,6 +91,9 @@ NB_MODULE(_solver_ext, m) {
             if (static_cast<int>(aggregates.shape(0)) != n_rows) {
                 throw std::invalid_argument("aggregates must have one entry per row");
             }
+            if (col_idx.shape(0) != values.shape(0)) {
+                throw std::invalid_argument("col_idx and values must have one entry per nonzero");
+            }
             return select_size4(n_rows, nnz, row_ptr.data(), col_idx.data(), values.data(),
                                 aggregates.data(), reinterpret_cast<cudaStream_t>(stream));
         },

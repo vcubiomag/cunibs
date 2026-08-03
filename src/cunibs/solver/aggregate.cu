@@ -41,6 +41,13 @@ struct Best {
     int col;
 };
 
+// A column is a matching candidate when it is off the diagonal and names a row this level
+// actually has. The unsigned compare rejects a negative index in the same test as an oversized
+// one: without it a negative column reaches diag/partner/aggregated below their base pointers.
+__device__ __forceinline__ bool is_candidate(int col, int row, int n) {
+    return col != row && static_cast<unsigned>(col) < static_cast<unsigned>(n);
+}
+
 __device__ __forceinline__ void best_take(Best& acc, float w, int col) {
     if (w > acc.w || (w == acc.w && col > acc.col)) {
         acc.w = w;
@@ -109,7 +116,7 @@ __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
     const int row_e = row_ptr[i + 1];
     for (int j = row_ptr[i]; j < row_e; ++j) {
         const int jc = col_idx[j];
-        if (jc == i || jc >= n) {
+        if (!is_candidate(jc, i, n)) {
             w[j] = -1.0f;
             continue;
         }
@@ -135,7 +142,7 @@ __global__ __launch_bounds__(kBlock) void agg_find_strongest_nomerge_kernel(
     const int row_e = row_ptr[tid + 1];
     for (int j = row_ptr[tid]; j < row_e; ++j) {
         const int jc = col_idx[j];
-        if (jc == tid || jc >= n || partner[jc] != -1) continue;
+        if (!is_candidate(jc, tid, n) || partner[jc] != -1) continue;
         best_take(best, w[j], jc);
     }
     if (best.col != -1) strongest[tid] = best.col;
@@ -179,7 +186,7 @@ __global__ __launch_bounds__(kBlock) void agg_find_strongest_store_kernel(
     const int row_e = row_ptr[tid + 1];
     for (int j = row_ptr[tid]; j < row_e; ++j) {
         const int jc = col_idx[j];
-        if (jc == tid || jc >= n) continue;
+        if (!is_candidate(jc, tid, n)) continue;
         if (aggregated[jc] != -1 || jc == p) continue;
         best_take(best, w[j], jc);
     }
@@ -236,7 +243,7 @@ __global__ __launch_bounds__(kBlock) void agg_merge_existing_kernel(
     const int row_e = row_ptr[tid + 1];
     for (int j = row_ptr[tid]; j < row_e; ++j) {
         const int jc = col_idx[j];
-        if (jc == tid || jc >= n || aggregated[jc] == -1) continue;
+        if (!is_candidate(jc, tid, n) || aggregated[jc] == -1) continue;
         best_take(best, w[j], jc);
     }
     cand[tid] = (best.col != -1) ? agg[best.col] : tid;
