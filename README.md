@@ -552,7 +552,10 @@ weights are built once per mesh by a fixed-order kernel, so a recovered field is
 reproducible for the same reason the raw one is.
 
 Floating-point results can still vary across GPU architectures, CUDA versions,
-compiler versions, and dependency versions.
+compiler versions, and dependency versions. One reduction inside the
+preconditioner is not ours to order: the coarsest level is solved by a dense
+inverse from cuSOLVER. It is stable for a fixed device and library version, and
+it only sets how fast the solve converges, not what it converges to.
 
 The ADM adjoint solves use a tighter tolerance (`1e-9`) than the forward solve
 because their near-point-source right-hand side is more sensitive.
