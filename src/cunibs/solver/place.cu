@@ -1,13 +1,17 @@
 #include "device_math.cuh"
 #include "kernels.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <climits>
 
 // Batched coil placement: for each target centre, find the closest point on the scalp surface
 // (closest-point-on-triangle over all skin triangles, Ericson), then build the coil-to-head
-// frame. One block per placement; threads stride over triangles and reduce to the nearest.
-// All double precision.
+// frame. All double precision.
+//
+// The scan runs as a block per (placement, triangle chunk) and the frame as a thread per
+// placement. Selection is a min over the total order (distance^2, triangle index), so the
+// chunk count never changes the result.
 
 namespace {
 
@@ -15,6 +19,9 @@ namespace {
 // still defines an in-plane axis: (1e-6 rad)^2. Below it the tangential component is numerical
 // noise and the coil's rotation about the normal is arbitrary.
 constexpr double kMinSin2 = 1e-12;
+
+// Fewest triangles worth a block of its own; below this the block reduction outweighs the scan.
+constexpr int kMinTrisPerChunk = 1024;
 
 // Loses the (distance^2, index) comparison to every real triangle, so threads that scan nothing
 // need no special case.
@@ -94,20 +101,24 @@ __device__ double closest_on_tri(const double* p, const double* a, const double*
     return dx * dx + dy * dy + dz * dz;
 }
 
-__global__ void place_kernel(const double* __restrict__ centers, const double* __restrict__ handles,
-                             const double* __restrict__ dists, Scalp scalp,
-                             double* __restrict__ out, int* __restrict__ degenerate, int n_tri) {
+// One block per (placement, chunk): the closest triangle in this block's slice of the scan.
+__global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scalp,
+                                  Candidate* __restrict__ cand, int n_tri, int n_chunks) {
     __shared__ double sdist[kBlock];
     __shared__ int stri[kBlock];
 
     const int p = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int per = (n_tri + n_chunks - 1) / n_chunks;
+    const int lo = chunk * per;
+    const int hi = min(lo + per, n_tri);
     const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
 
     // A thread's own candidates arrive in increasing j, so only a strict improvement can win
     // here; ties across threads are settled by the reduction below.
     Candidate best{DBL_MAX, kNoTri};
     double q[3];
-    for (int j = threadIdx.x; j < n_tri; j += kBlock) {
+    for (int j = lo + threadIdx.x; j < hi; j += kBlock) {
         const double d2 =
             closest_on_tri(center, &scalp.a[j * 3], &scalp.b[j * 3], &scalp.c[j * 3], q);
         if (d2 < best.d2) best = {d2, j};
@@ -127,8 +138,28 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
         __syncthreads();
     }
 
-    if (threadIdx.x != 0) return;
-    const int tri = stri[0];
+    if (threadIdx.x == 0) {
+        cand[static_cast<size_t>(p) * n_chunks + chunk] = {sdist[0], stri[0]};
+    }
+}
+
+// One thread per placement: pick the winning chunk candidate, then build that placement's frame.
+__global__ void place_frame_kernel(const double* __restrict__ centers,
+                                   const double* __restrict__ handles,
+                                   const double* __restrict__ dists, Scalp scalp,
+                                   const Candidate* __restrict__ cand, double* __restrict__ out,
+                                   int* __restrict__ degenerate, int n_pl, int n_chunks) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n_pl) return;
+
+    const Candidate* mine = cand + static_cast<size_t>(p) * n_chunks;
+    Candidate best = mine[0];
+    for (int i = 1; i < n_chunks; ++i) {
+        if (closer(mine[i], best)) best = mine[i];
+    }
+    const int tri = best.tri;
+
+    const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
     double proj[3];
     closest_on_tri(center, &scalp.a[tri * 3], &scalp.b[tri * 3], &scalp.c[tri * 3], proj);
     const double normal[3] = {scalp.normals[tri * 3], scalp.normals[tri * 3 + 1],
@@ -188,14 +219,44 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
     o[15] = 1.0;
 }
 
+// Cached because nothing changes the current device.
+int sm_count() {
+    static const int count = [] {
+        int device = 0, sms = 0;
+        check_cuda(cudaGetDevice(&device), "place", "getDevice");
+        check_cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "place",
+                   "getAttribute(multiProcessorCount)");
+        return sms;
+    }();
+    return count;
+}
+
 }  // namespace
 
 void launch_place(const double* centers, const double* handles, const double* dists,
                   const double* a, const double* b, const double* c, const double* tnorm,
                   double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream) {
-    // One block per placement; threads inside it stride over triangles.
-    if (const unsigned blocks = grid_for(n_pl, 1)) {
-        place_kernel<<<blocks, kBlock, 0, stream>>>(centers, handles, dists, Scalp{a, b, c, tnorm},
-                                                    out, degenerate, n_tri);
-    }
+    if (n_pl <= 0 || n_tri <= 0) return;
+
+    // Split a placement's scan across blocks only while the placements alone leave SMs idle, and
+    // never past a block per kMinTrisPerChunk triangles. Both terms are at least 1.
+    const int for_occupancy = (sm_count() + n_pl - 1) / n_pl;
+    const int for_size = (n_tri + kMinTrisPerChunk - 1) / kMinTrisPerChunk;
+    const int n_chunks = std::min(for_occupancy, for_size);
+    const Scalp scalp{a, b, c, tnorm};
+
+    // cudaMallocAsync is illegal inside a CUDA-graph capture; placement runs outside the
+    // solver's captured region.
+    Candidate* cand = nullptr;
+    check_cuda(
+        cudaMallocAsync(&cand, static_cast<size_t>(n_pl) * n_chunks * sizeof(Candidate), stream),
+        "place", "mallocAsync(cand)");
+
+    // Placements go on x, the only grid axis not capped at 65535 blocks.
+    place_scan_kernel<<<dim3(n_pl, n_chunks), kBlock, 0, stream>>>(centers, scalp, cand, n_tri,
+                                                                   n_chunks);
+    place_frame_kernel<<<grid_for(n_pl), kBlock, 0, stream>>>(centers, handles, dists, scalp, cand,
+                                                              out, degenerate, n_pl, n_chunks);
+
+    check_cuda(cudaFreeAsync(cand, stream), "place", "freeAsync(cand)");
 }
