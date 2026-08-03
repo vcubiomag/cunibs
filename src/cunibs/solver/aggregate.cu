@@ -453,6 +453,12 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     if (n_rows <= 0) return 0;
     if (nnz < 0) throw std::invalid_argument("aggregate: nnz must not be negative");
 
+    // The caller builds each level's operator with asynchronous library calls and never syncs,
+    // so read_counter below is the first synchronising point on the whole hierarchy build.
+    // Draining here keeps an asynchronous fault from that upstream work out of the aggregation's
+    // own error reports.
+    check_cuda(cudaStreamSynchronize(stream), "fault from work queued before this call");
+
     // Both are nonzero: n_rows > 0 above, and grid_for only returns 0 for an empty range.
     const unsigned blocks = grid_for(n_rows, kBlock);
     const unsigned scan_tiles = grid_for(n_rows, kScanTile);
