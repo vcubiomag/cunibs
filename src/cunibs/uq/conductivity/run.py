@@ -39,11 +39,6 @@ if TYPE_CHECKING:
 
 _NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
 
-# Ensemble size below which the subspace projection is not worth its setup. The basis costs P
-# solves up front and then saves ~3.7 iterations on every draw, so it pays from about 50 draws
-# and is a clear win by a few hundred.
-_PROJECTION_MIN_SAMPLES = 64
-
 # Tolerance for the sensitivity solves that span the projection basis. Deliberately far looser
 # than the draw tolerance: the basis only has to point in the right directions for an initial
 # guess that CG then refines to `pre.tolerance` anyway, so its accuracy sets the rate and never
@@ -125,7 +120,9 @@ def _sensitivity_basis(
     per-tissue RHS decomposition, and ``A_t x_nom`` is the same product the per-draw residual
     shortcut needs.
 
-    The SVD drops directions two tissues share; ``keep`` is P in the normal case.
+    The SVD drops directions two tissues share; ``keep`` is P in the normal case. A placement that
+    couples to nothing leaves every sensitivity zero and ``keep`` at 0; the empty basis then
+    contributes an empty correction, so there is nothing to guard.
     """
     n_red = int(pre.idx.shape[0])
     rhs = cp.ascontiguousarray(
@@ -141,18 +138,22 @@ def _sensitivity_basis(
 
 
 class _InitialGuess:
-    """The x0 policy for the sampling loop.
+    """The x0 the sampling loop starts every draw from.
 
-    Every draw starts from the solved ensemble-centre solution, and once the ensemble is big
-    enough to amortise the basis it additionally takes the Galerkin projection of its own
-    residual onto the sensitivity subspace:
+    A draw starts at the solved ensemble-centre solution, corrected by the Galerkin projection of
+    its own residual onto the sensitivity subspace:
 
         x0 = x_nominal + W·E⁻¹·Wᵀ·r0,   r0 = b(σ) − A(σ)·x_nominal,   E = Wᵀ·A_nominal·W.
 
-    Both mechanisms only move the starting point of a solve that still runs to ``pre.tolerance``,
-    so neither can change where a draw converges; they decide how many iterations it takes. Both
-    are also pure functions of the mesh, the placement and the nominal conductivities, so a
-    draw's result does not depend on which other draws were solved, or on how many.
+    The correction is A_nominal-optimal over ``span(W)`` for the residual it is handed. The drawn
+    system is A(σ), so that is optimal for the wrong operator, but the samples cluster at the
+    centre.
+
+    ``x_nominal`` and the basis are pure functions of the mesh, the placement and the nominal
+    conductivities, and the correction reads nothing else but the draw's own σ. Keep it that way.
+    x0 cannot move a draw outside ``pre.tolerance``, but it does decide where inside it the draw
+    lands, so anything reaching x0 from the ensemble — a size-dependent cost heuristic, a basis
+    accumulated over draws — makes a draw's last digits depend on the batch it was solved in.
     """
 
     def __init__(
@@ -160,13 +161,9 @@ class _InitialGuess:
         pre: ConductivityUQPrecompute,
         b_tissue: cp.ndarray,
         x_nominal: cp.ndarray,
-        n_samples: int,
         stream: int,
     ) -> None:
         self._x_nominal = x_nominal
-        self._project = n_samples >= _PROJECTION_MIN_SAMPLES
-        if not self._project:
-            return
         n_red = int(pre.idx.shape[0])
         shape = (n_red, n_red)
         # r0 is linear in σ, so A_base·x_nom and each A_t·x_nom are formed once here rather
@@ -184,8 +181,6 @@ class _InitialGuess:
 
     def for_draw(self, sigma: cp.ndarray, b_red: cp.ndarray) -> cp.ndarray:
         """The initial guess for one draw."""
-        if not self._project:
-            return self._x_nominal
         r0 = b_red - (self._ax_base + sigma @ self._ax_tissue)
         self._buf[:] = self._x_nominal + self._w @ (self._einv @ (self._w.T @ r0))
         return self._buf
@@ -293,7 +288,7 @@ def run_conductivity_uq(
     )
     pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
 
-    guess = _InitialGuess(pre, b_tissue, x_nominal, config.n_samples, stream)
+    guess = _InitialGuess(pre, b_tissue, x_nominal, stream)
 
     gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
     vols_gm = ctx.vols[gm_idx].astype(cp.float64)

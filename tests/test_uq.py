@@ -356,14 +356,19 @@ def test_tissue_sensitivity_rejects_an_unrecorded_roi(two_tissue_subject):
         r.tissue_sensitivity("m1")
 
 
-def test_uq_projection_path_does_not_change_the_answer(two_tissue_subject):
-    """Crossing ``_PROJECTION_MIN_SAMPLES`` turns the subspace projection on; it must not bias it.
+@pytest.mark.parametrize(("small_n", "large_n"), [(8, 64), (32, 200)])
+def test_uq_draws_do_not_depend_on_the_ensemble_size(two_tissue_subject, small_n, large_n):
+    """A draw's field must be the same however many draws were asked for, to the last bit.
 
-    Both runs share a seed, so the first 8 draws are the same conductivities either way — only
-    the initial guess differs, and an initial guess cannot move where a draw converges.
+    Both runs share a seed, so the shorter one's draws are the same conductivities either way and
+    only the initial guess could differ. It must not: the guess is built from the mesh, the
+    placement and the nominal conductivities, and applied per draw from that draw's own σ, so
+    ``n_samples`` reaches it nowhere.
+
+    Bitwise, not ``allclose``. Anything that reaches x0 from the ensemble moves a draw by about
+    the solve tolerance, 6e-07 on sub-004, which an ``rtol=1e-6`` would wave through.
     """
     from cunibs import ConductivityUQConfig
-    from cunibs.uq.conductivity.run import _PROJECTION_MIN_SAMPLES
 
     def run(n):
         return two_tissue_subject.simulate_conductivity_uq(
@@ -373,13 +378,9 @@ def test_uq_projection_path_does_not_change_the_answer(two_tissue_subject):
             moments=True,
         )
 
-    small_n, large_n = 8, max(64, _PROJECTION_MIN_SAMPLES)
-    assert small_n < _PROJECTION_MIN_SAMPLES <= large_n, "the run pair must straddle the gate"
     small, large = run(small_n), run(large_n)
-    np.testing.assert_allclose(
-        small.sigma_samples, large.sigma_samples[:small_n], rtol=0, atol=0
-    )
-    np.testing.assert_allclose(small.peak_samples, large.peak_samples[:small_n], rtol=1e-6)
+    np.testing.assert_array_equal(small.sigma_samples, large.sigma_samples[:small_n])
+    np.testing.assert_array_equal(small.peak_samples, large.peak_samples[:small_n])
 
 
 def test_uq_sensitivity_basis_predicts_a_small_perturbation(cp, two_tissue_subject):
