@@ -593,23 +593,39 @@ def test_l1_dinv_rejects_a_wrong_length_output(cp):
 
 @pytest.mark.realmesh
 def test_native_aggregation_is_deterministic(cp, patch_subject):
-    """One thread per row with fixed tie-breaks and no atomics: byte-identical across runs."""
+    """One thread per row with fixed tie-breaks and no atomics: byte-identical across runs.
+
+    The operators are checked alongside the aggregate maps because they are what the next
+    level aggregates on: a prolongator or Galerkin value that moves in its last bits can flip
+    a near-tie in ``select_size4``'s strongest-neighbour fold and change the hierarchy shape.
+    """
     from cunibs.fem.solve import aggregation_levels
 
     solver = patch_subject.context.solver
     values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
 
-    first, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
-    second, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    first, first_coarse = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    second, second_coarse = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
 
     assert len(first) == len(second)
     for i, (a, b) in enumerate(zip(first, second, strict=True)):
         assert a.n_coarse == b.n_coarse, f"level {i} aggregate count is not reproducible"
-        np.testing.assert_array_equal(
-            cp.asnumpy(a.aggregates),
-            cp.asnumpy(b.aggregates),
-            err_msg=f"level {i} is not reproducible",
-        )
+        for name, lhs, rhs in (
+            ("aggregates", a.aggregates, b.aggregates),
+            ("p.data", a.p.data, b.p.data),
+            ("p.indices", a.p.indices, b.p.indices),
+            ("a.data", a.a.data, b.a.data),
+        ):
+            np.testing.assert_array_equal(
+                cp.asnumpy(lhs),
+                cp.asnumpy(rhs),
+                err_msg=f"level {i} {name} is not reproducible",
+            )
+    np.testing.assert_array_equal(
+        cp.asnumpy(first_coarse.data),
+        cp.asnumpy(second_coarse.data),
+        err_msg="the coarsest operator is not reproducible",
+    )
 
 
 @pytest.mark.realmesh
