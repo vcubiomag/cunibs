@@ -553,6 +553,10 @@ compiler versions, and dependency versions.
 The ADM adjoint solves use a tighter tolerance (`1e-9`) than the forward solve
 because their near-point-source right-hand side is more sensitive.
 
+A conductivity-UQ draw is a function of its own conductivity vector on top of
+those inputs, and not of the ensemble size or of the other draws, so the same
+seed reproduces the same draws at any `n_samples`.
+
 ## Citation
 
 No archival citation is provided yet. For reproducible academic use, cite the
