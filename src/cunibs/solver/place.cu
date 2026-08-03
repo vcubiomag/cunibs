@@ -2,11 +2,12 @@
 #include "kernels.hpp"
 
 #include <cfloat>
+#include <climits>
 
 // Batched coil placement: for each target centre, find the closest point on the scalp surface
-// (closest-point-on-triangle over all skin triangles, Ericson), then build the coil-to-head frame.
-// One block per placement; threads stride over triangles and reduce to the nearest triangle (ties
-// broken by lowest index, matching cupy's argmin). All double precision.
+// (closest-point-on-triangle over all skin triangles, Ericson), then build the coil-to-head
+// frame. One block per placement; threads stride over triangles and reduce to the nearest.
+// All double precision.
 
 namespace {
 
@@ -14,6 +15,27 @@ namespace {
 // still defines an in-plane axis: (1e-6 rad)^2. Below it the tangential component is numerical
 // noise and the coil's rotation about the normal is arbitrary.
 constexpr double kMinSin2 = 1e-12;
+
+// Loses the (distance^2, index) comparison to every real triangle, so threads that scan nothing
+// need no special case.
+constexpr int kNoTri = INT_MAX;
+
+struct Scalp {
+    const double* a;
+    const double* b;
+    const double* c;
+    const double* normals;
+};
+
+struct Candidate {
+    double d2;
+    int tri;
+};
+
+// Ties break to the lower triangle index, matching cupy's argmin.
+__device__ __forceinline__ bool closer(Candidate x, Candidate y) {
+    return x.d2 < y.d2 || (x.d2 == y.d2 && x.tri < y.tri);
+}
 
 // Closest point q on triangle (a,b,c) to p; returns squared distance. Full Ericson ordering:
 // vertex A, vertex B, edge AB, vertex C, edge AC, edge BC, interior.
@@ -73,41 +95,33 @@ __device__ double closest_on_tri(const double* p, const double* a, const double*
 }
 
 __global__ void place_kernel(const double* __restrict__ centers, const double* __restrict__ handles,
-                             const double* __restrict__ dists, const double* __restrict__ av,
-                             const double* __restrict__ bv, const double* __restrict__ cv,
-                             const double* __restrict__ tnorm, double* __restrict__ out,
-                             int* __restrict__ degenerate, int n_tri) {
+                             const double* __restrict__ dists, Scalp scalp,
+                             double* __restrict__ out, int* __restrict__ degenerate, int n_tri) {
     __shared__ double sdist[kBlock];
     __shared__ int stri[kBlock];
 
     const int p = blockIdx.x;
     const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
 
-    // A thread's own candidates arrive in increasing j, so a later tie can never win here
-    // and only strict improvement is tested. Ties across threads are broken in the block
-    // reduction below, which is what matches cupy's argmin.
-    double best = DBL_MAX;
-    int btri = -1;
+    // A thread's own candidates arrive in increasing j, so only a strict improvement can win
+    // here; ties across threads are settled by the reduction below.
+    Candidate best{DBL_MAX, kNoTri};
     double q[3];
     for (int j = threadIdx.x; j < n_tri; j += kBlock) {
-        double d2 = closest_on_tri(center, &av[j * 3], &bv[j * 3], &cv[j * 3], q);
-        if (d2 < best) {
-            best = d2;
-            btri = j;
-        }
+        const double d2 =
+            closest_on_tri(center, &scalp.a[j * 3], &scalp.b[j * 3], &scalp.c[j * 3], q);
+        if (d2 < best.d2) best = {d2, j};
     }
-    sdist[threadIdx.x] = best;
-    stri[threadIdx.x] = btri;
-    __syncthreads();
 
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            double db = sdist[threadIdx.x + s];
-            int tb = stri[threadIdx.x + s];
-            if (db < sdist[threadIdx.x] ||
-                (db == sdist[threadIdx.x] && tb < stri[threadIdx.x])) {
-                sdist[threadIdx.x] = db;
-                stri[threadIdx.x] = tb;
+    sdist[threadIdx.x] = best.d2;
+    stri[threadIdx.x] = best.tri;
+    __syncthreads();
+    for (int step = kBlock / 2; step > 0; step >>= 1) {
+        if (threadIdx.x < step) {
+            const Candidate other{sdist[threadIdx.x + step], stri[threadIdx.x + step]};
+            if (closer(other, {sdist[threadIdx.x], stri[threadIdx.x]})) {
+                sdist[threadIdx.x] = other.d2;
+                stri[threadIdx.x] = other.tri;
             }
         }
         __syncthreads();
@@ -116,8 +130,9 @@ __global__ void place_kernel(const double* __restrict__ centers, const double* _
     if (threadIdx.x != 0) return;
     const int tri = stri[0];
     double proj[3];
-    closest_on_tri(center, &av[tri * 3], &bv[tri * 3], &cv[tri * 3], proj);
-    const double normal[3] = {tnorm[tri * 3], tnorm[tri * 3 + 1], tnorm[tri * 3 + 2]};
+    closest_on_tri(center, &scalp.a[tri * 3], &scalp.b[tri * 3], &scalp.c[tri * 3], proj);
+    const double normal[3] = {scalp.normals[tri * 3], scalp.normals[tri * 3 + 1],
+                              scalp.normals[tri * 3 + 2]};
     const double z[3] = {-normal[0], -normal[1], -normal[2]};
 
     // In-plane axis from the handle. It is undefined when the handle direction has no
@@ -180,7 +195,7 @@ void launch_place(const double* centers, const double* handles, const double* di
                   double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream) {
     // One block per placement; threads inside it stride over triangles.
     if (const unsigned blocks = grid_for(n_pl, 1)) {
-        place_kernel<<<blocks, kBlock, 0, stream>>>(centers, handles, dists, a, b, c, tnorm, out,
-                                                    degenerate, n_tri);
+        place_kernel<<<blocks, kBlock, 0, stream>>>(centers, handles, dists, Scalp{a, b, c, tnorm},
+                                                    out, degenerate, n_tri);
     }
 }
