@@ -35,6 +35,7 @@ from cunibs.solver import (
     NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
+    l1_dinv,
     reconstruct_e,
     reconstruct_e_block,
     rhs_assemble_weighted,
@@ -57,24 +58,34 @@ DEFAULT_TOLERANCE = 1e-6
 DEFAULT_MAX_ITERS = 2000
 
 
+def _csr_f32(a: csp.csr_matrix) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """``(indptr, indices, data)`` in the int32/fp32 layout the native kernels take."""
+    return (
+        cp.ascontiguousarray(a.indptr, dtype=cp.int32),
+        cp.ascontiguousarray(a.indices, dtype=cp.int32),
+        cp.ascontiguousarray(a.data, dtype=cp.float32),
+    )
+
+
 def _l1_dinv(a: csp.csr_matrix) -> cp.ndarray:
     """l1-Jacobi smoother scaling: 1 / d, with d_i = sign(a_ii) * sum_j |a_ij|.
 
     The diagonal is included in the L1 norm and the sign follows the diagonal, which is what
     keeps the smoother positive definite and so the whole V-cycle a valid PCG preconditioner.
-    The zero-row guard cannot fire for the SPD reduced stiffness, but keeps the reciprocal
-    finite for any input.
 
     Including the diagonal in the row sum is also what bounds the smoother's spectrum. For SPD
     ``a``, ``D - A`` is weakly diagonally dominant with a non-negative diagonal, hence PSD, so
     ``rho(D^-1 A) <= 1`` on every level with no estimate needed. Both the Chebyshev interval in
     vcycle.cu and the damping below rest on that bound.
+
+    The row sum is a kernel rather than an SpMV of ``|a|`` against a vector of ones so that its
+    summation order is fixed by the CSR: dinv scales every entry of the smoothed prolongator and
+    is uploaded to every V-cycle level, so any drift in it reaches the whole hierarchy.
+    See l1.cu.
     """
-    abs_a = csp.csr_matrix((cp.abs(a.data), a.indices, a.indptr), shape=a.shape)
-    d = abs_a.dot(cp.ones(a.shape[1], dtype=cp.float32))
-    d = cp.where(a.diagonal() < 0, -d, d)
-    d = cp.where(d != 0, d, cp.float32(1.0))
-    return cp.ascontiguousarray((cp.float32(1.0) / d).astype(cp.float32))
+    dinv = cp.empty(a.shape[0], dtype=cp.float32)
+    l1_dinv(*_csr_f32(a), dinv, cp.cuda.get_current_stream().ptr)
+    return dinv
 
 
 # Damping for the prolongator smoother: 4 / (3 rho) minimises the largest eigenvalue the
@@ -163,13 +174,7 @@ class SmootherParams:
 def _select_once(a: csp.csr_matrix, stream: int) -> tuple[cp.ndarray, int]:
     """One pairwise pass of the AMGx SIZE_4 selector over ``a``."""
     agg = cp.empty(a.shape[0], dtype=cp.int32)
-    n_coarse = select_size4(
-        cp.ascontiguousarray(a.indptr.astype(cp.int32)),
-        cp.ascontiguousarray(a.indices.astype(cp.int32)),
-        cp.ascontiguousarray(a.data.astype(cp.float32)),
-        agg,
-        stream,
-    )
+    n_coarse = select_size4(*_csr_f32(a), agg, stream)
     return agg, n_coarse
 
 

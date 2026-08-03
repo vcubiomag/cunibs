@@ -236,6 +236,24 @@ NB_MODULE(_solver_ext, m) {
         "Fill a CSR pattern's values with the stiffness matrix, one thread per row.");
 
     m.def(
+        "l1_dinv",
+        [](i32_cuda indptr, i32_cuda indices, f32_cuda_1d data, f32_cuda_1d dinv,
+           uintptr_t stream) {
+            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
+            if (static_cast<int>(dinv.shape(0)) != n_rows) {
+                throw std::invalid_argument("dinv must have one entry per row");
+            }
+            if (indices.shape(0) != data.shape(0)) {
+                throw std::invalid_argument("indices and data must have one entry per nonzero");
+            }
+            launch_l1_dinv(indptr.data(), indices.data(), data.data(), dinv.data(), n_rows,
+                           reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("indptr").noconvert(), nb::arg("indices").noconvert(), nb::arg("data").noconvert(),
+        nb::arg("dinv").noconvert(), nb::arg("stream"),
+        "l1-Jacobi smoother scaling 1 / (sign(a_ii) * sum_j |a_ij|), one thread per row.");
+
+    m.def(
         "rhs_assemble_weighted_block",
         [](std::vector<f32_cuda_2d> dadt_elm, f32_cuda_3d wg, i32_cuda ptr, i32_cuda idx,
            f32_cuda_2d b_block, uintptr_t stream) {

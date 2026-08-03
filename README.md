@@ -536,14 +536,18 @@ fell in the sweep, and repeating a run reproduces it bitwise. Splitting a sweep
 across calls, resuming an interrupted one, or retuning `block_k` for a different
 GPU all leave the numbers unchanged.
 
-Five things enforce that. Stiffness assembly, the right-hand side and any
+Six things enforce that. Stiffness assembly, the right-hand side and any
 recovery gather accumulate in a per-node order fixed by the stable sort that
 builds the map each walks. Each column of a block solve stops on its own residual
 rather than the block's, so a placement batched with a slower-converging
 neighbour is not carried past the point where it would have stopped alone. Every
 block width shares one summation order, in the fp64 operator and in its
 reductions. The aggregation runs one thread per row with a symmetric tie-break,
-and the only atomics anywhere in the solver are integer counters. The recovery
+and the only atomics anywhere in the solver are integer counters. The l1 smoother
+scaling that each level of the preconditioner is built from sums its row one
+thread at a time in column order, rather than through a sparse product whose
+split of a row depends on runtime state, so a level's prolongator and coarse
+operator are functions of the level above and of nothing else. The recovery
 weights are built once per mesh by a fixed-order kernel, so a recovered field is
 reproducible for the same reason the raw one is.
 

@@ -37,6 +37,13 @@ void launch_stiffness_rows(const double* g, const double* scale, const int* tet_
                            const int* ptr, const int* idx, const int* indptr, const int* indices,
                            double* data, int n_rows, cudaStream_t stream);
 
+// --- l1.cu: l1-Jacobi smoother scaling over a CSR operator ----------------------------------
+// dinv[i] = 1 / (sign(a_ii) · Σ_j |a_ij|), the diagonal included in the row sum, and 1 where that
+// sum is zero. indices need not be sorted; the row is scanned for the diagonal, and a row without
+// one keeps the positive sign. dinv is overwritten and must hold n_rows entries.
+void launch_l1_dinv(const int* indptr, const int* indices, const float* data, float* dinv,
+                    int n_rows, cudaStream_t stream);
+
 // --- reconstruct.cu: E = -grad(v) - dA/dt --------------------------------------------------
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,

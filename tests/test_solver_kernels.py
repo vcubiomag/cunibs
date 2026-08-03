@@ -522,6 +522,75 @@ def test_stiffness_assembly_is_reproducible(cp, patch_mesh):
         )
 
 
+def _csr_rows(cp, rows):
+    """Build a device CSR from a list of ``(column, value)`` lists, one per row."""
+    indptr = np.cumsum([0, *(len(r) for r in rows)], dtype=np.int32)
+    flat = [entry for row in rows for entry in row]
+    indices = np.array([c for c, _ in flat], dtype=np.int32)
+    data = np.array([v for _, v in flat], dtype=np.float32)
+    return cp.asarray(indptr), cp.asarray(indices), cp.asarray(data)
+
+
+def test_l1_dinv_matches_the_dense_formula(cp):
+    """1 / (sign(aᵢᵢ) · Σⱼ|aᵢⱼ|), with every branch of the kernel exercised once.
+
+    The rows, in order: a positive diagonal, a negative one (which flips the sign of the whole
+    row sum), a row summing to zero, an empty row, and a row with no stored diagonal at all.
+    """
+    from cunibs.solver import l1_dinv
+
+    indptr, indices, data = _csr_rows(
+        cp,
+        [
+            [(0, 2.0), (1, -1.0), (3, 0.5)],
+            [(0, -1.0), (1, -4.0), (2, 1.0)],
+            [(2, 0.0)],
+            [],
+            [(0, 3.0), (2, -1.0)],
+        ],
+    )
+    dinv = cp.empty(5, dtype=cp.float32)
+    l1_dinv(indptr, indices, data, dinv, cp.cuda.get_current_stream().ptr)
+
+    expected = np.array([1.0 / 3.5, -1.0 / 6.0, 1.0, 1.0, 0.25])
+    np.testing.assert_allclose(cp.asnumpy(dinv), expected, rtol=1e-6)
+
+
+def test_l1_dinv_is_bit_reproducible(cp):
+    """Fixed summation order, so repeated calls agree in the last bit.
+
+    The rows are long enough for the order to matter: a sparse product over rows of this width
+    splits them across a thread count the library picks at runtime.
+    """
+    from cunibs.solver import l1_dinv
+
+    rng = np.random.default_rng(3)
+    n, per_row = 64, 300
+    dense = rng.standard_normal((n, per_row)).astype(np.float32)
+    indptr, indices, data = _csr_rows(cp, [list(enumerate(row.tolist())) for row in dense])
+
+    dinv = cp.empty(n, dtype=cp.float32)
+    l1_dinv(indptr, indices, data, dinv, cp.cuda.get_current_stream().ptr)
+    first = cp.asnumpy(dinv).copy()
+
+    d = np.abs(dense).sum(axis=1, dtype=np.float64) * np.sign(dense.diagonal())
+    np.testing.assert_allclose(first, 1.0 / d, rtol=1e-5)
+
+    for attempt in range(1, 4):
+        again = cp.empty(n, dtype=cp.float32)
+        l1_dinv(indptr, indices, data, again, cp.cuda.get_current_stream().ptr)
+        np.testing.assert_array_equal(cp.asnumpy(again), first, err_msg=f"call {attempt}")
+
+
+def test_l1_dinv_rejects_a_wrong_length_output(cp):
+    """A short ``dinv`` would otherwise be written past its end on the device."""
+    from cunibs.solver import l1_dinv
+
+    indptr, indices, data = _csr_rows(cp, [[(0, 1.0)], [(1, 1.0)]])
+    with pytest.raises(ValueError, match="one entry per row"):
+        l1_dinv(indptr, indices, data, cp.empty(1, dtype=cp.float32), 0)
+
+
 @pytest.mark.realmesh
 def test_native_aggregation_is_deterministic(cp, patch_subject):
     """One thread per row with fixed tie-breaks and no atomics: byte-identical across runs."""
