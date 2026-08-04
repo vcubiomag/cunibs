@@ -102,6 +102,22 @@ def _solve_columns(
     return out
 
 
+def _dominant_left_basis(a: cp.ndarray, rtol: float = 1e-8) -> cp.ndarray:
+    """Orthonormal basis for the dominant column space of a tall, skinny ``a``.
+
+    ``a = QR`` with ``Q`` orthonormal, so ``R`` carries ``a``'s singular values exactly and ``a``'s
+    left singular vectors are ``Q·U_R``; only the P-by-P ``R`` reaches an SVD. Taking the SVD of
+    ``a`` itself is the same factorisation, but cuSOLVER sizes ``gesvd``'s workspace off the *row*
+    count and reserves gigabytes at mesh-sized rows, where ``geqrf``'s workspace is row-independent.
+    Going through ``aᵀa`` would be cheaper still and is not backward stable: it squares the
+    condition number, and the sensitivities decay steeply enough across tissues to lose the tail.
+    """
+    q, r = cp.linalg.qr(a, mode="reduced")
+    u, s, _ = cp.linalg.svd(r, full_matrices=False)
+    keep = int((s > rtol * float(s[0])).sum())
+    return cp.ascontiguousarray(q @ u[:, :keep])
+
+
 def _sensitivity_basis(
     pre: ConductivityUQPrecompute,
     b_tissue: cp.ndarray,
@@ -120,9 +136,9 @@ def _sensitivity_basis(
     per-tissue RHS decomposition, and ``A_t x_nom`` is the same product the per-draw residual
     shortcut needs.
 
-    The SVD drops directions two tissues share; ``keep`` is P in the normal case. A placement that
-    couples to nothing leaves every sensitivity zero and ``keep`` at 0; the empty basis then
-    contributes an empty correction, so there is nothing to guard.
+    ``_dominant_left_basis`` drops directions two tissues share, so the basis is P columns wide in
+    the normal case. A placement that couples to nothing leaves every sensitivity zero and the
+    basis empty; an empty basis contributes an empty correction, so there is nothing to guard.
     """
     n_red = int(pre.idx.shape[0])
     rhs = cp.ascontiguousarray(
@@ -130,9 +146,7 @@ def _sensitivity_basis(
     )
     sens = _solve_columns(pre, rhs, _SENSITIVITY_TOL, stream)
 
-    q, s, _ = cp.linalg.svd(sens, full_matrices=False)
-    keep = int((s > 1e-8 * float(s[0])).sum())
-    w = cp.ascontiguousarray(q[:, :keep])
+    w = _dominant_left_basis(sens)
     a_nom = csp.csr_matrix((pre.nominal_data, pre.indices, pre.indptr), shape=(n_red, n_red))
     return w, cp.linalg.inv(w.T @ (a_nom @ w))
 

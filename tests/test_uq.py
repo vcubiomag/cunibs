@@ -453,6 +453,59 @@ def test_uq_sensitivity_basis_predicts_a_small_perturbation(cp, two_tissue_subje
         )
 
 
+def test_dominant_left_basis_matches_dense_svd(cp):
+    """The basis must span the same leading subspace a dense SVD of the tall matrix gives."""
+    from cunibs.uq.conductivity.run import _dominant_left_basis
+
+    m, n = 200_000, 9
+    # A steeply decaying spectrum, the regime a squared-condition-number route loses the tail in,
+    # plus two exact dependencies so the rank cutoff has something to cut.
+    a = cp.random.RandomState(0).standard_normal((m, n)) * cp.asarray(
+        [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1.0, 1.0]
+    )
+    a[:, 7] = a[:, 2]
+    a[:, 8] = a[:, 0] + a[:, 1]
+    a = cp.ascontiguousarray(a)
+
+    w = _dominant_left_basis(a)
+    assert w.shape == (m, 7), "two dependent columns must drop out"
+    assert w.flags.c_contiguous
+    np.testing.assert_allclose(cp.asnumpy(w.T @ w), np.eye(7), atol=1e-10)
+
+    # Every column of the input lies in the span, down to the 1e-6 one. A direction missing
+    # outright leaves its column's relative residual at ~1.
+    resid = a - w @ (w.T @ a)
+    rel = cp.linalg.norm(resid, axis=0) / cp.linalg.norm(a, axis=0)
+    assert float(cp.max(rel)) < 1e-8
+
+    # Two orthonormal bases of one subspace differ by a rotation, so compare the subspaces:
+    # each reference direction must lie in span(W).
+    u_ref = cp.asarray(np.linalg.svd(cp.asnumpy(a), full_matrices=False)[0][:, :7])
+    off = cp.linalg.norm(u_ref - w @ (w.T @ u_ref), axis=0)
+    assert float(cp.max(off)) < 1e-8
+
+
+def test_dominant_left_basis_workspace_stays_bounded(cp):
+    """The basis must not reserve a cuSOLVER workspace sized off the row count.
+
+    Pinned at a full head mesh's DOF count, not a toy one: the routines whose workspace scales
+    with rows only blow past this at that scale, and the card is already holding a subject.
+    """
+    from cunibs.uq.conductivity.run import _dominant_left_basis
+
+    n_rows = 881_455
+    pool = cp.get_default_memory_pool()
+    a = cp.random.RandomState(0).standard_normal((n_rows, 9))
+    pool.free_all_blocks()
+    before = pool.total_bytes()
+    w = _dominant_left_basis(a)
+    cp.cuda.Device().synchronize()
+    grew = pool.total_bytes() - before
+
+    assert w.shape == (n_rows, 9)
+    assert grew < 1 << 30, f"basis reserved {grew / 2**20:.0f} MiB of workspace"
+
+
 def test_uq_unreachable_tolerance_rebuilds_then_raises(fresh_subject, two_tissue_cube_mesh):
     """An unreachable tolerance makes each draw build a matched preconditioner, then fail loudly."""
     from cunibs import ConductivityUQConfig
