@@ -14,9 +14,12 @@ import cupy as cp
 
 from cunibs.fem.assembly import (
     TISSUE_CONDUCTIVITY,
-    assemble_stiffness,
+    as_int32_tets,
+    build_node2corner,
     conductivity_per_tet,
+    fill_stiffness_values,
     gradient_operator,
+    stiffness_pattern,
 )
 from cunibs.fem.solve import (
     DEFAULT_MAX_ITERS,
@@ -67,34 +70,6 @@ class ConductivityUQPrecompute:
         )
 
 
-def _reduced_data_for(
-    ctx: SolverContext,
-    g64: cp.ndarray,
-    vols: cp.ndarray,
-    cond: cp.ndarray,
-    idx: cp.ndarray,
-    template: cp.ndarray | None,
-    sel: cp.ndarray | None = None,
-) -> cp.ndarray:
-    """Assemble a stiffness with conductivity ``cond``, ground it, and align to the pattern.
-
-    ``template`` is a zero-valued CSR on the reference pattern; adding it forces the reference
-    ordering so every component's ``.data`` is index-aligned with ``base_data``. ``sel``
-    restricts the assembly to a subset of tets so each component touches only its own tets; the
-    subset pattern is ⊆ the reference, so the template still aligns it. ``g64``/``vols``/``tet_nodes``
-    are subset by ``sel`` while ``cond`` is passed already subset.
-    """
-    tet_nodes = ctx.tet_nodes
-    if sel is not None:
-        g64 = g64[sel]
-        vols = vols[sel]
-        tet_nodes = tet_nodes[sel]
-    k = reduce_matrix(assemble_stiffness(g64, vols, cond, ctx.n_nodes, tet_nodes), idx)
-    if template is None:
-        return k
-    return (template + k).data
-
-
 def build_conductivity_uq_precompute(
     ctx: SolverContext, perturbed_tags: tuple[int, ...]
 ) -> ConductivityUQPrecompute:
@@ -105,25 +80,36 @@ def build_conductivity_uq_precompute(
     # the one the forward solver's hierarchy was built on.
     idx = solve_ordering(ctx.nodes_mm, ground_node)
 
-    cond_nom = conductivity_per_tet(ctx.tet_tags)
-    k_ref = _reduced_data_for(ctx, g64, vols, cond_nom, idx, template=None)
-    zero_ref = k_ref.copy()
-    zero_ref.data[:] = 0.0
+    tets = as_int32_tets(ctx.tet_nodes)
+    n_nodes = int(ctx.n_nodes)
+    a_full = stiffness_pattern(tets, n_nodes, g64.dtype)
+    n2c_ptr, n2c_idx = build_node2corner(tets, n_nodes)
 
-    perturbed = cp.asarray(perturbed_tags)
-    tissue_data = cp.empty((len(perturbed_tags), k_ref.data.shape[0]), dtype=cp.float64)
+    # Grounding selects a submatrix of a pattern that never moves, so every reduced nonzero comes
+    # from exactly one full nonzero. Reducing a matrix whose values are their own positions
+    # recovers that map once, which turns every component into a refill plus a gather.
+    a_full.data[:] = cp.arange(a_full.nnz, dtype=g64.dtype)
+    k_ref = reduce_matrix(a_full, idx)
+    gather = cp.ascontiguousarray(k_ref.data.astype(cp.int32))
+    row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
+    col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
+    nnz_red = int(gather.shape[0])
+    del k_ref
+
+    def reduced_data_for(cond: cp.ndarray, out: cp.ndarray | None = None) -> cp.ndarray:
+        fill_stiffness_values(a_full, g64, vols, cond, tets, n2c_ptr, n2c_idx)
+        return cp.take(a_full.data, gather, out=out)
+
+    # Every component is assembled over the whole mesh with zero conductivity outside its own
+    # tets: the zeros keep the reference pattern and contribute nothing to its values.
+    tissue_data = cp.empty((len(perturbed_tags), nnz_red), dtype=cp.float64)
     for i, tag in enumerate(perturbed_tags):
-        sel = cp.where(ctx.tet_tags == tag)[0]
-        ones = cp.ones(sel.shape[0], dtype=cp.float64)  # unit-σ component for this tissue
-        tissue_data[i] = _reduced_data_for(
-            ctx, g64, vols, ones, idx, template=zero_ref, sel=sel
-        )
+        reduced_data_for((ctx.tet_tags == tag).astype(cp.float64), out=tissue_data[i])
 
-    base_sel = cp.where(~cp.isin(ctx.tet_tags, perturbed))[0]
-    base_cond = conductivity_per_tet(ctx.tet_tags[base_sel])
-    base_data = _reduced_data_for(
-        ctx, g64, vols, base_cond, idx, template=zero_ref, sel=base_sel
-    )
+    cond_nom = conductivity_per_tet(ctx.tet_tags)
+    perturbed_mask = cp.isin(ctx.tet_tags, cp.asarray(perturbed_tags))
+    base_data = reduced_data_for(cp.where(perturbed_mask, 0.0, cond_nom))
+    nominal_direct = reduced_data_for(cond_nom)
 
     nominal_sigma = cp.asarray(
         [TISSUE_CONDUCTIVITY[t] for t in perturbed_tags], dtype=cp.float64
@@ -131,13 +117,12 @@ def build_conductivity_uq_precompute(
 
     # Correctness gate: the linear model must reproduce the nominal direct assembly exactly.
     recon = base_data + nominal_sigma @ tissue_data
-    rel = float(cp.linalg.norm(recon - k_ref.data) / cp.linalg.norm(k_ref.data))
+    rel = float(cp.linalg.norm(recon - nominal_direct) / cp.linalg.norm(nominal_direct))
     if rel > 1e-10:
         raise RuntimeError(f"UQ stiffness decomposition mismatch (rel={rel:.2e})")
+    del nominal_direct
 
     nominal_data = cp.ascontiguousarray(recon)
-    row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
-    col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
 
     nominal_f32 = cp.ascontiguousarray(nominal_data.astype(cp.float32))
     precond = build_native_vcycle(row_ptr, col_idx, nominal_f32)

@@ -95,17 +95,16 @@ def test_uq_precompute_gate_fires_on_corruption(monkeypatch, two_tissue_subject)
     """Corrupting one component must trip the built-in decomposition gate."""
     import cunibs.uq.conductivity.assembly as uq_assembly
 
-    real = uq_assembly.assemble_stiffness
+    real = uq_assembly.fill_stiffness_values
     calls = {"n": 0}
 
-    def flaky(g, vols, cond, n_nodes, tet_nodes):
+    def flaky(a, g, vols, cond, tet_nodes, ptr, idx):
         calls["n"] += 1
-        out = real(g, vols, cond, n_nodes, tet_nodes)
-        if calls["n"] == 2:  # the first per-tissue component
-            out.data *= 1.05
-        return out
+        real(a, g, vols, cond, tet_nodes, ptr, idx)
+        if calls["n"] == 1:  # the first per-tissue component
+            a.data *= 1.05
 
-    monkeypatch.setattr(uq_assembly, "assemble_stiffness", flaky)
+    monkeypatch.setattr(uq_assembly, "fill_stiffness_values", flaky)
     with pytest.raises(RuntimeError, match="decomposition mismatch"):
         uq_assembly.build_conductivity_uq_precompute(two_tissue_subject.context, (2, 3))
 
