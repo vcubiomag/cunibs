@@ -63,6 +63,11 @@ def gradient_operator(
     return g, vols
 
 
+def as_int32_tets(tet_nodes: cp.ndarray) -> cp.ndarray:
+    """Contiguous int32 connectivity, the layout the solver kernels index with."""
+    return cp.ascontiguousarray(tet_nodes.astype(cp.int32, copy=False))
+
+
 def assemble_stiffness(
     g: cp.ndarray,
     vols: cp.ndarray,
@@ -74,34 +79,58 @@ def assemble_stiffness(
 
     K_e[i,j] = vol_e · σ_e · (∇λ_i · ∇λ_j).
 
-    Two passes. The first merges a COO of ones into the sparsity pattern, whose row and column
-    indices do not depend on the order duplicates were summed in; the second fills the values
-    with ``assemble_stiffness_values``, one thread per row over the node2corner map, which is
-    what fixes the summation order. Values from the merge itself would not be reproducible.
+    Two passes: ``stiffness_pattern`` merges a COO of ones into row and column indices that do
+    not depend on the order duplicates were summed in, then ``fill_stiffness_values`` writes the
+    values one thread per row over the node2corner map, which is what fixes the summation order.
+    Values taken from the merge itself would not be reproducible.
+    """
+    tets = as_int32_tets(tet_nodes)
+    a = stiffness_pattern(tets, n_nodes, g.dtype)
+    ptr, idx = build_node2corner(tets, n_nodes)
+    fill_stiffness_values(a, g, vols, cond, tets, ptr, idx)
+    return a
+
+
+def stiffness_pattern(tet_nodes: cp.ndarray, n_nodes: int, dtype: cp.dtype) -> csp.csr_matrix:
+    """Zero-valued CSR sparsity pattern of the stiffness matrix.
+
+    The pattern depends only on connectivity, so a caller assembling several matrices over one
+    mesh builds it once and refills ``.data`` per conductivity with ``fill_stiffness_values``.
 
     Tiling limits temporary COO storage and the memory used to merge duplicate entries.
-    The solver kernels index with int32.
     """
-    tets = cp.ascontiguousarray(tet_nodes.astype(cp.int32, copy=False))
-    n_tet = tets.shape[0]
-    a = csp.csr_matrix((n_nodes, n_nodes), dtype=g.dtype)
-    for lo in range(0, n_tet, STIFFNESS_TILE_TETS):
-        tn = tets[lo : lo + STIFFNESS_TILE_TETS]
+    a = csp.csr_matrix((n_nodes, n_nodes), dtype=dtype)
+    for lo in range(0, tet_nodes.shape[0], STIFFNESS_TILE_TETS):
+        tn = tet_nodes[lo : lo + STIFFNESS_TILE_TETS]
         rows = cp.broadcast_to(tn[:, :, None], (tn.shape[0], 4, 4)).ravel()
         cols = cp.broadcast_to(tn[:, None, :], (tn.shape[0], 4, 4)).ravel()
         block = csp.coo_matrix(
-            (cp.ones(rows.size, dtype=g.dtype), (rows, cols)), shape=(n_nodes, n_nodes)
+            (cp.ones(rows.size, dtype=dtype), (rows, cols)), shape=(n_nodes, n_nodes)
         ).tocsr()
         a = a + block
         del tn, rows, cols, block
     a.sum_duplicates()
     a.sort_indices()
+    return a
 
-    ptr, idx = build_node2corner(tets, n_nodes)
+
+def fill_stiffness_values(
+    a: csp.csr_matrix,
+    g: cp.ndarray,
+    vols: cp.ndarray,
+    cond: cp.ndarray,
+    tet_nodes: cp.ndarray,
+    ptr: cp.ndarray,
+    idx: cp.ndarray,
+) -> None:
+    """Overwrite ``a.data`` in place with the values for conductivity ``cond``.
+
+    ``a`` keeps whatever pattern it already holds; ``ptr``/``idx`` are the mesh's node2corner CSR.
+    """
     assemble_stiffness_values(
         cp.ascontiguousarray(g),
         cp.ascontiguousarray(vols * cond),
-        tets,
+        tet_nodes,
         ptr,
         idx,
         a.indptr,
@@ -109,7 +138,6 @@ def assemble_stiffness(
         a.data,
         cp.cuda.get_current_stream().ptr,
     )
-    return a
 
 
 def build_node2corner(tet_nodes: cp.ndarray, n_nodes: int) -> tuple[cp.ndarray, cp.ndarray]:
