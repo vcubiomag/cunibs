@@ -98,6 +98,17 @@ def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return p
 
 
+def _scratch_pool() -> cp.cuda.MemoryPool:
+    """A pool for chunk-scoped temporaries, with the default pool's free blocks handed back.
+
+    A fresh pool cannot draw on blocks the default pool is holding free, so whatever the caller's
+    setup churned through would stay stranded for as long as the scratch pool lives. On a full
+    head mesh that is several GB the scratch pool needs.
+    """
+    cp.get_default_memory_pool().free_all_blocks()
+    return cp.cuda.MemoryPool()
+
+
 def _sites(placements: Sequence[Placement], method: str) -> list[Placement]:
     if isinstance(placements, Placement):
         raise TypeError(
@@ -412,7 +423,7 @@ class Subject:
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
-        temp_pool = cp.cuda.MemoryPool()
+        temp_pool = _scratch_pool()
         try:
             for start in range(0, len(sites), chunk_k):
                 chunk = sites[start : start + chunk_k]
@@ -552,7 +563,7 @@ class Subject:
         # Outside the pool below, for the same reason the precompute is: the patch weights are
         # cached on the context and outlive the placement that first asked for them.
         op = self._recovery_operator(recovery)
-        temp_pool = cp.cuda.MemoryPool()
+        temp_pool = _scratch_pool()
         try:
             for site in sites:
                 with cp.cuda.using_allocator(temp_pool.malloc):
