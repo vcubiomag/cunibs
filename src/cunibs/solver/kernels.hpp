@@ -60,14 +60,11 @@ void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const
 // c = 4e + i encoding rhs.cu uses; the harmonic ones take a CSR of patch nodes. Either way the
 // per-slot reduction order is fixed by the CSR's build.
 
-// keys must hold 4 * n_tet entries. Writes one sorted-and-packed node triple per tet face; the
-// caller sorts them and passes them to launch_boundary_mark. Requires n_nodes <= 2^21.
-void launch_face_keys(const int* tet_nodes, std::uint64_t* keys, int n_tet, cudaStream_t stream);
-
-// keys must be sorted. Sets is_boundary[n] = 1 for every node of a face that only one tet owns;
-// entries for other nodes are left alone, so is_boundary arrives zeroed.
-void launch_boundary_mark(const std::uint64_t* keys, int n_keys, int* is_boundary,
-                          cudaStream_t stream);
+// Sets is_boundary[n] = 1 for every node of a face that only one tet owns; entries for other nodes
+// are left alone, so is_boundary arrives zeroed. ptr/idx is rhs.cu's node2corner map, over which
+// a face's owners are counted from the incidence list of one of its nodes.
+void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int* idx,
+                                int* is_boundary, int n_tet, cudaStream_t stream);
 
 // One scalar weight per corner, from a linear least-squares fit over each slot's patch.
 // slot_node may be null when a slot is a node. is_boundary may be null to fit every slot.

@@ -55,11 +55,11 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 import cupy as cp
 
+from cunibs.fem.assembly import build_node2corner
 from cunibs.solver import (
-    boundary_mark,
-    face_keys,
     hpr_grad,
     hpr_weights,
+    mark_outer_boundary,
     recover_elements,
     recover_nodes,
     spr_weights,
@@ -99,11 +99,6 @@ TISSUE_SLOT_MODES: tuple[Recovery, ...] = ("spr_tissue", "harmonic")
 #: Modes that consume the nodal potential rather than the per-element field.
 POTENTIAL_MODES: tuple[Recovery, ...] = ("harmonic",)
 
-# Node ids are packed three to a uint64 face key, so a mesh may carry at most 2^21 - 1 of them.
-# Reuses the width solve_ordering's Morton keys already assume.
-_ID_BITS = 21
-_MAX_PACKABLE_NODES = 1 << _ID_BITS
-
 
 def validate_recovery(recovery: str) -> Recovery:
     """Normalise and check a recovery mode."""
@@ -114,33 +109,27 @@ def validate_recovery(recovery: str) -> Recovery:
     return recovery
 
 
-def outer_boundary_nodes(tet_nodes: cp.ndarray, n_nodes: int) -> cp.ndarray:
+def outer_boundary_nodes(
+    tet_nodes: cp.ndarray,
+    n_nodes: int,
+    node2corner: tuple[cp.ndarray, cp.ndarray] | None = None,
+) -> cp.ndarray:
     """Mark nodes lying on the outer boundary of the tetrahedral volume.
 
-    A boundary face is one that only a single tetrahedron owns, so the faces are packed into
-    sorted uint64 keys, sorted, and the runs of length one are read off.
+    A boundary face is one that only a single tetrahedron owns, and every owner of a face holds
+    each of its three nodes, so the owners are counted by walking one node's segment of the
+    node-to-corner incidence CSR. ``node2corner`` is that CSR, ``build_node2corner``'s result;
+    pass it when the caller already holds one, otherwise it is built here.
 
     ``mesh.skin_tris`` is not a substitute: it carries surface tag 1005 alone, while the
     volume's boundary also includes whatever the loader's volume-tag filtering exposed.
     """
-    if n_nodes >= _MAX_PACKABLE_NODES:
-        raise ValueError(
-            f"Recovery packs node ids into {_ID_BITS} bits, so it supports meshes up to "
-            f"{_MAX_PACKABLE_NODES - 1} nodes; this one has {n_nodes}."
-        )
     is_boundary = cp.zeros(n_nodes, dtype=cp.int32)
-    n_tet = int(tet_nodes.shape[0])
-    if n_tet == 0:
+    if int(tet_nodes.shape[0]) == 0:
         return is_boundary
 
-    stream = cp.cuda.get_current_stream().ptr
-    keys = cp.empty(n_tet * 4, dtype=cp.uint64)
-    face_keys(tet_nodes, keys, stream)
-    # cp.sort rather than cp.unique(return_counts=True): unique would additionally hold a mask
-    # and two index arrays, roughly doubling a peak that is already 158 MB of keys on a 5M-tet
-    # mesh. The run-length pass reads the counts straight off the sorted keys instead.
-    keys = cp.sort(keys)
-    boundary_mark(keys, is_boundary, stream)
+    ptr, idx = node2corner if node2corner is not None else build_node2corner(tet_nodes, n_nodes)
+    mark_outer_boundary(tet_nodes, ptr, idx, is_boundary, cp.cuda.get_current_stream().ptr)
     return is_boundary
 
 
@@ -377,7 +366,9 @@ def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
         slot_tag = None
         slot_arg = None
 
-    is_boundary = outer_boundary_nodes(ctx.tet_nodes, n_nodes)
+    is_boundary = outer_boundary_nodes(
+        ctx.tet_nodes, n_nodes, node2corner=(ctx.node2corner_ptr, ctx.node2corner_idx)
+    )
     w = cp.empty(int(idx.shape[0]), dtype=cp.float32)
     counter = cp.zeros(1, dtype=cp.int32)
     spr_weights(

@@ -20,8 +20,6 @@ using f64_cuda_2d = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::c
 using f64_cuda_3d = nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
 using i32_cuda = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 
-using u64_cuda = nb::ndarray<uint64_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
-
 using f32_cuda_1d = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
 using f32_cuda_2d = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 using f32_cuda_3d = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
@@ -330,28 +328,26 @@ NB_MODULE(_solver_ext, m) {
         "Element-centric E/magnE reconstruction; writes into caller-allocated e_out/magn_out.");
 
     m.def(
-        "face_keys",
-        [](i32_cuda_2d tet_nodes, u64_cuda keys, uintptr_t stream) {
+        "mark_outer_boundary",
+        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda is_boundary,
+           uintptr_t stream) {
             const int n_tet = static_cast<int>(tet_nodes.shape(0));
-            if (keys.shape(0) != static_cast<size_t>(n_tet) * 4) {
-                throw std::invalid_argument("face_keys: keys must hold 4 * n_tet entries");
+            if (idx.shape(0) != static_cast<size_t>(n_tet) * 4) {
+                throw std::invalid_argument(
+                    "mark_outer_boundary: idx must hold one entry per tet corner");
             }
-            launch_face_keys(tet_nodes.data(), keys.data(), n_tet,
-                             reinterpret_cast<cudaStream_t>(stream));
+            if (ptr.shape(0) != is_boundary.shape(0) + 1) {
+                throw std::invalid_argument(
+                    "mark_outer_boundary: ptr must hold n_nodes + 1 entries");
+            }
+            launch_mark_outer_boundary(tet_nodes.data(), ptr.data(), idx.data(),
+                                       is_boundary.data(), n_tet,
+                                       reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("tet_nodes").noconvert(), nb::arg("keys").noconvert(), nb::arg("stream"),
-        "Packed, per-face sorted node triples for outer-boundary detection; needs "
-        "n_nodes <= 2^21.");
-
-    m.def(
-        "boundary_mark",
-        [](u64_cuda keys, i32_cuda is_boundary, uintptr_t stream) {
-            launch_boundary_mark(keys.data(), static_cast<int>(keys.shape(0)), is_boundary.data(),
-                                 reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::arg("keys").noconvert(), nb::arg("is_boundary").noconvert(), nb::arg("stream"),
-        "Mark nodes of faces owned by exactly one tet. keys must be sorted; is_boundary is "
-        "only ever set, so it arrives zeroed.");
+        nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("is_boundary").noconvert(), nb::arg("stream"),
+        "Mark the nodes of every face owned by exactly one tet, counted over the node2corner "
+        "incidence CSR. is_boundary is only ever set, so it arrives zeroed.");
 
     m.def(
         "spr_weights",

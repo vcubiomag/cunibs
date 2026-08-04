@@ -311,7 +311,8 @@ def grounded_index(n: int, ground_node: int) -> cp.ndarray:
 
 
 # Morton keys quantise to a 2^21 grid per axis, which is the most that fits three ways into a
-# 64-bit key and is far finer than any mesh's node spacing.
+# 64-bit key and is far finer than any mesh's node spacing. _spread3's masks are written for that
+# width rather than derived from it, so changing this constant alone would be silently wrong.
 _MORTON_BITS = 21
 
 

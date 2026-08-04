@@ -27,17 +27,22 @@ namespace {
 // legitimately anisotropic patch while catching the near-degenerate ones.
 constexpr double kMaxLebesgue = 8.0;
 
-// Node ids pack three to a uint64 face key, matching the width solve_ordering's Morton keys use.
-constexpr int kIdBits = 21;
-constexpr std::uint64_t kIdMask = (1ULL << kIdBits) - 1ULL;
-
 // --- outer-boundary detection ---------------------------------------------------------------
 
 // One thread per face. The four faces of a tet are its four 3-subsets of local corners; which
 // subset maps to which face does not matter, only that every tet enumerates the same four.
-// Node ids are sorted within the face so the two tets sharing a face produce an identical key.
-__global__ void face_keys_kernel(const int* __restrict__ tet_nodes,
-                                 std::uint64_t* __restrict__ keys, int n_face) {
+//
+// A face is on the outer boundary when exactly one tet owns it. Every owner of face (n, p, q)
+// holds n, so every owner sits in n's segment of the node2corner CSR and counting them is one
+// walk of that segment.
+//
+// Marking is idempotent (every writer stores 1), so the concurrent stores race benignly and need
+// no atomic. The count does not depend on the order the segment is walked, so nothing here rests
+// on build_node2corner's stable sort.
+__global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
+                                           const int* __restrict__ ptr,
+                                           const int* __restrict__ idx,
+                                           int* __restrict__ is_boundary, int n_face) {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f >= n_face) return;
     const int e = f >> 2, skip = f & 3;
@@ -48,29 +53,31 @@ __global__ void face_keys_kernel(const int* __restrict__ tet_nodes,
     for (int i = 0; i < 4; ++i) {
         if (i != skip) a[m++] = tet_nodes[e * 4 + i];
     }
-    // Three compare-swaps sort three values.
-    if (a[0] > a[1]) { const int t = a[0]; a[0] = a[1]; a[1] = t; }
-    if (a[1] > a[2]) { const int t = a[1]; a[1] = a[2]; a[2] = t; }
-    if (a[0] > a[1]) { const int t = a[0]; a[0] = a[1]; a[1] = t; }
 
-    keys[f] = (static_cast<std::uint64_t>(a[0]) << (2 * kIdBits)) |
-              (static_cast<std::uint64_t>(a[1]) << kIdBits) |
-              static_cast<std::uint64_t>(a[2]);
-}
+    // Rotate the shortest incidence list into the pivot slot with scalar selects: indexing a[] by
+    // a runtime value would spill the triple out of registers into local memory.
+    int n = a[0], p = a[1], q = a[2];
+    int len = ptr[a[0] + 1] - ptr[a[0]];
+    const int len1 = ptr[a[1] + 1] - ptr[a[1]];
+    if (len1 < len) { len = len1; n = a[1]; p = a[2]; q = a[0]; }
+    const int len2 = ptr[a[2] + 1] - ptr[a[2]];
+    if (len2 < len) { len = len2; n = a[2]; p = a[0]; q = a[1]; }
 
-// One thread per sorted key. A face on the outer boundary of the tet volume belongs to exactly
-// one tet, so its key forms a run of length one. Marking is idempotent (every writer stores 1),
-// so the concurrent stores race benignly and need no atomic.
-__global__ void boundary_mark_kernel(const std::uint64_t* __restrict__ keys, int n_keys,
-                                     int* __restrict__ is_boundary) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_keys) return;
-    const std::uint64_t k = keys[i];
-    if (i > 0 && keys[i - 1] == k) return;
-    if (i + 1 < n_keys && keys[i + 1] == k) return;
-    is_boundary[static_cast<int>(k >> (2 * kIdBits))] = 1;
-    is_boundary[static_cast<int>((k >> kIdBits) & kIdMask)] = 1;
-    is_boundary[static_cast<int>(k & kIdMask)] = 1;
+    // Only "exactly one" against "more than one" matters, so the walk stops at the second owner.
+    const int begin = ptr[n], end = begin + len;
+    int owners = 0;
+    for (int k = begin; k < end && owners < 2; ++k) {
+        // A 16-byte load: tet_nodes is one contiguous 4 * n_tet block, so a tet's four ids never
+        // straddle the boundary and the base is an allocation start rather than a strided view.
+        const int4 t = *reinterpret_cast<const int4*>(tet_nodes + (idx[k] >> 2) * 4);
+        owners += (t.x == p || t.y == p || t.z == p || t.w == p) &&
+                  (t.x == q || t.y == q || t.z == q || t.w == q);
+    }
+    if (owners != 1) return;
+
+    is_boundary[n] = 1;
+    is_boundary[p] = 1;
+    is_boundary[q] = 1;
 }
 
 // --- patch fitting --------------------------------------------------------------------------
@@ -492,18 +499,12 @@ PtrPack pack(float* const* src, int k) {
 
 }  // namespace
 
-void launch_face_keys(const int* tet_nodes, std::uint64_t* keys, int n_tet, cudaStream_t stream) {
+void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int* idx,
+                                int* is_boundary, int n_tet, cudaStream_t stream) {
     const std::int64_t n_face = static_cast<std::int64_t>(n_tet) * 4;
     if (const unsigned blocks = grid_for(n_face)) {
-        face_keys_kernel<<<blocks, kBlock, 0, stream>>>(tet_nodes, keys,
-                                                        static_cast<int>(n_face));
-    }
-}
-
-void launch_boundary_mark(const std::uint64_t* keys, int n_keys, int* is_boundary,
-                          cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_keys)) {
-        boundary_mark_kernel<<<blocks, kBlock, 0, stream>>>(keys, n_keys, is_boundary);
+        mark_outer_boundary_kernel<<<blocks, kBlock, 0, stream>>>(
+            tet_nodes, ptr, idx, is_boundary, static_cast<int>(n_face));
     }
 }
 
