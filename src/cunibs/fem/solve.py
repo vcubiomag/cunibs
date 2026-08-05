@@ -615,6 +615,9 @@ class SolverContext:
     g: cp.ndarray
     wg: cp.ndarray
     vols: cp.ndarray
+    # Where every metric and ROI locates an element. HeadMesh computes the same thing on the
+    # host, which costs a second on a head mesh, so device consumers take it from here.
+    tet_barycenters_mm: cp.ndarray
     neg_vc: cp.ndarray
     solver: GroundedSolver
     node2corner_ptr: cp.ndarray
@@ -680,6 +683,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     vols = cp.ascontiguousarray(vols.astype(cp.float32))
     del cond
     ptr, idx = build_node2corner(tet_nodes, mesh.n_nodes)
+    barycenters = cp.ascontiguousarray(nodes_mm[tet_nodes].mean(axis=1))
 
     skin_a = cp.ascontiguousarray(nodes_mm[skin_tris[:, 0]])
     skin_b = cp.ascontiguousarray(nodes_mm[skin_tris[:, 1]])
@@ -694,6 +698,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         g,
         wg,
         vols,
+        barycenters,
         neg_vc,
         solver,
         ptr,

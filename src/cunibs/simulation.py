@@ -298,7 +298,7 @@ class Subject:
             if cached is None:
                 ctx = self.context
                 cached = metrics.region_slice(
-                    ctx.vols, cp.asarray(ctx.mesh.tet_barycenters_mm), ctx.tet_tags, region
+                    ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, region
                 )
                 self._region_slices[region] = cached
             return cached
@@ -312,7 +312,7 @@ class Subject:
                 self._host_metrics = (
                     cp.asnumpy(ctx.vols),
                     cp.asnumpy(ctx.tet_tags),
-                    np.asarray(ctx.mesh.tet_barycenters_mm),
+                    cp.asnumpy(ctx.tet_barycenters_mm),
                 )
             return self._host_metrics
 

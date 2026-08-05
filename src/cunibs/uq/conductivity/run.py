@@ -306,7 +306,7 @@ def run_conductivity_uq(
 
     gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
     vols_gm = ctx.vols[gm_idx].astype(cp.float64)
-    bary_gm = cp.asarray(ctx.mesh.tet_barycenters_mm)[gm_idx]
+    bary_gm = ctx.tet_barycenters_mm[gm_idx]
     anchor_q = cp.asarray([metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0], dtype=cp.float64)
     roi_names = list(record_rois)
     probes = [
@@ -375,7 +375,7 @@ def run_conductivity_uq(
         sigma_samples=cp.asnumpy(sigmas),
         vols=ctx.vols,
         tet_tags=ctx.tet_tags,
-        barycenters_mm=cp.asarray(ctx.mesh.tet_barycenters_mm),
+        barycenters_mm=ctx.tet_barycenters_mm,
         placement=placement,
         coil_name=coil.name,
         didt=didt,

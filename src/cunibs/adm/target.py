@@ -71,7 +71,7 @@ class ResolvedTarget:
 
 def resolve_target(ctx: SolverContext, target: Target) -> ResolvedTarget:
     """Map a :class:`Target` to ROI elements, weights, and adjoint directions."""
-    barys = cp.asarray(ctx.mesh.tet_barycenters_mm)
+    barys = ctx.tet_barycenters_mm
     mask = region_mask(ctx.tet_tags, target.region)
     region_ids = cp.where(mask)[0].astype(cp.int32)
     if region_ids.shape[0] == 0:
