@@ -50,8 +50,7 @@ if TYPE_CHECKING:
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
 
-# Stopping criterion of the mixed PCG: ||r||_2 / ||b||_2 <= DEFAULT_TOLERANCE. At 1e-6 the
-# field is accurate to ~1.4e-6 relative against a 1e-10 reference, at ~59 iterations.
+# Stopping criterion of the mixed PCG: ||r||_2 / ||b||_2 <= DEFAULT_TOLERANCE.
 DEFAULT_TOLERANCE = 1e-6
 DEFAULT_MAX_ITERS = 2000
 
@@ -59,9 +58,9 @@ DEFAULT_MAX_ITERS = 2000
 def _csr_f32(a: csp.csr_matrix) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """``(indptr, indices, data)`` in the int32/fp32 layout the native kernels take."""
     return (
-        cp.ascontiguousarray(a.indptr, dtype=cp.int32),
-        cp.ascontiguousarray(a.indices, dtype=cp.int32),
-        cp.ascontiguousarray(a.data, dtype=cp.float32),
+        a.indptr.astype(cp.int32, copy=False),
+        a.indices.astype(cp.int32, copy=False),
+        a.data.astype(cp.float32, copy=False),
     )
 
 
@@ -78,8 +77,7 @@ def _l1_dinv(a: csp.csr_matrix) -> cp.ndarray:
 
     The row sum is a kernel rather than an SpMV of ``|a|`` against a vector of ones so that its
     summation order is fixed by the CSR: dinv scales every entry of the smoothed prolongator and
-    is uploaded to every V-cycle level, so any drift in it reaches the whole hierarchy.
-    See l1.cu.
+    reaches every V-cycle level, so any drift in it reaches the whole hierarchy. See l1.cu.
     """
     dinv = cp.empty(a.shape[0], dtype=cp.float32)
     l1_dinv(*_csr_f32(a), dinv, cp.cuda.get_current_stream().ptr)
@@ -161,8 +159,7 @@ class SmootherParams:
 
     ``degree`` is how many terms the polynomial runs. Degree 1 is relaxed Jacobi at the
     interval's optimal weight; each further degree adds one SpMV-shaped kernel per level per
-    sweep, and degree 2 buys back more than that in iterations. Cost is flat in ``lower_ratio``
-    from 8 to 12 and rises either side, gently.
+    sweep, and degree 2 buys back more than that in iterations.
     """
 
     degree: int = 2
@@ -278,20 +275,9 @@ def build_native_vcycle(
         a, p = level.a, level.p
         r = p.T.tocsr()
         r.sort_indices()
-        vc.add_level(
-            cp.ascontiguousarray(a.indptr.astype(cp.int32)),
-            cp.ascontiguousarray(a.indices.astype(cp.int32)),
-            cp.ascontiguousarray(a.data.astype(cp.float32)),
-            _l1_dinv(a),
-            cp.ascontiguousarray(p.indptr.astype(cp.int32)),
-            cp.ascontiguousarray(p.indices.astype(cp.int32)),
-            cp.ascontiguousarray(p.data.astype(cp.float32)),
-            cp.ascontiguousarray(r.indptr.astype(cp.int32)),
-            cp.ascontiguousarray(r.indices.astype(cp.int32)),
-            cp.ascontiguousarray(r.data.astype(cp.float32)),
-        )
+        vc.add_level(*_csr_f32(a), _l1_dinv(a), *_csr_f32(p), *_csr_f32(r))
     ainv = cp.linalg.inv(coarse.todense().astype(cp.float32))
-    vc.set_coarse(cp.ascontiguousarray(ainv.astype(cp.float32)))
+    vc.set_coarse(cp.ascontiguousarray(ainv))
     vc.finalize()
     return vc
 
@@ -437,10 +423,10 @@ def prepare_grounded_solver(
     n = a.shape[0]
     idx = solve_ordering(nodes_mm, ground_node)
     a_red = reduce_matrix(a, idx)
-    row_ptr = cp.ascontiguousarray(a_red.indptr.astype(cp.int32))
-    col_idx = cp.ascontiguousarray(a_red.indices.astype(cp.int32))
-    values = cp.ascontiguousarray(a_red.data.astype(cp.float64))
-    values_f32 = cp.ascontiguousarray(values.astype(cp.float32))
+    row_ptr = a_red.indptr.astype(cp.int32, copy=False)
+    col_idx = a_red.indices.astype(cp.int32, copy=False)
+    values = a_red.data.astype(cp.float64, copy=False)
+    values_f32 = values.astype(cp.float32)
     precond = build_native_vcycle(row_ptr, col_idx, values_f32)
     pcg = PcgAmgSolver(row_ptr, col_idx, values)
     return GroundedSolver(
@@ -482,9 +468,9 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
     return v
 
 
-# Compiled block widths of the k-RHS solve kernels; smaller batches pad up by
-# replicating the last column. The padded column costs bandwidth but no extra matrix reads.
-# Read from the extension rather than restated, so adding a width is a one-place change.
+# Compiled block widths of the k-RHS solve kernels; smaller batches pad up by replicating the
+# last column, which costs bandwidth but no extra matrix reads. Read from the extension rather
+# than restated, so adding a width is a one-place change.
 BLOCK_SIZES = _BLOCK_SIZES
 MAX_BLOCK = BLOCK_SIZES[-1]
 
@@ -872,8 +858,7 @@ def solve_placements_block(
         stream,
     )
 
-    B = cp.ascontiguousarray(b_block[solver.idx, :].astype(cp.float64))
-    B_pad = _pad_block(B, k)
+    B_pad = _pad_block(b_block[solver.idx, :].astype(cp.float64), k)
     X = _solve_grounded_block_mat(solver, B_pad, k)
 
     v_block = cp.zeros((solver.n, k), dtype=cp.float64)

@@ -6,8 +6,8 @@
 // Two rounds of handshaking matching: round 1 forms pairs, round 2 merges pairs into quads,
 // then leftovers join their strongest aggregated neighbour.
 //
-// Upstream is github.com/srimanachanta/AMGX at b1e30c1, the commit this was ported from and
-// the one every AMGx reference below names a file in. The tree itself is no longer vendored.
+// Upstream is github.com/srimanachanta/AMGX at b1e30c1, the commit every AMGx reference in this
+// directory names a file in.
 //
 // Every row's entry is written by a single thread, from candidates combined under an
 // associative rule, so the map is independent of block and grid geometry and reproducible run

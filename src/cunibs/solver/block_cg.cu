@@ -13,16 +13,13 @@
 namespace {
 
 // Threads cooperating on one row in the strided SpMV. The reduced stiffness has ~14 nnz/row
-// (P1 tets), so eight threads cover a row in a couple of strided steps. This is the fp64 outer
-// operator; vcycle.cu tunes its fp32 counterpart separately and lands on 4 for every K.
+// (P1 tets), so eight threads cover a row in a couple of strided steps. vcycle.cu tunes its
+// fp32 counterpart separately.
 constexpr int kTpr = 8;
 
-// Blocks-per-SM floor for both fp64 SpMV kernels, which is what bounds the register budget
-// ptxas will spend. Both are purely bandwidth-bound and want the residency for latency hiding;
-// six buys the strided kernel 40 registers per thread. Left to the default floor ptxas unrolls
-// until a wide instantiation fits only two blocks per SM, which costs more than the unrolling
-// wins. The column-lane kernel needs the floor just as much, since it holds kTpr fp64 partials
-// per thread where the strided one spreads them across lanes.
+// Blocks-per-SM floor for both fp64 SpMV kernels, which is what bounds the register budget ptxas
+// will spend. Both are bandwidth-bound and want the residency for latency hiding; without the
+// floor ptxas unrolls a wide instantiation until only two blocks fit per SM.
 constexpr int kSpmvMinBlocks = 6;
 
 template <int K>
@@ -62,20 +59,15 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 //
 // The strided form above gives each thread a K-wide accumulator, so it issues K separate
 // eight-byte loads at x[col * K + c] per nonzero, to addresses unrelated to its warp
-// neighbours'. A warp then generates up to 32 distinct wavefronts for data occupying eight, and
-// the kernel saturates L1 request throughput well before DRAM: 91% of the STREAM ceiling at
-// k=1 against 39% at k=8. Morton ordering cannot rescue it, having been tuned so the k=1 gather
-// is cache-resident while the per-row working set here is K times larger.
-//
-// Giving each lane one column instead makes col_idx[j] and vals[j] broadcasts across a row's K
-// lanes, and turns the gather into one coalesced wavefront. Below K = 4 the strided form still
-// wins, because two lanes per row cannot hide the row loop.
+// neighbours'. A warp then generates up to 32 distinct wavefronts for data occupying eight and
+// the kernel saturates L1 request throughput well before DRAM. Giving each lane one column
+// instead makes col_idx[j] and vals[j] broadcasts across a row's K lanes and turns the gather
+// into one coalesced wavefront. Below K = 4 the strided form still wins, because two lanes per
+// row cannot hide the row loop.
 //
 // A lane owns its column outright, so no cross-lane reduction is needed, but it still carries the
-// strided kernel's kTpr accumulators and combines them with the same tree. The summation order is
-// part of the answer: which kernel runs is a throughput choice, and block_k must not move a
-// result. Holding the partials in registers rather than across lanes costs kTpr doubles per
-// thread and changes nothing about the loads.
+// strided kernel's kTpr accumulators and combines them with the same tree: which kernel runs is a
+// throughput choice, and block_k must not move a result.
 template <int K>
 __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     bcsrmv_f64_collane_kernel(int n, const int* __restrict__ row_ptr,
@@ -210,8 +202,7 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
 //
 // Freezing on the device rather than by skipping launches on the host is what keeps the CG body
 // replayable as a captured graph: the kernels are the same every iteration and only the mask's
-// contents change. A null mask means no column is frozen, which is what the single-RHS solve
-// passes.
+// contents change. A null mask means no column is frozen, which the single-RHS solve passes.
 __device__ __forceinline__ bool frozen(const double* __restrict__ converged, int c) {
     return converged != nullptr && converged[c] != 0.0;
 }
@@ -280,9 +271,8 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
     bcg_block_reduce_cols<K>(rloc, partials, n_blocks);
 }
 
-// The preconditioned residual never needs an fp64 materialization: consumers cast the
-// fp32 zf on the fly (exact float->double), saving a full (n, k) fp64 write + read
-// per iteration.
+// The preconditioned residual is never materialized in fp64: consumers cast the fp32 zf on the
+// fly, which is exact.
 template <int K>
 __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
                                     const double* __restrict__ r,

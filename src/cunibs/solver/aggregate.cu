@@ -26,16 +26,13 @@ __device__ __forceinline__ unsigned int agg_hash(unsigned int a, unsigned int se
     return a;
 }
 
-// The strongest neighbour of a row: the lexicographic maximum of (weight, column) starting
-// from (0, -1). Every row scan below is that same fold, so the tie-break (highest column
-// index wins) lives in one place.
+// The strongest neighbour of a row: the lexicographic maximum of (weight, column) starting from
+// (0, -1). Every row scan below is that same fold, so the tie-break (highest column index wins)
+// lives in one place.
 //
-// Deliberately one thread per row rather than a warp fraction as in vcycle.cu. Consecutive
-// CSR rows are contiguous, so a warp already walks a contiguous span and these kernels
-// already run near peak bandwidth; splitting a row across lanes buys tighter per-instruction
-// coalescing and pays for it in shuffles. On an 8M-row 7-point stencil that was a 70% loss
-// at 8 lanes per row and 11% at 2, and only rows well denser than these levels carry broke
-// even.
+// One thread per row rather than a warp fraction as in vcycle.cu: consecutive CSR rows are
+// contiguous, so a warp already walks a contiguous span and these kernels run near peak
+// bandwidth. Splitting a row across lanes would pay in shuffles for coalescing it already has.
 struct Best {
     float w;
     int col;
@@ -101,12 +98,11 @@ __global__ __launch_bounds__(kBlock) void agg_diag_kernel(int n, const int* __re
 }
 
 // w_ij = |a_ij| / max(|a_ii|, |a_jj|), then AMGx's uniform-weight perturbation
-// (common_selector.h), which is unconditional upstream. Dropping it costs
-// bit-exactness at scale: sub-001 lands on 208827 aggregates instead of 208828.
+// (common_selector.h), which breaks ties between equal-weight edges.
 //
-// The entries the matching skips, the diagonal and the columns past the row count, are set
-// to -1 here rather than by a separate fill pass over all nnz: the rows of a valid CSR cover
-// every j in [0, nnz) exactly once, so `w` ends up fully written either way.
+// The entries the matching skips, the diagonal and the columns past the row count, are set to -1
+// here rather than by a separate fill pass over all nnz: the rows of a valid CSR cover every j in
+// [0, nnz) exactly once, so `w` ends up fully written either way.
 __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
     int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
     const float* __restrict__ values, const float* __restrict__ diag, float* __restrict__ w) {
@@ -129,10 +125,9 @@ __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
     }
 }
 
-// Round 1: strongest unassigned neighbour. The absent else-branch is deliberate: leaving a
-// stale `strongest` lets a row that momentarily sees no unassigned neighbour still match on
-// its last proposal. Resetting it here measured 4.34 -> 3.68 coarsening and +35% PCG
-// iterations on the test patch.
+// Round 1: strongest unassigned neighbour. The absent else-branch is deliberate: leaving a stale
+// `strongest` lets a row that momentarily sees no unassigned neighbour still match on its last
+// proposal, which is worth a markedly coarser hierarchy.
 __global__ __launch_bounds__(kBlock) void agg_find_strongest_nomerge_kernel(
     int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
     const float* __restrict__ w, const int* __restrict__ partner, int* __restrict__ strongest) {

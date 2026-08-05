@@ -1,6 +1,6 @@
 """Direct unit tests for the native ``cunibs.solver`` kernels.
 
-Every kernel here was previously reached only through a full solve, where a wrong answer
+Every kernel here is otherwise reached only through a full solve, where a wrong answer
 only shows up if it is large enough to move a field norm. These call each binding on small
 hand-built inputs and compare against a NumPy transcription of the kernel's own documented
 formula, so an indexing or scaling error is caught at the kernel rather than at the pipeline.

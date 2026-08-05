@@ -22,9 +22,8 @@ Nodes on the outer boundary of the tetrahedral volume take a volume-weighted ave
 which is also a scalar per corner, so one array covers both rules.
 
 The fit runs in the node-centred, radius-scaled frame ``[1, (b_e - x_n) / h]``. That is an
-affine change of basis, so the recovered value is unchanged in exact arithmetic, but on
-head-mesh coordinates it takes the normal matrix from a condition number around 1e8 to
-around 30.
+affine change of basis, so the recovered value is unchanged in exact arithmetic, but it leaves
+the normal matrix far better conditioned on head-mesh coordinates.
 
 Harmonic recovery
 -----------------
@@ -320,8 +319,7 @@ def _build_harmonic_operator(ctx: SolverContext) -> RecoveryOperator:
     w = cp.empty((int(pidx.shape[0]), 3), dtype=cp.float32)
     status = cp.empty(n_slots, dtype=cp.int32)
     # In metres, not millimetres. These weights differentiate, so unlike the SPR ones they carry
-    # a length unit: v is in volts and E has to come out in V/m. Mirrors gradient_operator, which
-    # builds the element gradients from ``nodes_mm * 1e-3``. The scaling cancels in any check
+    # a length unit: v is in volts and E has to come out in V/m. The scaling cancels in any check
     # whose reference gradient is also per millimetre, so it stays invisible until dA/dt is added.
     nodes_m = cp.ascontiguousarray(ctx.nodes_mm * 1e-3)
     stream = cp.cuda.get_current_stream().ptr

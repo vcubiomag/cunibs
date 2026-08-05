@@ -84,8 +84,7 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
 
 // Cholesky-solve A X = [e_r : r in rhs_rows] for an N x N SPD A held in registers. Returns false
 // on a non-positive pivot, which is how a coplanar or under-filled patch reports itself. N <= 9,
-// so the factor sits in local memory: this runs once per mesh, not once per placement, and a
-// warp-cooperative version buys nothing at that duty cycle.
+// so the factor sits in local memory.
 template <int N>
 __device__ bool solve_spd_columns(const double a[N][N], const int* rhs_rows, int n_rhs,
                                   double out[][N]) {
@@ -149,13 +148,12 @@ __device__ __forceinline__ double spr_corner_weight(const double z[4], const dou
 }
 
 // One thread per slot. Four passes over the patch: the scaling radius, the normal matrix, the
-// Lebesgue constant, then the weights. Reading the patch repeatedly costs nothing here because
-// this runs once per mesh.
+// Lebesgue constant, then the weights.
 //
 // Fitting in p~ rather than SimNIBS's absolute [1, x, y, z] is an affine change of basis, so the
-// value recovered at the node is unchanged in exact arithmetic, but the normal matrix is
-// conditioned some eight orders better on head-mesh coordinates. In that frame p~(x_n) = e_0, so
-// only the first row of the inverse is needed: solve A z = e_0 and take w_c = z . p~_c.
+// value recovered at the node is unchanged in exact arithmetic, but the normal matrix is far
+// better conditioned on head-mesh coordinates. In that frame p~(x_n) = e_0, so only the first row
+// of the inverse is needed: solve A z = e_0 and take w_c = z . p~_c.
 //
 // Nodes on the outer boundary of the tet volume take a volume-weighted average instead, matching
 // SimNIBS, and so does any patch whose fit is ill-posed. Both are a select over the whole slot,
@@ -413,10 +411,10 @@ __global__ void hpr_grad_kernel(const double* __restrict__ v_block, const float*
 
 // One thread per slot, K placements at a time. The shared reads (w, ptr, idx) are paid once for
 // the whole block. K is a template parameter so the accumulators stay in registers; a runtime k
-// would put them in local memory, as it already does in rhs_gather_block_kernel.
+// would put them in local memory.
 //
-// The walk order over ptr/idx does not depend on K, so column c comes back bit-identical at
-// every block width, and the K=1 instantiation is what the serial launcher calls.
+// The walk order over ptr/idx does not depend on K, so column c comes back bit-identical at every
+// block width, and the K=1 instantiation is what the serial launcher calls.
 template <int K>
 __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict__ w,
                                      const int* __restrict__ ptr, const int* __restrict__ idx,

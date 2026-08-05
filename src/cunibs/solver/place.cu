@@ -179,9 +179,9 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
             for (int i = 0; i < 3; ++i) y[i] *= inv;
             const double cz = dot3(y, z);
             // After removing the out-of-plane part, |y|^2 = 1 - cos^2 = sin^2 of the angle to
-            // the tangent plane, so this test is exact and scale-free. kMinSin2 is (1e-6 rad)^2
-            // -- a numerical-annihilation threshold, not a geometry-quality one: on a curved
-            // scalp a legitimate handle can sit quite close to the normal.
+            // the tangent plane, so this test is exact and scale-free. kMinSin2 is a
+            // numerical-annihilation threshold, not a geometry-quality one: on a curved scalp a
+            // legitimate handle can sit quite close to the normal.
             if ((1.0 - cz * cz) > kMinSin2) {
                 for (int i = 0; i < 3; ++i) y[i] -= z[i] * cz;
                 const double inv2 = rnorm3d(y[0], y[1], y[2]);

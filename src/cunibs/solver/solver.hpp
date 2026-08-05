@@ -48,8 +48,8 @@ public:
 
 private:
     void reset() noexcept;
-    // Instantiating costs meaningfully more than updating, so an unchanged topology reuses
-    // the executable graph and only re-instantiates when cudaGraphExecUpdate declines.
+    // Instantiating costs more than updating, so an unchanged topology reuses the executable
+    // graph and only re-instantiates when cudaGraphExecUpdate declines.
     bool adopt(cudaGraph_t graph) noexcept;
 
     cudaGraph_t graph_ = nullptr;

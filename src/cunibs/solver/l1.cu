@@ -6,9 +6,9 @@
 //   dinv[i] = 1 / d[i]
 //
 // An SpMV of |A| against a vector of ones computes the same sum, but splits a row across a thread
-// count cuSPARSE picks at runtime, so the last bits it lands on vary between processes. dinv
-// scales every entry of the smoothed prolongator and is uploaded to every V-cycle level, so any
-// drift in it reaches the whole hierarchy.
+// count cuSPARSE picks at runtime, so the last bits vary between processes. dinv scales every
+// entry of the smoothed prolongator and reaches every V-cycle level, so any drift in it reaches
+// the whole hierarchy.
 
 namespace {
 

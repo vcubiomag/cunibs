@@ -59,10 +59,10 @@ def _prefix_sum(w: ArrayT, tile: int = 1024) -> ArrayT:
     """Inclusive prefix sum in float64, with an association order fixed by size.
 
     cupy's ``cumsum`` is a decoupled-lookback scan, so which partial sums combine with which
-    follows block scheduling rather than the data, and one array can yield several distinct
-    totals across calls. Splitting into fixed-size tiles pins the order: each tile is scanned
-    independently, and the tile offsets are scanned the same way, recursing until one tile
-    covers the array. Accumulating in float64 also bounds the drift over a million adds.
+    follows block scheduling rather than the data, and one array can yield several distinct totals
+    across calls. Splitting into fixed-size tiles pins the order: each tile is scanned
+    independently, and the tile offsets are scanned the same way, recursing until one tile covers
+    the array. Accumulating in float64 bounds the drift over a million adds.
     """
     xp = cp.get_array_module(w)
     a = w.astype(xp.float64, copy=False)

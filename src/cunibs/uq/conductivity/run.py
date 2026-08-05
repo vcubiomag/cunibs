@@ -42,7 +42,7 @@ _NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
 # Tolerance for the sensitivity solves that span the projection basis. Deliberately far looser
 # than the draw tolerance: the basis only has to point in the right directions for an initial
 # guess that CG then refines to `pre.tolerance` anyway, so its accuracy sets the rate and never
-# the answer. At 1e-3 the basis is iteration-neutral against a 1e-6 one and costs half as much.
+# the answer.
 _SENSITIVITY_TOL = 1e-3
 
 
@@ -89,7 +89,7 @@ def _solve_columns(
     """Solve the frozen nominal system against each column of ``rhs``, in block widths.
 
     The columns are independent, so they go through the block solver purely to share the
-    stiffness and hierarchy reads: at k=8 that is ~2x per column against solving them one by one.
+    stiffness and hierarchy reads.
     """
     n, k = rhs.shape
     out = cp.empty((n, k), dtype=cp.float64)

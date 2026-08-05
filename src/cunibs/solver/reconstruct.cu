@@ -28,9 +28,9 @@ __global__ void reconstruct_kernel(const double* __restrict__ v, const int* __re
     magn_out[e] = static_cast<float>(sqrt(ex * ex + ey * ey + ez * ez));
 }
 
-// Block variant: tet_nodes (63 MB) and g (189 MB) are read once for all k placements.
-// v_block is row-major (n_nodes, k) float64; the fp64 gradient accumulation per column
-// matches the single-RHS kernel exactly.
+// Block variant: tet_nodes and g are read once for all k placements. v_block is row-major
+// (n_nodes, k) float64; the fp64 gradient accumulation per column matches the single-RHS kernel
+// exactly.
 __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
                                          const int* __restrict__ tet_nodes,
                                          const float* __restrict__ g, ConstPtrPack dadt_elm,

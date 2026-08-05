@@ -1,4 +1,4 @@
-"""The ADM sampling grid and batched dipole placement — previously untested end to end.
+"""The ADM sampling grid and batched dipole placement, end to end.
 
 ``adm/grid.py`` decides where the Q-field is sampled and how world coordinates map to
 ``map_coordinates`` index space. An axis transposition between ``points_m`` and

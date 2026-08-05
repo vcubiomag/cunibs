@@ -17,20 +17,17 @@
 // coefficients, not here), and the smoothed prolongator P_l with its transpose R_l, both fp32
 // CSR. The coarsest level is only the precomputed dense inverse.
 //
-// The operator is stored as a_ij / max_j|a_ij| in fp16, and the row total is scaled back up
-// after the reduction. Halving the widest array in the two SpMV-shaped kernels is worth ~10%
-// of a CG iteration, and those kernels are the ones sitting on the memory ceiling. The row
-// scale is not optional: plain fp16 costs 14% more iterations on some meshes because the
-// stiffness spans more dynamic range than fp16 covers, while the scaled form is
-// iteration-neutral. Callers still hand over fp32; add_level converts.
+// The operator is stored as a_ij / max_j|a_ij| in fp16, and the row total is scaled back up after
+// the reduction. The row scale is not optional: the stiffness spans more dynamic range than fp16
+// covers, and unscaled fp16 costs iterations on some meshes. Callers hand over fp32; add_level
+// converts.
 //
 // apply() is stream-ordered and CUDA-graph-capturable (no allocations, no host syncs).
 // generation() keys PcgAmgSolver's cached CG graph, which embeds pointers into the buffers
 // owned here.
 
 // Longest Chebyshev recurrence the per-level coefficient arrays hold. Each degree adds one
-// SpMV-shaped kernel per level per sweep, so the range that pays for itself ends well below
-// this.
+// SpMV-shaped kernel per level per sweep.
 inline constexpr int kMaxSmootherDegree = 8;
 
 class NativeVCycle {

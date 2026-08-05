@@ -8,8 +8,7 @@
 // ``neg_vc[e] = -vols[e] * cond[e]``.
 //
 // Two forms. The fused one does the whole thing in the node gather, which reads g uncoalesced
-// once per incident node; the staged one pays a corner pass first so that both halves coalesce,
-// and is what the placement sweep uses.
+// once per incident node; the staged one pays a corner pass first so that both halves coalesce.
 
 namespace {
 

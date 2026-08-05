@@ -308,9 +308,8 @@ def test_solver_bindings_reject_dtype_and_layout(cp):
 def test_solver_bindings_reject_mismatched_output_buffer(cp):
     """A converted *output* buffer would swallow the kernel's writes.
 
-    nanobind has no writeback: it would hand the kernel a converted temporary, free it after the
-    call, and leave the caller's array untouched with no error. Verified against the pre-fix
-    build — an fp64 or strided ``out`` came back still all-zero.
+    nanobind has no writeback: without ``.noconvert()`` it would hand the kernel a converted
+    temporary, free it after the call, and leave the caller's array untouched with no error.
     """
     from cunibs.solver import dadt_node_to_element
 

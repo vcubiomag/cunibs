@@ -26,27 +26,18 @@ Buffer<T> device_clone(const T* src, std::size_t count, const char* what) {
     return ::device_clone<T>(src, count, "vcycle", what);
 }
 
-// Threads per row for the SpMV-shaped kernels. A_0 has ~14 nnz/row (P1 tets) and the
-// Galerkin coarse levels only densify to ~20, so a quarter warp covers a row in a few
-// strided steps and pays two shuffle levels to reduce it. Measured 6-11% faster than 8 at
-// every K on the 881k-row, 6-level hierarchy of a full head mesh, clocks locked. 2 ties it
-// there but loses once column locality is poor, so 4 is the safer of the two.
+// Threads per row for the SpMV-shaped kernels. A_0 has ~14 nnz/row (P1 tets) and the Galerkin
+// coarse levels only densify to ~20, so a quarter warp covers a row in a few strided steps and
+// pays two shuffle levels to reduce it.
 constexpr int kTpr = 4;
 
 static_assert(kWarp % kTpr == 0, "shuffle width must divide the warp");
 static_assert(kBlock % kTpr == 0, "a block must hold a whole number of rows");
 
 // One warp fraction per row: strided partial products over the row's nonzeros, then a
-// fixed-order shuffle reduction leaving the row total in lane 0. Threads whose row is past
-// the end still reach the shuffle with zero accumulators, which is why the mask is the full
-// warp. The fixed order is what keeps an apply run-to-run deterministic.
-//
-// The fp16 values are read one at a time. Pairing them into aligned __half2 loads, to stop a
-// kTpr-wide group from asking for an eight-byte slice of a two-byte type, measured 1% *slower*
-// on sm_120: consecutive steps of this loop walk the same 32-byte sector, so L1 was already
-// serving what the wider load would have fetched, and the masking a pair needs at the row
-// boundary costs more than the conversions it saves. That argument does not carry to the x
-// gather above, whose slices are K * 4 bytes apart and land in different sectors.
+// fixed-order shuffle reduction leaving the row total in lane 0. Threads whose row is past the
+// end still reach the shuffle with zero accumulators, which is why the mask is the full warp.
+// The fixed order is what keeps an apply run-to-run deterministic.
 template <int K>
 __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
                                          const int* __restrict__ col_idx,
@@ -102,11 +93,10 @@ __global__ void __launch_bounds__(kBlock)
 }
 
 // Threads per coarse row in the restriction. R = P^T has by far the widest rows in the
-// hierarchy and the fewest of them: on sub-004 a level-0 coarse row collects ~85 fine rows
-// against A's ~14, rising to ~740 at level 2 where there are only 138 rows in total. A whole
-// warp per row is what keeps the coarse end from starving for parallelism and the fine end
-// from walking each row alone. Unlike kTpr there is no locality argument against going wide
-// here: consecutive entries of a restriction row are consecutive fine indices.
+// hierarchy and the fewest of them, so a whole warp per row keeps the coarse end from starving
+// for parallelism and the fine end from walking each row alone. Unlike kTpr there is no
+// locality argument against going wide: consecutive entries of a restriction row are
+// consecutive fine indices.
 constexpr int kRestrictTpr = 32;
 
 static_assert(kWarp % kRestrictTpr == 0, "shuffle width must divide the warp");
@@ -315,9 +305,8 @@ void launch_coarse_gemv(int n, const float* ainv, const float* b, float* x,
     }
 }
 
-// Setup-only: one thread per row takes the row's max |a_ij| as its scale, then rewrites the
-// row as a_ij / scale in fp16. Reading the row twice costs nothing here and keeps the scale
-// out of shared memory. An all-zero row keeps a scale of 1 so the reciprocal stays finite.
+// Setup-only: one thread per row takes the row's max |a_ij| as its scale, then rewrites the row
+// as a_ij / scale in fp16. An all-zero row keeps a scale of 1 so the reciprocal stays finite.
 __global__ void __launch_bounds__(kBlock)
     vc_pack_values_kernel(int n, const int* __restrict__ row_ptr,
                           const float* __restrict__ src, __half* __restrict__ dst,
@@ -352,13 +341,12 @@ NativeVCycle::NativeVCycle() : generation_(++g_vcycle_generation) {
 // x-recurrence the step kernel takes:
 //     x_{i+1} = (1 + beta_i) x_i - beta_i x_{i-1} + alpha_i D^-1 (b - A x_i).
 //
-// The interval's top is 1 because dinv carries the l1 diagonal, for which rho(D^-1 A) <= 1
-// holds analytically on any SPD operator (D - A is weakly diagonally dominant with a
-// non-negative diagonal, hence PSD). That is a bound, not an estimate, so alpha0 = 2r/(r+1) < 2
-// can never reach 2/rho: the smoother is A-convergent and the cycle SPD on every level and
-// every mesh, with nothing to tune and nothing to seed. A cheap power-iteration estimate would
-// be the footgun here, since it lands under the true rho and an under-estimate over-relaxes the
-// smoother badly enough to stall the cycle.
+// The interval's top is 1 because dinv carries the l1 diagonal, for which rho(D^-1 A) <= 1 holds
+// analytically on any SPD operator (D - A is weakly diagonally dominant with a non-negative
+// diagonal, hence PSD). That is a bound, not an estimate, so alpha0 = 2r/(r+1) < 2 can never
+// reach 2/rho: the smoother is A-convergent and the cycle SPD on every level and every mesh.
+// An estimated rho would be the footgun, since an under-estimate over-relaxes the smoother
+// badly enough to stall the cycle.
 void NativeVCycle::set_smoother(int degree, float lower_ratio) {
     if (!levels_.empty()) {
         throw std::runtime_error("NativeVCycle: set_smoother after add_level");

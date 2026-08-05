@@ -216,8 +216,8 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
 
     // Every reduction here runs the same k = 1 block kernels solve_mixed_block does, so the two
     // paths sum in the same order: a column that misses tolerance and is retried through this
-    // solver has to come back with the numbers the block path would have produced. That rules
-    // out substituting a vendor BLAS dot or norm, whose association order is unspecified.
+    // solver comes back with the numbers the block path would have produced. A vendor BLAS dot or
+    // norm, whose association order is unspecified, could not stand in.
     auto host_norm = [&](const double* v, const char* what) {
         launch_bcg_norm2(n_, 1, v, partials, d_norm, s);
         check_cuda(
@@ -272,8 +272,8 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     // Identical every iteration (fixed buffers updated in place), so it is captured once and
     // replayed; the residual readback is inside the body but the host convergence test stays outside.
     auto run_body = [&]() {
-        // p·(Ap) stays a separate pass: folding it into the SpMV epilogue makes the block-wide
-        // reduction tree stall the SpMV's memory pipeline.
+        // p·(Ap) stays a separate pass: folding it into the SpMV epilogue would make the
+        // block-wide reduction tree stall the SpMV's memory pipeline.
         launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), p, ap, s);
         launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
         launch_bcg_alpha(1, d_rz, d_pap, nullptr, d_alpha, d_neg_alpha, s);

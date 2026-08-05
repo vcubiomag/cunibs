@@ -102,8 +102,8 @@ def _scratch_pool() -> cp.cuda.MemoryPool:
     """A pool for chunk-scoped temporaries, with the default pool's free blocks handed back.
 
     A fresh pool cannot draw on blocks the default pool is holding free, so whatever the caller's
-    setup churned through would stay stranded for as long as the scratch pool lives. On a full
-    head mesh that is several GB the scratch pool needs.
+    setup churned through would stay stranded for as long as the scratch pool lives -- several GB
+    on a full head mesh.
     """
     cp.get_default_memory_pool().free_all_blocks()
     return cp.cuda.MemoryPool()
@@ -289,9 +289,8 @@ class Subject:
     def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
         """The field-independent half of a summary, gathered once per region.
 
-        Building it uploads the mesh barycentres, 94.6 MB on a 3.9M-tetrahedron mesh, so a sweep
-        builds it once and reuses it for every placement it solves. Call it first outside any
-        scratch allocator: filling the cache inside one would tie it to that pool's lifetime.
+        Call it first outside any scratch allocator: filling the cache inside one would tie it to
+        that pool's lifetime.
         """
         with self._lock:
             cached = self._region_slices.get(region)
@@ -350,7 +349,7 @@ class Subject:
         host = self._host_metric_inputs if (retain.magnitude or retain.nodal) else None
         slot_node, slot_tag = self._host_slot_maps(op) if retain.nodal else (None, None)
         # Only per-node slots need the connectivity to say which nodes a region touches; a
-        # (node, tissue) slot carries its own tag, so it skips 79 MB on a 5M-tet mesh.
+        # (node, tissue) slot carries its own tag.
         tet_nodes = self._host_tet_nodes if retain.nodal and slot_tag is None else None
         n_nodes = int(self.context.n_nodes) if retain.nodal else None
         return [
@@ -469,10 +468,9 @@ class Subject:
 
         ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
 
-        Every result carries its gray-matter metrics; the flags say which of the
-        full-volume arrays to keep as well. All three default to off because they are what
-        makes a result large -- on a 4M-tetrahedron mesh they total roughly 70 MB, against
-        about a kilobyte for a result with none of them.
+        Every result carries its gray-matter metrics; the flags say which of the full-volume
+        arrays to keep as well. All three default to off because they are what makes a result
+        large -- tens of megabytes on a head mesh, against about a kilobyte without them.
 
         Retaining ``magnitude`` also unlocks the metrics a precomputed summary cannot
         answer: :meth:`FieldResult.summary_for` for a non-default region, and
