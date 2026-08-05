@@ -28,6 +28,7 @@ from cunibs.fem.recovery import (
     apply_recovery,
     apply_recovery_into,
 )
+from cunibs.mesh import HeadMesh
 from cunibs.solver import (
     BLOCK_SIZES as _BLOCK_SIZES,
 )
@@ -46,8 +47,6 @@ from cunibs.solver import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-    from cunibs.mesh import HeadMesh
 
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
@@ -337,21 +336,36 @@ def morton_order(points_mm: cp.ndarray) -> cp.ndarray:
     return cp.argsort(key, kind="stable").astype(cp.int32)
 
 
-def solve_ordering(nodes_mm: cp.ndarray, ground_node: int) -> cp.ndarray:
-    """Reduced-system row index: drop the ground DOF, then renumber along a Morton curve.
+def invert_permutation(perm: cp.ndarray) -> cp.ndarray:
+    """The index that undoes ``perm``."""
+    inverse = cp.empty_like(perm)
+    inverse[perm] = cp.arange(int(perm.shape[0]), dtype=perm.dtype)
+    return inverse
 
-    Gmsh node order bears no relation to position, so the SpMV gather over ``x`` lands
-    anywhere in the vector: on a 703k-DOF head mesh the mean |i-j| over nonzeros is ~193k and
-    only a quarter of the nonzeros sit within a 4096-column window. Renumbering spatially takes
-    that to ~4.8k and 92%, which is worth ~16% of the solve because it is what separates the
-    fp32 V-cycle kernels from the memory ceiling the fp64 SpMV already reaches.
 
-    This composes into the index every caller already gathers through, so it costs nothing at
-    solve time. It does change the reduction order of every kernel, so results move within the
-    solver tolerance rather than staying bit-identical to an unordered build.
+def spatial_order(nodes_mm: cp.ndarray, tet_nodes: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+    """Node and tetrahedron permutations that lay a mesh out along a Morton curve.
+
+    Nodes are ordered by position and tetrahedra by their lowest renumbered node. Gmsh order
+    bears no relation to position: on a head mesh the four node indices of a tetrahedron span
+    ~380k, which is what every element-centric gather pays, and ~9k once ordered.
+
+    A mesh already in this order sorts to the identity, so reordering is idempotent.
     """
-    idx = grounded_index(int(nodes_mm.shape[0]), ground_node)
-    return cp.ascontiguousarray(idx[morton_order(nodes_mm[idx])])
+    node_perm = morton_order(nodes_mm)
+    lowest = invert_permutation(node_perm)[tet_nodes].min(axis=1)
+    tet_perm = cp.argsort(lowest, kind="stable").astype(cp.int32)
+    return node_perm, tet_perm
+
+
+def solve_ordering(nodes_mm: cp.ndarray, ground_node: int) -> cp.ndarray:
+    """Reduced-system row index: the mesh nodes bar the grounded one.
+
+    The rows inherit the mesh's spatial order (see :func:`spatial_order`), which is what keeps
+    the SpMV gather over ``x`` local: 92% of the reduced operator's nonzeros sit within a
+    4096-column window, against a quarter of them on an unordered mesh.
+    """
+    return grounded_index(int(nodes_mm.shape[0]), ground_node)
 
 
 def reduce_matrix(a: csp.csr_matrix, idx: cp.ndarray) -> csp.csr_matrix:
@@ -614,15 +628,44 @@ class SolverContext:
     recovery: dict[Recovery, RecoveryOperator] = field(default_factory=dict)
 
 
+def _spatially_ordered(
+    mesh: HeadMesh,
+) -> tuple[HeadMesh, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Reorder a mesh along a Morton curve and return it with its device arrays.
+
+    The returned mesh is the order every array in the context carries, host and device alike,
+    and so the one a caller reads results against. Surface rows keep their file order; only the
+    node ids they name move.
+    """
+    nodes_mm = cp.asarray(mesh.nodes_mm)
+    tet_nodes = cp.asarray(mesh.tet_nodes)
+    node_perm, tet_perm = spatial_order(nodes_mm, tet_nodes)
+    inverse = invert_permutation(node_perm)
+
+    nodes_mm = cp.ascontiguousarray(nodes_mm[node_perm])
+    tet_nodes = cp.ascontiguousarray(inverse[tet_nodes[tet_perm]])
+    tet_tags = cp.ascontiguousarray(cp.asarray(mesh.tet_tags)[tet_perm])
+    skin_tris = cp.ascontiguousarray(inverse[cp.asarray(mesh.skin_tris)])
+
+    ordered = HeadMesh(
+        nodes_mm=cp.asnumpy(nodes_mm),
+        tet_nodes=cp.asnumpy(tet_nodes),
+        tet_tags=cp.asnumpy(tet_tags),
+        skin_tris=cp.asnumpy(skin_tris),
+    )
+    return ordered, nodes_mm, tet_nodes, tet_tags, skin_tris
+
+
 def build_context(mesh: HeadMesh) -> SolverContext:
     """Build the GPU state shared by all placements.
+
+    The mesh is first laid out along a Morton curve, and ``ctx.mesh`` is that reordering: it is
+    what every array here, and every field a solve returns, is indexed by.
 
     Assemble ``g``, volumes, and stiffness in float64. Store ``g``, volumes, and
     ``-volume * conductivity`` in float32 for placement kernels.
     """
-    nodes_mm = cp.asarray(mesh.nodes_mm)
-    tet_nodes = cp.asarray(mesh.tet_nodes)
-    tet_tags = cp.asarray(mesh.tet_tags)
+    mesh, nodes_mm, tet_nodes, tet_tags, skin_tris = _spatially_ordered(mesh)
 
     g, vols = gradient_operator(nodes_mm * 1e-3, tet_nodes)
     cond = conductivity_per_tet(tet_tags)
@@ -638,7 +681,6 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     del cond
     ptr, idx = build_node2corner(tet_nodes, mesh.n_nodes)
 
-    skin_tris = cp.asarray(mesh.skin_tris)
     skin_a = cp.ascontiguousarray(nodes_mm[skin_tris[:, 0]])
     skin_b = cp.ascontiguousarray(nodes_mm[skin_tris[:, 1]])
     skin_c = cp.ascontiguousarray(nodes_mm[skin_tris[:, 2]])

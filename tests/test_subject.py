@@ -19,13 +19,25 @@ PLACEMENT = Placement([50, 50, 100], [50, 100, 100])
 
 
 @pytest.mark.realmesh
-def test_from_mesh_matches_load_mesh(patch_mesh_path, patch_mesh):
+def test_from_mesh_reorders_the_loaded_mesh(patch_mesh_path, patch_mesh):
+    """The subject's mesh is a spatial reordering of the file's, not a different mesh.
+
+    Every comparison here is permutation invariant, which is the point: the node and element
+    order moves, the geometry does not.
+    """
     subj = Subject.from_mesh(patch_mesh_path)
     try:
-        assert subj.mesh.n_nodes == patch_mesh.n_nodes
-        np.testing.assert_array_equal(subj.mesh.tet_tags, patch_mesh.tet_tags)
-        np.testing.assert_array_equal(subj.mesh.tet_nodes, patch_mesh.tet_nodes)
-        np.testing.assert_allclose(subj.mesh.nodes_mm, patch_mesh.nodes_mm)
+        mesh = subj.mesh
+        assert mesh.n_nodes == patch_mesh.n_nodes
+        assert mesh.tet_nodes.shape == patch_mesh.tet_nodes.shape
+        np.testing.assert_array_equal(np.sort(mesh.tet_tags), np.sort(patch_mesh.tet_tags))
+        np.testing.assert_allclose(
+            np.sort(mesh.nodes_mm, axis=0), np.sort(patch_mesh.nodes_mm, axis=0)
+        )
+        np.testing.assert_allclose(
+            np.sort(mesh.tet_barycenters_mm, axis=0),
+            np.sort(patch_mesh.tet_barycenters_mm, axis=0),
+        )
     finally:
         subj.free()
 
@@ -71,9 +83,13 @@ def test_context_manager_frees_on_exit(cube_mesh, synthetic_coil):
     subj.free()
 
 
-def test_mesh_property_is_the_input_mesh(cube_mesh):
+def test_mesh_property_is_the_context_mesh(cube_mesh):
+    """Results index against the context's ordering, so that is what the property must expose."""
     subj = Subject(cube_mesh)
-    assert subj.mesh is cube_mesh
+    try:
+        assert subj.mesh is subj.context.mesh
+    finally:
+        subj.free()
 
 
 @pytest.mark.realmesh

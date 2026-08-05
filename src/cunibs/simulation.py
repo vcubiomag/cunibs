@@ -215,7 +215,13 @@ class Subject:
 
     @property
     def mesh(self) -> HeadMesh:
-        return self._mesh
+        """The mesh in the order every result array is indexed by.
+
+        :func:`~cunibs.fem.build_context` lays the loaded mesh out along a Morton curve, so this
+        is a reordering of the file's nodes and tetrahedra rather than the arrays
+        :func:`~cunibs.mesh.load_mesh` returned. Reading it builds the solver context.
+        """
+        return self.context.mesh
 
     @property
     def context(self) -> SolverContext:
@@ -292,7 +298,7 @@ class Subject:
             if cached is None:
                 ctx = self.context
                 cached = metrics.region_slice(
-                    ctx.vols, cp.asarray(self._mesh.tet_barycenters_mm), ctx.tet_tags, region
+                    ctx.vols, cp.asarray(ctx.mesh.tet_barycenters_mm), ctx.tet_tags, region
                 )
                 self._region_slices[region] = cached
             return cached
@@ -306,7 +312,7 @@ class Subject:
                 self._host_metrics = (
                     cp.asnumpy(ctx.vols),
                     cp.asnumpy(ctx.tet_tags),
-                    np.asarray(self._mesh.tet_barycenters_mm),
+                    np.asarray(ctx.mesh.tet_barycenters_mm),
                 )
             return self._host_metrics
 
@@ -375,7 +381,7 @@ class Subject:
         """Host connectivity, built once and shared by every result carrying a nodal field."""
         with self._lock:
             if self._host_tets is None:
-                self._host_tets = np.asarray(self._mesh.tet_nodes)
+                self._host_tets = np.asarray(self.context.mesh.tet_nodes)
             return self._host_tets
 
     def _host_slot_maps(

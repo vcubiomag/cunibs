@@ -50,16 +50,13 @@ def test_outer_boundary_matches_a_face_count(cp, refined_cube_mesh, boundary_fac
     """The boundary set is a set, so it must be exact rather than merely well-ordered."""
     from cunibs.fem import build_context, outer_boundary_nodes
 
-    ctx = build_context(refined_cube_mesh)
-    got = cp.asnumpy(outer_boundary_nodes(ctx.tet_nodes, refined_cube_mesh.n_nodes)).astype(
-        bool
-    )
-    expected = np.zeros(refined_cube_mesh.n_nodes, dtype=bool)
-    expected[np.unique(boundary_faces(refined_cube_mesh.tet_nodes))] = True
+    mesh = build_context(refined_cube_mesh).mesh
+    tets = cp.asarray(mesh.tet_nodes)
+    got = cp.asnumpy(outer_boundary_nodes(tets, mesh.n_nodes)).astype(bool)
+    expected = np.zeros(mesh.n_nodes, dtype=bool)
+    expected[np.unique(boundary_faces(mesh.tet_nodes))] = True
     np.testing.assert_array_equal(got, expected)
-    assert 0 < expected.sum() < refined_cube_mesh.n_nodes, (
-        "fixture must have both kinds of node"
-    )
+    assert 0 < expected.sum() < mesh.n_nodes, "fixture must have both kinds of node"
 
 
 def test_weights_are_a_partition_of_unity(cp, cube_op):
@@ -74,7 +71,7 @@ def test_weights_are_a_partition_of_unity(cp, cube_op):
     np.testing.assert_allclose(sums, 1.0, atol=1e-6)
 
 
-def test_recovery_reproduces_a_linear_field(cp, cube_op, refined_cube_mesh):
+def test_recovery_reproduces_a_linear_field(cp, cube_op):
     """A linear field is in the fit space, so an interior patch must return it exactly.
 
     Checked at the nodes and again after sampling back at the barycentres. Boundary nodes take a
@@ -84,7 +81,7 @@ def test_recovery_reproduces_a_linear_field(cp, cube_op, refined_cube_mesh):
     from cunibs.fem import apply_recovery, outer_boundary_nodes
 
     ctx, op = cube_op
-    nodes, tets = refined_cube_mesh.nodes_mm, refined_cube_mesh.tet_nodes
+    nodes, tets = ctx.mesh.nodes_mm, ctx.mesh.tet_nodes
     bary = nodes[tets].mean(axis=1)
     rng = np.random.default_rng(0)
     offset, slope = rng.normal(size=3), rng.normal(size=(3, 3))
@@ -103,12 +100,12 @@ def test_recovery_reproduces_a_linear_field(cp, cube_op, refined_cube_mesh):
     np.testing.assert_allclose(at_bary, offset + bary[inner_tet] @ slope.T, atol=1e-5 * scale)
 
 
-def test_matches_a_numpy_transcription_of_simnibs(cp, cube_op, refined_cube_mesh):
+def test_matches_a_numpy_transcription_of_simnibs(cp, cube_op):
     """The kernel's centred, scaled fit equals SimNIBS's absolute-coordinate one."""
     from cunibs.fem import apply_recovery, outer_boundary_nodes
 
     ctx, op = cube_op
-    nodes, tets = refined_cube_mesh.nodes_mm, refined_cube_mesh.tet_nodes
+    nodes, tets = ctx.mesh.nodes_mm, ctx.mesh.tet_nodes
     rng = np.random.default_rng(1)
     field = rng.normal(size=(tets.shape[0], 3)).astype(np.float32)
 
@@ -118,12 +115,12 @@ def test_matches_a_numpy_transcription_of_simnibs(cp, cube_op, refined_cube_mesh
     np.testing.assert_allclose(cp.asnumpy(slots[0]), expected, atol=2e-5, rtol=2e-5)
 
 
-def test_boundary_nodes_take_the_volume_weighted_average(cp, cube_op, refined_cube_mesh):
+def test_boundary_nodes_take_the_volume_weighted_average(cp, cube_op):
     """The boundary rule is SimNIBS's, so it is pinned separately from the fit."""
     from cunibs.fem import apply_recovery, outer_boundary_nodes
 
     ctx, op = cube_op
-    nodes, tets = refined_cube_mesh.nodes_mm, refined_cube_mesh.tet_nodes
+    nodes, tets = ctx.mesh.nodes_mm, ctx.mesh.tet_nodes
     rng = np.random.default_rng(2)
     field = rng.normal(size=(tets.shape[0], 3)).astype(np.float32)
     slots = apply_recovery(op, tets.shape[0], elements=[cp.asarray(field)]).E_slots
@@ -146,7 +143,7 @@ def test_operator_build_is_bit_reproducible(cp, refined_cube_mesh):
         np.testing.assert_array_equal(first, again)
 
 
-def test_apply_is_bit_reproducible_and_block_width_invariant(cp, cube_op, refined_cube_mesh):
+def test_apply_is_bit_reproducible_and_block_width_invariant(cp, cube_op):
     """A placement's recovered field must not depend on who shared its block.
 
     The per-slot walk order is fixed by ptr/idx and does not depend on the compiled width, so
@@ -154,8 +151,8 @@ def test_apply_is_bit_reproducible_and_block_width_invariant(cp, cube_op, refine
     """
     from cunibs.fem import apply_recovery
 
-    _, op = cube_op
-    n_tet = refined_cube_mesh.tet_nodes.shape[0]
+    ctx, op = cube_op
+    n_tet = ctx.mesh.tet_nodes.shape[0]
     rng = np.random.default_rng(3)
     fields = [cp.asarray(rng.normal(size=(n_tet, 3)).astype(np.float32)) for _ in range(8)]
 
@@ -457,15 +454,15 @@ def harmonic_op(refined_cube_mesh):
     return ctx, ensure_recovery(ctx, "harmonic")
 
 
-def test_harmonic_reproduces_its_own_fit_space(cp, harmonic_op, refined_cube_mesh):
+def test_harmonic_reproduces_its_own_fit_space(cp, harmonic_op):
     """Constant, linear and *harmonic* quadratic potentials must all come back exactly.
 
     The harmonic quadratic is the load-bearing one: it is in the 9-term space precisely because
     Laplace's equation holds inside a tissue, so exactness there is what the constraint buys.
     """
-    _, op = harmonic_op
-    nodes = refined_cube_mesh.nodes_mm
-    n_tet = refined_cube_mesh.tet_nodes.shape[0]
+    ctx, op = harmonic_op
+    nodes = ctx.mesh.nodes_mm
+    n_tet = ctx.mesh.tet_nodes.shape[0]
     zero = np.zeros((nodes.shape[0], 3), dtype=np.float32)
 
     at_nodes, _ = _harmonic_grads(op, np.full(nodes.shape[0], 3.7), zero, n_tet, cp)
@@ -491,15 +488,15 @@ def test_harmonic_reproduces_its_own_fit_space(cp, harmonic_op, refined_cube_mes
     assert np.abs(at_nodes + gradient).max() / np.abs(gradient).max() < 1e-5
 
 
-def test_harmonic_constraint_is_actually_active(cp, harmonic_op, refined_cube_mesh):
+def test_harmonic_constraint_is_actually_active(cp, harmonic_op):
     """A non-harmonic quadratic must NOT be reproduced, or the basis is the unconstrained one.
 
     Without this the exactness test above would pass just as well for a plain 10-term quadratic
     fit, which is a measurably worse recovery at interfaces.
     """
-    _, op = harmonic_op
-    nodes = refined_cube_mesh.nodes_mm
-    n_tet = refined_cube_mesh.tet_nodes.shape[0]
+    ctx, op = harmonic_op
+    nodes = ctx.mesh.nodes_mm
+    n_tet = ctx.mesh.tet_nodes.shape[0]
     zero = np.zeros((nodes.shape[0], 3), dtype=np.float32)
 
     exact = np.zeros_like(nodes)
@@ -508,12 +505,12 @@ def test_harmonic_constraint_is_actually_active(cp, harmonic_op, refined_cube_me
     assert np.abs(at_nodes + exact).max() / np.abs(exact).max() > 1e-3
 
 
-def test_harmonic_adds_dadt_exactly_at_the_nodes(cp, harmonic_op, refined_cube_mesh):
+def test_harmonic_adds_dadt_exactly_at_the_nodes(cp, harmonic_op):
     """The raw path averages dA/dt onto elements; this one keeps the nodal value it was given."""
-    _, op = harmonic_op
-    nodes = refined_cube_mesh.nodes_mm
-    n_nodes = refined_cube_mesh.n_nodes
-    n_tet = refined_cube_mesh.tet_nodes.shape[0]
+    ctx, op = harmonic_op
+    nodes = ctx.mesh.nodes_mm
+    n_nodes = ctx.mesh.n_nodes
+    n_tet = ctx.mesh.tet_nodes.shape[0]
     rng = np.random.default_rng(1)
     dadt = rng.normal(size=(n_nodes, 3)).astype(np.float32)
     at_nodes, _ = _harmonic_grads(op, np.zeros(n_nodes), dadt, n_tet, cp)
@@ -669,11 +666,11 @@ def test_harmonic_beats_spr_across_a_conductivity_jump(cp, two_region_mesh, two_
     from cunibs.fem import apply_recovery, build_context, ensure_recovery, outer_boundary_nodes
 
     z0 = two_region_z0
-    mesh = two_region_mesh
+    ctx = build_context(two_region_mesh)
+    mesh = ctx.mesh
     nodes, tets, tags = mesh.nodes_mm, mesh.tet_nodes.astype(np.int64), mesh.tet_tags
     v, grad = _p1_solve(nodes, tets, tags, z0)
     n_tet = tets.shape[0]
-    ctx = build_context(mesh)
     e_raw = -np.einsum(
         "ei,eik->ek", v[tets], grad
     )  # dA/dt is zero in this manufactured problem
