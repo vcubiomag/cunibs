@@ -264,8 +264,7 @@ def test_build_context_dtypes_and_contiguity(cp, cube_subject):
     assert ctx.g.dtype == cp.float32 and ctx.g.shape == (n_tet, 4, 3)
     assert ctx.vols.dtype == cp.float32 and ctx.vols.shape == (n_tet,)
     assert ctx.neg_vc.dtype == cp.float32
-    assert ctx.wg.shape == ctx.g.shape and ctx.wg.dtype == cp.float32
-    for name in ("g", "wg", "vols", "neg_vc", "tet_nodes", "tet_tags"):
+    for name in ("g", "vols", "neg_vc", "tet_nodes", "tet_tags"):
         assert getattr(ctx, name).flags.c_contiguous, name
 
     cond = conductivity_per_tet(ctx.tet_tags).astype(cp.float32)
@@ -274,24 +273,18 @@ def test_build_context_dtypes_and_contiguity(cp, cube_subject):
     )
 
 
-def test_weighted_gradient_matches_numpy(cp, cube_subject):
-    ctx = cube_subject.context
-    np.testing.assert_allclose(
-        cp.asnumpy(ctx.wg),
-        cp.asnumpy(ctx.g) * cp.asnumpy(ctx.neg_vc)[:, None, None],
-        rtol=1e-6,
-    )
-
-
 def test_solver_bindings_reject_host_arrays(cp, cube_subject):
     """``nb::device::cuda`` on every binding parameter: a host array is a type error."""
-    from cunibs.solver import weighted_gradient
+    from cunibs.solver import dadt_node_to_element
 
     ctx = cube_subject.context
-    host_g = cp.asnumpy(ctx.g)
-    out = cp.empty_like(ctx.g)
+    n_tet = int(ctx.tet_nodes.shape[0])
+    nodal = cp.zeros((int(ctx.n_nodes), 3), dtype=cp.float32)
+    out = cp.empty((n_tet, 3), dtype=cp.float32)
     with pytest.raises(TypeError):
-        weighted_gradient(host_g, ctx.neg_vc, out, cp.cuda.get_current_stream().ptr)
+        dadt_node_to_element(
+            cp.asnumpy(nodal), ctx.tet_nodes, out, cp.cuda.get_current_stream().ptr
+        )
 
 
 def test_solver_bindings_reject_dtype_and_layout(cp):
@@ -300,16 +293,16 @@ def test_solver_bindings_reject_dtype_and_layout(cp):
     Without it nanobind repairs a mismatch through cupy's ``.astype(dtype, order)``, costing a
     device allocation and copy per call — invisible in a hot loop.
     """
-    from cunibs.solver import weighted_gradient
+    from cunibs.solver import dadt_node_to_element
 
     stream = cp.cuda.get_current_stream().ptr
-    g = cp.arange(5 * 4 * 3, dtype=cp.float32).reshape(5, 4, 3)
-    neg_vc = cp.full(5, -2.0, dtype=cp.float32)
+    nodal = cp.arange(8 * 3, dtype=cp.float32).reshape(8, 3)
+    tets = cp.zeros((5, 4), dtype=cp.int32)
 
-    for variant in (g.astype(cp.float64), cp.repeat(g, 2, axis=0)[::2]):
-        out = cp.zeros_like(g)
+    for variant in (nodal.astype(cp.float64), cp.repeat(nodal, 2, axis=0)[::2]):
+        out = cp.zeros((5, 3), dtype=cp.float32)
         with pytest.raises(TypeError):
-            weighted_gradient(variant, neg_vc, out, stream)
+            dadt_node_to_element(variant, tets, out, stream)
 
 
 def test_solver_bindings_reject_mismatched_output_buffer(cp):
@@ -319,18 +312,18 @@ def test_solver_bindings_reject_mismatched_output_buffer(cp):
     call, and leave the caller's array untouched with no error. Verified against the pre-fix
     build — an fp64 or strided ``out`` came back still all-zero.
     """
-    from cunibs.solver import weighted_gradient
+    from cunibs.solver import dadt_node_to_element
 
     stream = cp.cuda.get_current_stream().ptr
-    g = cp.arange(5 * 4 * 3, dtype=cp.float32).reshape(5, 4, 3)
-    neg_vc = cp.full(5, -2.0, dtype=cp.float32)
+    nodal = cp.arange(8 * 3, dtype=cp.float32).reshape(8, 3)
+    tets = cp.zeros((5, 4), dtype=cp.int32)
 
     for bad_out in (
-        cp.zeros(g.shape, dtype=cp.float64),
-        cp.zeros((10, 4, 3), dtype=cp.float32)[::2],
+        cp.zeros((5, 3), dtype=cp.float64),
+        cp.zeros((10, 3), dtype=cp.float32)[::2],
     ):
         with pytest.raises(TypeError):
-            weighted_gradient(g, neg_vc, bad_out, stream)
+            dadt_node_to_element(nodal, tets, bad_out, stream)
 
 
 def test_solver_bindings_reject_dtype_inside_list_arg(cp):
@@ -339,11 +332,12 @@ def test_solver_bindings_reject_dtype_inside_list_arg(cp):
     nanobind's list caster forwards the flags unchanged, so one wrong-dtype entry in the
     per-placement list is rejected rather than silently converted.
     """
-    from cunibs.solver import rhs_assemble_weighted_block
+    from cunibs.solver import rhs_assemble_staged_block
 
     stream = cp.cuda.get_current_stream().ptr
     n_tet, n_nodes, k = 6, 5, 2
-    wg = cp.zeros((n_tet, 4, 3), dtype=cp.float32)
+    g = cp.zeros((n_tet, 4, 3), dtype=cp.float32)
+    neg_vc = cp.zeros(n_tet, dtype=cp.float32)
     ptr = cp.zeros(n_nodes + 1, dtype=cp.int32)
     idx = cp.zeros(1, dtype=cp.int32)
     b_block = cp.zeros((n_nodes, k), dtype=cp.float32)
@@ -351,7 +345,7 @@ def test_solver_bindings_reject_dtype_inside_list_arg(cp):
 
     dadt_elm = [good, good.astype(cp.float64)]
     with pytest.raises(TypeError):
-        rhs_assemble_weighted_block(dadt_elm, wg, ptr, idx, b_block, stream)
+        rhs_assemble_staged_block(dadt_elm, g, neg_vc, ptr, idx, b_block, stream)
 
 
 @pytest.mark.realmesh

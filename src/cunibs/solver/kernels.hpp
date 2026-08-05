@@ -18,21 +18,18 @@ void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, 
                                  int n_tet, cudaStream_t stream);
 
 // --- rhs.cu: FEM right-hand-side assembly --------------------------------------------------
-// launch_rhs fuses the corner dot product into the node gather, for callers whose neg_vc
-// changes per call; the weighted pair instead reuses a precomputed wg across placements.
+// launch_rhs fuses the corner dot product into the node gather; the staged pair pays a corner
+// pass first so that both halves coalesce.
 void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
                 const int* idx, float* b, int n_nodes, cudaStream_t stream);
 
-void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr, const int* idx,
-                         float* b, int n_nodes, int n_tet, cudaStream_t stream);
-
-void launch_weighted_gradient(const float* g, const float* neg_vc, float* wg, int n_tet,
-                              cudaStream_t stream);
+void launch_rhs_staged(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
+                       const int* idx, float* b, int n_nodes, int n_tet, cudaStream_t stream);
 
 // b_block is row-major (n_nodes, k) float32 — the layout the block solver consumes.
-void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, const int* ptr,
-                               const int* idx, float* b_block, int n_nodes, int n_tet, int k,
-                               cudaStream_t stream);
+void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const float* neg_vc,
+                             const int* ptr, const int* idx, float* b_block, int n_nodes,
+                             int n_tet, int k, cudaStream_t stream);
 
 // --- pattern.cu: segment-wise CSR construction ----------------------------------------------
 // Both entry points take two caller-owned int32 work buffers and leave the result CSR as out_ptr

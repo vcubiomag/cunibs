@@ -226,17 +226,18 @@ NB_MODULE(_solver_ext, m) {
         "Deterministic node-centric RHS assembly; writes into caller-allocated b.");
 
     m.def(
-        "rhs_assemble_weighted",
-        [](f32_cuda_2d dadt_elm, f32_cuda_3d wg, i32_cuda ptr, i32_cuda idx, f32_cuda_1d b,
-           uintptr_t stream) {
+        "rhs_assemble_staged",
+        [](f32_cuda_2d dadt_elm, f32_cuda_3d g, f32_cuda_1d neg_vc, i32_cuda ptr, i32_cuda idx,
+           f32_cuda_1d b, uintptr_t stream) {
             int n_nodes = static_cast<int>(b.shape(0));
             int n_tet = static_cast<int>(dadt_elm.shape(0));
-            launch_rhs_weighted(dadt_elm.data(), wg.data(), ptr.data(), idx.data(), b.data(),
-                                n_nodes, n_tet, reinterpret_cast<cudaStream_t>(stream));
+            launch_rhs_staged(dadt_elm.data(), g.data(), neg_vc.data(), ptr.data(), idx.data(),
+                              b.data(), n_nodes, n_tet, reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("dadt_elm").noconvert(), nb::arg("wg").noconvert(), nb::arg("ptr").noconvert(),
-        nb::arg("idx").noconvert(), nb::arg("b").noconvert(), nb::arg("stream"),
-        "Deterministic node-centric RHS assembly with preweighted gradients.");
+        nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
+        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("b").noconvert(),
+        nb::arg("stream"),
+        "Deterministic node-centric RHS assembly, corner pass then gather.");
 
     m.def(
         "build_incident_node_csr",
@@ -324,26 +325,27 @@ NB_MODULE(_solver_ext, m) {
         "l1-Jacobi smoother scaling 1 / (sign(a_ii) * sum_j |a_ij|), one thread per row.");
 
     m.def(
-        "rhs_assemble_weighted_block",
-        [](std::vector<f32_cuda_2d> dadt_elm, f32_cuda_3d wg, i32_cuda ptr, i32_cuda idx,
-           f32_cuda_2d b_block, uintptr_t stream) {
+        "rhs_assemble_staged_block",
+        [](std::vector<f32_cuda_2d> dadt_elm, f32_cuda_3d g, f32_cuda_1d neg_vc, i32_cuda ptr,
+           i32_cuda idx, f32_cuda_2d b_block, uintptr_t stream) {
             const int k = static_cast<int>(dadt_elm.size());
             if (k < 1 || k > kMaxStageBlock ||
                 static_cast<int>(b_block.shape(1)) != k) {
-                throw std::invalid_argument("rhs_assemble_weighted_block: bad list sizes");
+                throw std::invalid_argument("rhs_assemble_staged_block: bad list sizes");
             }
             const float* in_ptrs[kMaxStageBlock];
             for (int c = 0; c < k; ++c) in_ptrs[c] = dadt_elm[c].data();
             int n_nodes = static_cast<int>(b_block.shape(0));
             int n_tet = static_cast<int>(dadt_elm[0].shape(0));
-            launch_rhs_weighted_block(in_ptrs, wg.data(), ptr.data(), idx.data(),
-                                      b_block.data(), n_nodes, n_tet, k,
-                                      reinterpret_cast<cudaStream_t>(stream));
+            launch_rhs_staged_block(in_ptrs, g.data(), neg_vc.data(), ptr.data(), idx.data(),
+                                    b_block.data(), n_nodes, n_tet, k,
+                                    reinterpret_cast<cudaStream_t>(stream));
         },
-        nb::arg("dadt_elm").noconvert(), nb::arg("wg").noconvert(), nb::arg("ptr").noconvert(),
-        nb::arg("idx").noconvert(), nb::arg("b_block").noconvert(), nb::arg("stream"),
-        "Block RHS assembly for <=8 placements: wg/node2corner read once; writes "
-        "row-major (n_nodes, k) float32.");
+        nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
+        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("b_block").noconvert(),
+        nb::arg("stream"),
+        "Block RHS assembly for <=8 placements: the gradients and node2corner are read once for "
+        "the whole block; writes row-major (n_nodes, k) float32.");
 
     m.def(
         "reconstruct_e_block",
@@ -374,17 +376,6 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("magn_out").noconvert(), nb::arg("stream"),
         "Block E/magnE reconstruction for <=8 placements: tet_nodes/g read once; "
         "v_block is row-major (n_nodes, k) float64.");
-
-    m.def(
-        "weighted_gradient",
-        [](f32_cuda_3d g, f32_cuda_1d neg_vc, f32_cuda_3d wg, uintptr_t stream) {
-            int n_tet = static_cast<int>(neg_vc.shape(0));
-            launch_weighted_gradient(g.data(), neg_vc.data(), wg.data(), n_tet,
-                                     reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(), nb::arg("wg").noconvert(),
-        nb::arg("stream"),
-        "Precompute neg_vc-scaled gradients for repeated RHS assembly.");
 
     m.def(
         "reconstruct_e",

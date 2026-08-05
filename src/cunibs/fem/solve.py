@@ -39,10 +39,9 @@ from cunibs.solver import (
     l1_dinv,
     reconstruct_e,
     reconstruct_e_block,
-    rhs_assemble_weighted,
-    rhs_assemble_weighted_block,
+    rhs_assemble_staged,
+    rhs_assemble_staged_block,
     select_size4,
-    weighted_gradient,
 )
 
 if TYPE_CHECKING:
@@ -553,29 +552,18 @@ def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarr
     return dadt_elm
 
 
-def _assemble_rhs_weighted_kernel(
-    dadt_elm: cp.ndarray,
-    wg: cp.ndarray,
-    node2corner_ptr: cp.ndarray,
-    node2corner_idx: cp.ndarray,
-    n_nodes: int,
-) -> cp.ndarray:
-    b = cp.empty(n_nodes, dtype=cp.float32)
-    rhs_assemble_weighted(
+def _assemble_rhs_kernel(ctx: SolverContext, dadt_elm: cp.ndarray) -> cp.ndarray:
+    b = cp.empty(ctx.n_nodes, dtype=cp.float32)
+    rhs_assemble_staged(
         cp.ascontiguousarray(dadt_elm),
-        wg,
-        node2corner_ptr,
-        node2corner_idx,
+        ctx.g,
+        ctx.neg_vc,
+        ctx.node2corner_ptr,
+        ctx.node2corner_idx,
         b,
         cp.cuda.get_current_stream().ptr,
     )
     return b
-
-
-def _weighted_gradient_kernel(g: cp.ndarray, neg_vc: cp.ndarray) -> cp.ndarray:
-    wg = cp.empty_like(g)
-    weighted_gradient(g, neg_vc, wg, cp.cuda.get_current_stream().ptr)
-    return wg
 
 
 def _reconstruct_e_kernel(
@@ -613,7 +601,6 @@ class SolverContext:
     tet_tags: cp.ndarray
     n_nodes: int
     g: cp.ndarray
-    wg: cp.ndarray
     vols: cp.ndarray
     # Where every metric and ROI locates an element. HeadMesh computes the same thing on the
     # host, which costs a second on a head mesh, so device consumers take it from here.
@@ -679,7 +666,6 @@ def build_context(mesh: HeadMesh) -> SolverContext:
 
     g = cp.ascontiguousarray(g.astype(RESIDENT_G_DTYPE))
     neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
-    wg = _weighted_gradient_kernel(g, neg_vc)
     vols = cp.ascontiguousarray(vols.astype(cp.float32))
     del cond
     ptr, idx = build_node2corner(tet_nodes, mesh.n_nodes)
@@ -696,7 +682,6 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         tet_tags,
         mesh.n_nodes,
         g,
-        wg,
         vols,
         barycenters,
         neg_vc,
@@ -783,13 +768,7 @@ def solve_placement(
     dadt_nodes = coil_dadt_at_nodes(dip_pos_m, dip_moment, transform, didt, ctx.nodes_mm)
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
 
-    b = _assemble_rhs_weighted_kernel(
-        dadt_elm,
-        ctx.wg,
-        ctx.node2corner_ptr,
-        ctx.node2corner_idx,
-        ctx.n_nodes,
-    )
+    b = _assemble_rhs_kernel(ctx, dadt_elm)
 
     v = solve_grounded(ctx.solver, b)
 
@@ -883,9 +862,10 @@ def solve_placements_block(
         del dadt_nodes
 
     b_block = cp.empty((ctx.n_nodes, k), dtype=cp.float32)
-    rhs_assemble_weighted_block(
+    rhs_assemble_staged_block(
         dadt_elms,
-        ctx.wg,
+        ctx.g,
+        ctx.neg_vc,
         ctx.node2corner_ptr,
         ctx.node2corner_idx,
         b_block,

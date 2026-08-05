@@ -26,11 +26,10 @@ try:
         recover_elements,
         recover_nodes,
         rhs_assemble,
-        rhs_assemble_weighted,
-        rhs_assemble_weighted_block,
+        rhs_assemble_staged,
+        rhs_assemble_staged_block,
         select_size4,
         spr_weights,
-        weighted_gradient,
     )
 except ImportError as exc:
     raise ImportError(_cuda_preload.describe_failure(exc)) from exc
@@ -59,9 +58,8 @@ __all__ = [
     "recover_elements",
     "recover_nodes",
     "rhs_assemble",
-    "rhs_assemble_weighted",
-    "rhs_assemble_weighted_block",
+    "rhs_assemble_staged",
+    "rhs_assemble_staged_block",
     "select_size4",
     "spr_weights",
-    "weighted_gradient",
 ]

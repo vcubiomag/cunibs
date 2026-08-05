@@ -5,7 +5,11 @@
 
 // Assign one thread per node to avoid atomic updates and fix the sum order.
 //   b[node] = Σ_{(e,i): tet_nodes[e,i]=node}  neg_vc[e] · dot(dadt_elm[e], g[e,i])
-// ``neg_vc[e] = -vols[e] * cond[e]`` is precomputed because it does not change by placement.
+// ``neg_vc[e] = -vols[e] * cond[e]``.
+//
+// Two forms. The fused one does the whole thing in the node gather, which reads g uncoalesced
+// once per incident node; the staged one pays a corner pass first so that both halves coalesce,
+// and is what the placement sweep uses.
 
 namespace {
 
@@ -29,17 +33,18 @@ __global__ void rhs_kernel(const float* __restrict__ dadt_elm, const float* __re
     b[node] = acc;
 }
 
-// One thread per corner c: q[c] = dadt_elm[c>>2] · wg[c]. Kept separate from the node-centric
-// gather so both reads coalesce (corners c=4e..4e+3 share e → broadcast; wg[c] is
-// corner-contiguous); a gather that indexed dadt_elm directly would read it uncoalesced once
-// per incident node.
-__global__ void rhs_corner_kernel(const float* __restrict__ dadt_elm, const float* __restrict__ wg,
-                                  float* __restrict__ q, int n_corner) {
+// One thread per corner c: q[c] = neg_vc[c>>2] · dadt_elm[c>>2] · g[c]. Kept separate from the
+// node-centric gather so both reads coalesce (corners c=4e..4e+3 share e → broadcast; g[c] is
+// corner-contiguous).
+__global__ void rhs_corner_kernel(const float* __restrict__ dadt_elm, const float* __restrict__ g,
+                                  const float* __restrict__ neg_vc, float* __restrict__ q,
+                                  int n_corner) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n_corner) return;
     const int e = c >> 2;
-    q[c] = dadt_elm[e * 3 + 0] * wg[c * 3 + 0] + dadt_elm[e * 3 + 1] * wg[c * 3 + 1] +
-           dadt_elm[e * 3 + 2] * wg[c * 3 + 2];
+    const float w = neg_vc[e];
+    q[c] = dadt_elm[e * 3 + 0] * (g[c * 3 + 0] * w) + dadt_elm[e * 3 + 1] * (g[c * 3 + 1] * w) +
+           dadt_elm[e * 3 + 2] * (g[c * 3 + 2] * w);
 }
 
 // Segmented reduction b[node] = Σ_{p∈[ptr[node],ptr[node+1])} q[idx[p]]. The per-node
@@ -55,24 +60,18 @@ __global__ void rhs_gather_kernel(const float* __restrict__ q, const int* __rest
     b[node] = acc;
 }
 
-__global__ void weighted_gradient_kernel(const float* __restrict__ g,
-                                         const float* __restrict__ neg_vc,
-                                         float* __restrict__ wg, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    wg[i] = g[i] * neg_vc[i / 12];
-}
-
-// Block corner pass: wg[c] (the 189 MB shared read) is loaded once for all k
-// placements; q_block is row-major (n_corner, k).
-__global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __restrict__ wg,
+// Block corner pass: g and neg_vc are loaded once for all k placements; q_block is row-major
+// (n_corner, k).
+__global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __restrict__ g,
+                                        const float* __restrict__ neg_vc,
                                         float* __restrict__ q_block, int n_corner, int k) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n_corner) return;
     const int e = c >> 2;
-    const float w0 = wg[c * 3 + 0];
-    const float w1 = wg[c * 3 + 1];
-    const float w2 = wg[c * 3 + 2];
+    const float w = neg_vc[e];
+    const float w0 = g[c * 3 + 0] * w;
+    const float w1 = g[c * 3 + 1] * w;
+    const float w2 = g[c * 3 + 2] * w;
     const std::int64_t out = static_cast<std::int64_t>(c) * k;
     for (int i = 0; i < k; ++i) {
         const float* de = dadt_elm.p[i] + e * 3;
@@ -80,9 +79,9 @@ __global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __re
     }
 }
 
-// Block gather: node2corner ptr/idx (66 MB shared) read once; per-node accumulation
-// order per column matches the single-RHS kernel, so each column is bit-identical to
-// its serial counterpart. Writes b_block row-major (n_nodes, k) — the solver layout.
+// Block gather: node2corner ptr/idx read once. Per-node accumulation order per column matches the
+// single-RHS kernel, so each column is bit-identical to its serial counterpart. Writes b_block
+// row-major (n_nodes, k) — the solver layout.
 __global__ void rhs_gather_block_kernel(const float* __restrict__ q_block,
                                         const int* __restrict__ ptr,
                                         const int* __restrict__ idx,
@@ -110,8 +109,8 @@ void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, cons
     }
 }
 
-void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr, const int* idx,
-                         float* b, int n_nodes, int n_tet, cudaStream_t stream) {
+void launch_rhs_staged(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
+                       const int* idx, float* b, int n_nodes, int n_tet, cudaStream_t stream) {
     const int n_corner = 4 * n_tet;
     float* q = nullptr;
     // Safe here because the RHS build runs outside the solver's CUDA-graph capture; cudaMallocAsync
@@ -119,7 +118,7 @@ void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr,
     check_cuda(cudaMallocAsync(&q, static_cast<size_t>(n_corner) * sizeof(float), stream), "rhs",
                "mallocAsync(q)");
     if (const unsigned blocks = grid_for(n_corner)) {
-        rhs_corner_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, wg, q, n_corner);
+        rhs_corner_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, g, neg_vc, q, n_corner);
     }
     if (const unsigned blocks = grid_for(n_nodes)) {
         rhs_gather_kernel<<<blocks, kBlock, 0, stream>>>(q, ptr, idx, b, n_nodes);
@@ -127,27 +126,20 @@ void launch_rhs_weighted(const float* dadt_elm, const float* wg, const int* ptr,
     check_cuda(cudaFreeAsync(q, stream), "rhs", "freeAsync(q)");
 }
 
-void launch_weighted_gradient(const float* g, const float* neg_vc, float* wg, int n_tet,
-                              cudaStream_t stream) {
-    const int n = n_tet * 12;
-    if (const unsigned blocks = grid_for(n)) {
-        weighted_gradient_kernel<<<blocks, kBlock, 0, stream>>>(g, neg_vc, wg, n);
-    }
-}
-
-void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, const int* ptr,
-                               const int* idx, float* b_block, int n_nodes, int n_tet, int k,
-                               cudaStream_t stream) {
+void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const float* neg_vc,
+                             const int* ptr, const int* idx, float* b_block, int n_nodes,
+                             int n_tet, int k, cudaStream_t stream) {
     ConstPtrPack in{};
     for (int i = 0; i < k; ++i) in.p[i] = dadt_elm[i];
     const int n_corner = 4 * n_tet;
     float* q_block = nullptr;
-    // Outside any CUDA-graph capture (same constraint as launch_rhs_weighted).
+    // Outside any CUDA-graph capture (same constraint as launch_rhs_staged).
     check_cuda(cudaMallocAsync(&q_block, static_cast<size_t>(n_corner) * k * sizeof(float),
                                stream),
                "rhs", "mallocAsync(q_block)");
     if (const unsigned blocks = grid_for(n_corner)) {
-        rhs_corner_block_kernel<<<blocks, kBlock, 0, stream>>>(in, wg, q_block, n_corner, k);
+        rhs_corner_block_kernel<<<blocks, kBlock, 0, stream>>>(in, g, neg_vc, q_block, n_corner,
+                                                               k);
     }
     if (const unsigned blocks = grid_for(n_nodes)) {
         rhs_gather_block_kernel<<<blocks, kBlock, 0, stream>>>(q_block, ptr, idx, b_block,

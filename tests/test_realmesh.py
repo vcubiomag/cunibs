@@ -175,7 +175,7 @@ def test_patch_multilevel_solve_true_residual(
 
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
     from cunibs.fem.solve import (
-        _assemble_rhs_weighted_kernel,
+        _assemble_rhs_kernel,
         _dadt_node_to_elm,
         solve_grounded,
     )
@@ -188,9 +188,7 @@ def test_patch_multilevel_solve_true_residual(
         coil_dadt_at_nodes(d70_coil.positions_m, d70_coil.moments, tf, 1e6, ctx.nodes_mm),
         ctx.tet_nodes,
     )
-    b = _assemble_rhs_weighted_kernel(
-        dadt_elm, ctx.wg, ctx.node2corner_ptr, ctx.node2corner_idx, ctx.n_nodes
-    )
+    b = _assemble_rhs_kernel(ctx, dadt_elm)
 
     solver = ctx.solver
     v = solve_grounded(solver, b)

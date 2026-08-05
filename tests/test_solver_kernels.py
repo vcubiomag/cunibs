@@ -58,17 +58,7 @@ def stream(cp):
     return cp.cuda.get_current_stream().ptr
 
 
-# --- weighted_gradient / dadt_node_to_element --------------------------------------------
-
-
-def test_weighted_gradient_scales_each_corner_by_its_element(cp, dev, mesh_arrays, stream):
-    """wg[e,i,k] = g[e,i,k] · neg_vc[e] — the flat kernel indexes neg_vc[i/12]."""
-    from cunibs.solver import weighted_gradient
-
-    wg = cp.empty_like(dev["g"])
-    weighted_gradient(dev["g"], dev["neg_vc"], wg, stream)
-    expected = mesh_arrays["g"] * mesh_arrays["neg_vc"][:, None, None]
-    np.testing.assert_allclose(cp.asnumpy(wg), expected, rtol=1e-6)
+# --- dadt_node_to_element ----------------------------------------------------------------
 
 
 def test_dadt_node_to_element_averages_the_four_corners(cp, dev, mesh_arrays, stream):
@@ -119,44 +109,35 @@ def test_rhs_assemble_matches_numpy(cp, dev, mesh_arrays, stream):
     np.testing.assert_allclose(cp.asnumpy(b), rhs_reference(mesh_arrays), rtol=1e-4)
 
 
-def test_rhs_assemble_weighted_matches_numpy(cp, dev, mesh_arrays, stream):
-    from cunibs.solver import rhs_assemble_weighted, weighted_gradient
-
-    wg = cp.empty_like(dev["g"])
-    weighted_gradient(dev["g"], dev["neg_vc"], wg, stream)
+def test_rhs_assemble_staged_matches_numpy(cp, dev, mesh_arrays, stream):
+    from cunibs.solver import rhs_assemble_staged
 
     b = cp.empty(N_NODES, dtype=cp.float32)
-    rhs_assemble_weighted(dev["dadt_elm"], wg, dev["ptr"], dev["idx"], b, stream)
+    rhs_assemble_staged(
+        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b, stream
+    )
     np.testing.assert_allclose(cp.asnumpy(b), rhs_reference(mesh_arrays), rtol=1e-4)
 
 
-def test_rhs_assemble_weighted_equals_unweighted(cp, dev, stream):
+def test_rhs_assemble_staged_equals_fused(cp, dev, stream):
     """Both spellings must produce the same RHS; only their memory traffic differs."""
-    from cunibs.solver import rhs_assemble, rhs_assemble_weighted, weighted_gradient
+    from cunibs.solver import rhs_assemble, rhs_assemble_staged
 
-    wg = cp.empty_like(dev["g"])
-    weighted_gradient(dev["g"], dev["neg_vc"], wg, stream)
-
-    plain = cp.empty(N_NODES, dtype=cp.float32)
-    weighted = cp.empty(N_NODES, dtype=cp.float32)
+    fused = cp.empty(N_NODES, dtype=cp.float32)
+    staged = cp.empty(N_NODES, dtype=cp.float32)
     rhs_assemble(
-        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], plain, stream
+        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], fused, stream
     )
-    rhs_assemble_weighted(dev["dadt_elm"], wg, dev["ptr"], dev["idx"], weighted, stream)
-    np.testing.assert_allclose(cp.asnumpy(plain), cp.asnumpy(weighted), rtol=1e-5)
+    rhs_assemble_staged(
+        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], staged, stream
+    )
+    np.testing.assert_allclose(cp.asnumpy(fused), cp.asnumpy(staged), rtol=1e-5)
 
 
 @pytest.mark.parametrize("k", [1, 2, 3, 8])
-def test_rhs_assemble_weighted_block_matches_single(cp, dev, stream, k):
+def test_rhs_assemble_staged_block_matches_single(cp, dev, stream, k):
     """Every column of the block RHS must equal the single-RHS kernel on that column."""
-    from cunibs.solver import (
-        rhs_assemble_weighted,
-        rhs_assemble_weighted_block,
-        weighted_gradient,
-    )
-
-    wg = cp.empty_like(dev["g"])
-    weighted_gradient(dev["g"], dev["neg_vc"], wg, stream)
+    from cunibs.solver import rhs_assemble_staged, rhs_assemble_staged_block
 
     rng = np.random.default_rng(2)
     columns = [
@@ -165,11 +146,15 @@ def test_rhs_assemble_weighted_block_matches_single(cp, dev, stream, k):
     ]
 
     b_block = cp.empty((N_NODES, k), dtype=cp.float32)
-    rhs_assemble_weighted_block(columns, wg, dev["ptr"], dev["idx"], b_block, stream)
+    rhs_assemble_staged_block(
+        columns, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b_block, stream
+    )
 
     for c, dadt in enumerate(columns):
         single = cp.empty(N_NODES, dtype=cp.float32)
-        rhs_assemble_weighted(dadt, wg, dev["ptr"], dev["idx"], single, stream)
+        rhs_assemble_staged(
+            dadt, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], single, stream
+        )
         np.testing.assert_array_equal(
             cp.asnumpy(b_block[:, c]), cp.asnumpy(single), err_msg=f"column {c}"
         )
@@ -177,15 +162,14 @@ def test_rhs_assemble_weighted_block_matches_single(cp, dev, stream, k):
 
 def test_rhs_assembly_is_bit_reproducible(cp, dev, stream):
     """Node-centric, atomic-free, fixed summation order — repeated calls must be identical."""
-    from cunibs.solver import rhs_assemble_weighted, weighted_gradient
-
-    wg = cp.empty_like(dev["g"])
-    weighted_gradient(dev["g"], dev["neg_vc"], wg, stream)
+    from cunibs.solver import rhs_assemble_staged
 
     runs = []
     for _ in range(3):
         b = cp.empty(N_NODES, dtype=cp.float32)
-        rhs_assemble_weighted(dev["dadt_elm"], wg, dev["ptr"], dev["idx"], b, stream)
+        rhs_assemble_staged(
+            dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b, stream
+        )
         runs.append(cp.asnumpy(b))
     np.testing.assert_array_equal(runs[0], runs[1])
     np.testing.assert_array_equal(runs[0], runs[2])
