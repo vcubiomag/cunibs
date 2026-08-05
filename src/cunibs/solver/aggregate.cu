@@ -45,6 +45,8 @@ __device__ __forceinline__ bool is_candidate(int col, int row, int n) {
     return col != row && static_cast<unsigned>(col) < static_cast<unsigned>(n);
 }
 
+// The `==` drops a NaN weight, which agg_edge_weight_kernel produces when a stored zero meets two
+// zero diagonals.
 __device__ __forceinline__ void best_take(Best& acc, float w, int col) {
     if (w > acc.w || (w == acc.w && col > acc.col)) {
         acc.w = w;
@@ -118,8 +120,8 @@ __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
         }
         const float den = fmaxf(d_i, fabsf(diag[jc]));
         const float ed = fabsf(values[j]) / den;
-        const unsigned int lo = static_cast<unsigned int>(i < jc ? i : jc);
-        const unsigned int hi = static_cast<unsigned int>(i < jc ? jc : i);
+        const unsigned int lo = static_cast<unsigned int>(min(i, jc));
+        const unsigned int hi = static_cast<unsigned int>(max(i, jc));
         const float frac = 1e-5f * static_cast<float>(agg_hash(lo, hi)) / 4294967295.0f;
         w[j] = ed + frac * ed;
     }
@@ -154,7 +156,7 @@ __global__ __launch_bounds__(kBlock) void agg_match_edges_kernel(
         const int pm = strongest[tid];
         if (pm != -1 && strongest[pm] == tid) {
             partner[tid] = pm;
-            agg[tid] = (pm > tid) ? tid : pm;
+            agg[tid] = min(pm, tid);
         } else {
             unassigned = 1;
         }
@@ -220,7 +222,7 @@ __global__ __launch_bounds__(kBlock) void agg_match_aggregates_kernel(
         const int mine = agg[tid];
         if (pm != -1 && strongest[pm] == mine) {
             aggregated[tid] = 1;
-            agg[tid] = (pm > mine) ? mine : pm;
+            agg[tid] = min(pm, mine);
         } else {
             unassigned = 1;
         }

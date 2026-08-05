@@ -1,6 +1,8 @@
 #include "device_math.cuh"
 #include "kernels.hpp"
 
+#include <cuda/cmath>
+
 #include <algorithm>
 #include <cfloat>
 #include <climits>
@@ -109,7 +111,7 @@ __global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scal
 
     const int p = blockIdx.x;
     const int chunk = blockIdx.y;
-    const int per = (n_tri + n_chunks - 1) / n_chunks;
+    const int per = cuda::ceil_div(n_tri, n_chunks);
     const int lo = chunk * per;
     const int hi = min(lo + per, n_tri);
     const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
@@ -240,8 +242,8 @@ void launch_place(const double* centers, const double* handles, const double* di
 
     // Split a placement's scan across blocks only while the placements alone leave SMs idle, and
     // never past a block per kMinTrisPerChunk triangles. Both terms are at least 1.
-    const int for_occupancy = (sm_count() + n_pl - 1) / n_pl;
-    const int for_size = (n_tri + kMinTrisPerChunk - 1) / kMinTrisPerChunk;
+    const int for_occupancy = cuda::ceil_div(sm_count(), n_pl);
+    const int for_size = cuda::ceil_div(n_tri, kMinTrisPerChunk);
     const int n_chunks = std::min(for_occupancy, for_size);
     const Scalp scalp{a, b, c, tnorm};
 
