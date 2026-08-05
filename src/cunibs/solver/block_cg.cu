@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "cg_kernels.hpp"
+#include "device_math.cuh"
 
 namespace {
 
@@ -243,16 +244,22 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
     for (int c = 0; c < K; ++c) rloc[c] = 0.0;
     if (i < n) {
         const std::int64_t base = static_cast<std::int64_t>(i) * K;
+        double pv[K], apv[K], xv[K], rv[K];
+        load_row<K>(p + base, pv);
+        load_row<K>(ap + base, apv);
+        load_row<K>(x + base, xv);
+        load_row<K>(r + base, rv);
+        float rfv[K];
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const double a = __ldg(alpha + c);
-            const double na = __ldg(neg_alpha + c);
-            x[base + c] += a * p[base + c];
-            const double rv = r[base + c] + na * ap[base + c];
-            r[base + c] = rv;
-            rf[base + c] = static_cast<float>(rv);
-            rloc[c] = rv * rv;
+            xv[c] += __ldg(alpha + c) * pv[c];
+            rv[c] += __ldg(neg_alpha + c) * apv[c];
+            rfv[c] = static_cast<float>(rv[c]);
+            rloc[c] = rv[c] * rv[c];
         }
+        store_row<K>(x + base, xv);
+        store_row<K>(r + base, rv);
+        store_row<K>(rf + base, rfv);
     }
     bcg_block_reduce_cols<K>(rloc, partials, n_blocks);
 }

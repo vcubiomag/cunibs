@@ -1,6 +1,7 @@
 // Every V-cycle step is written once, templated on the number of right-hand sides K, and
 // the single-RHS cycle is the K = 1 instantiation: for K = 1 the row-major (n, K) operands
 // collapse to plain vectors and the compiler folds the column loops away.
+#include "device_math.cuh"
 #include "vcycle.hpp"
 
 #include <atomic>
@@ -35,43 +36,6 @@ constexpr int kTpr = 4;
 static_assert(kWarp % kTpr == 0, "shuffle width must divide the warp");
 static_assert(kBlock % kTpr == 0, "a block must hold a whole number of rows");
 
-// Gather the K contiguous values of one column block as vector loads rather than K scalar
-// ones. K * sizeof(float) is a power of two and every buffer here starts at a cudaMalloc
-// boundary, so x + col * K is always aligned to the width being read.
-//
-// This is what keeps the wide blocks off the L1 request limit: scalar loads would ask for K
-// separate four-byte slices per thread per nonzero, so a warp generates up to 32 distinct
-// wavefronts for data occupying four and the kernel stalls on request throughput long before
-// DRAM. The values and their accumulation order are unaffected.
-template <int K>
-__device__ __forceinline__ void gather_k(const float* __restrict__ p, float (&v)[K]) {
-    if constexpr (K == 2) {
-        const float2 t = *reinterpret_cast<const float2*>(p);
-        v[0] = t.x;
-        v[1] = t.y;
-    } else if constexpr (K == 4) {
-        const float4 t = *reinterpret_cast<const float4*>(p);
-        v[0] = t.x;
-        v[1] = t.y;
-        v[2] = t.z;
-        v[3] = t.w;
-    } else if constexpr (K == 8) {
-        const float4 a = *reinterpret_cast<const float4*>(p);
-        const float4 b = *reinterpret_cast<const float4*>(p + 4);
-        v[0] = a.x;
-        v[1] = a.y;
-        v[2] = a.z;
-        v[3] = a.w;
-        v[4] = b.x;
-        v[5] = b.y;
-        v[6] = b.z;
-        v[7] = b.w;
-    } else {
-#pragma unroll
-        for (int c = 0; c < K; ++c) v[c] = __ldg(p + c);
-    }
-}
-
 // One warp fraction per row: strided partial products over the row's nonzeros, then a
 // fixed-order shuffle reduction leaving the row total in lane 0. Threads whose row is past
 // the end still reach the shuffle with zero accumulators, which is why the mask is the full
@@ -97,7 +61,7 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
             const float v = __half2float(vals[j]);
             const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
             float xv[K];
-            gather_k<K>(x + base, xv);
+            load_row<K>(x + base, xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
@@ -168,7 +132,7 @@ __global__ void __launch_bounds__(kBlock)
             const float v = r_vals[j];
             const std::int64_t base = static_cast<std::int64_t>(r_col_idx[j]) * K;
             float xv[K];
-            gather_k<K>(r_fine + base, xv);
+            load_row<K>(r_fine + base, xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
@@ -204,7 +168,7 @@ __global__ void __launch_bounds__(kBlock)
         const float v = p_vals[j];
         const std::int64_t base = static_cast<std::int64_t>(p_col_idx[j]) * K;
         float xv[K];
-        gather_k<K>(x_coarse + base, xv);
+        load_row<K>(x_coarse + base, xv);
 #pragma unroll
         for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
     }
