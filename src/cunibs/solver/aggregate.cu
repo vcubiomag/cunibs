@@ -1,12 +1,12 @@
 #include "aggregate.hpp"
 
+#include <cub/device/device_scan.cuh>
+
 #include <cstddef>
 #include <stdexcept>
 #include <string>
 
 namespace {
-
-constexpr int kWarpsPerBlock = kBlock / kWarp;
 
 // AMGx defaults (core.cu). Fixed rather than exposed: nothing in the pipeline varies them,
 // and round 1 must not apply kMaxUnassignedFraction at all (see select_size4).
@@ -274,94 +274,6 @@ __global__ __launch_bounds__(kBlock) void agg_relabel_kernel(int n, int* __restr
     if (tid < n) agg[tid] = excl[agg[tid]];
 }
 
-// Exclusive prefix sum over the used-label flags, in the usual three passes over fixed tiles.
-// CUB would do this in one call; hand-rolling it keeps this file free of any dependency
-// beyond the CUDA runtime, which is the point of the file. Every add is an integer add, so
-// the result does not depend on how the tiles get scheduled.
-constexpr int kScanItemsPerThread = 8;
-constexpr int kScanTile = kBlock * kScanItemsPerThread;
-
-// Block-wide exclusive scan of one value per thread; `total` receives the block sum. All
-// threads must call it, and callers must __syncthreads() between successive calls, which
-// share `smem`.
-__device__ __forceinline__ int block_exclusive_scan(int value, int& total,
-                                                    int* __restrict__ smem) {
-    const int lane = static_cast<int>(threadIdx.x) % kWarp;
-    const int warp = static_cast<int>(threadIdx.x) / kWarp;
-
-    int x = value;
-#pragma unroll
-    for (int off = 1; off < kWarp; off <<= 1) {
-        const int y = __shfl_up_sync(0xffffffffu, x, off);
-        if (lane >= off) x += y;
-    }
-    if (lane == kWarp - 1) smem[warp] = x;
-    __syncthreads();
-
-    if (warp == 0) {
-        int s = (lane < kWarpsPerBlock) ? smem[lane] : 0;
-#pragma unroll
-        for (int off = 1; off < kWarpsPerBlock; off <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, s, off);
-            if (lane >= off) s += y;
-        }
-        if (lane < kWarpsPerBlock) smem[lane] = s;
-    }
-    __syncthreads();
-
-    total = smem[kWarpsPerBlock - 1];
-    return (warp == 0 ? 0 : smem[warp - 1]) + x - value;
-}
-
-__global__ __launch_bounds__(kBlock) void agg_scan_tile_sums_kernel(
-    int n, const int* __restrict__ in, int* __restrict__ tile_sum) {
-    __shared__ int smem[kWarpsPerBlock];
-    const int tile = blockIdx.x * kScanTile;
-    int sum = 0;
-    for (int r = 0; r < kScanItemsPerThread; ++r) {
-        const int i = tile + r * kBlock + static_cast<int>(threadIdx.x);
-        if (i < n) sum += in[i];
-    }
-    int total = 0;
-    block_exclusive_scan(sum, total, smem);
-    if (threadIdx.x == 0) tile_sum[blockIdx.x] = total;
-}
-
-// One block walking the tile sums, so the offsets come out in a single pass with no second
-// level to scan. A few thousand tiles at most, 256 at a time.
-__global__ __launch_bounds__(kBlock) void agg_scan_tile_offsets_kernel(
-    int n_tiles, int* __restrict__ tile_sum, int* __restrict__ total_out) {
-    __shared__ int smem[kWarpsPerBlock];
-    int running = 0;
-    for (int base = 0; base < n_tiles; base += kBlock) {
-        const int i = base + static_cast<int>(threadIdx.x);
-        const int v = (i < n_tiles) ? tile_sum[i] : 0;
-        int total = 0;
-        const int prefix = block_exclusive_scan(v, total, smem);
-        if (i < n_tiles) tile_sum[i] = running + prefix;
-        running += total;
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) *total_out = running;
-}
-
-__global__ __launch_bounds__(kBlock) void agg_scan_write_kernel(int n, const int* __restrict__ in,
-                                                                const int* __restrict__ tile_sum,
-                                                                int* __restrict__ out) {
-    __shared__ int smem[kWarpsPerBlock];
-    const int tile = blockIdx.x * kScanTile;
-    int running = tile_sum[blockIdx.x];
-    for (int r = 0; r < kScanItemsPerThread; ++r) {
-        const int i = tile + r * kBlock + static_cast<int>(threadIdx.x);
-        const int v = (i < n) ? in[i] : 0;
-        int total = 0;
-        const int prefix = block_exclusive_scan(v, total, smem);
-        if (i < n) out[i] = running + prefix;
-        running += total;
-        __syncthreads();
-    }
-}
-
 constexpr size_t kArenaAlign = 256;
 
 constexpr size_t align_up(size_t bytes) {
@@ -398,11 +310,11 @@ struct Scratch {
     int* cand;
     int* used;
     int* excl;
-    int* tile_sum;
     int* counter;
+    std::byte* cub;
 };
 
-Scratch lay_out(Bump& bump, size_t n, size_t nnz, size_t scan_tiles) {
+Scratch lay_out(Bump& bump, size_t n, size_t nnz, size_t cub_bytes) {
     Scratch s{};
     s.diag = bump.take<float>(n);
     s.w = bump.take<float>(nnz > 0 ? nnz : 1);
@@ -411,30 +323,32 @@ Scratch lay_out(Bump& bump, size_t n, size_t nnz, size_t scan_tiles) {
     s.strongest = bump.take<int>(n);
     s.aggregated = bump.take<int>(n);
     s.cand = bump.take<int>(n);
-    s.used = bump.take<int>(n);
+    // One slot past the flags so the exclusive scan has somewhere to deposit the total.
+    s.used = bump.take<int>(n + 1);
     s.excl = bump.take<int>(n + 1);
-    s.tile_sum = bump.take<int>(scan_tiles);
     s.counter = bump.take<int>(1);
+    s.cub = bump.take<std::byte>(cub_bytes);
     return s;
 }
 
-// cudaMalloc synchronises the whole device, so every scratch buffer shares one allocation:
-// on the small coarse levels the separate allocations cost more than the aggregation itself.
+// Every scratch buffer shares one stream-ordered allocation: on the small coarse levels a dozen
+// separate ones cost more than the aggregation itself.
 class DeviceArena {
   public:
-    explicit DeviceArena(size_t bytes) {
-        check_cuda(cudaMalloc(&base_, bytes), "alloc aggregate scratch");
+    DeviceArena(size_t bytes, cudaStream_t stream) : stream_(stream) {
+        check_cuda(cudaMallocAsync(&base_, bytes, stream), "alloc aggregate scratch");
     }
     DeviceArena(const DeviceArena&) = delete;
     DeviceArena& operator=(const DeviceArena&) = delete;
     ~DeviceArena() {
-        if (base_ != nullptr) cudaFree(base_);
+        if (base_ != nullptr) cudaFreeAsync(base_, stream_);
     }
 
     std::byte* get() const { return static_cast<std::byte*>(base_); }
 
   private:
     void* base_ = nullptr;
+    cudaStream_t stream_;
 };
 
 // The matching loops are data dependent, so each one costs a round trip per iteration.
@@ -459,15 +373,19 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     // own error reports.
     check_cuda(cudaStreamSynchronize(stream), "fault from work queued before this call");
 
-    // Both are nonzero: n_rows > 0 above, and grid_for only returns 0 for an empty range.
+    // Nonzero: n_rows > 0 above, and grid_for only returns 0 for an empty range.
     const unsigned blocks = grid_for(n_rows, kBlock);
-    const unsigned scan_tiles = grid_for(n_rows, kScanTile);
+
+    size_t cub_bytes = 0;
+    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, cub_bytes, static_cast<int*>(nullptr),
+                                             static_cast<int*>(nullptr), n_rows + 1, stream),
+               "size(renumber scan)");
 
     Bump sizing(nullptr);
-    lay_out(sizing, n_rows, nnz, scan_tiles);
-    DeviceArena arena(sizing.bytes());
+    lay_out(sizing, n_rows, nnz, cub_bytes);
+    DeviceArena arena(sizing.bytes(), stream);
     Bump bump(arena.get());
-    const Scratch s = lay_out(bump, n_rows, nnz, scan_tiles);
+    const Scratch s = lay_out(bump, n_rows, nnz, cub_bytes);
 
     agg_diag_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, row_ptr, col_idx, values, s.diag);
     if (nnz > 0) {
@@ -536,16 +454,16 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     }
 
     // Order-preserving dense renumbering (agg_selector.cu): mark the labels in use,
-    // exclusive-scan the flags, and gather. Surjective by construction.
-    check_cuda(cudaMemsetAsync(s.used, 0, static_cast<size_t>(n_rows) * sizeof(int), stream),
+    // exclusive-scan the flags, and gather. Surjective by construction. The scan runs over one
+    // slot more than there are rows, so excl[n_rows] comes back holding the aggregate count.
+    check_cuda(cudaMemsetAsync(s.used, 0, (static_cast<size_t>(n_rows) + 1) * sizeof(int), stream),
                "memset used");
     agg_mark_used_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.used);
-    agg_scan_tile_sums_kernel<<<scan_tiles, kBlock, 0, stream>>>(n_rows, s.used, s.tile_sum);
-    agg_scan_tile_offsets_kernel<<<1, kBlock, 0, stream>>>(static_cast<int>(scan_tiles),
-                                                           s.tile_sum, s.excl + n_rows);
-    agg_scan_write_kernel<<<scan_tiles, kBlock, 0, stream>>>(n_rows, s.used, s.tile_sum, s.excl);
+    check_cuda(cudaGetLastError(), "mark used launch");
+    check_cuda(cub::DeviceScan::ExclusiveSum(s.cub, cub_bytes, s.used, s.excl, n_rows + 1, stream),
+               "renumber scan");
     agg_relabel_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.excl);
-    check_cuda(cudaGetLastError(), "renumber launch");
+    check_cuda(cudaGetLastError(), "relabel launch");
 
     return read_counter(s.excl + n_rows, stream);
 }

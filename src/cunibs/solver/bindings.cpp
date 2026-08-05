@@ -550,6 +550,20 @@ NB_MODULE(_solver_ext, m) {
         "Per-element reciprocity weight w_e = vol*sigma*(G_e values); into caller-allocated w_e.");
 
     m.def(
+        "node_gather",
+        [](f64_cuda corner, i32_cuda ptr, i32_cuda idx, f64_cuda out, uintptr_t stream) {
+            int n_nodes = static_cast<int>(ptr.shape(0)) - 1;
+            if (static_cast<int>(out.shape(0)) != n_nodes) {
+                throw std::invalid_argument("node_gather: out must have one entry per node");
+            }
+            launch_node_gather(corner.data(), ptr.data(), idx.data(), out.data(), n_nodes,
+                               reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("corner").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("stream"),
+        "Node-centric scalar corner gather over the node2corner CSR; into caller-allocated out.");
+
+    m.def(
         "node_scatter3",
         [](f64_cuda_2d w_e, i32_cuda ptr, i32_cuda idx, f64_cuda_2d node_w, uintptr_t stream) {
             int n_nodes = static_cast<int>(ptr.shape(0)) - 1;

@@ -20,7 +20,23 @@ __global__ void element_weight_kernel(const double* __restrict__ values,
     w_e[e * 3 + 2] = s * grad.z;
 }
 
-//   node_w[n,k] = ¼ Σ_{c ∋ n} w_e[c>>2, k]   (node2corner stores corner ids c = 4e + i)
+//   out[n] = Σ_{c ∋ n} corner[c]   (node2corner stores corner ids c = 4e + i)
+// One thread per node over the incidence CSR, so the per-node order is the one every other
+// assembly uses and the sum is reproducible; a scatter would need atomics and sum each node's
+// corners in whatever order the blocks retired.
+__global__ void node_gather_kernel(const double* __restrict__ corner, const int* __restrict__ ptr,
+                                   const int* __restrict__ idx, double* __restrict__ out,
+                                   int n_nodes) {
+    const int node = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node >= n_nodes) return;
+
+    const int end = ptr[node + 1];
+    double acc = 0.0;
+    for (int p = ptr[node]; p < end; ++p) acc += corner[idx[p]];
+    out[node] = acc;
+}
+
+//   node_w[n,k] = ¼ Σ_{c ∋ n} w_e[c>>2, k]
 __global__ void node_scatter3_kernel(const double* __restrict__ w_e, const int* __restrict__ ptr,
                                      const int* __restrict__ idx, double* __restrict__ node_w,
                                      int n_nodes) {
@@ -48,6 +64,13 @@ void launch_element_weight(const double* values, const int* tet_nodes, const flo
     if (const unsigned blocks = grid_for(n_tet)) {
         element_weight_kernel<<<blocks, kBlock, 0, stream>>>(values, tet_nodes, g, neg_vc, w_e,
                                                              n_tet);
+    }
+}
+
+void launch_node_gather(const double* corner, const int* ptr, const int* idx, double* out,
+                        int n_nodes, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(n_nodes)) {
+        node_gather_kernel<<<blocks, kBlock, 0, stream>>>(corner, ptr, idx, out, n_nodes);
     }
 }
 

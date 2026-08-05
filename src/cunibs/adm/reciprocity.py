@@ -29,7 +29,7 @@ from cunibs.fem.solve import (
     prepare_grounded_solver,
     solve_grounded,
 )
-from cunibs.solver import dadt_nbody, element_weight, node_scatter3
+from cunibs.solver import dadt_nbody, element_weight, node_gather, node_scatter3
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -66,13 +66,25 @@ def build_adjoint_solver(
 def _adjoint_rhs(
     ctx: SolverContext, elem_idx: cp.ndarray, weights: cp.ndarray, direction: cp.ndarray
 ) -> cp.ndarray:
-    """Assemble the full-size nodal adjoint RHS ``c`` for one direction ``ê``."""
-    g_roi = ctx.g[elem_idx].astype(cp.float64)  # (K,4,3)
-    nodes = ctx.tet_nodes[elem_idx]  # (K,4)
-    # α_e (ê·∇λ_i) per ROI corner.
-    contrib = weights[:, None] * (g_roi @ direction)  # (K,4)
-    c = cp.zeros(ctx.n_nodes, dtype=cp.float64)
-    cp.add.at(c, nodes.ravel(), contrib.ravel())
+    """Assemble the full-size nodal adjoint RHS ``c`` for one direction ``ê``.
+
+    The ROI's corner contributions ``α_e (ê·∇λ_i)`` are laid over the whole mesh so the nodal sum
+    is the same fixed-order gather over the node2corner CSR that every other assembly uses. A
+    scatter straight from the ROI would need atomics, and would sum a node's corners in whatever
+    order the blocks retired.
+    """
+    corner = cp.zeros(4 * int(ctx.tet_nodes.shape[0]), dtype=cp.float64)
+    corner.reshape(-1, 4)[elem_idx] = weights[:, None] * (
+        ctx.g[elem_idx].astype(cp.float64) @ direction
+    )
+    c = cp.empty(ctx.n_nodes, dtype=cp.float64)
+    node_gather(
+        corner,
+        ctx.node2corner_ptr,
+        ctx.node2corner_idx,
+        c,
+        cp.cuda.get_current_stream().ptr,
+    )
     return c
 
 

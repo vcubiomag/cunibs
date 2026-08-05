@@ -120,6 +120,10 @@ void launch_recover_elements(const float* const* e_slots, const int* slot_of_cor
 void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
                            const float* neg_vc, double* w_e, int n_tet, cudaStream_t stream);
 
+// corner is indexed by corner id c = 4e + i, not by element.
+void launch_node_gather(const double* corner, const int* ptr, const int* idx, double* out,
+                        int n_nodes, cudaStream_t stream);
+
 void launch_node_scatter3(const double* w_e, const int* ptr, const int* idx, double* node_w,
                           int n_nodes, cudaStream_t stream);
 
