@@ -2,7 +2,6 @@
 
 from cunibs.fem.assembly import (
     GM_TAG,
-    STIFFNESS_TILE_TETS,
     TISSUE_CONDUCTIVITY,
     assemble_stiffness,
     build_node2corner,
@@ -57,7 +56,6 @@ __all__ = [
     "MU0_OVER_4PI",
     "POTENTIAL_MODES",
     "RECOVERY_MODES",
-    "STIFFNESS_TILE_TETS",
     "TISSUE_CONDUCTIVITY",
     "TISSUE_SLOT_MODES",
     "GroundedSolver",

@@ -82,8 +82,8 @@ def build_conductivity_uq_precompute(
 
     tets = as_int32_tets(ctx.tet_nodes)
     n_nodes = int(ctx.n_nodes)
-    a_full = stiffness_pattern(tets, n_nodes, g64.dtype)
     n2c_ptr, n2c_idx = build_node2corner(tets, n_nodes)
+    a_full = stiffness_pattern(tets, n_nodes, n2c_ptr, n2c_idx)
 
     # Grounding selects a submatrix of a pattern that never moves, so every reduced nonzero comes
     # from exactly one full nonzero. Reducing a matrix whose values are their own positions

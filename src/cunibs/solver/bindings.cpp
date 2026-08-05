@@ -239,6 +239,32 @@ NB_MODULE(_solver_ext, m) {
         "Deterministic node-centric RHS assembly with preweighted gradients.");
 
     m.def(
+        "build_stiffness_pattern",
+        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda cand, i32_cuda sorted,
+           i32_cuda indptr, uintptr_t stream) {
+            const int n_tet = static_cast<int>(tet_nodes.shape(0));
+            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
+            const size_t needed = static_cast<size_t>(n_tet) * 16;
+            if (cand.shape(0) < needed || sorted.shape(0) < needed) {
+                throw std::invalid_argument(
+                    "build_stiffness_pattern: work buffers must hold 16 * n_tet entries");
+            }
+            if (ptr.shape(0) != indptr.shape(0)) {
+                throw std::invalid_argument(
+                    "build_stiffness_pattern: ptr and indptr must both be n_rows + 1");
+            }
+            return build_stiffness_pattern(tet_nodes.data(), ptr.data(), idx.data(), cand.data(),
+                                           sorted.data(), indptr.data(), n_rows, n_tet,
+                                           reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("cand").noconvert(), nb::arg("sorted").noconvert(), nb::arg("indptr").noconvert(),
+        nb::arg("stream"),
+        "CSR sparsity pattern of the stiffness matrix over the node2corner map. Fills indptr and "
+        "leaves the sorted, distinct column indices in the first nnz entries of cand, which it "
+        "returns. Synchronises the stream.");
+
+    m.def(
         "assemble_stiffness_values",
         [](f64_cuda_3d g, f64_cuda scale, i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx,
            i32_cuda indptr, i32_cuda indices, f64_cuda data, uintptr_t stream) {

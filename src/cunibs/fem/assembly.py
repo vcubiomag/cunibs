@@ -5,7 +5,11 @@ from __future__ import annotations
 import cupy as cp
 import cupyx.scipy.sparse as csp
 
-from cunibs.solver import assemble_stiffness_values, p1_gradients
+from cunibs.solver import (
+    assemble_stiffness_values,
+    build_stiffness_pattern,
+    p1_gradients,
+)
 
 TISSUE_CONDUCTIVITY: dict[int, float] = {
     1: 0.126,  # white matter
@@ -21,8 +25,6 @@ TISSUE_CONDUCTIVITY: dict[int, float] = {
 }
 
 GM_TAG = 2
-
-STIFFNESS_TILE_TETS = 1 << 18
 
 
 def conductivity_per_tet(tet_tags: cp.ndarray) -> cp.ndarray:
@@ -76,39 +78,42 @@ def assemble_stiffness(
 
     K_e[i,j] = vol_e · σ_e · (∇λ_i · ∇λ_j).
 
-    Two passes: ``stiffness_pattern`` merges a COO of ones into row and column indices that do
-    not depend on the order duplicates were summed in, then ``fill_stiffness_values`` writes the
-    values one thread per row over the node2corner map, which is what fixes the summation order.
-    Values taken from the merge itself would not be reproducible.
+    Two passes: ``stiffness_pattern`` derives row and column indices from the connectivity alone,
+    then ``fill_stiffness_values`` writes the values one thread per row over the node2corner map,
+    which is what fixes the summation order.
     """
     tets = as_int32_tets(tet_nodes)
-    a = stiffness_pattern(tets, n_nodes, g.dtype)
     ptr, idx = build_node2corner(tets, n_nodes)
+    a = stiffness_pattern(tets, n_nodes, ptr, idx)
     fill_stiffness_values(a, g, vols, cond, tets, ptr, idx)
     return a
 
 
-def stiffness_pattern(tet_nodes: cp.ndarray, n_nodes: int, dtype: cp.dtype) -> csp.csr_matrix:
-    """Zero-valued CSR sparsity pattern of the stiffness matrix.
+def stiffness_pattern(
+    tet_nodes: cp.ndarray, n_nodes: int, ptr: cp.ndarray, idx: cp.ndarray
+) -> csp.csr_matrix:
+    """CSR sparsity pattern of the stiffness matrix, with uninitialised values.
 
     The pattern depends only on connectivity, so a caller assembling several matrices over one
     mesh builds it once and refills ``.data`` per conductivity with ``fill_stiffness_values``.
+    ``ptr``/``idx`` is the mesh's node2corner CSR.
 
-    Tiling limits temporary COO storage and the memory used to merge duplicate entries.
+    The candidate column list is 16 entries per tetrahedron, so this holds two int32 buffers of
+    that size while it runs: ~500 MB on a 4M-tetrahedron mesh, released on return.
     """
-    a = csp.csr_matrix((n_nodes, n_nodes), dtype=dtype)
-    for lo in range(0, tet_nodes.shape[0], STIFFNESS_TILE_TETS):
-        tn = tet_nodes[lo : lo + STIFFNESS_TILE_TETS]
-        rows = cp.broadcast_to(tn[:, :, None], (tn.shape[0], 4, 4)).ravel()
-        cols = cp.broadcast_to(tn[:, None, :], (tn.shape[0], 4, 4)).ravel()
-        block = csp.coo_matrix(
-            (cp.ones(rows.size, dtype=dtype), (rows, cols)), shape=(n_nodes, n_nodes)
-        ).tocsr()
-        a = a + block
-        del tn, rows, cols, block
-    a.sum_duplicates()
-    a.sort_indices()
-    return a
+    n_tet = int(tet_nodes.shape[0])
+    indptr = cp.empty(n_nodes + 1, dtype=cp.int32)
+    cand = cp.empty(16 * n_tet, dtype=cp.int32)
+    sorted_cand = cp.empty_like(cand)
+    nnz = build_stiffness_pattern(
+        tet_nodes, ptr, idx, cand, sorted_cand, indptr, cp.cuda.get_current_stream().ptr
+    )
+    del sorted_cand
+    indices = cp.ascontiguousarray(cand[:nnz])
+    del cand
+    return csp.csr_matrix(
+        (cp.empty(nnz, dtype=cp.float64), indices, indptr), shape=(n_nodes, n_nodes)
+    )
 
 
 def fill_stiffness_values(

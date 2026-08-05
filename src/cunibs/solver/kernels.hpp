@@ -34,6 +34,14 @@ void launch_rhs_weighted_block(const float* const* dadt_elm, const float* wg, co
                                const int* idx, float* b_block, int n_nodes, int n_tet, int k,
                                cudaStream_t stream);
 
+// --- pattern.cu: CSR sparsity pattern of the stiffness matrix ------------------------------
+// ptr/idx is rhs.cu's node2corner map. cand and sorted are caller-owned int32 work buffers of
+// 16 * n_tet entries each; on return indptr holds the row offsets and the first nnz entries of
+// cand hold the sorted, distinct column indices. Returns nnz. Synchronises the stream.
+int build_stiffness_pattern(const int* tet_nodes, const int* ptr, const int* idx, int* cand,
+                            int* sorted, int* indptr, int n_rows, int n_tet,
+                            cudaStream_t stream);
+
 // --- stiffness.cu: conductivity stiffness values over a prebuilt CSR pattern ----------------
 // indptr/indices must have sorted column indices per row and cover every (i, j) the tets touch;
 // a contribution whose column is missing lands in a neighbouring slot rather than faulting.
