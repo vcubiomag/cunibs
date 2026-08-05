@@ -239,30 +239,57 @@ NB_MODULE(_solver_ext, m) {
         "Deterministic node-centric RHS assembly with preweighted gradients.");
 
     m.def(
-        "build_stiffness_pattern",
+        "build_incident_node_csr",
         [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda cand, i32_cuda sorted,
-           i32_cuda indptr, uintptr_t stream) {
-            const int n_tet = static_cast<int>(tet_nodes.shape(0));
-            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
-            const size_t needed = static_cast<size_t>(n_tet) * 16;
+           i32_cuda out_ptr, uintptr_t stream) {
+            const int n_corner = static_cast<int>(idx.shape(0));
+            const int n_seg = static_cast<int>(out_ptr.shape(0)) - 1;
+            const size_t needed = static_cast<size_t>(n_corner) * 4;
             if (cand.shape(0) < needed || sorted.shape(0) < needed) {
                 throw std::invalid_argument(
-                    "build_stiffness_pattern: work buffers must hold 16 * n_tet entries");
+                    "build_incident_node_csr: work buffers must hold 4 * n_corner entries");
             }
-            if (ptr.shape(0) != indptr.shape(0)) {
+            if (ptr.shape(0) != out_ptr.shape(0)) {
                 throw std::invalid_argument(
-                    "build_stiffness_pattern: ptr and indptr must both be n_rows + 1");
+                    "build_incident_node_csr: ptr and out_ptr must both be n_seg + 1");
             }
-            return build_stiffness_pattern(tet_nodes.data(), ptr.data(), idx.data(), cand.data(),
-                                           sorted.data(), indptr.data(), n_rows, n_tet,
+            return build_incident_node_csr(tet_nodes.data(), ptr.data(), idx.data(), cand.data(),
+                                           sorted.data(), out_ptr.data(), n_seg, n_corner,
                                            reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
-        nb::arg("cand").noconvert(), nb::arg("sorted").noconvert(), nb::arg("indptr").noconvert(),
-        nb::arg("stream"),
-        "CSR sparsity pattern of the stiffness matrix over the node2corner map. Fills indptr and "
-        "leaves the sorted, distinct column indices in the first nnz entries of cand, which it "
-        "returns. Synchronises the stream.");
+        nb::arg("cand").noconvert(), nb::arg("sorted").noconvert(),
+        nb::arg("out_ptr").noconvert(), nb::arg("stream"),
+        "Distinct nodes of the tetrahedra in each segment of a corner CSR. Fills out_ptr and "
+        "leaves the sorted, distinct entries in the first nnz slots of cand, which it returns. "
+        "Synchronises the stream.");
+
+    m.def(
+        "build_patch_csr",
+        [](i32_cuda r1_ptr, i32_cuda r1_idx, i32_cuda neighbour, int min_nodes, i32_cuda cand,
+           i32_cuda sorted, i32_cuda out_ptr, uintptr_t stream) {
+            const int n_slots = static_cast<int>(r1_ptr.shape(0)) - 1;
+            if (neighbour.shape(0) != r1_idx.shape(0)) {
+                throw std::invalid_argument(
+                    "build_patch_csr: neighbour must have one entry per first-ring node");
+            }
+            if (out_ptr.shape(0) != r1_ptr.shape(0)) {
+                throw std::invalid_argument(
+                    "build_patch_csr: r1_ptr and out_ptr must both be n_slots + 1");
+            }
+            if (cand.shape(0) != sorted.shape(0)) {
+                throw std::invalid_argument("build_patch_csr: work buffers must match in size");
+            }
+            return build_patch_csr(r1_ptr.data(), r1_idx.data(), neighbour.data(), min_nodes,
+                                   cand.data(), sorted.data(), out_ptr.data(), n_slots,
+                                   static_cast<int>(cand.shape(0)),
+                                   reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
+        nb::arg("neighbour").noconvert(), nb::arg("min_nodes"), nb::arg("cand").noconvert(),
+        nb::arg("sorted").noconvert(), nb::arg("out_ptr").noconvert(), nb::arg("stream"),
+        "Recovery patches from the first-ring CSR: a slot reaching fewer than min_nodes grows to "
+        "the union of its neighbours' rings. Same output convention as build_incident_node_csr.");
 
     m.def(
         "assemble_stiffness_values",

@@ -7,7 +7,7 @@ import cupyx.scipy.sparse as csp
 
 from cunibs.solver import (
     assemble_stiffness_values,
-    build_stiffness_pattern,
+    build_incident_node_csr,
     p1_gradients,
 )
 
@@ -101,11 +101,10 @@ def stiffness_pattern(
     The candidate column list is 16 entries per tetrahedron, so this holds two int32 buffers of
     that size while it runs: ~500 MB on a 4M-tetrahedron mesh, released on return.
     """
-    n_tet = int(tet_nodes.shape[0])
     indptr = cp.empty(n_nodes + 1, dtype=cp.int32)
-    cand = cp.empty(16 * n_tet, dtype=cp.int32)
+    cand = cp.empty(4 * int(idx.shape[0]), dtype=cp.int32)
     sorted_cand = cp.empty_like(cand)
-    nnz = build_stiffness_pattern(
+    nnz = build_incident_node_csr(
         tet_nodes, ptr, idx, cand, sorted_cand, indptr, cp.cuda.get_current_stream().ptr
     )
     del sorted_cand

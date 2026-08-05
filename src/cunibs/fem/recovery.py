@@ -57,6 +57,8 @@ import cupy as cp
 
 from cunibs.fem.assembly import build_node2corner
 from cunibs.solver import (
+    build_incident_node_csr,
+    build_patch_csr,
     hpr_grad,
     hpr_weights,
     mark_outer_boundary,
@@ -188,96 +190,87 @@ def tissue_slots(tet_nodes: cp.ndarray, tet_tags: cp.ndarray) -> TissueSlots:
     )
 
 
-# Slots are processed in chunks because the intermediate (slot, node) pair list is what bounds
-# peak memory, not the result. The 2-ring expansion multiplies each pair by the incident-tet
-# count, so it uses a smaller chunk.
-_RING1_CHUNK = 1 << 16
-_RING2_CHUNK = 1 << 12
-
 # Escalate to the 2-ring below this many patch nodes. The harmonic basis needs 9; the margin
 # covers patches that are large enough to be determined but too flat to be well conditioned.
 _MIN_PATCH_NODES = 12
 
 
-def _unique_pairs(slot_of: cp.ndarray, node_of: cp.ndarray, n_nodes: int) -> cp.ndarray:
-    """Deduplicate (slot, node) pairs, returned sorted by slot then node."""
-    return cp.unique(slot_of.astype(cp.int64) * n_nodes + node_of.astype(cp.int64))
-
-
-def _exclusive_scan(counts: cp.ndarray) -> cp.ndarray:
-    out = cp.zeros(counts.shape[0], dtype=cp.int64)
-    out[1:] = cp.cumsum(counts[:-1])
-    return out
-
-
-def _ring1_pairs(
-    tet_nodes: cp.ndarray, ptr: cp.ndarray, idx: cp.ndarray, lo: int, hi: int, n_nodes: int
-) -> cp.ndarray:
-    """The distinct nodes of each slot's own tetrahedra, as packed (slot, node) keys."""
-    corners = idx[int(ptr[lo]) : int(ptr[hi])]
-    counts = cp.diff(ptr[lo : hi + 1])
-    slot_of_corner = cp.repeat(cp.arange(lo, hi, dtype=cp.int64), counts)
-    nodes = tet_nodes[corners >> 2]
-    return _unique_pairs(cp.repeat(slot_of_corner, 4), nodes.reshape(-1), n_nodes)
-
-
-def _ring2_pairs(
-    ctx: SolverContext, slot_tag: cp.ndarray, pairs: cp.ndarray, n_nodes: int
-) -> cp.ndarray:
-    """Grow each slot's patch to the nodes of every same-tissue tet touching its 1-ring."""
-    slots = pairs // n_nodes
-    counts = cp.diff(ctx.node2corner_ptr)[pairs % n_nodes]
-    total = int(counts.sum())
-    if total == 0:
-        return pairs
-    # Ragged range: for each (slot, patch node) walk that node's slice of the incidence CSR.
-    offsets = cp.repeat(ctx.node2corner_ptr[pairs % n_nodes], counts) + (
-        cp.arange(total, dtype=cp.int64) - cp.repeat(_exclusive_scan(counts), counts)
-    )
-    elems = ctx.node2corner_idx[offsets] >> 2
-    slot_of = cp.repeat(slots, counts)
-    keep = ctx.tet_tags[elems] == slot_tag[slot_of]
-    grown = _unique_pairs(
-        cp.repeat(slot_of[keep], 4), ctx.tet_nodes[elems[keep]].reshape(-1), n_nodes
-    )
-    return cp.union1d(pairs, grown)
-
-
-def node_patches(
-    ctx: SolverContext, ptr: cp.ndarray, idx: cp.ndarray, slot_tag: cp.ndarray
+def _first_ring(
+    tet_nodes: cp.ndarray, ptr: cp.ndarray, idx: cp.ndarray, n_slots: int
 ) -> tuple[cp.ndarray, cp.ndarray]:
+    """The distinct nodes of each slot's own tetrahedra, as a CSR over slots."""
+    r1_ptr = cp.empty(n_slots + 1, dtype=cp.int32)
+    cand = cp.empty(4 * int(idx.shape[0]), dtype=cp.int32)
+    sorted_cand = cp.empty_like(cand)
+    nnz = build_incident_node_csr(
+        tet_nodes, ptr, idx, cand, sorted_cand, r1_ptr, cp.cuda.get_current_stream().ptr
+    )
+    del sorted_cand
+    r1_idx = cp.ascontiguousarray(cand[:nnz])
+    return r1_ptr, r1_idx
+
+
+def _neighbour_slots(
+    r1_ptr: cp.ndarray,
+    r1_idx: cp.ndarray,
+    slot_key: cp.ndarray,
+    slot_tag: cp.ndarray,
+    stride: int,
+) -> cp.ndarray:
+    """For each first-ring entry, the slot of the same tissue centred on that node.
+
+    Every such slot exists: a first-ring node was reached through a tetrahedron of the slot's own
+    tissue, so it carries that tissue itself.
+    """
+    counts = cp.diff(r1_ptr)
+    owner = cp.repeat(cp.arange(int(counts.shape[0]), dtype=cp.int32), counts)
+    key = r1_idx.astype(cp.int64) * stride + slot_tag[owner].astype(cp.int64)
+    return cp.searchsorted(slot_key, key).astype(cp.int32)
+
+
+def node_patches(ctx: SolverContext, slots: TissueSlots) -> tuple[cp.ndarray, cp.ndarray]:
     """Build the per-slot node patch the potential is fitted over.
 
     Starts from the nodes of the slot's own tetrahedra and grows to the next ring wherever that
-    is too small to determine a harmonic quadratic.
+    is too small to determine a harmonic quadratic. Growing means taking the union of the
+    neighbours' own first rings, which reaches the same nodes as re-walking the same-tissue
+    tetrahedra around the slot without touching the mesh a second time.
 
     Returns ``(pptr, pidx)``. The patch is emitted sorted by node within each slot, so the
     reduction order every weight and field is built on is fixed by construction.
     """
-    n_nodes = int(ctx.n_nodes)
-    n_slots = int(ptr.shape[0]) - 1
-    chunks = [
-        _ring1_pairs(ctx.tet_nodes, ptr, idx, lo, min(lo + _RING1_CHUNK, n_slots), n_nodes)
-        for lo in range(0, n_slots, _RING1_CHUNK)
-    ]
-    pairs = cp.concatenate(chunks) if chunks else cp.empty(0, dtype=cp.int64)
-    del chunks
+    n_slots = int(slots.slot_node.shape[0])
+    if n_slots == 0:
+        return cp.zeros(1, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
 
-    slot_of_pair = pairs // n_nodes
-    small = cp.flatnonzero(cp.bincount(slot_of_pair, minlength=n_slots) < _MIN_PATCH_NODES)
-    n_small = int(small.shape[0])
-    if n_small:
-        parts = [pairs[cp.isin(slot_of_pair, small, invert=True)]]
-        for lo in range(0, n_small, _RING2_CHUNK):
-            subset = pairs[cp.isin(slot_of_pair, small[lo : lo + _RING2_CHUNK])]
-            parts.append(_ring2_pairs(ctx, slot_tag, subset, n_nodes))
-        pairs = cp.sort(cp.concatenate(parts))
-        del parts
+    r1_ptr, r1_idx = _first_ring(ctx.tet_nodes, slots.ptr, slots.idx, n_slots)
+    stride = int(slots.slot_tag.max()) + 1
+    slot_key = slots.slot_node.astype(cp.int64) * stride + slots.slot_tag.astype(cp.int64)
+    neighbour = _neighbour_slots(r1_ptr, r1_idx, slot_key, slots.slot_tag, stride)
 
-    pptr = cp.zeros(n_slots + 1, dtype=cp.int32)
-    pptr[1:] = cp.cumsum(cp.bincount(pairs // n_nodes, minlength=n_slots)).astype(cp.int32)
-    pidx = cp.ascontiguousarray((pairs % n_nodes).astype(cp.int32))
-    return pptr, pidx
+    # Candidate capacity: a grown slot draws one first ring per first-ring node, an ungrown one
+    # only its own. Sampling the running sum at the segment bounds avoids a segmented reduction
+    # that would have to special-case an empty ring.
+    counts = cp.diff(r1_ptr)
+    running = cp.zeros(int(r1_idx.shape[0]) + 1, dtype=cp.int64)
+    cp.cumsum(counts[neighbour], out=running[1:])
+    n_cand = int(cp.where(counts < _MIN_PATCH_NODES, cp.diff(running[r1_ptr]), counts).sum())
+
+    pptr = cp.empty(n_slots + 1, dtype=cp.int32)
+    cand = cp.empty(n_cand, dtype=cp.int32)
+    sorted_cand = cp.empty_like(cand)
+    nnz = build_patch_csr(
+        r1_ptr,
+        r1_idx,
+        neighbour,
+        _MIN_PATCH_NODES,
+        cand,
+        sorted_cand,
+        pptr,
+        cp.cuda.get_current_stream().ptr,
+    )
+    del sorted_cand
+    return pptr, cp.ascontiguousarray(cand[:nnz])
 
 
 @dataclass(frozen=True)
@@ -321,7 +314,7 @@ class RecoveryOperator:
 def _build_harmonic_operator(ctx: SolverContext) -> RecoveryOperator:
     """Fit the potential over same-tissue node patches, in the harmonic-quadratic space."""
     slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
-    pptr, pidx = node_patches(ctx, slots.ptr, slots.idx, slots.slot_tag)
+    pptr, pidx = node_patches(ctx, slots)
     n_slots = int(slots.slot_node.shape[0])
 
     w = cp.empty((int(pidx.shape[0]), 3), dtype=cp.float32)
