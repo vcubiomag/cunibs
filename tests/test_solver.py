@@ -18,12 +18,17 @@ def test_conductivity_mapping_and_unknown_tag(cp):
 def test_gradient_operator_reference_tet(cp):
     from cunibs.fem.assembly import gradient_operator
 
-    nodes = cp.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=cp.float64)
+    nodes_mm = cp.asarray([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=cp.float64)
     tets = cp.asarray([[0, 1, 2, 3]], dtype=cp.int32)
-    g, vols = gradient_operator(nodes, tets)
-    assert float(vols[0]) == pytest.approx(1 / 6)
+    g, vols = gradient_operator(nodes_mm, tets)
+    # Coordinates are millimetres, the operator is in metre units: a 1 mm edge gives a basis
+    # gradient of 1000 /m and the unit tet a volume of (1/6) mm^3.
+    assert float(vols[0]) == pytest.approx(1e-9 / 6)
+    np.testing.assert_allclose(
+        cp.asnumpy(g[0]), [[-1e3, -1e3, -1e3], [1e3, 0, 0], [0, 1e3, 0], [0, 0, 1e3]], atol=1e-9
+    )
     # P1 basis gradients sum to zero (partition of unity).
-    np.testing.assert_allclose(cp.asnumpy(g[0].sum(0)), [0, 0, 0], atol=1e-12)
+    np.testing.assert_allclose(cp.asnumpy(g[0].sum(0)), [0, 0, 0], atol=1e-9)
 
 
 def test_stiffness_symmetric_zero_rowsum(cp, cube_mesh):
@@ -33,7 +38,7 @@ def test_stiffness_symmetric_zero_rowsum(cp, cube_mesh):
         gradient_operator,
     )
 
-    nodes = cp.asarray(cube_mesh.nodes_mm) * 1e-3
+    nodes = cp.asarray(cube_mesh.nodes_mm)
     tets = cp.asarray(cube_mesh.tet_nodes)
     g, vols = gradient_operator(nodes, tets)
     cond = conductivity_per_tet(cp.asarray(cube_mesh.tet_tags))
@@ -98,7 +103,7 @@ def test_reduce_matrix_drops_row_and_col(cp, cube_mesh):
     )
     from cunibs.fem.solve import ground_node_of, grounded_index, reduce_matrix
 
-    nodes = cp.asarray(cube_mesh.nodes_mm) * 1e-3
+    nodes = cp.asarray(cube_mesh.nodes_mm)
     tets = cp.asarray(cube_mesh.tet_nodes)
     g, vols = gradient_operator(nodes, tets)
     cond = conductivity_per_tet(cp.asarray(cube_mesh.tet_tags))

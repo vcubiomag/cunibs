@@ -2,7 +2,6 @@
 
 from cunibs.fem.assembly import (
     GM_TAG,
-    GRADIENT_TILE_TETS,
     STIFFNESS_TILE_TETS,
     TISSUE_CONDUCTIVITY,
     assemble_stiffness,
@@ -54,7 +53,6 @@ __all__ = [
     "DEFAULT_MAX_ITERS",
     "DEFAULT_TOLERANCE",
     "GM_TAG",
-    "GRADIENT_TILE_TETS",
     "MAX_BLOCK",
     "MU0_OVER_4PI",
     "POTENTIAL_MODES",

@@ -54,7 +54,7 @@ def build_adjoint_solver(
     Reassembles the stiffness in float64 (``ctx.g`` is float32) and grounds the same DOF the forward
     solver uses, so the adjoint is consistent with the forward system.
     """
-    g64, vols = gradient_operator(ctx.nodes_mm * 1e-3, ctx.tet_nodes)
+    g64, vols = gradient_operator(ctx.nodes_mm, ctx.tet_nodes)
     cond = conductivity_per_tet(ctx.tet_tags)
     stiffness = assemble_stiffness(g64, vols, cond, ctx.n_nodes, ctx.tet_nodes)
     ground_node = int(cp.argmin(ctx.nodes_mm[:, 2]))

@@ -503,10 +503,10 @@ def test_stiffness_assembly_is_reproducible(cp, patch_mesh):
         gradient_operator,
     )
 
-    nodes_m = cp.asarray(patch_mesh.nodes_mm, dtype=cp.float64) * 1e-3
+    nodes_mm = cp.asarray(patch_mesh.nodes_mm, dtype=cp.float64)
     tet_nodes = cp.asarray(patch_mesh.tet_nodes)
     cond = conductivity_per_tet(cp.asarray(patch_mesh.tet_tags))
-    g, vols = gradient_operator(nodes_m, tet_nodes)
+    g, vols = gradient_operator(nodes_mm, tet_nodes)
 
     first = assemble_stiffness(g, vols, cond, patch_mesh.n_nodes, tet_nodes)
     for attempt in range(1, 4):

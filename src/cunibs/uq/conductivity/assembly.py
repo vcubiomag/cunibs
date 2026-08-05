@@ -74,7 +74,7 @@ def build_conductivity_uq_precompute(
     ctx: SolverContext, perturbed_tags: tuple[int, ...]
 ) -> ConductivityUQPrecompute:
     """Assemble the reference pattern, per-tissue components, and the nominal-σ preconditioner."""
-    g64, vols = gradient_operator(ctx.nodes_mm * 1e-3, ctx.tet_nodes)
+    g64, vols = gradient_operator(ctx.nodes_mm, ctx.tet_nodes)
     ground_node = ground_node_of(ctx.nodes_mm)
     # Must match prepare_grounded_solver's ordering, or this frozen CSR pattern would not be
     # the one the forward solver's hierarchy was built on.

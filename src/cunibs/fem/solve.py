@@ -667,7 +667,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     """
     mesh, nodes_mm, tet_nodes, tet_tags, skin_tris = _spatially_ordered(mesh)
 
-    g, vols = gradient_operator(nodes_mm * 1e-3, tet_nodes)
+    g, vols = gradient_operator(nodes_mm, tet_nodes)
     cond = conductivity_per_tet(tet_tags)
     stiffness = assemble_stiffness(g, vols, cond, mesh.n_nodes, tet_nodes)
     ground_node = ground_node_of(nodes_mm)

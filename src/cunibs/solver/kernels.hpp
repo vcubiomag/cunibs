@@ -4,6 +4,11 @@
 // Launchers for the per-placement pipeline stages, grouped by the translation unit that
 // implements them. The AMG solver's own launchers live in solver.hpp and aggregate.hpp.
 
+// --- gradient.cu: P1 basis-function gradients and element volumes --------------------------
+// nodes_mm is (n_nodes, 3) in millimetres; g is (n_tet, 4, 3) in 1/m and vols is (n_tet,) in m^3.
+void launch_p1_gradients(const double* nodes_mm, const int* tet_nodes, double* g, double* vols,
+                         int n_tet, cudaStream_t stream);
+
 // --- dadt.cu: Biot-Savart dA/dt from the coil's dipoles -----------------------------------
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
                  int n_dip, int n_nodes, float didt, float mu0_4pi, cudaStream_t stream);

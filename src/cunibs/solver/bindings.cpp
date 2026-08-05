@@ -169,6 +169,25 @@ NB_MODULE(_solver_ext, m) {
             "k in {1, 2, 4, 8}.");
 
     m.def(
+        "p1_gradients",
+        [](f64_cuda_2d nodes_mm, i32_cuda_2d tet_nodes, f64_cuda_3d g, f64_cuda vols,
+           uintptr_t stream) {
+            const int n_tet = static_cast<int>(tet_nodes.shape(0));
+            if (static_cast<int>(g.shape(0)) != n_tet || g.shape(1) != 4 || g.shape(2) != 3) {
+                throw std::invalid_argument("p1_gradients: g must be (n_tet, 4, 3)");
+            }
+            if (static_cast<int>(vols.shape(0)) != n_tet) {
+                throw std::invalid_argument("p1_gradients: vols must have one entry per tet");
+            }
+            launch_p1_gradients(nodes_mm.data(), tet_nodes.data(), g.data(), vols.data(), n_tet,
+                                reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("g").noconvert(), nb::arg("vols").noconvert(), nb::arg("stream"),
+        "P1 basis-function gradients (n_tet, 4, 3) in 1/m and element volumes in m^3, from node "
+        "coordinates in millimetres; writes into caller-allocated g/vols.");
+
+    m.def(
         "dadt_nbody",
         [](f32_cuda_2d s, f32_cuda_2d mp, f32_cuda_1d sn, f32_cuda_2d r, f32_cuda_2d out,
            float didt, float mu0_4pi, uintptr_t stream) {

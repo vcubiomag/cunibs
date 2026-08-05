@@ -5,7 +5,7 @@ from __future__ import annotations
 import cupy as cp
 import cupyx.scipy.sparse as csp
 
-from cunibs.solver import assemble_stiffness_values
+from cunibs.solver import assemble_stiffness_values, p1_gradients
 
 TISSUE_CONDUCTIVITY: dict[int, float] = {
     1: 0.126,  # white matter
@@ -22,7 +22,6 @@ TISSUE_CONDUCTIVITY: dict[int, float] = {
 
 GM_TAG = 2
 
-GRADIENT_TILE_TETS = 1 << 20
 STIFFNESS_TILE_TETS = 1 << 18
 
 
@@ -41,25 +40,23 @@ def conductivity_per_tet(tet_tags: cp.ndarray) -> cp.ndarray:
 
 
 def gradient_operator(
-    nodes_m: cp.ndarray, tet_nodes: cp.ndarray
+    nodes_mm: cp.ndarray, tet_nodes: cp.ndarray
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Per-tetrahedron P1 basis-function gradients G (M,4,3) in 1/m and volumes (M,) in m³.
 
-    G = (T^{-1} A)^T with A = [[-1,1,0,0],[-1,0,1,0],[-1,0,0,1]] and T the edge matrix to
-    barycentric coords.
+    Node coordinates are in millimetres; the metre conversion is folded into the kernel. See
+    gradient.cu for the closed form.
     """
-    n_tet = tet_nodes.shape[0]
-    g = cp.empty((n_tet, 4, 3), dtype=nodes_m.dtype)
-    vols = cp.empty(n_tet, dtype=nodes_m.dtype)
-    a = cp.hstack([-cp.ones((3, 1)), cp.eye(3)])
-    for lo in range(0, n_tet, GRADIENT_TILE_TETS):
-        hi = min(lo + GRADIENT_TILE_TETS, n_tet)
-        th = nodes_m[tet_nodes[lo:hi]]
-        edges = th[:, 1:4] - th[:, 0, None]
-        vols[lo:hi] = cp.abs(cp.linalg.det(edges)) / 6.0
-        solved = cp.linalg.solve(edges, cp.broadcast_to(a, (hi - lo, 3, 4)))
-        g[lo:hi] = cp.transpose(solved, (0, 2, 1))
-        del th, edges, solved
+    n_tet = int(tet_nodes.shape[0])
+    g = cp.empty((n_tet, 4, 3), dtype=cp.float64)
+    vols = cp.empty(n_tet, dtype=cp.float64)
+    p1_gradients(
+        cp.ascontiguousarray(nodes_mm, dtype=cp.float64),
+        as_int32_tets(tet_nodes),
+        g,
+        vols,
+        cp.cuda.get_current_stream().ptr,
+    )
     return g, vols
 
 

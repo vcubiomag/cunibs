@@ -35,7 +35,7 @@ def _direct_reduced_stiffness(ctx, sigma_by_tag):
     from cunibs.fem.assembly import assemble_stiffness, gradient_operator
     from cunibs.fem.solve import ground_node_of, grounded_index, reduce_matrix
 
-    g64, vols = gradient_operator(ctx.nodes_mm * 1e-3, ctx.tet_nodes)
+    g64, vols = gradient_operator(ctx.nodes_mm, ctx.tet_nodes)
     cond = cp.zeros(int(ctx.tet_nodes.shape[0]), dtype=cp.float64)
     for tag, value in sigma_by_tag.items():
         cond[ctx.tet_tags == tag] = value
