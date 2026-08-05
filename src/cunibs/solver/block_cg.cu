@@ -119,13 +119,23 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     y[static_cast<std::int64_t>(row) * K + c] = part[0];
 }
 
+// Rows each thread of a reducing kernel carries. A warp's shuffle tree spends five fp64 adds per
+// lane and per column to combine 32 values, and fp64 runs at a sixty-fourth of fp32 on a GeForce
+// part, so the tree rather than the loads is what bounds these kernels: with the tree removed the
+// r.z dot runs in 86 us against 150. Folding rows into a thread's accumulator first replaces
+// eight trees with seven sequential adds and one tree. The rows a thread takes are a grid stride
+// apart, so every access stays as coalesced as it was at one row per thread.
+//
+// Past eight the return is under a percent and the grid stops covering the SMs.
+constexpr int kRowsPerThread = 8;
+
 // Per-block reduction of K register accumulators into one partial per (column, block): warp
 // shuffles, one cross-warp pass through shared memory, a single __syncthreads(). Keeping it to
 // one barrier matters because the streaming kernels that embed it are bandwidth-bound.
 //
-// The order is the shuffle tree within each warp, then a sequential sum over the kBlock/kWarp
-// warp results. It does not depend on K, which is what makes the same placement solved at
-// block_k=1 and block_k=8 come back bitwise identical.
+// The order is the rows a thread folded in, then the shuffle tree within each warp, then a
+// sequential sum over the kBlock/kWarp warp results. None of that depends on K, which is what
+// makes the same placement solved at block_k=1 and block_k=8 come back bitwise identical.
 template <int K>
 __device__ __forceinline__ void bcg_block_reduce_cols(double (&local)[K],
                                                       double* __restrict__ partials,
@@ -157,16 +167,19 @@ template <int K, bool KDOT_XY>
 __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
                                     const double* __restrict__ y, double* __restrict__ partials,
                                     int n_blocks) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     double local[K];
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
-    if (i < n) {
+    const int stride = gridDim.x * blockDim.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
+        if (i >= n) break;
         const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             const double xv = x[base + c];
-            local[c] = KDOT_XY ? xv * y[base + c] : xv * xv;
+            local[c] += KDOT_XY ? xv * y[base + c] : xv * xv;
         }
     }
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
@@ -238,11 +251,14 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
                                      double* __restrict__ x, double* __restrict__ r,
                                      float* __restrict__ rf, double* __restrict__ partials,
                                      int n_blocks) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     double rloc[K];
 #pragma unroll
     for (int c = 0; c < K; ++c) rloc[c] = 0.0;
-    if (i < n) {
+    const int stride = gridDim.x * blockDim.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
+        if (i >= n) break;
         const std::int64_t base = static_cast<std::int64_t>(i) * K;
         double pv[K], apv[K], xv[K], rv[K];
         load_row<K>(p + base, pv);
@@ -255,7 +271,7 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
             xv[c] += __ldg(alpha + c) * pv[c];
             rv[c] += __ldg(neg_alpha + c) * apv[c];
             rfv[c] = static_cast<float>(rv[c]);
-            rloc[c] = rv[c] * rv[c];
+            rloc[c] += rv[c] * rv[c];
         }
         store_row<K>(x + base, xv);
         store_row<K>(r + base, rv);
@@ -271,15 +287,18 @@ template <int K>
 __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
                                     const double* __restrict__ r,
                                     double* __restrict__ partials, int n_blocks) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
     double local[K];
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
-    if (i < n) {
+    const int stride = gridDim.x * blockDim.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
+        if (i >= n) break;
         const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            local[c] = r[base + c] * static_cast<double>(zf[base + c]);
+            local[c] += r[base + c] * static_cast<double>(zf[base + c]);
         }
     }
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
@@ -345,7 +364,7 @@ constexpr const char* kBadK = "block CG supports k in {1, 2, 4, 8}";
 
 }  // namespace
 
-int bcg_partials_blocks(int n) { return static_cast<int>(grid_for(n)); }
+int bcg_partials_blocks(int n) { return static_cast<int>(grid_for(n, kBlock * kRowsPerThread)); }
 
 void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
                              const double* vals, const double* x, double* y,
