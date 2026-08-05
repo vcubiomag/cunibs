@@ -14,8 +14,14 @@ import pytest
 pytestmark = pytest.mark.gpu
 
 
-def _numpy_spr(nodes, tets, values, is_boundary):
-    """SimNIBS's recovery, transcribed: a linear fit per patch, volume average on the boundary."""
+def _numpy_spr(nodes, tets, values, is_boundary, tags=None, slots=None):
+    """SimNIBS's recovery, transcribed: a linear fit per patch, volume average on the boundary.
+
+    Pass ``tags`` and a list of ``(node, tag)`` ``slots`` for the tissue-restricted path, which
+    SimNIBS reaches by cropping to one tag before recovering: the patch is then that tag's
+    incident tetrahedra alone, and ``is_boundary`` is the cropped volume's boundary rather than
+    the whole mesh's. Without them a slot is a node and every incident tetrahedron counts.
+    """
     n_nodes = nodes.shape[0]
     bary = nodes[tets].mean(axis=1)
     vol = np.abs(np.linalg.det(nodes[tets][:, 1:] - nodes[tets][:, :1])) / 6.0
@@ -23,18 +29,22 @@ def _numpy_spr(nodes, tets, values, is_boundary):
     for e, tet in enumerate(tets):
         for node in tet:
             incident[node].append(e)
+    if slots is None:
+        slots = [(node, None) for node in range(n_nodes)]
 
-    out = np.zeros((n_nodes, 3))
-    for node in range(n_nodes):
+    out = np.zeros((len(slots), 3))
+    for s, (node, tag) in enumerate(slots):
         ets = np.array(incident[node], dtype=np.int64)
+        if tag is not None:
+            ets = ets[tags[ets] == tag]
         if ets.size == 0:
             continue
         if is_boundary[node] or ets.size < 4:
-            out[node] = (values[ets] * vol[ets, None]).sum(0) / vol[ets].sum()
+            out[s] = (values[ets] * vol[ets, None]).sum(0) / vol[ets].sum()
             continue
         design = np.hstack([np.ones((ets.size, 1)), bary[ets]])
         coef = np.linalg.solve(design.T @ design, design.T @ values[ets])
-        out[node] = np.hstack([[1.0], nodes[node]]) @ coef
+        out[s] = np.hstack([[1.0], nodes[node]]) @ coef
     return out
 
 
@@ -397,6 +407,203 @@ def test_spr_tissue_equals_spr_on_a_single_tissue_mesh(cp, refined_cube_mesh):
     np.testing.assert_array_equal(cp.asnumpy(plain), cp.asnumpy(tissue))
 
 
+def _per_tag_boundary(boundary_faces, tets, tags, n_nodes):
+    """The union over tags of each cropped submesh's boundary nodes, counted face by face."""
+    is_boundary = np.zeros(n_nodes, dtype=bool)
+    for tag in np.unique(tags):
+        is_boundary[np.unique(boundary_faces(tets[tags == tag]))] = True
+    return is_boundary
+
+
+def _check_tissue_boundary(cp, boundary_faces, tets, tags, n_nodes):
+    """Check the mask tag by tag against a crop-and-count oracle.
+
+    One node mask serves every tag, so checking only the union would pass even if the mask were
+    right for one tag and wrong for another. Restricting to the nodes a tag touches is what makes
+    each tag its own assertion.
+    """
+    from cunibs.fem import tissue_boundary_nodes
+    from cunibs.fem.recovery import tissue_slots
+
+    assert np.unique(tags).size > 1, "fixture must carry more than one tag"
+    dev_tets = cp.asarray(tets)
+    slot_node = tissue_slots(dev_tets, cp.asarray(tags)).slot_node
+    got = cp.asnumpy(tissue_boundary_nodes(dev_tets, n_nodes, slot_node)).astype(bool)
+
+    for tag in np.unique(tags):
+        sub = tets[tags == tag]
+        touches = np.zeros(n_nodes, dtype=bool)
+        touches[np.unique(sub)] = True
+        expected = np.zeros(n_nodes, dtype=bool)
+        expected[np.unique(boundary_faces(sub))] = True
+        np.testing.assert_array_equal(got & touches, expected)
+
+
+def test_tissue_boundary_matches_a_per_tag_face_count(cp, two_region_mesh, boundary_faces):
+    """SimNIBS crops to one tag before asking for the boundary, so the oracle must crop too."""
+    _check_tissue_boundary(
+        cp,
+        boundary_faces,
+        two_region_mesh.tet_nodes,
+        two_region_mesh.tet_tags,
+        two_region_mesh.n_nodes,
+    )
+
+
+@pytest.mark.realmesh
+def test_tissue_boundary_matches_a_per_tag_face_count_on_a_head(
+    cp, patch_subject, boundary_faces
+):
+    """A head mesh is where a non-manifold interface would show up, if one existed."""
+    mesh = patch_subject.mesh
+    _check_tissue_boundary(cp, boundary_faces, mesh.tet_nodes, mesh.tet_tags, mesh.n_nodes)
+
+
+def test_tissue_boundary_is_a_superset_of_the_outer_boundary(cp, two_region_mesh):
+    """The interface term is the whole difference between the two masks."""
+    from cunibs.fem import outer_boundary_nodes, tissue_boundary_nodes
+    from cunibs.fem.recovery import tissue_slots
+
+    tets = cp.asarray(two_region_mesh.tet_nodes)
+    n_nodes = two_region_mesh.n_nodes
+    slot_node = tissue_slots(tets, cp.asarray(two_region_mesh.tet_tags)).slot_node
+
+    outer = cp.asnumpy(outer_boundary_nodes(tets, n_nodes)).astype(bool)
+    tissue = cp.asnumpy(tissue_boundary_nodes(tets, n_nodes, slot_node)).astype(bool)
+    assert (tissue | outer == tissue).all()
+    assert tissue.sum() > outer.sum(), "fixture must have interior interface nodes"
+
+
+def test_spr_tissue_matches_a_numpy_transcription_of_simnibs(
+    cp, two_region_mesh, boundary_faces
+):
+    """The tissue path end to end, against a transcription that crops the way SimNIBS does.
+
+    The oracle's boundary set comes from a per-tag face count rather than from the mask under
+    test, so this pins the boundary rule and the fit together.
+    """
+    from cunibs.fem import apply_recovery, build_context, ensure_recovery
+
+    ctx = build_context(two_region_mesh)
+    op = ensure_recovery(ctx, "spr_tissue")
+    # ctx.mesh, not the fixture: build_context renumbers, and that ordering is what op indexes.
+    nodes, tets, tags = ctx.mesh.nodes_mm, ctx.mesh.tet_nodes, ctx.mesh.tet_tags
+    rng = np.random.default_rng(11)
+    field = rng.normal(size=(tets.shape[0], 3)).astype(np.float32)
+
+    got = cp.asnumpy(apply_recovery(op, tets.shape[0], elements=[cp.asarray(field)]).E_slots[0])
+    slots = list(
+        zip(cp.asnumpy(op.slot_node).tolist(), cp.asnumpy(op.slot_tag).tolist(), strict=True)
+    )
+    expected = _numpy_spr(
+        nodes,
+        tets.astype(np.int64),
+        field.astype(np.float64),
+        _per_tag_boundary(boundary_faces, tets, tags, ctx.n_nodes),
+        tags=tags,
+        slots=slots,
+    )
+    np.testing.assert_allclose(got, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_spr_tissue_averages_at_a_tissue_interface(cp, two_region_mesh, two_region_z0):
+    """The interface rule is SimNIBS's, so it is pinned separately from the fit.
+
+    Each side of the jump takes its own tissue's volume-weighted average, which is what keeps
+    the field two-valued there without either side fitting a half-ball.
+    """
+    from cunibs.fem import apply_recovery, build_context, ensure_recovery, outer_boundary_nodes
+
+    ctx = build_context(two_region_mesh)
+    op = ensure_recovery(ctx, "spr_tissue")
+    nodes, tets, tags = ctx.mesh.nodes_mm, ctx.mesh.tet_nodes, ctx.mesh.tet_tags
+    rng = np.random.default_rng(12)
+    field = rng.normal(size=(tets.shape[0], 3)).astype(np.float32)
+    got = cp.asnumpy(apply_recovery(op, tets.shape[0], elements=[cp.asarray(field)]).E_slots[0])
+
+    vol = np.abs(np.linalg.det(nodes[tets][:, 1:] - nodes[tets][:, :1])) / 6.0
+    outer = cp.asnumpy(outer_boundary_nodes(ctx.tet_nodes, ctx.n_nodes)).astype(bool)
+    slot_node, slot_tag = cp.asnumpy(op.slot_node), cp.asnumpy(op.slot_tag)
+    # Interior to the volume, so only the interface rule can be sending these to the average.
+    interface = ~outer[slot_node] & np.isclose(nodes[slot_node][:, 2], two_region_z0)
+    assert interface.sum() > 50
+
+    for s in np.flatnonzero(interface)[::5]:
+        ets = np.flatnonzero((tets == slot_node[s]).any(axis=1) & (tags == slot_tag[s]))
+        want = (field[ets].astype(np.float64) * vol[ets, None]).sum(0) / vol[ets].sum()
+        np.testing.assert_allclose(got[s], want, atol=1e-5, rtol=1e-5)
+
+
+def test_spr_tissue_still_fits_away_from_an_interface(cp, two_region_mesh):
+    """Averaging at the interface must not disable the fit everywhere else."""
+    from cunibs.fem import apply_recovery, build_context, ensure_recovery, tissue_boundary_nodes
+
+    ctx = build_context(two_region_mesh)
+    op = ensure_recovery(ctx, "spr_tissue")
+    nodes, tets = ctx.mesh.nodes_mm, ctx.mesh.tet_nodes
+    bary = nodes[tets].mean(axis=1)
+    rng = np.random.default_rng(13)
+    offset, slope = rng.normal(size=3), rng.normal(size=(3, 3))
+    field = (offset + bary @ slope.T).astype(np.float32)
+    scale = np.abs(offset + bary @ slope.T).max()
+
+    got = cp.asnumpy(apply_recovery(op, tets.shape[0], elements=[cp.asarray(field)]).E_slots[0])
+    is_boundary = cp.asnumpy(
+        tissue_boundary_nodes(ctx.tet_nodes, ctx.n_nodes, op.slot_node)
+    ).astype(bool)
+    slot_node = cp.asnumpy(op.slot_node)
+    fitted = ~is_boundary[slot_node]
+    assert fitted.sum() > 100
+
+    # A linear field is in the fit space, so a fitted slot must return it exactly.
+    want = offset + nodes[slot_node[fitted]] @ slope.T
+    np.testing.assert_allclose(got[fitted], want, atol=1e-5 * scale)
+
+
+def _count_rejected_fits(cp, ctx, mode):
+    """Slots sent to the average by a guard rather than by the boundary rule.
+
+    The kernel rejects a patch on three tests SimNIBS has no counterpart for: fewer than four
+    incident tetrahedra, a non-positive Cholesky pivot, and a Lebesgue constant above 8. Each
+    rejection lands in n_fallback alongside the boundary slots, so subtracting the boundary
+    count isolates them.
+    """
+    from cunibs.fem import (
+        TISSUE_SLOT_MODES,
+        ensure_recovery,
+        outer_boundary_nodes,
+        tissue_boundary_nodes,
+    )
+
+    op = ensure_recovery(ctx, mode)
+    mask = (
+        tissue_boundary_nodes(ctx.tet_nodes, ctx.n_nodes, op.slot_node)
+        if mode in TISSUE_SLOT_MODES
+        else outer_boundary_nodes(ctx.tet_nodes, ctx.n_nodes)
+    )
+    return op.n_fallback - int(cp.asnumpy(mask[op.slot_node]).sum())
+
+
+@pytest.mark.parametrize("mode", ["spr_global", "spr_tissue"])
+def test_no_patch_is_rejected_by_a_guard_simnibs_lacks(cp, two_region_mesh, mode):
+    """Every fallback must be the boundary rule, which is the rule SimNIBS shares.
+
+    SimNIBS averages on the boundary and fits everywhere else. A slot rejected by one of the
+    kernel's guards is one where cuNIBS reports an average and SimNIBS reports a fit, so the two
+    codes would no longer be computing the same quantity.
+    """
+    from cunibs.fem import build_context
+
+    assert _count_rejected_fits(cp, build_context(two_region_mesh), mode) == 0
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("mode", ["spr_global", "spr_tissue"])
+def test_no_patch_is_rejected_by_a_guard_on_a_head(cp, patch_subject, mode):
+    """The same on real anatomy, where thin structures actually occur."""
+    assert _count_rejected_fits(cp, patch_subject.context, mode) == 0
+
+
 @pytest.mark.realmesh
 def test_spr_tissue_preserves_the_jump_that_spr_smears(
     patch_subject, d70_coil, patch_placement
@@ -683,9 +890,10 @@ def test_harmonic_beats_spr_across_a_conductivity_jump(cp, two_region_mesh, two_
         sel = slot_tag == tag
         exact[sel] = -_exact_grad(nodes[slot_node[sel]], tag, z0)
 
-    # Score away from the outer surface. Every mode applies the same volume-weighted average
-    # there, so keeping those slots would let a rule the modes share dominate a comparison
-    # about the rule they do not.
+    # Score away from the outer surface, where every mode applies the same volume-weighted
+    # average and a rule they share would dominate a comparison about the rules they do not.
+    # Interface slots stay in: spr_tissue averages there too, but over one tissue alone, and how
+    # that one-sided average compares to a global fit and a harmonic one is the question.
     on_surface = cp.asnumpy(outer_boundary_nodes(ctx.tet_nodes, nodes.shape[0])).astype(bool)
     interior = ~on_surface[slot_node]
     at_interface = interior & np.isclose(nodes[slot_node][:, 2], z0)

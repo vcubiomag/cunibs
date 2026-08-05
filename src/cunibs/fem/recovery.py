@@ -18,8 +18,9 @@ incidence::
 
 The same weight serves all three components and none of it depends on the placement, so the
 whole operator is one float per corner laid over a corner CSR, built once per mesh and reused.
-Nodes on the outer boundary of the tetrahedral volume take a volume-weighted average instead,
-which is also a scalar per corner, so one array covers both rules.
+Nodes on the boundary of the volume the patch is drawn from take a volume-weighted average
+instead, which is also a scalar per corner, so one array covers both rules. That volume is the
+whole mesh for ``"spr_global"`` and one tissue for ``"spr_tissue"``.
 
 The fit runs in the node-centred, radius-scaled frame ``[1, (b_e - x_n) / h]``. That is an
 affine change of basis, so the recovered value is unchanged in exact arithmetic, but it leaves
@@ -86,7 +87,9 @@ type Recovery = Literal["raw", "spr_global", "spr_tissue", "harmonic"]
     is genuinely two-valued at a conductivity jump -- the tangential component is continuous
     while the normal one jumps by the conductivity ratio -- and a patch spanning the jump fits a
     discontinuous function with a linear polynomial. This is what SimNIBS's surface and volume
-    overlays report.
+    overlays report, down to the boundary rule: a tissue-interface node lies on the cropped
+    tissue's boundary, so each of its slots takes that tissue's own volume-weighted average
+    rather than a fit, and what survives the jump is two one-sided averages.
 ``"harmonic"``
     Recovers the *potential* over a same-tissue node patch and differentiates it, in the
     9-dimensional space of harmonic quadratics. The default. See the module docstring.
@@ -131,6 +134,38 @@ def outer_boundary_nodes(
 
     ptr, idx = node2corner if node2corner is not None else build_node2corner(tet_nodes, n_nodes)
     mark_outer_boundary(tet_nodes, ptr, idx, is_boundary, cp.cuda.get_current_stream().ptr)
+    return is_boundary
+
+
+def tissue_boundary_nodes(
+    tet_nodes: cp.ndarray,
+    n_nodes: int,
+    slot_node: cp.ndarray,
+    node2corner: tuple[cp.ndarray, cp.ndarray] | None = None,
+) -> cp.ndarray:
+    """Mark nodes lying on the boundary of *their own tissue's* submesh.
+
+    This is the set SimNIBS's tissue path sees: it crops the mesh to one tag and runs
+    ``elm_data2node_data`` there, where ``get_outside_faces`` returns the cropped volume's
+    boundary, so a tissue-interface node takes the volume-weighted average just as an
+    outer-surface node does.
+
+    One node mask serves every tag, and no per-tag face count is needed, because a node is on the
+    tag-``T`` submesh's boundary exactly when it is on the whole volume's outer boundary or it
+    touches more than one tag, whichever ``T`` is. Forwards: a face with a single tag-``T`` owner
+    either has one owner in total, or a second owner carrying another tag. Backwards: were a mixed
+    node's tag-``T`` faces all doubly owned, its tag-``T`` tetrahedra would close into a
+    neighbourhood ball around it and leave a conforming mesh nowhere to put the other tag's.
+
+    ``slot_node`` is :func:`tissue_slots`' sorted map from slot to node, so a node carrying more
+    than one tag repeats.
+    """
+    is_boundary = outer_boundary_nodes(tet_nodes, n_nodes, node2corner=node2corner)
+    if int(slot_node.shape[0]) < 2:
+        return is_boundary
+
+    repeated = slot_node[:-1][slot_node[1:] == slot_node[:-1]]
+    is_boundary[repeated] = 1
     return is_boundary
 
 
@@ -288,7 +323,9 @@ class RecoveryOperator:
     field is sampled at the barycentres.
 
     ``n_fallback`` counts slots that took the volume-weighted average rather than a fit, either
-    because they sit on the outer boundary or because their patch was too small or degenerate.
+    because they sit on their patch volume's boundary or because their patch was too small or
+    degenerate. The boundary term dominates and is a rule rather than a failure, so subtract
+    ``is_boundary[slot_node].sum()`` to isolate the fits that were rejected.
     ``n_undetermined`` counts slots where no gradient was determined at all, leaving ``-dA/dt``
     there; that takes an all-coplanar patch, so anything but zero is worth investigating.
     """
@@ -357,8 +394,11 @@ def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
         slot_tag = None
         slot_arg = None
 
-    is_boundary = outer_boundary_nodes(
-        ctx.tet_nodes, n_nodes, node2corner=(ctx.node2corner_ptr, ctx.node2corner_idx)
+    node2corner = (ctx.node2corner_ptr, ctx.node2corner_idx)
+    is_boundary = (
+        tissue_boundary_nodes(ctx.tet_nodes, n_nodes, slot_node, node2corner=node2corner)
+        if mode in TISSUE_SLOT_MODES
+        else outer_boundary_nodes(ctx.tet_nodes, n_nodes, node2corner=node2corner)
     )
     w = cp.empty(int(idx.shape[0]), dtype=cp.float32)
     counter = cp.zeros(1, dtype=cp.int32)

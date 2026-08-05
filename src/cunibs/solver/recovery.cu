@@ -155,9 +155,12 @@ __device__ __forceinline__ double spr_corner_weight(const double z[4], const dou
 // better conditioned on head-mesh coordinates. In that frame p~(x_n) = e_0, so only the first row
 // of the inverse is needed: solve A z = e_0 and take w_c = z . p~_c.
 //
-// Nodes on the outer boundary of the tet volume take a volume-weighted average instead, matching
-// SimNIBS, and so does any patch whose fit is ill-posed. Both are a select over the whole slot,
-// never a blend: a failed solve must not leak into a good one.
+// Boundary nodes take a volume-weighted average instead, matching SimNIBS, and so does any patch
+// whose fit is ill-posed. Both are a select over the whole slot, never a blend: a failed solve
+// must not leak into a good one.
+//
+// is_boundary is indexed by node, not by slot, and is read through slot_node. Which nodes it
+// marks is the caller's choice of boundary, one per recovery mode; see fem/recovery.py.
 __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
                                    const int* __restrict__ tet_nodes,
                                    const float* __restrict__ vols, const int* __restrict__ ptr,
@@ -209,7 +212,8 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     // The weights sum to one, so sum|w| -- the patch's Lebesgue constant -- is how much the fit
     // can amplify its inputs. A healthy patch sits near 1. A pivot test alone does not catch a
     // patch that is merely very flat: it passes, and then returns weights of order thousands.
-    // Restricting patches to one tissue makes such thin structures common.
+    // Every patch reaching here is a full ball in its own volume, the half-balls having gone to
+    // the average above, so this is a guard against a malformed mesh rather than a routine path.
     if (fit) {
         double lebesgue = 0.0;
         for (int p = begin; p < end; ++p) {

@@ -26,6 +26,7 @@ from cunibs.fem.recovery import (
     build_recovery_operator,
     ensure_recovery,
     outer_boundary_nodes,
+    tissue_boundary_nodes,
     validate_recovery,
 )
 from cunibs.fem.solve import (
@@ -87,5 +88,6 @@ __all__ = [
     "solve_ordering",
     "solve_placement",
     "solve_placements_block",
+    "tissue_boundary_nodes",
     "validate_recovery",
 ]

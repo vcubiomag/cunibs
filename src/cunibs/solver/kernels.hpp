@@ -87,8 +87,9 @@ void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int*
                                 int* is_boundary, int n_tet, cudaStream_t stream);
 
 // One scalar weight per corner, from a linear least-squares fit over each slot's patch.
-// slot_node may be null when a slot is a node. is_boundary may be null to fit every slot.
-// n_fallback may be null; when given it counts slots that took the volume-weighted average.
+// slot_node may be null when a slot is a node. is_boundary is indexed by node, not by slot, and
+// is read through slot_node; it may be null to fit every slot. n_fallback may be null; when given
+// it counts slots that took the volume-weighted average.
 void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const float* vols,
                         const int* ptr, const int* idx, const int* slot_node,
                         const int* is_boundary, float* w, int* n_fallback, int n_slots,
