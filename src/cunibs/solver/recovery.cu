@@ -27,6 +27,14 @@ namespace {
 // legitimately anisotropic patch while catching the near-degenerate ones.
 constexpr double kMaxLebesgue = 8.0;
 
+// The same idea for the gradient fits. A gradient functional carries a length unit, so the
+// dimensionless quantity is h * max_c sum_m |w[m,c]|: how far the recovered gradient can travel
+// outside the range of the potential it is fitted to, relative to the patch's own scale. The
+// harmonic fit sits an order of magnitude under this on real patches, so the bound catches only
+// the tail, where a determined-but-ill-conditioned patch turns the potential's rounding into
+// field error. Rejection drops a rung rather than failing.
+constexpr double kMaxGradientAmplification = 50.0;
+
 // --- outer-boundary detection ---------------------------------------------------------------
 
 // One thread per face. The four faces of a tet are its four 3-subsets of local corners; which
@@ -283,8 +291,9 @@ struct LinearBasis {
 
 // Fit the potential over one slot's node patch in Basis, then write the three gradient weights
 // per patch node. The gradient at the node is the linear coefficients divided by the scaling
-// radius, because every quadratic term has zero derivative at the centre. Leaves w untouched and
-// returns false when the normal matrix is not positive definite.
+// radius, because every quadratic term has zero derivative at the centre. Returns false when the
+// normal matrix is not positive definite or the fit amplifies beyond kMaxGradientAmplification;
+// w may have been written either way, and the caller's next rung overwrites the same entries.
 template <typename Basis>
 __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
                                      const int* __restrict__ pidx, int begin, int end,
@@ -311,6 +320,10 @@ __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
     double z[3][N];
     if (!solve_spd_columns<N>(a, grad_rows, 3, z)) return false;
 
+    // sum accumulates h * sum_m |w[m,c]|, since w is acc / h. Kept in the same walk that writes
+    // w rather than in a pass of its own: the guard needs every entry anyway, and the alternative
+    // is a second evaluation of the basis over the whole patch.
+    double sum[3] = {0.0, 0.0, 0.0};
     for (int p = begin; p < end; ++p) {
         const int m = pidx[p];
         double q[N];
@@ -321,10 +334,11 @@ __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
             double acc = 0.0;
 #pragma unroll
             for (int i = 0; i < N; ++i) acc += z[c][i] * q[i];
+            sum[c] += fabs(acc);
             w[p * 3 + c] = static_cast<float>(acc / h);
         }
     }
-    return true;
+    return fmax(sum[0], fmax(sum[1], sum[2])) <= kMaxGradientAmplification;
 }
 
 // One thread per slot over the node patch, taking the harmonic fit where it is well posed and a

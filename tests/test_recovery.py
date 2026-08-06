@@ -737,6 +737,25 @@ def test_harmonic_patch_ladder_covers_every_slot(harmonic_op):
     assert op.idx.shape[0] / op.n_slots >= 9, "patches must be big enough for the basis"
 
 
+def test_harmonic_weights_cannot_amplify(cp, harmonic_op):
+    """h * max_c sum_m |w[m, c]| is bounded, so the fit cannot turn rounding into field error.
+
+    The gradient weights carry a length unit, so unlike the SPR ones they are only bounded once
+    scaled by the patch's own radius. A pivot test alone does not catch a merely very flat patch:
+    it passes and returns weights of order 1e10.
+    """
+    ctx, op = harmonic_op
+    ptr, idx = cp.asnumpy(op.ptr), cp.asnumpy(op.idx)
+    w, slot_node = cp.asnumpy(op.w), cp.asnumpy(op.slot_node)
+    nodes_m = cp.asnumpy(ctx.nodes_mm) * 1e-3
+
+    owner = np.repeat(np.arange(op.n_slots), np.diff(ptr))
+    offset = np.abs(nodes_m[idx] - nodes_m[slot_node[owner]]).max(axis=1)
+    radius = np.maximum.reduceat(offset, ptr[:-1])
+    amplification = radius * np.add.reduceat(np.abs(w), ptr[:-1], axis=0).max(axis=1)
+    assert amplification.max() <= 50.0, f"max amplification = {amplification.max()}"
+
+
 @pytest.mark.realmesh
 def test_harmonic_is_reproducible_and_block_width_invariant(
     patch_subject, d70_coil, patch_placement
