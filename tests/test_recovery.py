@@ -731,10 +731,58 @@ def test_harmonic_adds_dadt_exactly_at_the_nodes(cp, harmonic_op):
 
 
 def test_harmonic_patch_ladder_covers_every_slot(harmonic_op):
-    """Growing to the next ring is what keeps the 9-term fit determined on real patches."""
+    """Growing to the next ring is what keeps the 16-term fit determined on real patches."""
     _, op = harmonic_op
     assert op.n_slots > 0
-    assert op.idx.shape[0] / op.n_slots >= 9, "patches must be big enough for the basis"
+    assert op.idx.shape[0] / op.n_slots >= 20, "patches must be big enough for the basis"
+
+
+def test_status_is_the_array_the_fallback_counts_reduce(cp, harmonic_op):
+    """The per-slot rung, kept rather than reduced away.
+
+    ``n_fallback`` alone says how many fits left the harmonic ladder but not where, and a rejected
+    fit is only interesting if it can be attributed to a place on the mesh.
+    """
+    _, op = harmonic_op
+    status = cp.asnumpy(op.status)
+    assert status.shape == (op.n_slots,)
+    assert set(np.unique(status).tolist()) <= {0, 1, 2, 3}
+    # Dropping from the cubic rung to the quadratic one is not a fallback; leaving the ladder is.
+    assert int((status >= 2).sum()) == op.n_fallback
+    assert int((status == 3).sum()) == op.n_undetermined
+
+
+# x(4z^2 - x^2 - y^2) is one of the seven degree-3 solid harmonics: f_xx + f_yy + f_zz =
+# -6x - 2x + 8x = 0. It is outside the 9-term quadratic space, so it separates the two rungs.
+def _cubic_potential(nodes):
+    x, y, z = nodes.T
+    potential = x * (4 * z**2 - x**2 - y**2)
+    gradient = np.stack([4 * z**2 - 3 * x**2 - y**2, -2 * x * y, 8 * x * z], axis=1)
+    return potential, gradient * 1e3
+
+
+def test_the_cubic_rung_reproduces_a_cubic_and_the_quadratic_one_does_not(cp, harmonic_op):
+    """Each rung is the basis it claims to be.
+
+    Both halves are needed. Exactness alone would hold just as well if the degree-3 terms were
+    never used, since a mesh-wide error is dominated by whichever rung is in the majority.
+    """
+    ctx, op = harmonic_op
+    nodes = ctx.mesh.nodes_mm
+    n_tet = ctx.mesh.tet_nodes.shape[0]
+    zero = np.zeros((nodes.shape[0], 3), dtype=np.float32)
+
+    potential, gradient = _cubic_potential(nodes)
+    at_nodes, _ = _harmonic_grads(op, potential, zero, n_tet, cp)
+    err = np.abs(at_nodes + gradient).max(axis=1) / np.abs(gradient).max()
+
+    status = cp.asnumpy(op.status)
+    on_cubic, on_quadratic = status == 0, status == 1
+    assert on_cubic.mean() > 0.5, "the cubic rung has to reach most slots to be worth testing"
+    assert on_quadratic.any(), "this mesh should leave some slots below the cubic rung"
+
+    assert err[on_cubic].max() < 1e-4
+    assert err[on_quadratic].max() > 1e-3
 
 
 def test_harmonic_weights_cannot_amplify(cp, harmonic_op):
@@ -754,6 +802,45 @@ def test_harmonic_weights_cannot_amplify(cp, harmonic_op):
     radius = np.maximum.reduceat(offset, ptr[:-1])
     amplification = radius * np.add.reduceat(np.abs(w), ptr[:-1], axis=0).max(axis=1)
     assert amplification.max() <= 50.0, f"max amplification = {amplification.max()}"
+
+
+def test_a_coplanar_patch_determines_no_gradient(cp):
+    """Every rung fails on a patch with no thickness, and the slot is left with zero weights.
+
+    Driven straight at the kernel, because no mesh reaches this path: ``n_undetermined`` is 0 on
+    every mesh in the suite. Zero weights are what leave E = -dA/dt there rather than a NaN.
+    """
+    from cunibs.solver import hpr_weights
+
+    nodes = cp.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ],
+        dtype=cp.float64,
+    )
+    pptr = cp.asarray([0, 6], dtype=cp.int32)
+    pidx = cp.arange(6, dtype=cp.int32)
+    # Poisoned rather than zeroed, so the assertion sees the kernel's writes and not the
+    # allocation's.
+    w = cp.full((6, 3), cp.nan, dtype=cp.float32)
+    status = cp.empty(1, dtype=cp.int32)
+    hpr_weights(
+        nodes,
+        pptr,
+        pidx,
+        slot_node=cp.zeros(1, dtype=cp.int32),
+        w=w,
+        status=status,
+        stream=cp.cuda.get_current_stream().ptr,
+    )
+
+    assert int(status[0]) == 3
+    np.testing.assert_array_equal(cp.asnumpy(w), np.zeros((6, 3), dtype=np.float32))
 
 
 @pytest.mark.realmesh

@@ -439,8 +439,8 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "hpr_weights",
-        [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node,
-           f32_cuda_2d w, i32_cuda status, uintptr_t stream) {
+        [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node, f32_cuda_2d w,
+           i32_cuda status, uintptr_t stream) {
             const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
             if (w.shape(0) != pidx.shape(0) || w.shape(1) != 3) {
                 throw std::invalid_argument("hpr_weights: w must be (nnz, 3)");
@@ -457,7 +457,8 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("slot_node").noconvert(), nb::arg("w").noconvert(), nb::arg("status").noconvert(),
         nb::arg("stream"),
         "Harmonic-constrained potential-recovery weights: grad_v[s] = sum_m w[s,m] v[m]. "
-        "status is 0 harmonic, 1 linear fallback, 2 no gradient determined.");
+        "status is the rung the fit took, counted down from the widest basis: 0 harmonic cubic, "
+        "1 harmonic quadratic, 2 linear, 3 no gradient determined.");
 
     m.def(
         "hpr_grad",

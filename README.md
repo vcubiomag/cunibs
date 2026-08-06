@@ -244,8 +244,8 @@ raw field is not additionally retained.
 
 | `recovery` | What it does |
 | --- | --- |
-| `"harmonic"` | Recovers the potential in the space of harmonic quadratics and differentiates it. **The default**, and the most accurate mode at a tissue interface. |
-| `"raw"` | The per-tetrahedron field straight from the solve. Its peak is set by whichever sliver element the mesh contains, so it reads high and moves with mesh resolution. |
+| `"harmonic"` | Recovers the potential in the space of harmonic polynomials and differentiates it. **The default**, and the most accurate mode at a tissue interface. |
+| `"raw"` | The per-tetrahedron field straight from the solve. Its peak is the largest element average rather than a value at a point, so it reads high and moves with mesh resolution. |
 | `"spr_tissue"` | Zienkiewicz-Zhu superconvergent patch recovery (Zienkiewicz and Zhu, 1992) with each patch restricted to one tissue. **What SimNIBS's surface and volume overlays report**, so use it when comparing against them. Its boundary rule is SimNIBS's too: wherever the cropped tissue ends, including at every tissue interface, each side takes its own one-sided volume-weighted average rather than a fit. |
 | `"spr_global"` | The same fit over patches spanning every incident tetrahedron regardless of tissue. Corresponds to SimNIBS's `continuous=True`. |
 
@@ -257,6 +257,14 @@ fitting there and converges at first order; `"harmonic"` fits and converges at
 roughly 1.7. On a reference head mesh 62% of nodes have a mixed-tissue patch and
 90% of gray-matter tetrahedra touch one, so 81% of `"spr_tissue"`'s slots are
 volume averages.
+
+Inside a region of constant conductivity the potential is harmonic, so the fit
+runs in the harmonic polynomials rather than all of them: 16 of the 20 cubics,
+dropping to 9 of the 10 quadratics on a patch too small to carry the cubic. That
+constraint is also what makes the fit well posed at an interface, where the
+same-tissue patch is a half-ball and cannot see the curvature normal to the flat
+side. The assumption is specific to this formulation, with the source outside the
+head; it would not carry to a problem with interior current sources.
 
 Recovery costs one extra pass over the mesh per placement. Its patch weights are
 built once per subject on first use and reused across placements.

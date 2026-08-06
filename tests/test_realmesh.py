@@ -23,7 +23,7 @@ pytestmark = pytest.mark.gpu
 
 # Pinned from a run of the committed fixture. Changing these means the pipeline changed.
 PATCH_PEAK_MAGNE = 0.556405
-PATCH_PEAK_MAGNE_HARMONIC = 0.447677
+PATCH_PEAK_MAGNE_HARMONIC = 0.484461
 PATCH_PEAK_LOCATION_MM = np.array([11.794, -1.125, 77.349])
 
 # Pinned from sub-001 at the same canonical placement.

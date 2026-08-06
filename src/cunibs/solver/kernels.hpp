@@ -101,7 +101,10 @@ void launch_recover_nodes(const float* const* e_in, const float* w, const int* p
 
 // Harmonic-constrained potential recovery. pptr/pidx is a CSR of patch NODES per slot, not
 // corners, and w carries a 3-vector per entry: grad_v[s] = sum_m w[s,m] * v[m].
-// status[s] records which rung the fit took: 0 harmonic, 1 linear, 2 no gradient determined.
+//
+// The fit takes the widest basis its patch can carry and drops a rung where it cannot. status[s]
+// records which one it took, counted down from the widest: 0 harmonic cubic, 1 harmonic quadratic,
+// 2 linear, 3 no gradient determined.
 void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
                         const int* slot_node, float* w, int* status, int n_slots,
                         cudaStream_t stream);

@@ -29,11 +29,15 @@ constexpr double kMaxLebesgue = 8.0;
 
 // The same idea for the gradient fits. A gradient functional carries a length unit, so the
 // dimensionless quantity is h * max_c sum_m |w[m,c]|: how far the recovered gradient can travel
-// outside the range of the potential it is fitted to, relative to the patch's own scale. The
-// harmonic fit sits an order of magnitude under this on real patches, so the bound catches only
+// outside the range of the potential it is fitted to, relative to the patch's own scale. Both
+// harmonic rungs sit an order of magnitude under this on real patches, so the bound catches only
 // the tail, where a determined-but-ill-conditioned patch turns the potential's rounding into
-// field error. Rejection drops a rung rather than failing.
+// field error. Rejection drops a rung rather than failing; the rung below is still a fit.
 constexpr double kMaxGradientAmplification = 50.0;
+
+// Threads per block for the potential fit. Its 16x16 register Cholesky spills ~4 KB of local
+// memory per thread, so a block narrower than kBlock keeps more of that spill inside L1.
+constexpr int kFitBlock = 64;
 
 // --- outer-boundary detection ---------------------------------------------------------------
 
@@ -91,7 +95,7 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
 // --- patch fitting --------------------------------------------------------------------------
 
 // Cholesky-solve A X = [e_r : r in rhs_rows] for an N x N SPD A held in registers. Returns false
-// on a non-positive pivot, which is how a coplanar or under-filled patch reports itself. N <= 9,
+// on a non-positive pivot, which is how a coplanar or under-filled patch reports itself. N <= 16,
 // so the factor sits in local memory.
 template <int N>
 __device__ bool solve_spd_columns(const double a[N][N], const int* rhs_rows, int n_rhs,
@@ -264,6 +268,9 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
 // source is a divergence-free dipole potential outside the head.
 struct HarmonicBasis {
     static constexpr int kTerms = 9;
+    // Smallest patch that may attempt the fit. This rung carries no margin of its own because the
+    // escalation threshold supplies one; see _MIN_PATCH_NODES in fem/recovery.py.
+    static constexpr int kMinPatch = 9;
     __device__ __forceinline__ static void eval(double u, double v, double t, double p[kTerms]) {
         p[0] = 1.0;
         p[1] = u;
@@ -277,10 +284,37 @@ struct HarmonicBasis {
     }
 };
 
+// The top rung. Harmonic polynomials of degree exactly l span 2l+1 dimensions, so degree <= 3 is
+// 1 + 3 + 5 + 7 = 16 against the quadratic's 9. Terms 0..8 are HarmonicBasis unchanged, so the two
+// agree wherever the cubic coefficients vanish, and terms 9..15 are the seven real solid harmonics
+// of degree 3. Gradient extraction is the same either way: every term above linear still has zero
+// gradient at the patch centre, so it remains rows 1..3 of the inverse. What the extra terms buy
+// is truncation, O(h^3) against O(h^2).
+//
+// kMinPatch carries a real margin here. A patch with exactly kTerms points makes the normal matrix
+// square, and a square fit interpolates rather than averages, which is how a patch passes the
+// pivot test and still returns weights of order 1e10.
+struct CubicHarmonicBasis {
+    static constexpr int kTerms = 16;
+    static constexpr int kMinPatch = 20;
+    __device__ __forceinline__ static void eval(double u, double v, double t, double p[kTerms]) {
+        HarmonicBasis::eval(u, v, t, p);
+        const double uu = u * u, vv = v * v, tt = t * t;
+        p[9] = t * (2.0 * tt - 3.0 * uu - 3.0 * vv);
+        p[10] = u * (4.0 * tt - uu - vv);
+        p[11] = v * (4.0 * tt - uu - vv);
+        p[12] = t * (uu - vv);
+        p[13] = u * v * t;
+        p[14] = u * (uu - 3.0 * vv);
+        p[15] = v * (3.0 * uu - vv);
+    }
+};
+
 // The fallback rung: a plain linear fit needs only four non-coplanar patch nodes, so it is
 // reachable from any non-degenerate tetrahedron.
 struct LinearBasis {
     static constexpr int kTerms = 4;
+    static constexpr int kMinPatch = 4;
     __device__ __forceinline__ static void eval(double u, double v, double t, double p[kTerms]) {
         p[0] = 1.0;
         p[1] = u;
@@ -289,17 +323,33 @@ struct LinearBasis {
     }
 };
 
+// The scaling radius: the patch's half-width in the infinity norm, which is what puts the fit in a
+// frame where the offsets lie in [-1, 1] and the normal matrix is conditioned on shape rather than
+// on head-mesh coordinates.
+__device__ __forceinline__ double patch_radius(const double* __restrict__ nodes_mm,
+                                               const int* __restrict__ pidx, int begin, int end,
+                                               const double xn[3]) {
+    double h = 0.0;
+    for (int p = begin; p < end; ++p) {
+        const int m = pidx[p];
+#pragma unroll
+        for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_mm[m * 3 + c] - xn[c]));
+    }
+    return h;
+}
+
 // Fit the potential over one slot's node patch in Basis, then write the three gradient weights
 // per patch node. The gradient at the node is the linear coefficients divided by the scaling
-// radius, because every quadratic term has zero derivative at the centre. Returns false when the
-// normal matrix is not positive definite or the fit amplifies beyond kMaxGradientAmplification;
-// w may have been written either way, and the caller's next rung overwrites the same entries.
+// radius, because every term above linear has zero derivative at the centre. Returns false when
+// the normal matrix is not positive definite or the fit amplifies beyond
+// kMaxGradientAmplification; w may have been written either way, and the caller's next rung
+// overwrites the same entries.
 template <typename Basis>
 __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
                                      const int* __restrict__ pidx, int begin, int end,
                                      const double xn[3], double h, float* __restrict__ w) {
     constexpr int N = Basis::kTerms;
-    if (end - begin < N) return false;
+    if (end - begin < Basis::kMinPatch) return false;
 
     double a[N][N] = {};
     for (int p = begin; p < end; ++p) {
@@ -341,9 +391,9 @@ __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
     return fmax(sum[0], fmax(sum[1], sum[2])) <= kMaxGradientAmplification;
 }
 
-// One thread per slot over the node patch, taking the harmonic fit where it is well posed and a
-// plain linear one where it is not. status records which rung each slot took: 0 harmonic,
-// 1 linear, 2 no gradient determined.
+// One thread per slot over the node patch, taking the widest basis the patch can carry and
+// dropping a rung where it cannot. status records which rung each slot took, counted down from
+// the widest: 0 cubic, 1 quadratic, 2 linear, 3 no gradient determined.
 __global__ void hpr_weights_kernel(const double* __restrict__ nodes_mm,
                                    const int* __restrict__ pptr, const int* __restrict__ pidx,
                                    const int* __restrict__ slot_node, float* __restrict__ w,
@@ -355,21 +405,19 @@ __global__ void hpr_weights_kernel(const double* __restrict__ nodes_mm,
     const int node = slot_node[s];
     const double xn[3] = {nodes_mm[node * 3 + 0], nodes_mm[node * 3 + 1],
                           nodes_mm[node * 3 + 2]};
-
-    double h = 0.0;
-    for (int p = begin; p < end; ++p) {
-        const int m = pidx[p];
-#pragma unroll
-        for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_mm[m * 3 + c] - xn[c]));
-    }
+    const double h = patch_radius(nodes_mm, pidx, begin, end, xn);
 
     if (h > 0.0) {
-        if (fit_gradient_weights<HarmonicBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
+        if (fit_gradient_weights<CubicHarmonicBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
             status[s] = 0;
             return;
         }
-        if (fit_gradient_weights<LinearBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
+        if (fit_gradient_weights<HarmonicBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
             status[s] = 1;
+            return;
+        }
+        if (fit_gradient_weights<LinearBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
+            status[s] = 2;
             return;
         }
     }
@@ -379,7 +427,7 @@ __global__ void hpr_weights_kernel(const double* __restrict__ nodes_mm,
     for (int p = begin; p < end; ++p) {
         w[p * 3 + 0] = w[p * 3 + 1] = w[p * 3 + 2] = 0.f;
     }
-    status[s] = 2;
+    status[s] = 3;
 }
 
 // One thread per slot, K placements at a time.
@@ -538,9 +586,9 @@ void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const floa
 void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
                         const int* slot_node, float* w, int* status, int n_slots,
                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_slots)) {
-        hpr_weights_kernel<<<blocks, kBlock, 0, stream>>>(nodes_mm, pptr, pidx, slot_node, w,
-                                                          status, n_slots);
+    if (const unsigned blocks = grid_for(n_slots, kFitBlock)) {
+        hpr_weights_kernel<<<blocks, kFitBlock, 0, stream>>>(nodes_mm, pptr, pidx, slot_node, w,
+                                                             status, n_slots);
     }
 }
 

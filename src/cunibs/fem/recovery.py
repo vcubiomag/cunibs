@@ -35,9 +35,9 @@ Two properties of this PDE make recovering ``v`` better than recovering ``E`` di
 ``grad(v)``; recovering the potential and adding the exact nodal ``dA/dt`` afterwards keeps the
 smooth part exact. And inside a region of constant sigma, ``v`` is *harmonic*: the weak form
 gives ``div(sigma grad v) = -div(sigma dA/dt)``, and a magnetic dipole's ``A`` is
-divergence-free away from its source, so ``lap(v) = 0``. Restricting the fit to the
-9-dimensional harmonic quadratics rather than the full 10-term space therefore encodes the
-solution rather than regularising it.
+divergence-free away from its source, so ``lap(v) = 0``. Restricting the fit to the harmonic
+polynomials, 9 of the 10 quadratics, 16 of the 20 cubics, since those of degree exactly ``l``
+span ``2l + 1`` dimensions, therefore encodes the solution rather than regularising it.
 
 That constraint is also what makes the fit well posed where the plain one is not. At an
 interface or outer-boundary node the same-tissue patch is a half-ball, which cannot determine
@@ -77,7 +77,8 @@ type Recovery = Literal["raw", "spr_global", "spr_tissue", "harmonic"]
 
 ``"raw"``
     The per-tetrahedron field straight from the solve, constant over each element. Its peak is
-    resolution-dependent, set by whichever sliver element the mesh happens to contain.
+    the largest element *average* rather than a value at a point, so it overstates the pointwise
+    maximum and moves with mesh resolution.
 ``"spr_global"``
     Zienkiewicz-Zhu superconvergent patch recovery over patches spanning every incident
     tetrahedron regardless of tissue, smearing the genuine E discontinuity at a conductivity
@@ -92,7 +93,8 @@ type Recovery = Literal["raw", "spr_global", "spr_tissue", "harmonic"]
     rather than a fit, and what survives the jump is two one-sided averages.
 ``"harmonic"``
     Recovers the *potential* over a same-tissue node patch and differentiates it, in the
-    9-dimensional space of harmonic quadratics. The default. See the module docstring.
+    16-dimensional space of harmonic cubics, dropping to the 9-dimensional harmonic quadratics on
+    a patch too small to carry them. The default. See the module docstring.
 """
 
 RECOVERY_MODES: tuple[Recovery, ...] = get_args(Recovery.__value__)
@@ -224,9 +226,12 @@ def tissue_slots(tet_nodes: cp.ndarray, tet_tags: cp.ndarray) -> TissueSlots:
     )
 
 
-# Escalate to the 2-ring below this many patch nodes. The harmonic basis needs 9; the margin
-# covers patches that are large enough to be determined but too flat to be well conditioned.
-_MIN_PATCH_NODES = 12
+# Escalate to the 2-ring below this many patch nodes. A fit over a patch barely larger than its
+# basis interpolates rather than averages, so a determined but too-flat patch passes the pivot test
+# and still returns weights of order 1e10. 16 gives the quadratic rung's 9 terms that margin, and
+# leaves the great majority of a head mesh's slots on the cubic rung, which wants 20 nodes for its
+# 16 terms.
+_MIN_PATCH_NODES = 16
 
 
 def _first_ring(
@@ -266,9 +271,9 @@ def node_patches(ctx: SolverContext, slots: TissueSlots) -> tuple[cp.ndarray, cp
     """Build the per-slot node patch the potential is fitted over.
 
     Starts from the nodes of the slot's own tetrahedra and grows to the next ring wherever that
-    is too small to determine a harmonic quadratic. Growing means taking the union of the
-    neighbours' own first rings, which reaches the same nodes as re-walking the same-tissue
-    tetrahedra around the slot without touching the mesh a second time.
+    holds fewer than ``_MIN_PATCH_NODES``. Growing means taking the union of the neighbours' own
+    first rings, which reaches the same nodes as re-walking the same-tissue tetrahedra around the
+    slot without touching the mesh a second time.
 
     Returns ``(pptr, pidx)``. The patch is emitted sorted by node within each slot, so the
     reduction order every weight and field is built on is fixed by construction.
@@ -322,12 +327,25 @@ class RecoveryOperator:
     ``slot_of_corner`` always says which slot each corner reads back from when the recovered
     field is sampled at the barycentres.
 
-    ``n_fallback`` counts slots that took the volume-weighted average rather than a fit, either
-    because they sit on their patch volume's boundary or because their patch was too small or
-    degenerate. The boundary term dominates and is a rule rather than a failure, so subtract
-    ``is_boundary[slot_node].sum()`` to isolate the fits that were rejected.
+    ``n_fallback`` counts slots that did not take the mode's own fit: for the SPR modes the
+    volume-weighted average, for ``"harmonic"`` the linear rung or nothing at all. A slot lands
+    there either because it sits on its patch volume's boundary or because the patch could not
+    support the fit. For the SPR modes the boundary term dominates and is a rule rather than a
+    failure, so subtract ``is_boundary[slot_node].sum()`` to isolate the rejections;
+    ``"harmonic"`` has no boundary rule, so every one of its fallbacks is a rejection.
+
+    A harmonic rejection means the patch could not carry either harmonic rung even after growing,
+    which on a head mesh is a tissue fragment too small to fit anything to rather than a bad patch
+    around a good one; the patch is typically the whole same-tissue connected component, so the
+    linear rung is the only thing available there.
+
     ``n_undetermined`` counts slots where no gradient was determined at all, leaving ``-dA/dt``
     there; that takes an all-coplanar patch, so anything but zero is worth investigating.
+
+    ``status`` is the harmonic mode's per-slot rung and is ``None`` elsewhere: 0 harmonic cubic,
+    1 harmonic quadratic, 2 linear, 3 undetermined. It is the array the two counts above are
+    reductions of, and what makes a rejected fit attributable to a place on the mesh rather than
+    only countable.
     """
 
     mode: Recovery
@@ -340,6 +358,7 @@ class RecoveryOperator:
     n_fallback: int
     slot_tag: cp.ndarray | None = None
     n_undetermined: int = 0
+    status: cp.ndarray | None = None
 
     @property
     def on_potential(self) -> bool:
@@ -348,7 +367,7 @@ class RecoveryOperator:
 
 
 def _build_harmonic_operator(ctx: SolverContext) -> RecoveryOperator:
-    """Fit the potential over same-tissue node patches, in the harmonic-quadratic space."""
+    """Fit the potential over same-tissue node patches, in the harmonic-polynomial space."""
     slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
     pptr, pidx = node_patches(ctx, slots)
     n_slots = int(slots.slot_node.shape[0])
@@ -359,9 +378,11 @@ def _build_harmonic_operator(ctx: SolverContext) -> RecoveryOperator:
     # a length unit: v is in volts and E has to come out in V/m. The scaling cancels in any check
     # whose reference gradient is also per millimetre, so it stays invisible until dA/dt is added.
     nodes_m = cp.ascontiguousarray(ctx.nodes_mm * 1e-3)
-    stream = cp.cuda.get_current_stream().ptr
-    hpr_weights(nodes_m, pptr, pidx, slots.slot_node, w, status, stream)
+    hpr_weights(
+        nodes_m, pptr, pidx, slots.slot_node, w, status, cp.cuda.get_current_stream().ptr
+    )
     del nodes_m
+
     return RecoveryOperator(
         mode="harmonic",
         ptr=pptr,
@@ -371,8 +392,11 @@ def _build_harmonic_operator(ctx: SolverContext) -> RecoveryOperator:
         slot_node=slots.slot_node,
         slot_tag=slots.slot_tag,
         n_slots=n_slots,
-        n_fallback=int((status != 0).sum()),
-        n_undetermined=int((status == 2).sum()),
+        # Dropping from the cubic rung to the quadratic one is still a harmonic fit, so it is not
+        # a fallback; only leaving the harmonic ladder is.
+        n_fallback=int((status >= 2).sum()),
+        n_undetermined=int((status == 3).sum()),
+        status=status,
     )
 
 
