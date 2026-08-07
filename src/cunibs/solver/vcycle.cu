@@ -218,27 +218,43 @@ __global__ void __launch_bounds__(kBlock)
     }
 }
 
-// One thread per row, sequential dot over the dense inverse row: deterministic, and the
-// coarsest system is a few hundred rows, so efficiency is irrelevant.
+// One warp per row of the dense inverse, strided then reduced in a fixed shuffle order. Threads
+// whose row is past the end still reach the shuffle with zero accumulators, which is why the mask
+// is the full warp.
+//
+// The coarsest system is only a few hundred rows, but it is one launch on the critical path of
+// every V-cycle. A thread per row would read ainv[row * n + j] with a warp's lanes n floats apart,
+// a separate sector per useful value; striding a warp along the row makes each load one
+// contiguous 128-byte transaction.
 template <int K>
 __global__ void __launch_bounds__(kBlock)
     vc_coarse_gemv_kernel(int n, const float* __restrict__ ainv, const float* __restrict__ b,
                           float* __restrict__ x) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (row >= n) return;
-    const float* arow = ainv + static_cast<std::int64_t>(row) * n;
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kWarp;
+    const int lane = static_cast<int>(threadIdx.x) % kWarp;
     float sum[K];
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
-    for (int j = 0; j < n; ++j) {
-        const float a = arow[j];
-        const std::int64_t base = static_cast<std::int64_t>(j) * K;
+    if (row < n) {
+        const float* arow = ainv + static_cast<std::int64_t>(row) * n;
+        for (int j = lane; j < n; j += kWarp) {
+            const float a = arow[j];
+            float bv[K];
+            load_row<K>(b + static_cast<std::int64_t>(j) * K, bv);
 #pragma unroll
-        for (int c = 0; c < K; ++c) sum[c] += a * b[base + c];
+            for (int c = 0; c < K; ++c) sum[c] += a * bv[c];
+        }
     }
-    const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll
-    for (int c = 0; c < K; ++c) x[out + c] = sum[c];
+    for (int off = kWarp / 2; off > 0; off >>= 1) {
+#pragma unroll
+        for (int c = 0; c < K; ++c) sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kWarp);
+    }
+    if (row < n && lane == 0) {
+        const std::int64_t out = static_cast<std::int64_t>(row) * K;
+#pragma unroll
+        for (int c = 0; c < K; ++c) x[out + c] = sum[c];
+    }
 }
 
 // The launchers deliberately do not check cudaGetLastError(). A cycle runs inside the CG
@@ -300,7 +316,7 @@ void launch_cheby_step(int n, const int* row_ptr, const int* col_idx, const __ha
 template <int K>
 void launch_coarse_gemv(int n, const float* ainv, const float* b, float* x,
                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kWarp)) {
         vc_coarse_gemv_kernel<K><<<blocks, kBlock, 0, stream>>>(n, ainv, b, x);
     }
 }
