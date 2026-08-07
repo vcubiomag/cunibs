@@ -131,6 +131,27 @@ def evaluate(
     return e[0] if single else e
 
 
+def evaluate_frames(
+    recip: ReciprocityField,
+    coil: Coil,
+    transforms: cp.ndarray,
+    didt: float = 1e6,
+) -> cp.ndarray:
+    """Target E-vector ``(P,D)`` for coil-to-head affines given directly, one per placement.
+
+    ``transforms`` is ``(P,4,4)`` with the rotation in ``[:3,:3]`` and a translation in **mm** in
+    ``[:3,3]``. Unlike :func:`evaluate`, the frame is used verbatim rather than re-derived from a
+    scalp projection, so a caller comparing against another code can adopt that code's frames
+    exactly instead of reproducing its projection rule.
+    """
+    s, m = place_coil_dipoles_batch(
+        cp.ascontiguousarray(cp.asarray(transforms, dtype=cp.float64).reshape(-1, 4, 4)),
+        coil.positions_m,
+        coil.moments,
+    )
+    return _interp_reduce(recip, s, m, didt)
+
+
 def evaluate_exact(
     adjoint: AdjointField,
     coil: Coil,

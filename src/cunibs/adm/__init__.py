@@ -5,7 +5,7 @@ regular grid; thereafter the target E-field of any placement is a trilinear inte
 dipole sum.
 """
 
-from cunibs.adm.evaluate import evaluate
+from cunibs.adm.evaluate import evaluate, evaluate_frames
 from cunibs.adm.optimize import OptimizeResult, optimize
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
@@ -17,6 +17,7 @@ __all__ = [
     "Target",
     "build_reciprocity",
     "evaluate",
+    "evaluate_frames",
     "optimize",
     "resolve_target",
 ]

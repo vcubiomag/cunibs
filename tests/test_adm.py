@@ -289,6 +289,49 @@ def test_evaluate_batched_matches_single(cp, cube_reciprocity, coil):
         np.testing.assert_allclose(batched[i], one, rtol=1e-12)
 
 
+def test_evaluate_frames_matches_the_placement_path(cp, cube_reciprocity, coil):
+    """A frame taken verbatim must give what the same frame derived from a Placement gives.
+
+    This is the contract a cross-code comparison rests on: adopting another code's coil-to-head
+    affine has to be equivalent to re-deriving it here, or the two are evaluating different
+    placements while appearing to agree on the parameters.
+    """
+    from cunibs.adm import evaluate, evaluate_frames
+    from cunibs.fem.placement import compute_coil_transforms
+    from cunibs.simulation import Placement
+
+    pls = [
+        Placement([50, 50, 100], [50, 150, 100], 4.0),
+        Placement([45, 55, 100], [90, 150, 100], 4.0),
+        Placement([55, 45, 100], [10, 150, 100], 6.0),
+    ]
+    ctx = cube_reciprocity.ctx
+    frames = compute_coil_transforms(
+        ctx,
+        cp.asarray([pl.center_mm for pl in pls], dtype=cp.float64),
+        cp.asarray([pl.handle_mm for pl in pls], dtype=cp.float64),
+        cp.asarray([pl.distance_mm for pl in pls], dtype=cp.float64),
+    )
+    np.testing.assert_array_equal(
+        cp.asnumpy(evaluate_frames(cube_reciprocity, coil, frames, DIDT)),
+        cp.asnumpy(evaluate(cube_reciprocity, coil, pls, DIDT)),
+    )
+
+
+def test_evaluate_frames_ignores_the_scalp(cp, cube_reciprocity, coil):
+    """The frame is used as given: translating it must move the coil, not re-project it."""
+    from cunibs.adm import evaluate_frames
+
+    base = cp.eye(4, dtype=cp.float64)[None]
+    base[0, :3, 3] = cp.asarray([50.0, 50.0, 100.0])
+    lifted = base.copy()
+    lifted[0, 2, 3] += 6.0
+
+    near = cp.asnumpy(evaluate_frames(cube_reciprocity, coil, base, DIDT))
+    far = cp.asnumpy(evaluate_frames(cube_reciprocity, coil, lifted, DIDT))
+    assert np.linalg.norm(far) < np.linalg.norm(near)
+
+
 def test_evaluate_outside_the_grid_raises(cube_reciprocity, coil):
     """The grid is sized for distance_mm=4; a far larger stand-off leaves it entirely."""
     from cunibs.adm import evaluate

@@ -13,8 +13,7 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
-from cunibs.adm.evaluate import _interp_reduce
-from cunibs.adm.place import place_coil_dipoles_batch
+from cunibs.adm.evaluate import evaluate_frames
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.fem.placement import compute_coil_transforms
 
@@ -99,8 +98,7 @@ def _sample_objective(
     c = proj.shape[0]
     a = angles.shape[0]
     frames = _frames(proj, normal, u, v, angles, distance_mm)
-    s, m = place_coil_dipoles_batch(frames, coil.positions_m, coil.moments)
-    return _interp_reduce(recip, s, m, didt).reshape(c, a, -1)
+    return evaluate_frames(recip, coil, frames, didt).reshape(c, a, -1)
 
 
 def _parabolic_refine(
@@ -244,5 +242,4 @@ def _eval_per_position(
     m[:, :3, 2] = z
     m[:, :3, 3] = t
     m[:, 3, 3] = 1.0
-    s, mom = place_coil_dipoles_batch(m, coil.positions_m, coil.moments)
-    return _interp_reduce(recip, s, mom, didt)
+    return evaluate_frames(recip, coil, m, didt)
