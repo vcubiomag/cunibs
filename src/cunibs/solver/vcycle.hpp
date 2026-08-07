@@ -75,6 +75,10 @@ private:
     struct Level {
         int n = 0;
         int n_coarse = 0;
+        // Threads cooperating on one row in this level's SpMV-shaped kernels, from the operator's
+        // own shape (see choose_tpr). Never a function of k, so a placement's result does not
+        // depend on the block width it was solved at.
+        int tpr = 0;
         Buffer<int> row_ptr;
         Buffer<int> col_idx;
         Buffer<__half> values;    // a_ij / row_scale[i]

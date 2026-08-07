@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -26,19 +27,47 @@ Buffer<T> device_clone(const T* src, std::size_t count, const char* what) {
     return ::device_clone<T>(src, count, "vcycle", what);
 }
 
-// Threads per row for the SpMV-shaped kernels. A_0 has ~14 nnz/row (P1 tets) and the Galerkin
-// coarse levels only densify to ~20, so a quarter warp covers a row in a few strided steps and
-// pays two shuffle levels to reduce it.
-constexpr int kTpr = 4;
+// Threads per row for the SpMV-shaped kernels, chosen per level from that level's own shape. The
+// hierarchy is not self-similar: every Galerkin product widens the stencil, so nnz/row climbs from
+// ~14 at the fine level into the hundreds at the coarsest while the row count collapses, and one
+// split cannot serve that spread.
+//
+// Widening trades the two halves of the kernel against each other. The matrix half improves: a
+// row's lanes read TPR consecutive fp16 values, and below a 32-byte sector that is a partial
+// transaction. The epilogue half degrades: only lane 0 writes, and it touches six fp32 streams
+// indexed by row, so halving the active lanes per warp halves the coalescing on all of them. At
+// the fine level the epilogue is about a fifth of the row's traffic and its loss outweighs the
+// matrix gain; by the coarsest it is ~1% and the matrix decides alone.
+constexpr int kTprChoices[] = {4, 8, 16, 32};
 
-static_assert(kWarp % kTpr == 0, "shuffle width must divide the warp");
-static_assert(kBlock % kTpr == 0, "a block must hold a whole number of rows");
+// Strided steps of matrix work per thread needed before widening pays for what the epilogue loses.
+constexpr int kMinRowIters = 4;
+
+// Blocks per SM to cover when a level is too small to fill the GPU, where idle SMs cost more than
+// either side of that trade. Past this, latency hiding stops improving on this shape of kernel.
+constexpr int kTargetBlocksPerSm = 4;
+
+// Every choice has to hold the invariant, not just the narrowest: a width that did not divide the
+// warp would put one row's lanes across two shuffle groups and silently drop part of its sum.
+constexpr bool tpr_choices_are_shuffle_widths() {
+    for (const int tpr : kTprChoices) {
+        if (kWarp % tpr != 0 || kBlock % tpr != 0) return false;
+    }
+    return true;
+}
+
+static_assert(tpr_choices_are_shuffle_widths(),
+              "every threads-per-row choice must divide both the warp and the block");
 
 // One warp fraction per row: strided partial products over the row's nonzeros, then a
 // fixed-order shuffle reduction leaving the row total in lane 0. Threads whose row is past the
 // end still reach the shuffle with zero accumulators, which is why the mask is the full warp.
 // The fixed order is what keeps an apply run-to-run deterministic.
-template <int K>
+//
+// TPR is a template argument so the strided loop and the shuffle tree fold. It is a property of
+// the level's operator and never of K, which is what keeps a placement's result identical at every
+// block width.
+template <int K, int TPR>
 __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
                                          const int* __restrict__ col_idx,
                                          const __half* __restrict__ vals,
@@ -48,7 +77,7 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n) {
         const int row_e = row_ptr[row + 1];
-        for (int j = row_ptr[row] + lane; j < row_e; j += kTpr) {
+        for (int j = row_ptr[row] + lane; j < row_e; j += TPR) {
             const float v = __half2float(vals[j]);
             const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
             float xv[K];
@@ -58,10 +87,40 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
         }
     }
 #pragma unroll
-    for (int off = kTpr / 2; off > 0; off >>= 1) {
+    for (int off = TPR / 2; off > 0; off >>= 1) {
 #pragma unroll
-        for (int c = 0; c < K; ++c) sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kTpr);
+        for (int c = 0; c < K; ++c) sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, TPR);
     }
+}
+
+// Setup-only. This only ever decides how wide to split a row, so a failed query falls back to one
+// SM and costs throughput on a small level, nothing more.
+inline int sm_count() {
+    int device = 0;
+    int count = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return 1;
+    if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return 1;
+    }
+    return count > 0 ? count : 1;
+}
+
+// Threads per row for one level, from that level's shape alone: deterministic, and independent of
+// k, so the same operator always gets the same split and a solve reproduces across block widths.
+inline int choose_tpr(int n_rows, int nnz, int n_sm) {
+    if (n_rows <= 0) return kTprChoices[0];
+    const std::int64_t nnz_per_row = (static_cast<std::int64_t>(nnz) + n_rows - 1) / n_rows;
+    const std::int64_t to_fill = static_cast<std::int64_t>(n_sm) * kTargetBlocksPerSm * kBlock;
+    int tpr = kTprChoices[0];
+    for (std::size_t i = 1; i < std::size(kTprChoices); ++i) {
+        // Widen while the matrix half still has enough work per thread to pay for what the
+        // epilogue loses, or while the level is too small to fill the machine.
+        const bool matrix_pays = kTprChoices[i] * kMinRowIters <= nnz_per_row;
+        const bool starved = static_cast<std::int64_t>(n_rows) * tpr < to_fill;
+        if (!matrix_pays && !starved) break;
+        tpr = kTprChoices[i];
+    }
+    return tpr;
 }
 
 // n_total = n * K throughout the elementwise kernels; K is a power of two, so the row and
@@ -74,16 +133,16 @@ __global__ void __launch_bounds__(kBlock)
     if (i < n_total) x[i] = alpha * dinv[i / K] * b[i];
 }
 
-template <int K>
+template <int K, int TPR>
 __global__ void __launch_bounds__(kBlock)
     vc_residual_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
                        const __half* __restrict__ vals, const float* __restrict__ row_scale,
                        const float* __restrict__ x, const float* __restrict__ b,
                        float* __restrict__ r) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
-    const int lane = static_cast<int>(threadIdx.x) % kTpr;
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
+    const int lane = static_cast<int>(threadIdx.x) % TPR;
     float sum[K];
-    row_spmv<K>(n, row_ptr, col_idx, vals, x, row, lane, sum);
+    row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x, row, lane, sum);
     if (row < n && lane == 0) {
         const float s = row_scale[row];
         const std::int64_t base = static_cast<std::int64_t>(row) * K;
@@ -94,8 +153,9 @@ __global__ void __launch_bounds__(kBlock)
 
 // Threads per coarse row in the restriction. R = P^T has by far the widest rows in the
 // hierarchy and the fewest of them, so a whole warp per row keeps the coarse end from starving
-// for parallelism and the fine end from walking each row alone. Unlike kTpr there is no
-// locality argument against going wide: consecutive entries of a restriction row are
+// for parallelism and the fine end from walking each row alone. Unlike the operator's tpr this
+// needs no per-level choice: R's rows are wide at every level, its values are fp32 so a warp's
+// segment is already several sectors, and consecutive entries of a restriction row are
 // consecutive fine indices.
 constexpr int kRestrictTpr = 32;
 
@@ -187,17 +247,17 @@ __global__ void __launch_bounds__(kBlock)
 //
 // The coefficients also cover the degenerate case (c_cur, 0, alpha), the first recurrence step
 // of a zero-initial-guess sweep, so this is the only smoother kernel there is.
-template <int K>
+template <int K, int TPR>
 __global__ void __launch_bounds__(kBlock)
     vc_cheby_step_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
                          const __half* __restrict__ vals, const float* __restrict__ row_scale,
                          const float* __restrict__ dinv, const float* __restrict__ b,
                          const float* __restrict__ x_cur, const float* x_prev, float c_cur,
                          float c_prev, float alpha, float* x_out) {
-    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
-    const int lane = static_cast<int>(threadIdx.x) % kTpr;
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
+    const int lane = static_cast<int>(threadIdx.x) % TPR;
     float sum[K];
-    row_spmv<K>(n, row_ptr, col_idx, vals, x_cur, row, lane, sum);
+    row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x_cur, row, lane, sum);
     if (row < n && lane == 0) {
         const float d = alpha * dinv[row];
         const float s = row_scale[row];
@@ -272,14 +332,26 @@ void launch_jacobi_zero(int n, const float* dinv, const float* b, float alpha, f
     }
 }
 
+// Turns a level's threads-per-row into the template argument the two SpMV-shaped kernels take.
+// The widths enumerated here are exactly the set choose_tpr picks from, so an unmatched value is
+// a disagreement between the two and not something a caller can provoke.
+template <typename F>
+void dispatch_tpr(int tpr, F&& f) {
+    dispatch_k<4, 8, 16, 32>(tpr, "V-cycle threads-per-row must be one of {4, 8, 16, 32}",
+                             std::forward<F>(f));
+}
+
 template <int K>
-void launch_residual(int n, const int* row_ptr, const int* col_idx, const __half* values,
+void launch_residual(int n, int tpr, const int* row_ptr, const int* col_idx, const __half* values,
                      const float* row_scale, const float* x, const float* b, float* r,
                      cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
-        vc_residual_kernel<K>
-            <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, values, row_scale, x, b, r);
-    }
+    dispatch_tpr(tpr, [&](auto tc) {
+        constexpr int TPR = decltype(tc)::value;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
+            vc_residual_kernel<K, TPR>
+                <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, values, row_scale, x, b, r);
+        }
+    });
 }
 
 template <int K>
@@ -302,15 +374,18 @@ void launch_prolongate(int n, const int* p_row_ptr, const int* p_col_idx, const 
 }
 
 template <int K>
-void launch_cheby_step(int n, const int* row_ptr, const int* col_idx, const __half* values,
-                       const float* row_scale, const float* dinv, const float* b,
-                       const float* x_cur, const float* x_prev, float c_cur, float c_prev,
-                       float alpha, float* x_out, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
-        vc_cheby_step_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            n, row_ptr, col_idx, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
-            alpha, x_out);
-    }
+void launch_cheby_step(int n, int tpr, const int* row_ptr, const int* col_idx,
+                       const __half* values, const float* row_scale, const float* dinv,
+                       const float* b, const float* x_cur, const float* x_prev, float c_cur,
+                       float c_prev, float alpha, float* x_out, cudaStream_t stream) {
+    dispatch_tpr(tpr, [&](auto tc) {
+        constexpr int TPR = decltype(tc)::value;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
+            vc_cheby_step_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
+                n, row_ptr, col_idx, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
+                alpha, x_out);
+        }
+    });
 }
 
 template <int K>
@@ -407,6 +482,7 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     Level lvl;
     lvl.n = n_rows;
     lvl.n_coarse = n_coarse;
+    lvl.tpr = choose_tpr(n_rows, nnz, sm_count());
     lvl.row_ptr = device_clone(row_ptr, static_cast<std::size_t>(n_rows) + 1, "level row_ptr");
     lvl.col_idx = device_clone(col_idx, static_cast<std::size_t>(nnz), "level col_idx");
     lvl.values = device_alloc<__half>(static_cast<std::size_t>(nnz), "level values");
@@ -522,9 +598,9 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         if (x0 == nullptr) {
             launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, cheby_.alpha0, target(0), stream);
         } else {
-            launch_cheby_step<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
-                                 lvl.row_scale.get(), lvl.dinv.get(), bi, x0, x0, 1.0f, 0.0f,
-                                 cheby_.alpha0, target(0), stream);
+            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.col_idx.get(),
+                                 lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, x0,
+                                 x0, 1.0f, 0.0f, cheby_.alpha0, target(0), stream);
         }
         float* cur = target(0);
         // From a zero initial guess the first recurrence step has no x_{-1}, and its c_prev is
@@ -537,9 +613,10 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         for (int s = 1; s < degree_; ++s) {
             float* out = target(s);
             const float c_prev = (s == 1 && x0 == nullptr) ? 0.0f : cheby_.c_prev[s - 1];
-            launch_cheby_step<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
-                                 lvl.row_scale.get(), lvl.dinv.get(), bi, cur, prev,
-                                 cheby_.c_cur[s - 1], c_prev, cheby_.alpha[s - 1], out, stream);
+            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.col_idx.get(),
+                                 lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, cur,
+                                 prev, cheby_.c_cur[s - 1], c_prev, cheby_.alpha[s - 1], out,
+                                 stream);
             prev = cur;
             cur = out;
         }
@@ -556,8 +633,9 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         const float* bi = (i == 0) ? b : level_b(lvl);
         smooth(lvl, bi, nullptr, odd ? level_x(lvl) : level_r(lvl),
                odd ? level_r(lvl) : level_x(lvl), nullptr);
-        launch_residual<K>(lvl.n, lvl.row_ptr.get(), lvl.col_idx.get(), lvl.values.get(),
-                           lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl), stream);
+        launch_residual<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.col_idx.get(),
+                           lvl.values.get(), lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl),
+                           stream);
         float* next_b = (i + 1 < n_levels) ? level_b(levels_[i + 1]) : coarse_b;
         launch_restrict<K>(lvl.n_coarse, lvl.r_row_ptr.get(), lvl.r_col_idx.get(),
                            lvl.r_values.get(), level_r(lvl), next_b, stream);
