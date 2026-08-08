@@ -136,6 +136,16 @@ def test_parser_rejects_unsized_element_type(tmp_path):
         parse_msh_binary(path)
 
 
+def test_every_conductivity_tag_is_loadable():
+    """The two tables must agree, or the loader narrows the tissue model behind an error.
+
+    Imported here rather than at module scope to keep this file runnable without CUDA.
+    """
+    from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
+
+    assert set(VOLUME_KEY_TO_LABEL) == set(TISSUE_CONDUCTIVITY)
+
+
 def test_parser_filters_unknown_volume_tags(tmp_path):
     """Tags outside VOLUME_KEY_TO_LABEL drop out, and their nodes drop with them."""
     nodes, tets, _ = _disjoint_mesh(3, [2, 77, 5])

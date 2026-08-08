@@ -82,6 +82,7 @@ Conductivities follow the standard SimNIBS values:
 | 1 | White matter | 0.126 | Wagner et al. (2004) |
 | 2 | Gray matter | 0.275 | Wagner et al. (2004) |
 | 3 | Cerebrospinal fluid | 1.654 | Wagner et al. (2004) |
+| 4 | Average bone | 0.010 | Wagner et al. (2004) |
 | 5 | Scalp | 0.465 | Wagner et al. (2004) |
 | 6 | Eye | 0.500 | Opitz et al. (2015) |
 | 7 | Cortical bone | 0.008 | Opitz et al. (2015) |
@@ -233,7 +234,7 @@ volume.
 ```python
 result = subject.simulate(coil, placement, didt=1.0e6, magnitude=True)
 
-result.magnE     # |E| of the recovered field
+result.magnE  # |E| of the recovered field
 result.recovery  # "harmonic"
 
 raw = subject.simulate(coil, placement, didt=1.0e6, magnitude=True, recovery="raw")
@@ -277,7 +278,7 @@ a cortical surface needs:
 ```python
 result = subject.simulate(coil, placement, magnitude=True, nodal=True)
 
-result.nodal_field()       # (n_nodes, 3) gray matter, NaN where it does not reach
+result.nodal_field()  # (n_nodes, 3) gray matter, NaN where it does not reach
 result.nodal_field("csf")  # the CSF-side value at the same nodes
 ```
 
@@ -337,10 +338,10 @@ uq_result = subject.simulate_conductivity_uq(
     coil, placement, config, didt=1.0e6, record_rois={"M1": m1}
 )
 
-uq_result.roi_samples["M1"]       # (n_samples,) per-draw ROI mean |E| (V/m)
-uq_result.peak_samples            # (n_samples,) per-draw gray-matter peak |E|
-uq_result.focality_samples        # (n_samples,) per-draw stimulated volume (m³)
-uq_result.peak_location_samples   # (n_samples, 3) per-draw peak location (mm)
+uq_result.roi_samples["M1"]  # (n_samples,) per-draw ROI mean |E| (V/m)
+uq_result.peak_samples  # (n_samples,) per-draw gray-matter peak |E|
+uq_result.focality_samples  # (n_samples,) per-draw stimulated volume (m³)
+uq_result.peak_location_samples  # (n_samples, 3) per-draw peak location (mm)
 uq_result.tissue_sensitivity("peak")  # variance share per tissue tag
 ```
 
