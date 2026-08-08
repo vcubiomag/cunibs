@@ -79,7 +79,7 @@ class MeshArrays(NamedTuple):
     surf_tags: npt.NDArray[np.int32]
 
 
-class _SurfaceBlock(NamedTuple):
+class _ElementBlock(NamedTuple):
     nodes: npt.NDArray[np.int32]
     tags: npt.NDArray[np.int32]
 
@@ -153,25 +153,22 @@ def _read_nodes(cursor: _MshCursor) -> tuple[int, npt.NDArray[np.float64]]:
     return num_nodes, nodes_xyz
 
 
-def _known_surfaces(block: npt.NDArray[np.int32]) -> _SurfaceBlock:
+def _known_surfaces(block: npt.NDArray[np.int32]) -> _ElementBlock:
     """Filter per block so triangles with unknown tags never reach a contiguous buffer."""
     tags = block[:, 1]
     keep = np.isin(tags, _SURFACE_KEYS)
     if keep.all():
-        return _SurfaceBlock(block[:, 3:], np.array(tags))
-    return _SurfaceBlock(block[:, 3:][keep], tags[keep])
+        return _ElementBlock(block[:, 3:], np.array(tags))
+    return _ElementBlock(block[:, 3:][keep], tags[keep])
 
 
-def _read_element_blocks(
-    cursor: _MshCursor,
-) -> tuple[npt.NDArray[np.int32], npt.NDArray[np.int32], list[_SurfaceBlock]]:
+def _read_element_blocks(cursor: _MshCursor) -> tuple[list[_ElementBlock], list[_ElementBlock]]:
     """Walk $Elements, keeping tetrahedra and surface triangles and skipping the rest."""
     cursor.expect("$Elements")
     total = cursor.count("element")
 
-    tet_nodes: npt.NDArray[np.int32] | None = None
-    tet_tags: npt.NDArray[np.int32] | None = None
-    surfaces: list[_SurfaceBlock] = []
+    tet_blocks: list[_ElementBlock] = []
+    surf_blocks: list[_ElementBlock] = []
     consumed = 0
 
     while consumed < total:
@@ -179,10 +176,10 @@ def _read_element_blocks(
         if num_tags != 2:
             cursor.fail(f"element block declares {num_tags} tags, expected 2")
         if elem_type == _ELEM_TYPE_TRIANGLE:
-            surfaces.append(_known_surfaces(cursor.block(_I4, count * 6).reshape(count, 6)))
+            surf_blocks.append(_known_surfaces(cursor.block(_I4, count * 6).reshape(count, 6)))
         elif elem_type == _ELEM_TYPE_TET:
             block = cursor.block(_I4, count * 7).reshape(count, 7)
-            tet_tags, tet_nodes = block[:, 1], block[:, 3:]
+            tet_blocks.append(_ElementBlock(block[:, 3:], block[:, 1]))
         elif (n_elem_nodes := _ELEMENT_NODES.get(elem_type)) is not None:
             cursor.skip(count * (1 + num_tags + n_elem_nodes) * 4)
         else:
@@ -190,21 +187,23 @@ def _read_element_blocks(
         consumed += count
 
     cursor.expect("$EndElements")
-    if tet_nodes is None or tet_tags is None:
+    if not tet_blocks:
         cursor.fail("no tetrahedron block")
-    return tet_nodes, tet_tags, surfaces
+    return tet_blocks, surf_blocks
 
 
-def _join_surfaces(surfaces: list[_SurfaceBlock]) -> _SurfaceBlock:
-    match surfaces:
+def _join_blocks(blocks: list[_ElementBlock], nodes_per_element: int) -> _ElementBlock:
+    match blocks:
         case []:
-            return _SurfaceBlock(np.empty((0, 3), np.int32), np.empty(0, np.int32))
+            return _ElementBlock(
+                np.empty((0, nodes_per_element), np.int32), np.empty(0, np.int32)
+            )
         case [only]:
             return only
         case _:
-            return _SurfaceBlock(
-                np.concatenate([s.nodes for s in surfaces]),
-                np.concatenate([s.tags for s in surfaces]),
+            return _ElementBlock(
+                np.concatenate([b.nodes for b in blocks]),
+                np.concatenate([b.tags for b in blocks]),
             )
 
 
@@ -264,15 +263,16 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         cursor = _MshCursor(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ), mesh_file)
         _read_format(cursor)
         num_nodes, nodes_xyz = _read_nodes(cursor)
-        tet_nodes_raw, tet_tags_raw, surfaces = _read_element_blocks(cursor)
+        tet_blocks, surf_blocks = _read_element_blocks(cursor)
 
-        known = np.isin(tet_tags_raw, _VOLUME_KEYS)
+        tet = _join_blocks(tet_blocks, _ELEMENT_NODES[_ELEM_TYPE_TET])
+        known = np.isin(tet.tags, _VOLUME_KEYS)
         if known.all():
-            tet_tags, tet_nodes = np.array(tet_tags_raw), tet_nodes_raw
+            tet_tags, tet_nodes = np.array(tet.tags), tet.nodes
         else:
-            tet_tags, tet_nodes = tet_tags_raw[known], tet_nodes_raw[known]
+            tet_tags, tet_nodes = tet.tags[known], tet.nodes[known]
 
-        surface = _join_surfaces(surfaces)
+        surface = _join_blocks(surf_blocks, _ELEMENT_NODES[_ELEM_TYPE_TRIANGLE])
         nodes_mm, tet_nodes, surf_tris = _reindex_nodes(
             nodes_xyz, num_nodes, tet_nodes - 1, surface.nodes - 1, mesh_file
         )

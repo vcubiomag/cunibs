@@ -160,6 +160,32 @@ def test_parser_filters_unknown_volume_tags(tmp_path):
     np.testing.assert_allclose(out_nodes, nodes[[0, 1, 2, 3, 8, 9, 10, 11]])
 
 
+def test_parser_joins_multiple_tetrahedron_blocks(tmp_path):
+    """Gmsh may emit one tet block per volume entity; every block must survive."""
+    nodes, tets, _ = _disjoint_mesh(3, [2, 5, 9])
+    # A second tet block, written by hand because pack_msh emits only one: per record an
+    # element id, the two tags, then the four 1-based node ids.
+    second = np.empty((2, 7), dtype="<i4")
+    second[:, 0] = [98, 99]
+    second[:, 1] = [5, 9]
+    second[:, 2] = [5, 9]
+    second[:, 3:] = tets[1:] + 1
+    path = tmp_path / "twoblocks.msh"
+    path.write_bytes(
+        pack_msh(
+            nodes,
+            tets[:1] + 1,
+            [2],
+            np.empty((0, 3), np.int32),
+            np.empty(0, np.int32),
+            extra_blocks=[(4, len(second), second.tobytes())],
+        )
+    )
+    _, tet_nodes, tet_tags, _, _ = parse_msh_binary(path)
+    np.testing.assert_array_equal(tet_tags, [2, 5, 9])
+    np.testing.assert_array_equal(tet_nodes, tets)
+
+
 def test_parser_filters_unknown_surface_tags(tmp_path):
     """2000 is not a known surface tag; 1099 is known to the parser but is not skin."""
     tris = np.array([[1, 2, 3], [1, 2, 4], [2, 3, 4]], dtype=np.int32)
