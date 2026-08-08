@@ -16,6 +16,9 @@ struct PcgResult {
 struct PcgBlockResult {
     int iterations = 0;                     // iterations the block ran, i.e. its slowest column
     std::vector<double> relative_residual;  // per-column final relative residual
+    // Per-column iteration at which that column reached tolerance and froze, so the count it
+    // would have taken solving alone. max_iters for a column that never reached it.
+    std::vector<int> column_iterations;
 };
 
 // A captured CG iteration body, replayed until the preconditioner it was captured against
@@ -137,8 +140,8 @@ public:
     // Block solve: k independent CG chains in lockstep over row-major (n, k) operands, sharing
     // every stiffness-matrix read (block SpMV + block V-cycle). The block runs until its worst
     // column reaches tolerance, but each column freezes at its own, so a column's answer does
-    // not depend on who it was batched with. Per-column residuals are reported so callers can
-    // fall back per column. k in {1, 2, 4, 8}.
+    // not depend on who it was batched with, nor does its cost. Per-column residuals and
+    // iteration counts are reported so callers can fall back per column. k in {1, 2, 4, 8}.
     PcgBlockResult solve_mixed_block(NativeVCycle& preconditioner, const double* B, double* X,
                                      int k, double tolerance, int max_iters,
                                      cudaStream_t stream, const double* X0 = nullptr);

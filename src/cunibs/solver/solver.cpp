@@ -167,6 +167,9 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
 
     const GraphCache::Key key{&preconditioner, preconditioner.generation(), k};
     std::vector<double> rel(k, 0.0);
+    // max_iters doubles as the default for a column that never reaches tolerance and as the
+    // value a column crossing on the last iteration would be given.
+    std::vector<int> col_iters(k, max_iters);
     int result_iters = max_iters;
     for (int it = 1; it <= max_iters; ++it) {
         block_graph_.run(s, key, it, run_body);
@@ -175,6 +178,9 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
         for (int c = 0; c < k; ++c) {
             rel[c] = std::sqrt(h_norm[c]) / norm_ref[c];
             if (rel[c] > worst) worst = rel[c];
+            // First crossing only: launch_bcg_mark_converged froze the column on the same
+            // expression, so rel[c] holds from here on and would otherwise re-trigger.
+            if (col_iters[c] == max_iters && rel[c] <= tolerance) col_iters[c] = it;
         }
         if (worst <= tolerance) {
             result_iters = it;
@@ -187,6 +193,7 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     PcgBlockResult result;
     result.iterations = result_iters;
     result.relative_residual = std::move(rel);
+    result.column_iterations = std::move(col_iters);
     return result;
 }
 

@@ -361,17 +361,42 @@ def reduce_matrix(a: csp.csr_matrix, idx: cp.ndarray) -> csp.csr_matrix:
 
 
 class SolverConvergenceError(RuntimeError):
-    """The mixed PCG missed tolerance even after rebuilding the preconditioner."""
+    """The mixed PCG missed tolerance even after rebuilding the preconditioner.
 
-    def __init__(self, iterations: int, relative_residual: float, tolerance: float) -> None:
+    ``column`` is the offending column of the block, or ``None`` for a single-RHS solve. Blocks
+    are contiguous slices of the sweep, so the placement is the block's first index plus it.
+    """
+
+    def __init__(
+        self,
+        iterations: int,
+        relative_residual: float,
+        tolerance: float,
+        *,
+        column: int | None = None,
+    ) -> None:
+        where = "" if column is None else f" (column {column} of the block)"
         super().__init__(
-            f"PCG did not converge: {iterations} iterations, relative residual "
+            f"PCG did not converge{where}: {iterations} iterations, relative residual "
             f"{relative_residual:.3e} > tolerance {tolerance:.3e}, after rebuilding the "
             f"preconditioner at the current matrix values"
         )
         self.iterations = iterations
         self.relative_residual = relative_residual
         self.tolerance = tolerance
+        self.column = column
+
+
+class ColumnTelemetry(NamedTuple):
+    """How the linear solve went for one right-hand side.
+
+    ``iterations`` is that column's own count, the iteration at which its residual first met
+    tolerance and it froze, not the block's. A retried column is charged both passes, since the
+    retry restarts from the failed iterate rather than from zero.
+    """
+
+    iterations: int
+    relative_residual: float
 
 
 @dataclass
@@ -475,8 +500,10 @@ BLOCK_SIZES = _BLOCK_SIZES
 MAX_BLOCK = BLOCK_SIZES[-1]
 
 
-def _solve_grounded_block_mat(solver: GroundedSolver, B: cp.ndarray, k: int) -> cp.ndarray:
-    """Block-solve a padded (n_red, k_pad) RHS matrix; returns X with retries applied.
+def _solve_grounded_block_mat(
+    solver: GroundedSolver, B: cp.ndarray, k: int
+) -> tuple[cp.ndarray, list[ColumnTelemetry]]:
+    """Block-solve a padded (n_red, k_pad) RHS matrix; returns X and the k columns' telemetry.
 
     Each of the k chains is numerically independent: per-column reductions, and a column that
     reaches tolerance freezes rather than being carried along to the block's slowest one, so it
@@ -486,9 +513,10 @@ def _solve_grounded_block_mat(solver: GroundedSolver, B: cp.ndarray, k: int) -> 
     """
     X = cp.empty_like(B)
     stream = cp.cuda.get_current_stream().ptr
-    iters, rels = solver.pcg.solve_mixed_block(
+    iters, rels, col_iters = solver.pcg.solve_mixed_block(
         solver.precond, B, X, solver.tolerance, solver.max_iters, stream
     )
+    telemetry = [ColumnTelemetry(int(col_iters[c]), float(rels[c])) for c in range(k)]
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(max(rels[:k]))
 
@@ -503,15 +531,20 @@ def _solve_grounded_block_mat(solver: GroundedSolver, B: cp.ndarray, k: int) -> 
                 solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
             )
             if float(rel) > solver.tolerance:
-                raise SolverConvergenceError(int(retry_iters), float(rel), solver.tolerance)
+                raise SolverConvergenceError(
+                    int(retry_iters), float(rel), solver.tolerance, column=c
+                )
             X[:, c] = x_red
+            telemetry[c] = ColumnTelemetry(
+                telemetry[c].iterations + int(retry_iters), float(rel)
+            )
             solver.last_iterations = max(solver.last_iterations, int(retry_iters))
             worst = max(worst, float(rel))
         # The retried columns now bound the block: every other column already met tolerance.
         solver.last_relative_residual = max(
             worst, max((rels[c] for c in range(k) if c not in missed), default=0.0)
         )
-    return X
+    return X, telemetry
 
 
 def _pad_block(B: cp.ndarray, k: int) -> cp.ndarray:
@@ -684,10 +717,13 @@ def build_context(mesh: HeadMesh) -> SolverContext:
 
 
 class PlacementResult(TypedDict):
-    """Arrays produced for one placement.
+    """Arrays produced for one placement, plus how its linear solve went.
 
     ``E``/``magnE`` are whichever field the run's ``recovery`` mode asked for. ``E_slots`` is
     present only when a recovery mode ran and the caller asked for it.
+
+    ``iterations``/``relative_residual`` are this placement's own, not its block's: in a k-RHS
+    solve every column freezes at its own residual.
     """
 
     transform: npt.NDArray[np.float64]
@@ -695,6 +731,8 @@ class PlacementResult(TypedDict):
     E: cp.ndarray
     magnE: cp.ndarray
     v: cp.ndarray
+    iterations: int
+    relative_residual: float
     E_slots: NotRequired[cp.ndarray]
 
 
@@ -757,6 +795,11 @@ def solve_placement(
     b = _assemble_rhs_kernel(ctx, dadt_elm)
 
     v = solve_grounded(ctx.solver, b)
+    # The solver's last-solve state belongs to the call above only until the next solve on this
+    # context, so read it before anything else can run.
+    telemetry = ColumnTelemetry(
+        int(ctx.solver.last_iterations), float(ctx.solver.last_relative_residual)
+    )
 
     n_tet = int(ctx.tet_nodes.shape[0])
     # The potential path never reads the raw field, so reconstructing it there would be a full
@@ -781,6 +824,8 @@ def solve_placement(
         "E": e,
         "magnE": magn_e,
         "v": v,
+        "iterations": telemetry.iterations,
+        "relative_residual": telemetry.relative_residual,
     }
     if nodal:
         result["E_slots"] = slots
@@ -859,7 +904,7 @@ def solve_placements_block(
     )
 
     B_pad = _pad_block(b_block[solver.idx, :].astype(cp.float64), k)
-    X = _solve_grounded_block_mat(solver, B_pad, k)
+    X, telemetry = _solve_grounded_block_mat(solver, B_pad, k)
 
     v_block = cp.zeros((solver.n, k), dtype=cp.float64)
     v_block[solver.idx, :] = X[:, :k]
@@ -892,6 +937,8 @@ def solve_placements_block(
             "E": es[i],
             "magnE": magns[i],
             "v": cp.ascontiguousarray(v_block[:, i]),
+            "iterations": telemetry[i].iterations,
+            "relative_residual": telemetry[i].relative_residual,
         }
         for i in range(k)
     ]

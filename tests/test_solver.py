@@ -219,8 +219,11 @@ def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degre
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
     for k in BLOCK_SIZES:
         B = cp.ascontiguousarray(cp.tile(b_red[:, None], (1, k)))
-        X = _solve_grounded_block_mat(solver, B, k)
+        X, telemetry = _solve_grounded_block_mat(solver, B, k)
         assert bool(cp.isfinite(X).all()), f"block_k={k}, degree={degree}: non-finite solve"
+        # Identical columns, so identical counts: a count that varied here would be reading the
+        # wrong column's residual.
+        assert len({t.iterations for t in telemetry}) == 1, f"block_k={k}, degree={degree}"
         for c in range(k):
             err = np.linalg.norm(cp.asnumpy(X[:, c]) - x_ref) / np.linalg.norm(x_ref)
             assert err <= 1e-6, f"block_k={k}, column {c}, degree={degree}: rel {err:.3e}"

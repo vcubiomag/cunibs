@@ -77,6 +77,10 @@ def test_block_k1_matches_serial(cube_subject, synthetic_coil):
     ref = serial(cube_subject.context, synthetic_coil, sites)[0]
     for key in ("E", "magnE", "v"):
         np.testing.assert_array_equal(cp.asnumpy(got[key]), cp.asnumpy(ref[key]), err_msg=key)
+    # The telemetry reaches the two results by different routes: the block path threads a
+    # per-column list out of the solve, the serial one reads the solver afterwards.
+    for key in ("iterations", "relative_residual"):
+        assert got[key] == ref[key], key
 
 
 @pytest.mark.realmesh
@@ -203,6 +207,31 @@ def test_block_width_invariance(patch_subject, d70_coil, patch_sites, k):
         np.testing.assert_array_equal(g, r, err_msg=f"block_k={k}, placement {i}")
 
 
+def _telemetry(outs):
+    return [(o["iterations"], o["relative_residual"]) for o in outs]
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_per_placement_telemetry_is_block_width_invariant(
+    patch_subject, d70_coil, patch_sites, k
+):
+    """A placement's reported iterations and residual are its own, not its block's.
+
+    Exact equality on the residual too: the per-column arithmetic is width-invariant, so there
+    is nothing for a float to drift by. The padded widths are in the list because a padded
+    column's residual bleeding into a live one would show up here first.
+    """
+    ctx = patch_subject.context
+    ref = _telemetry(serial(ctx, d70_coil, patch_sites))
+    got = [
+        t
+        for i in range(0, len(patch_sites), k)
+        for t in _telemetry(block(ctx, d70_coil, patch_sites[i : i + k]))
+    ]
+    assert got == ref, f"block_k={k}"
+
+
 @pytest.mark.realmesh
 def test_repeated_subjects_agree_bitwise(fresh_subject, patch_mesh, d70_coil, patch_sites):
     """The same mesh built into three subjects must give the same field.
@@ -230,10 +259,10 @@ def test_simulate_block_k_matches_serial(patch_subject, d70_coil, patch_sites):
 
 
 def _solve_two(solver, cp, left, right):
-    """Solve a k=2 block and return its columns plus the block's iteration count."""
+    """Solve a k=2 block; returns its columns, the block's count, and each column's own."""
     b = cp.ascontiguousarray(cp.stack([left, right], axis=1))
     x = cp.empty_like(b)
-    iters, _ = solver.pcg.solve_mixed_block(
+    iters, _, col_iters = solver.pcg.solve_mixed_block(
         solver.precond,
         b,
         x,
@@ -241,12 +270,12 @@ def _solve_two(solver, cp, left, right):
         solver.max_iters,
         cp.cuda.get_current_stream().ptr,
     )
-    return x, int(iters)
+    return x, int(iters), [int(i) for i in col_iters]
 
 
 @pytest.mark.realmesh
 def test_a_column_stops_on_its_own_residual(cp, fresh_subject, patch_mesh):
-    """A column's answer may not depend on how fast its block-mates converge.
+    """Neither a column's answer nor its cost may depend on how fast its block-mates converge.
 
     A column carried past its own tolerance by a slower block-mate lands further inside the
     tolerance ball. That is over-convergence rather than error, but it makes the field a
@@ -265,11 +294,14 @@ def test_a_column_stops_on_its_own_residual(cp, fresh_subject, patch_mesh):
     fast[2 * n // 3] = -1.0
     slow = cp.sin(cp.arange(n, dtype=cp.float64) * (2 * np.pi / n))
 
-    with_twin, twin_iters = _solve_two(solver, cp, fast, fast)
-    with_slow, slow_iters = _solve_two(solver, cp, fast, slow)
+    with_twin, twin_iters, twin_cols = _solve_two(solver, cp, fast, fast)
+    with_slow, slow_iters, cols = _solve_two(solver, cp, fast, slow)
     assert slow_iters > twin_iters, "the companion must actually take longer"
 
     np.testing.assert_array_equal(cp.asnumpy(with_slow[:, 0]), cp.asnumpy(with_twin[:, 0]))
+    assert twin_cols == [twin_iters, twin_iters]
+    # The fast column is charged what it cost alone, and the block runs as long as its slowest.
+    assert cols == [twin_iters, slow_iters]
 
 
 def test_simulate_block_k_is_clamped(cube_subject, synthetic_coil):
@@ -321,6 +353,7 @@ def test_unreachable_tolerance_rebuilds_then_raises_block(
     assert ctx.solver.precond is not before, "the preconditioner was not rebuilt"
     assert excinfo.value.relative_residual > 0.0
     assert excinfo.value.tolerance == 0.0
+    assert excinfo.value.column in range(len(sites)), "the failing column must be attributable"
 
 
 @pytest.mark.realmesh
@@ -337,9 +370,10 @@ def test_unreachable_tolerance_rebuilds_then_raises_serial(
 
     _force_fallback(ctx)
     before = ctx.solver.precond
-    with pytest.raises(SolverConvergenceError):
+    with pytest.raises(SolverConvergenceError) as excinfo:
         serial(ctx, d70_coil, [site])
     assert ctx.solver.precond is not before, "the preconditioner was not rebuilt"
+    assert excinfo.value.column is None, "there is no block to be a column of"
 
 
 @pytest.mark.realmesh

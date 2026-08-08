@@ -158,15 +158,17 @@ NB_MODULE(_solver_ext, m) {
                     X0.has_value() ? X0->data() : nullptr);
                 nb::list rels;
                 for (double r : result.relative_residual) rels.append(r);
-                return nb::make_tuple(result.iterations, rels);
+                nb::list col_iters;
+                for (int i : result.column_iterations) col_iters.append(i);
+                return nb::make_tuple(result.iterations, rels, col_iters);
             },
             nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
             nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
             nb::arg("X0").noconvert() = nb::none(),
             "Lockstep k-RHS mixed-precision PCG over row-major (n, k) operands; returns "
-            "(block iterations, per-column relative residuals). A column freezes once its own "
-            "residual meets tolerance, so it stops where it would have solved alone. "
-            "k in {1, 2, 4, 8}.");
+            "(block iterations, per-column relative residuals, per-column iteration counts). A "
+            "column freezes once its own residual meets tolerance, so it stops where it would "
+            "have solved alone. k in {1, 2, 4, 8}.");
 
     m.def(
         "p1_gradients",
