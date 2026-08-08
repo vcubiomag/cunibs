@@ -17,4 +17,5 @@ compile_commands.json
 
 # Benchmarking
 benchmarks
+metrics
 reference_data
