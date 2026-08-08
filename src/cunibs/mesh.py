@@ -63,7 +63,7 @@ _SURFACE_KEYS = np.fromiter(SURFACE_KEY_TO_LABEL, dtype=np.int32)
 
 
 class MeshArrays(NamedTuple):
-    """The arrays a .msh file yields, filtered to known tissue tags and 0-indexed.
+    """The arrays a .msh file yields, filtered to known surface tags and 0-indexed.
 
     nodes_mm  : (N, 3) float64  node coordinates in millimetres
     tet_nodes : (M, 4) int32    tetrahedron node indices
@@ -162,6 +162,24 @@ def _known_surfaces(block: npt.NDArray[np.int32]) -> _ElementBlock:
     return _ElementBlock(block[:, 3:][keep], tags[keep])
 
 
+def _reject_unknown_volume_tags(tags: npt.NDArray[np.int32], cursor: _MshCursor) -> None:
+    """Refuse a mesh whose tetrahedra carry tags this build has no tissue for.
+
+    Dropping them instead would delete a whole tissue while the field computed from what is
+    left still looks plausible. Surface tags are filtered rather than rejected: only the skin
+    surface is consumed, and meshes routinely carry unrelated surface entities.
+    """
+    known = np.isin(tags, _VOLUME_KEYS)
+    if known.all():
+        return
+    offenders, counts = np.unique(tags[~known], return_counts=True)
+    histogram = ", ".join(f"{int(t)}: {int(c)}" for t, c in zip(offenders, counts, strict=True))
+    cursor.fail(
+        f"{int(counts.sum())} tetrahedra carry volume tags absent from "
+        f"VOLUME_KEY_TO_LABEL ({histogram})"
+    )
+
+
 def _read_element_blocks(cursor: _MshCursor) -> tuple[list[_ElementBlock], list[_ElementBlock]]:
     """Walk $Elements, keeping tetrahedra and surface triangles and skipping the rest."""
     cursor.expect("$Elements")
@@ -218,7 +236,7 @@ def _reindex_nodes(
     surf_tris: npt.NDArray[np.int32],
     path: Path,
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.int32], npt.NDArray[np.int32]]:
-    """Drop nodes that no surviving tetrahedron references, and rebase indices to 0.
+    """Drop nodes that no tetrahedron references, and rebase indices to 0.
 
     Both index arrays arrive already shifted to 0-based. When every node is referenced
     that shift is the whole answer, the id-to-index map is the identity, so the
@@ -247,7 +265,7 @@ def _reindex_nodes(
     if (orphaned := surf_tris < 0).any():
         raise ValueError(
             f"{path}: {int(orphaned.any(axis=1).sum())} surface triangles reference nodes "
-            "that were dropped with a filtered tetrahedron"
+            "that no tetrahedron uses"
         )
     return np.ascontiguousarray(nodes_xyz[unique_ids]), node_index[tet_nodes], surf_tris
 
@@ -266,15 +284,14 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         tet_blocks, surf_blocks = _read_element_blocks(cursor)
 
         tet = _join_blocks(tet_blocks, _ELEMENT_NODES[_ELEM_TYPE_TET])
-        known = np.isin(tet.tags, _VOLUME_KEYS)
-        if known.all():
-            tet_tags, tet_nodes = np.array(tet.tags), tet.nodes
-        else:
-            tet_tags, tet_nodes = tet.tags[known], tet.nodes[known]
+        # The tag check reads the contiguous copy, not the stride-28 view over the mapping it
+        # comes from. Validating before the copy is measurably slower on a full head mesh.
+        tet_tags = np.array(tet.tags)
+        _reject_unknown_volume_tags(tet_tags, cursor)
 
         surface = _join_blocks(surf_blocks, _ELEMENT_NODES[_ELEM_TYPE_TRIANGLE])
         nodes_mm, tet_nodes, surf_tris = _reindex_nodes(
-            nodes_xyz, num_nodes, tet_nodes - 1, surface.nodes - 1, mesh_file
+            nodes_xyz, num_nodes, tet.nodes - 1, surface.nodes - 1, mesh_file
         )
         return MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surface.tags)
 

@@ -136,6 +136,18 @@ def test_parser_rejects_unsized_element_type(tmp_path):
         parse_msh_binary(path)
 
 
+def test_parser_rejects_unknown_volume_tags(tmp_path):
+    """A tag with no tissue is refused, not dropped: losing a tissue must never be quiet."""
+    tags = [2, 77, 5, 77]
+    nodes, tets, _ = _disjoint_mesh(4, tags)
+    path = tmp_path / "vol.msh"
+    path.write_bytes(
+        pack_msh(nodes, tets + 1, tags, np.empty((0, 3), np.int32), np.empty(0, np.int32))
+    )
+    with pytest.raises(ValueError, match=r"2 tetrahedra carry volume tags.*\(77: 2\)"):
+        parse_msh_binary(path)
+
+
 def test_every_conductivity_tag_is_loadable():
     """The two tables must agree, or the loader narrows the tissue model behind an error.
 
@@ -144,20 +156,6 @@ def test_every_conductivity_tag_is_loadable():
     from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
 
     assert set(VOLUME_KEY_TO_LABEL) == set(TISSUE_CONDUCTIVITY)
-
-
-def test_parser_filters_unknown_volume_tags(tmp_path):
-    """Tags outside VOLUME_KEY_TO_LABEL drop out, and their nodes drop with them."""
-    nodes, tets, _ = _disjoint_mesh(3, [2, 77, 5])
-    path = tmp_path / "vol.msh"
-    path.write_bytes(
-        pack_msh(nodes, tets + 1, [2, 77, 5], np.empty((0, 3), np.int32), np.empty(0, np.int32))
-    )
-    out_nodes, tet_nodes, tet_tags, _, _ = parse_msh_binary(path)
-    np.testing.assert_array_equal(tet_tags, [2, 5])
-    assert out_nodes.shape == (8, 3)  # tag-77's four nodes are gone
-    np.testing.assert_array_equal(tet_nodes, [[0, 1, 2, 3], [4, 5, 6, 7]])
-    np.testing.assert_allclose(out_nodes, nodes[[0, 1, 2, 3, 8, 9, 10, 11]])
 
 
 def test_parser_joins_multiple_tetrahedron_blocks(tmp_path):
@@ -197,16 +195,18 @@ def test_parser_filters_unknown_surface_tags(tmp_path):
 
 
 def test_parser_rejects_orphan_surface_node(tmp_path):
-    """A skin triangle whose nodes died with a filtered tet is a hard error.
+    """A skin triangle standing on nodes no tetrahedron uses is a hard error.
 
     ``tools/make_test_patch.py`` depends on this: it may only keep triangles whose three
     nodes all survive the tet subset.
     """
-    nodes, tets, _ = _disjoint_mesh(2, [2, 77])
-    orphan_tri = tets[1][:3] + 1  # nodes owned only by the tag-77 tet
+    nodes, tets, _ = _disjoint_mesh(3, [2, 5, 9])
+    orphan_tri = tets[2][:3] + 1
     path = tmp_path / "orphan.msh"
-    path.write_bytes(pack_msh(nodes, tets + 1, [2, 77], orphan_tri[None], [1005]))
-    with pytest.raises(ValueError, match="dropped with a filtered tetrahedron"):
+    # Only the first two tets are written, so the third quadruple's nodes reach the node
+    # table without any tetrahedron referencing them.
+    path.write_bytes(pack_msh(nodes, tets[:2] + 1, [2, 5], orphan_tri[None], [1005]))
+    with pytest.raises(ValueError, match="no tetrahedron uses"):
         parse_msh_binary(path)
 
 
