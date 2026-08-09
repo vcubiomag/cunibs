@@ -91,7 +91,8 @@ set_source_files_properties(src/cunibs/solver/dadt.cu PROPERTIES COMPILE_OPTIONS
 if(MSVC)
   # solver.hpp and several kernels carry UTF-8 bytes; MSVC otherwise decodes the sources
   # in the system ANSI code page.
-  set(_msvc_flags /utf-8)
+  # CCCL refuses to compile under cl.exe's legacy preprocessor.
+  set(_msvc_flags /utf-8 /Zc:preprocessor)
   list(JOIN _msvc_flags "," _msvc_flags_nvcc)
   target_compile_options(_solver_ext PRIVATE
     "$<$<COMPILE_LANGUAGE:CXX>:${_msvc_flags}>"
