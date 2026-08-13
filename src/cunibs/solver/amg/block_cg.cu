@@ -29,7 +29,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
                       const double* __restrict__ x, double* __restrict__ y) {
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = threadIdx.x % kTpr;
-    double sum[K];
+    cuda::std::array<double, K> sum;
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0;
     if (row < n) {
@@ -41,13 +41,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
             for (int c = 0; c < K; ++c) sum[c] += v * __ldg(x + base + c);
         }
     }
-#pragma unroll
-    for (int off = kTpr / 2; off > 0; off >>= 1) {
-#pragma unroll
-        for (int c = 0; c < K; ++c) {
-            sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kTpr);
-        }
-    }
+    warp_reduce_sum<kTpr>(sum);
     if (row < n && lane == 0) {
         const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
@@ -101,8 +95,8 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
         }
     }
 
-    // The same pairing __shfl_down_sync performs above, so both kernels land on
-    // ((p0+p4)+(p2+p6)) + ((p1+p5)+(p3+p7)).
+    // The same pairing warp_reduce_sum performs above, in registers rather than across lanes,
+    // so both kernels land on ((p0+p4)+(p2+p6)) + ((p1+p5)+(p3+p7)).
 #pragma unroll
     for (int off = kTpr / 2; off > 0; off >>= 1) {
 #pragma unroll
@@ -129,21 +123,17 @@ constexpr int kRowsPerThread = 8;
 // sequential sum over the kBlock/kWarp warp results. None of that depends on K, which is what
 // makes the same placement solved at block_k=1 and block_k=8 come back bitwise identical.
 template <int K>
-__device__ __forceinline__ void bcg_block_reduce_cols(double (&local)[K],
+__device__ __forceinline__ void bcg_block_reduce_cols(cuda::std::array<double, K>& local,
                                                       double* __restrict__ partials,
                                                       int n_blocks) {
     constexpr int kWarps = kBlock / kWarp;
     __shared__ double s[kWarps][K];
     const int lane = threadIdx.x % kWarp;
     const int warp = threadIdx.x / kWarp;
+    warp_reduce_sum<kWarp>(local);
+    if (lane == 0) {
 #pragma unroll
-    for (int c = 0; c < K; ++c) {
-        double v = local[c];
-#pragma unroll
-        for (int off = kWarp / 2; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffffu, v, off);
-        }
-        if (lane == 0) s[warp][c] = v;
+        for (int c = 0; c < K; ++c) s[warp][c] = local[c];
     }
     __syncthreads();
     if (threadIdx.x < K) {
@@ -159,7 +149,7 @@ template <int K, bool KDOT_XY>
 __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
                                     const double* __restrict__ y, double* __restrict__ partials,
                                     int n_blocks) {
-    double local[K];
+    cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
     const int stride = gridDim.x * blockDim.x;
@@ -242,7 +232,7 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
                                      double* __restrict__ x, double* __restrict__ r,
                                      float* __restrict__ rf, double* __restrict__ partials,
                                      int n_blocks) {
-    double rloc[K];
+    cuda::std::array<double, K> rloc;
 #pragma unroll
     for (int c = 0; c < K; ++c) rloc[c] = 0.0;
     const int stride = gridDim.x * blockDim.x;
@@ -251,12 +241,12 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
     for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
         if (i >= n) break;
         const std::int64_t base = static_cast<std::int64_t>(i) * K;
-        double pv[K], apv[K], xv[K], rv[K];
+        cuda::std::array<double, K> pv, apv, xv, rv;
         load_row<K>(p + base, pv);
         load_row<K>(ap + base, apv);
         load_row<K>(x + base, xv);
         load_row<K>(r + base, rv);
-        float rfv[K];
+        cuda::std::array<float, K> rfv;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             xv[c] += __ldg(alpha + c) * pv[c];
@@ -277,7 +267,7 @@ template <int K>
 __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
                                     const double* __restrict__ r,
                                     double* __restrict__ partials, int n_blocks) {
-    double local[K];
+    cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
     const int stride = gridDim.x * blockDim.x;

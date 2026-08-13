@@ -73,7 +73,7 @@ __global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __re
     const float w2 = g[c * 3 + 2] * w;
     const std::int64_t out = static_cast<std::int64_t>(c) * k;
     for (int i = 0; i < k; ++i) {
-        const float* de = dadt_elm.p[i] + e * 3;
+        const float* de = dadt_elm[i] + e * 3;
         q_block[out + i] = de[0] * w0 + de[1] * w1 + de[2] * w2;
     }
 }
@@ -89,7 +89,7 @@ __global__ void rhs_gather_block_kernel(const float* __restrict__ q_block,
     if (node >= n_nodes) return;
     const int begin = ptr[node];
     const int end = ptr[node + 1];
-    float acc[kMaxStageBlock];
+    cuda::std::array<float, kMaxStageBlock> acc;
     for (int i = 0; i < k; ++i) acc[i] = 0.f;
     for (int p = begin; p < end; ++p) {
         const std::int64_t base = static_cast<std::int64_t>(idx[p]) * k;
@@ -129,7 +129,7 @@ void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const
                              const int* ptr, const int* idx, float* b_block, int n_nodes,
                              int n_tet, int k, cudaStream_t stream) {
     ConstPtrPack in{};
-    for (int i = 0; i < k; ++i) in.p[i] = dadt_elm[i];
+    for (int i = 0; i < k; ++i) in[i] = dadt_elm[i];
     const int n_corner = 4 * n_tet;
     float* q_block = nullptr;
     // Outside any CUDA-graph capture (same constraint as launch_rhs_staged).

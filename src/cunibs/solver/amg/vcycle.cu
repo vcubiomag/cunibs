@@ -72,7 +72,7 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
                                          const int* __restrict__ col_idx,
                                          const __half* __restrict__ vals,
                                          const float* __restrict__ x, int row, int lane,
-                                         float (&sum)[K]) {
+                                         cuda::std::array<float, K>& sum) {
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n) {
@@ -80,17 +80,13 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
         for (int j = row_ptr[row] + lane; j < row_e; j += TPR) {
             const float v = __half2float(vals[j]);
             const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
-            float xv[K];
+            cuda::std::array<float, K> xv;
             load_row<K>(x + base, xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
     }
-#pragma unroll
-    for (int off = TPR / 2; off > 0; off >>= 1) {
-#pragma unroll
-        for (int c = 0; c < K; ++c) sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, TPR);
-    }
+    warp_reduce_sum<TPR>(sum);
 }
 
 // Setup-only. This only ever decides how wide to split a row, so a failed query falls back to one
@@ -141,7 +137,7 @@ __global__ void __launch_bounds__(kBlock)
                        float* __restrict__ r) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
-    float sum[K];
+    cuda::std::array<float, K> sum;
     row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x, row, lane, sum);
     if (row < n && lane == 0) {
         const float s = row_scale[row];
@@ -173,7 +169,7 @@ __global__ void __launch_bounds__(kBlock)
                        const float* __restrict__ r_fine, float* __restrict__ b_coarse) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kRestrictTpr;
     const int lane = static_cast<int>(threadIdx.x) % kRestrictTpr;
-    float sum[K];
+    cuda::std::array<float, K> sum;
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n_coarse) {
@@ -181,19 +177,13 @@ __global__ void __launch_bounds__(kBlock)
         for (int j = r_row_ptr[row] + lane; j < row_e; j += kRestrictTpr) {
             const float v = r_vals[j];
             const std::int64_t base = static_cast<std::int64_t>(r_col_idx[j]) * K;
-            float xv[K];
+            cuda::std::array<float, K> xv;
             load_row<K>(r_fine + base, xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
     }
-#pragma unroll
-    for (int off = kRestrictTpr / 2; off > 0; off >>= 1) {
-#pragma unroll
-        for (int c = 0; c < K; ++c) {
-            sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kRestrictTpr);
-        }
-    }
+    warp_reduce_sum<kRestrictTpr>(sum);
     if (row < n_coarse && lane == 0) {
         const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll
@@ -211,13 +201,13 @@ __global__ void __launch_bounds__(kBlock)
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= n) return;
     const int row_e = p_row_ptr[row + 1];
-    float sum[K];
+    cuda::std::array<float, K> sum;
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     for (int j = p_row_ptr[row]; j < row_e; ++j) {
         const float v = p_vals[j];
         const std::int64_t base = static_cast<std::int64_t>(p_col_idx[j]) * K;
-        float xv[K];
+        cuda::std::array<float, K> xv;
         load_row<K>(x_coarse + base, xv);
 #pragma unroll
         for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
@@ -256,15 +246,15 @@ __global__ void __launch_bounds__(kBlock)
                          float c_prev, float alpha, float* x_out) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
-    float sum[K];
+    cuda::std::array<float, K> sum;
     row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x_cur, row, lane, sum);
     if (row < n && lane == 0) {
         const float d = alpha * dinv[row];
         const float s = row_scale[row];
         const std::int64_t base = static_cast<std::int64_t>(row) * K;
-        float cur[K];
-        float prev[K];
-        float rhs[K];
+        cuda::std::array<float, K> cur;
+        cuda::std::array<float, K> prev;
+        cuda::std::array<float, K> rhs;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             cur[c] = x_cur[base + c];
@@ -292,24 +282,20 @@ __global__ void __launch_bounds__(kBlock)
                           float* __restrict__ x) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kWarp;
     const int lane = static_cast<int>(threadIdx.x) % kWarp;
-    float sum[K];
+    cuda::std::array<float, K> sum;
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n) {
         const float* arow = ainv + static_cast<std::int64_t>(row) * n;
         for (int j = lane; j < n; j += kWarp) {
             const float a = arow[j];
-            float bv[K];
+            cuda::std::array<float, K> bv;
             load_row<K>(b + static_cast<std::int64_t>(j) * K, bv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += a * bv[c];
         }
     }
-#pragma unroll
-    for (int off = kWarp / 2; off > 0; off >>= 1) {
-#pragma unroll
-        for (int c = 0; c < K; ++c) sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, kWarp);
-    }
+    warp_reduce_sum<kWarp>(sum);
     if (row < n && lane == 0) {
         const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll

@@ -1,9 +1,14 @@
 #pragma once
 #include "core/common.hpp"
 
+#include <cuda/std/array>
+
 // __device__ helpers shared across kernels. .cu only. Keep this out of dadt.cu: that
 // translation unit alone compiles with --use_fast_math, which would give these fp64
 // bodies different contraction rules than every other caller gets.
+
+// The K-wide accumulators these helpers move are cuda::std::array. Index them only with
+// compile-time constants from unrolled loops; a runtime index spills one to local memory.
 
 struct Vec3d {
     double x, y, z;
@@ -31,12 +36,29 @@ __device__ __forceinline__ Vec3d tet_grad4(const double* __restrict__ v,
 }
 
 // Per-placement pointers for the block stages, passed by value as a kernel argument.
-struct ConstPtrPack {
-    const float* p[kMaxStageBlock];
-};
-struct PtrPack {
-    float* p[kMaxStageBlock];
-};
+using ConstPtrPack = cuda::std::array<const float*, kMaxStageBlock>;
+using PtrPack = cuda::std::array<float*, kMaxStageBlock>;
+
+// Fixed-order shuffle reduction of K per-lane accumulators into lane 0 of each WIDTH-wide group.
+//
+// The pairing is load-bearing: block_cg.cu's two SpMV kernels land on the same association, and a
+// V-cycle level takes its threads-per-row from the operator alone, so a placement's field is the
+// same whatever block width it was solved at.
+//
+// The mask is the full warp, not the group: threads whose row is past the end of the matrix still
+// have to reach the shuffle, carrying zero accumulators.
+template <int WIDTH, typename T, cuda::std::size_t K>
+__device__ __forceinline__ void warp_reduce_sum(cuda::std::array<T, K>& sum) {
+    static_assert(WIDTH > 0 && WIDTH <= kWarp && kWarp % WIDTH == 0,
+                  "a shuffle group must be a power-of-two fraction of the warp");
+#pragma unroll
+    for (int off = WIDTH / 2; off > 0; off >>= 1) {
+#pragma unroll
+        for (cuda::std::size_t c = 0; c < K; ++c) {
+            sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, WIDTH);
+        }
+    }
+}
 
 // Move the K contiguous values of one row of a (n, K) row-major operand as vector accesses
 // rather than K scalar ones.
@@ -52,7 +74,8 @@ struct PtrPack {
 // breaks.
 
 template <int K>
-__device__ __forceinline__ void load_row(const float* __restrict__ p, float (&v)[K]) {
+__device__ __forceinline__ void load_row(const float* __restrict__ p,
+                                         cuda::std::array<float, K>& v) {
     if constexpr (K == 2) {
         const float2 t = *reinterpret_cast<const float2*>(p);
         v[0] = t.x;
@@ -73,7 +96,8 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p, float (&v)
 }
 
 template <int K>
-__device__ __forceinline__ void load_row(const double* __restrict__ p, double (&v)[K]) {
+__device__ __forceinline__ void load_row(const double* __restrict__ p,
+                                         cuda::std::array<double, K>& v) {
     if constexpr (K % 2 == 0) {
 #pragma unroll
         for (int b = 0; b < K / 2; ++b) {
@@ -88,7 +112,7 @@ __device__ __forceinline__ void load_row(const double* __restrict__ p, double (&
 }
 
 template <int K>
-__device__ __forceinline__ void store_row(float* p, const float (&v)[K]) {
+__device__ __forceinline__ void store_row(float* p, const cuda::std::array<float, K>& v) {
     if constexpr (K == 2) {
         *reinterpret_cast<float2*>(p) = make_float2(v[0], v[1]);
     } else if constexpr (K % 4 == 0) {
@@ -104,7 +128,7 @@ __device__ __forceinline__ void store_row(float* p, const float (&v)[K]) {
 }
 
 template <int K>
-__device__ __forceinline__ void store_row(double* p, const double (&v)[K]) {
+__device__ __forceinline__ void store_row(double* p, const cuda::std::array<double, K>& v) {
     if constexpr (K % 2 == 0) {
 #pragma unroll
         for (int b = 0; b < K / 2; ++b) {

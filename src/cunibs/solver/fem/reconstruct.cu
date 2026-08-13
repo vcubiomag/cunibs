@@ -58,15 +58,15 @@ __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
             gy += vi * static_cast<double>(gm[i][1]);
             gz += vi * static_cast<double>(gm[i][2]);
         }
-        const float* de = dadt_elm.p[c] + e * 3;
+        const float* de = dadt_elm[c] + e * 3;
         const double ex = -gx - static_cast<double>(de[0]);
         const double ey = -gy - static_cast<double>(de[1]);
         const double ez = -gz - static_cast<double>(de[2]);
-        float* eo = e_out.p[c] + e * 3;
+        float* eo = e_out[c] + e * 3;
         eo[0] = static_cast<float>(ex);
         eo[1] = static_cast<float>(ey);
         eo[2] = static_cast<float>(ez);
-        magn_out.p[c][e] = static_cast<float>(sqrt(ex * ex + ey * ey + ez * ez));
+        magn_out[c][e] = static_cast<float>(sqrt(ex * ex + ey * ey + ez * ez));
     }
 }
 
@@ -88,9 +88,9 @@ void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const
     PtrPack eo{};
     PtrPack mo{};
     for (int c = 0; c < k; ++c) {
-        in.p[c] = dadt_elm[c];
-        eo.p[c] = e_out[c];
-        mo.p[c] = magn_out[c];
+        in[c] = dadt_elm[c];
+        eo[c] = e_out[c];
+        mo[c] = magn_out[c];
     }
     if (const unsigned blocks = grid_for(n_tet)) {
         reconstruct_block_kernel<<<blocks, kBlock, 0, stream>>>(v_block, tet_nodes, g, in, eo, mo,

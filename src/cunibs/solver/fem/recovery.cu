@@ -465,8 +465,8 @@ __global__ void hpr_grad_kernel(const double* __restrict__ v_block, const float*
     const int node = slot_node[s];
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        const float* da = dadt_nodes.p[c] + node * 3;
-        float* dst = e_slots.p[c] + s * 3;
+        const float* da = dadt_nodes[c] + node * 3;
+        float* dst = e_slots[c] + s * 3;
         dst[0] = static_cast<float>(-acc[c][0] - static_cast<double>(da[0]));
         dst[1] = static_cast<float>(-acc[c][1] - static_cast<double>(da[1]));
         dst[2] = static_cast<float>(-acc[c][2] - static_cast<double>(da[2]));
@@ -498,7 +498,7 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
         const int e = idx[p] >> 2;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const float* src = e_in.p[c] + e * 3;
+            const float* src = e_in[c] + e * 3;
             acc[c][0] += wp * src[0];
             acc[c][1] += wp * src[1];
             acc[c][2] += wp * src[2];
@@ -506,7 +506,7 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
     }
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        float* dst = e_slots.p[c] + s * 3;
+        float* dst = e_slots[c] + s * 3;
         dst[0] = acc[c][0];
         dst[1] = acc[c][1];
         dst[2] = acc[c][2];
@@ -533,7 +533,7 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
         double sx = 0.0, sy = 0.0, sz = 0.0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float* src = e_slots.p[c] + slots[i] * 3;
+            const float* src = e_slots[c] + slots[i] * 3;
             sx += static_cast<double>(src[0]);
             sy += static_cast<double>(src[1]);
             sz += static_cast<double>(src[2]);
@@ -541,23 +541,23 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
         sx *= 0.25;
         sy *= 0.25;
         sz *= 0.25;
-        float* dst = e_out.p[c] + e * 3;
+        float* dst = e_out[c] + e * 3;
         dst[0] = static_cast<float>(sx);
         dst[1] = static_cast<float>(sy);
         dst[2] = static_cast<float>(sz);
-        magn_out.p[c][e] = static_cast<float>(sqrt(sx * sx + sy * sy + sz * sz));
+        magn_out[c][e] = static_cast<float>(sqrt(sx * sx + sy * sy + sz * sz));
     }
 }
 
 ConstPtrPack pack_const(const float* const* src, int k) {
     ConstPtrPack out{};
-    for (int c = 0; c < k; ++c) out.p[c] = src[c];
+    for (int c = 0; c < k; ++c) out[c] = src[c];
     return out;
 }
 
 PtrPack pack(float* const* src, int k) {
     PtrPack out{};
-    for (int c = 0; c < k; ++c) out.p[c] = src[c];
+    for (int c = 0; c < k; ++c) out[c] = src[c];
     return out;
 }
 
