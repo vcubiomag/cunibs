@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "core/common.hpp"
 
 #include <cuda_fp16.h>
 

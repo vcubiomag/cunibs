@@ -1,8 +1,8 @@
 // Every V-cycle step is written once, templated on the number of right-hand sides K, and
 // the single-RHS cycle is the K = 1 instantiation: for K = 1 the row-major (n, K) operands
 // collapse to plain vectors and the compiler folds the column loops away.
-#include "device_math.cuh"
-#include "vcycle.hpp"
+#include "amg/vcycle.hpp"
+#include "core/device_math.cuh"
 
 #include <atomic>
 #include <cstddef>

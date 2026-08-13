@@ -1,21 +1,14 @@
 #pragma once
-#include "common.hpp"
+#include "core/common.hpp"
 
-// Launchers for the per-placement pipeline stages, grouped by the translation unit that
-// implements them. The AMG solver's own launchers live in solver.hpp and aggregate.hpp.
+// Launchers for the mesh-side stages: the P1 operator, the assembled system, and the
+// post-processing that turns a solved potential back into a field. The AMG solver's own
+// launchers live in amg/, the coil-side ones in coil/.
 
 // --- gradient.cu: P1 basis-function gradients and element volumes --------------------------
 // nodes_mm is (n_nodes, 3) in millimetres; g is (n_tet, 4, 3) in 1/m and vols is (n_tet,) in m^3.
 void launch_p1_gradients(const double* nodes_mm, const int* tet_nodes, double* g, double* vols,
                          int n_tet, cudaStream_t stream);
-
-// --- dadt.cu: Biot-Savart dA/dt from the coil's dipoles -----------------------------------
-void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
-                 int n_dip, int n_nodes, float didt, float mu0_4pi, cudaStream_t stream);
-
-// --- dadt_element.cu -----------------------------------------------------------------------
-void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
-                                 int n_tet, cudaStream_t stream);
 
 // --- rhs.cu: FEM right-hand-side assembly --------------------------------------------------
 // launch_rhs fuses the corner dot product into the node gather; the staged pair pays a corner
@@ -56,13 +49,6 @@ int build_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, 
 void launch_stiffness_rows(const double* g, const double* scale, const int* tet_nodes,
                            const int* ptr, const int* idx, const int* indptr, const int* indices,
                            double* data, int n_rows, cudaStream_t stream);
-
-// --- l1.cu: l1-Jacobi smoother scaling over a CSR operator ----------------------------------
-// dinv[i] = 1 / (sign(a_ii) · Σ_j |a_ij|), the diagonal included in the row sum, and 1 where that
-// sum is zero. indices need not be sorted; the row is scanned for the diagonal, and a row without
-// one keeps the positive sign. dinv is overwritten and must hold n_rows entries.
-void launch_l1_dinv(const int* indptr, const int* indices, const float* data, float* dinv,
-                    int n_rows, cudaStream_t stream);
 
 // --- reconstruct.cu: E = -grad(v) - dA/dt --------------------------------------------------
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
@@ -131,16 +117,6 @@ void launch_node_gather(const double* corner, const int* ptr, const int* idx, do
 void launch_node_scatter3(const double* w_e, const int* ptr, const int* idx, double* node_w,
                           int n_nodes, cudaStream_t stream);
 
-// --- moments.cu: streaming UQ statistics ---------------------------------------------------
+// --- moments.cu: streaming UQ statistics over the |E| this directory produces ---------------
 void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
                                cudaStream_t stream);
-
-// --- place.cu: coil placement frames -------------------------------------------------------
-// handles may be null, for callers that want only the scalp projection and normal; the frame
-// then takes an arbitrary but deterministic in-plane axis. degenerate (n_pl) is set to 1 where
-// a supplied handle left the in-plane axis undefined and that same fallback was used instead;
-// pass null alongside a null handles, where the flag would carry no information. The transform
-// is orthonormal either way.
-void launch_place(const double* centers, const double* handles, const double* dists,
-                  const double* a, const double* b, const double* c, const double* tnorm,
-                  double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream);

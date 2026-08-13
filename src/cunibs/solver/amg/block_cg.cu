@@ -7,8 +7,8 @@
 // independent of its neighbours.
 #include <cstdint>
 
-#include "cg_kernels.hpp"
-#include "device_math.cuh"
+#include "amg/cg_kernels.hpp"
+#include "core/device_math.cuh"
 
 namespace {
 

@@ -1,5 +1,5 @@
-#include "device_math.cuh"
-#include "kernels.hpp"
+#include "coil/coil.hpp"
+#include "core/device_math.cuh"
 
 #include <cuda/cmath>
 

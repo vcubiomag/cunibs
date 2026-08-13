@@ -1,5 +1,5 @@
-#include "device_math.cuh"
-#include "kernels.hpp"
+#include "core/device_math.cuh"
+#include "fem/fem.hpp"
 
 namespace {
 

@@ -1,7 +1,7 @@
-#include "solver.hpp"
+#include "amg/solver.hpp"
 
-#include "cg_kernels.hpp"
-#include "vcycle.hpp"
+#include "amg/cg_kernels.hpp"
+#include "amg/vcycle.hpp"
 
 #include <cmath>
 #include <cstdint>

@@ -1,4 +1,4 @@
-#include "kernels.hpp"
+#include "fem/fem.hpp"
 
 #include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_sort.cuh>

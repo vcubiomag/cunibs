@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "core/common.hpp"
 
 // Launchers for the mixed-precision CG kernels (block_cg.cu), for k in {1, 2, 4, 8}. All dense
 // operands are row-major (n, k). k = 1 is a compiled width like any other, so the single-RHS

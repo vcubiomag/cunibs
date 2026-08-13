@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "common.hpp"
+#include "core/common.hpp"
 
 // Only ever held by reference or pointer here; solver.cpp includes vcycle.hpp for the calls.
 class NativeVCycle;

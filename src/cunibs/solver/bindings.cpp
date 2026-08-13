@@ -7,10 +7,12 @@
 #include <new>
 #include <stdexcept>
 
-#include "aggregate.hpp"
-#include "kernels.hpp"
-#include "solver.hpp"
-#include "vcycle.hpp"
+#include "amg/aggregate.hpp"
+#include "amg/l1.hpp"
+#include "amg/solver.hpp"
+#include "amg/vcycle.hpp"
+#include "coil/coil.hpp"
+#include "fem/fem.hpp"
 
 namespace nb = nanobind;
 

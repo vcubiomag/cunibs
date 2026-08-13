@@ -68,25 +68,28 @@ find_package(nanobind CONFIG REQUIRED)
 
 nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/bindings.cpp
-  src/cunibs/solver/solver.cpp
-  src/cunibs/solver/vcycle.cu
-  src/cunibs/solver/aggregate.cu
-  src/cunibs/solver/block_cg.cu
-  src/cunibs/solver/dadt.cu
-  src/cunibs/solver/gradient.cu
-  src/cunibs/solver/dadt_element.cu
-  src/cunibs/solver/pattern.cu
-  src/cunibs/solver/rhs.cu
-  src/cunibs/solver/stiffness.cu
-  src/cunibs/solver/l1.cu
-  src/cunibs/solver/reconstruct.cu
-  src/cunibs/solver/recovery.cu
-  src/cunibs/solver/adm.cu
-  src/cunibs/solver/moments.cu
-  src/cunibs/solver/place.cu
+  src/cunibs/solver/amg/solver.cpp
+  src/cunibs/solver/amg/vcycle.cu
+  src/cunibs/solver/amg/aggregate.cu
+  src/cunibs/solver/amg/block_cg.cu
+  src/cunibs/solver/amg/l1.cu
+  src/cunibs/solver/fem/gradient.cu
+  src/cunibs/solver/fem/pattern.cu
+  src/cunibs/solver/fem/rhs.cu
+  src/cunibs/solver/fem/stiffness.cu
+  src/cunibs/solver/fem/reconstruct.cu
+  src/cunibs/solver/fem/recovery.cu
+  src/cunibs/solver/fem/adm.cu
+  src/cunibs/solver/fem/moments.cu
+  src/cunibs/solver/coil/dadt.cu
+  src/cunibs/solver/coil/dadt_element.cu
+  src/cunibs/solver/coil/place.cu
 )
 
-set_source_files_properties(src/cunibs/solver/dadt.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+target_include_directories(_solver_ext PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/cunibs/solver")
+
+set_source_files_properties(src/cunibs/solver/coil/dadt.cu
+  PROPERTIES COMPILE_OPTIONS "--use_fast_math")
 
 if(MSVC)
   # solver.hpp and several kernels carry UTF-8 bytes; MSVC otherwise decodes the sources

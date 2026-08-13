@@ -1,4 +1,4 @@
-#include "kernels.hpp"
+#include "amg/l1.hpp"
 
 // One thread per row, the same shape rhs.cu uses for the node gather and for the same reason:
 // it fixes the summation order.

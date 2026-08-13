@@ -1,5 +1,5 @@
 #pragma once
-#include "common.hpp"
+#include "core/common.hpp"
 
 // __device__ helpers shared across kernels. .cu only. Keep this out of dadt.cu: that
 // translation unit alone compiles with --use_fast_math, which would give these fp64

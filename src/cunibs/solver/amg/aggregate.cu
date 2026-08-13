@@ -1,4 +1,4 @@
-#include "aggregate.hpp"
+#include "amg/aggregate.hpp"
 
 #include <cub/device/device_scan.cuh>
 
