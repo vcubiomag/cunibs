@@ -1,5 +1,7 @@
 #include "amg/aggregate.hpp"
 
+#include <cuda/atomic>
+
 #include <cub/device/device_scan.cuh>
 
 #include <cstddef>
@@ -57,10 +59,14 @@ __device__ __forceinline__ void best_take(Best& acc, float w, int col) {
 // One atomic per block instead of one per row, folded into the kernel that produces the
 // flag so the convergence check costs no extra pass over the row arrays. Integer addition
 // is associative, so the order the blocks arrive in does not affect the count. Every thread
-// of the block must reach this.
+// of the block must reach this. The counter guards nothing and the host reads it only after the
+// stream has drained, so relaxed is the whole ordering it needs.
 __device__ __forceinline__ void count_block(int predicate, int* __restrict__ counter) {
     const int n_set = __syncthreads_count(predicate);
-    if (threadIdx.x == 0 && n_set != 0) atomicAdd(counter, n_set);
+    if (threadIdx.x == 0 && n_set != 0) {
+        cuda::atomic_ref<int, cuda::thread_scope_device> total(*counter);
+        total.fetch_add(n_set, cuda::std::memory_order_relaxed);
+    }
 }
 
 __global__ __launch_bounds__(kBlock) void agg_init_round1_kernel(int n, int* __restrict__ agg,

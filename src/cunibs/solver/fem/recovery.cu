@@ -1,6 +1,8 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
+#include <cuda/atomic>
+
 #include <cstdint>
 
 // Recovery post-processing: turn the raw per-tetrahedron E into a smoothed field by fitting
@@ -239,7 +241,11 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     }
 
     if (!fit) {
-        if (n_fallback) atomicAdd(n_fallback, 1);
+        // Diagnostic only, and read after the stream drains, so relaxed is the whole ordering.
+        if (n_fallback) {
+            cuda::atomic_ref<int, cuda::thread_scope_device> fallbacks(*n_fallback);
+            fallbacks.fetch_add(1, cuda::std::memory_order_relaxed);
+        }
         double total = 0.0;
         for (int p = begin; p < end; ++p) total += static_cast<double>(vols[idx[p] >> 2]);
         // A zero-volume patch cannot be averaged either; fall back once more to a plain mean so
