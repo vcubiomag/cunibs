@@ -13,11 +13,13 @@ __global__ void element_weight_kernel(const double* __restrict__ values,
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    const Vec3d grad = tet_grad4(values, tet_nodes, g, e);
+    const Vec3d grad = tet_grad4(values, Tet4View<const int>(tet_nodes, n_tet),
+                                 TetGradView<const float>(g, n_tet), e);
+    const Vec3View<double> w(w_e, n_tet);
     const double s = -static_cast<double>(neg_vc[e]);
-    w_e[e * 3 + 0] = s * grad.x;
-    w_e[e * 3 + 1] = s * grad.y;
-    w_e[e * 3 + 2] = s * grad.z;
+    w(e, 0) = s * grad.x;
+    w(e, 1) = s * grad.y;
+    w(e, 2) = s * grad.z;
 }
 
 //   out[n] = Σ_{c ∋ n} corner[c]   (node2corner stores corner ids c = 4e + i)
@@ -43,18 +45,21 @@ __global__ void node_scatter3_kernel(const double* __restrict__ w_e, const int* 
     const int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= n_nodes) return;
 
+    const Vec3View<const double> w(w_e, kUnsizedRows);
+    const Vec3View<double> out(node_w, n_nodes);
+
     const int begin = ptr[node];
     const int end = ptr[node + 1];
     double ax = 0.0, ay = 0.0, az = 0.0;
     for (int p = begin; p < end; ++p) {
         const int e = idx[p] >> 2;
-        ax += w_e[e * 3 + 0];
-        ay += w_e[e * 3 + 1];
-        az += w_e[e * 3 + 2];
+        ax += w(e, 0);
+        ay += w(e, 1);
+        az += w(e, 2);
     }
-    node_w[node * 3 + 0] = 0.25 * ax;
-    node_w[node * 3 + 1] = 0.25 * ay;
-    node_w[node * 3 + 2] = 0.25 * az;
+    out(node, 0) = 0.25 * ax;
+    out(node, 1) = 0.25 * ay;
+    out(node, 2) = 0.25 * az;
 }
 
 }  // namespace

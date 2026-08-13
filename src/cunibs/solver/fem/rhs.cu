@@ -1,8 +1,6 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
-#include <cstdint>
-
 // Assign one thread per node to avoid atomic updates and fix the sum order.
 //   b[node] = Σ_{(e,i): tet_nodes[e,i]=node}  neg_vc[e] · dot(dadt_elm[e], g[e,i])
 // ``neg_vc[e] = -vols[e] * cond[e]``.
@@ -18,15 +16,16 @@ __global__ void rhs_kernel(const float* __restrict__ dadt_elm, const float* __re
     const int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= n_nodes) return;
 
+    const Vec3View<const float> dadt(dadt_elm, kUnsizedRows);
+    const Vec3View<const float> gv(g, kUnsizedRows);
+
     const int begin = ptr[node];
     const int end = ptr[node + 1];
     float acc = 0.f;
     for (int p = begin; p < end; ++p) {
         const int c = idx[p];
         const int e = c >> 2;
-        const float dot = dadt_elm[e * 3 + 0] * g[c * 3 + 0] +
-                          dadt_elm[e * 3 + 1] * g[c * 3 + 1] +
-                          dadt_elm[e * 3 + 2] * g[c * 3 + 2];
+        const float dot = dadt(e, 0) * gv(c, 0) + dadt(e, 1) * gv(c, 1) + dadt(e, 2) * gv(c, 2);
         acc += neg_vc[e] * dot;
     }
     b[node] = acc;
@@ -40,10 +39,12 @@ __global__ void rhs_corner_kernel(const float* __restrict__ dadt_elm, const floa
                                   int n_corner) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n_corner) return;
+    const Vec3View<const float> dadt(dadt_elm, kUnsizedRows);
+    const Vec3View<const float> gv(g, n_corner);
     const int e = c >> 2;
     const float w = neg_vc[e];
-    q[c] = dadt_elm[e * 3 + 0] * (g[c * 3 + 0] * w) + dadt_elm[e * 3 + 1] * (g[c * 3 + 1] * w) +
-           dadt_elm[e * 3 + 2] * (g[c * 3 + 2] * w);
+    q[c] = dadt(e, 0) * (gv(c, 0) * w) + dadt(e, 1) * (gv(c, 1) * w) +
+           dadt(e, 2) * (gv(c, 2) * w);
 }
 
 // Segmented reduction b[node] = Σ_{p∈[ptr[node],ptr[node+1])} q[idx[p]]. The per-node
@@ -66,15 +67,16 @@ __global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __re
                                         float* __restrict__ q_block, int n_corner, int k) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n_corner) return;
+    const Vec3View<const float> gv(g, n_corner);
+    const Mat2View<float> q(q_block, n_corner, k);
     const int e = c >> 2;
     const float w = neg_vc[e];
-    const float w0 = g[c * 3 + 0] * w;
-    const float w1 = g[c * 3 + 1] * w;
-    const float w2 = g[c * 3 + 2] * w;
-    const std::int64_t out = static_cast<std::int64_t>(c) * k;
+    const float w0 = gv(c, 0) * w;
+    const float w1 = gv(c, 1) * w;
+    const float w2 = gv(c, 2) * w;
     for (int i = 0; i < k; ++i) {
-        const float* de = dadt_elm[i] + e * 3;
-        q_block[out + i] = de[0] * w0 + de[1] * w1 + de[2] * w2;
+        const Vec3View<const float> dadt(dadt_elm[i], kUnsizedRows);
+        q(c, i) = dadt(e, 0) * w0 + dadt(e, 1) * w1 + dadt(e, 2) * w2;
     }
 }
 
@@ -87,16 +89,18 @@ __global__ void rhs_gather_block_kernel(const float* __restrict__ q_block,
                                         float* __restrict__ b_block, int n_nodes, int k) {
     const int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= n_nodes) return;
+    const Mat2View<const float> q(q_block, kUnsizedRows, k);
+    const Mat2View<float> b(b_block, n_nodes, k);
+
     const int begin = ptr[node];
     const int end = ptr[node + 1];
     cuda::std::array<float, kMaxStageBlock> acc;
     for (int i = 0; i < k; ++i) acc[i] = 0.f;
     for (int p = begin; p < end; ++p) {
-        const std::int64_t base = static_cast<std::int64_t>(idx[p]) * k;
-        for (int i = 0; i < k; ++i) acc[i] += q_block[base + i];
+        const int corner = idx[p];
+        for (int i = 0; i < k; ++i) acc[i] += q(corner, i);
     }
-    const std::int64_t out = static_cast<std::int64_t>(node) * k;
-    for (int i = 0; i < k; ++i) b_block[out + i] = acc[i];
+    for (int i = 0; i < k; ++i) b(node, i) = acc[i];
 }
 
 }  // namespace

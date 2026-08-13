@@ -1,8 +1,6 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
-#include <cstdint>
-
 // Assign one thread per tetrahedron to avoid scatter writes.
 //   grad_v[k] = Σ_i v[tet_nodes[e,i]] · g[e,i,k]
 //   E[e]      = −grad_v − dadt_elm[e]
@@ -18,13 +16,17 @@ __global__ void reconstruct_kernel(const double* __restrict__ v, const int* __re
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    const Vec3d grad = tet_grad4(v, tet_nodes, g, e);
-    const double ex = -grad.x - static_cast<double>(dadt_elm[e * 3 + 0]);
-    const double ey = -grad.y - static_cast<double>(dadt_elm[e * 3 + 1]);
-    const double ez = -grad.z - static_cast<double>(dadt_elm[e * 3 + 2]);
-    e_out[e * 3 + 0] = static_cast<float>(ex);
-    e_out[e * 3 + 1] = static_cast<float>(ey);
-    e_out[e * 3 + 2] = static_cast<float>(ez);
+    const Vec3View<const float> dadt(dadt_elm, n_tet);
+    const Vec3View<float> out(e_out, n_tet);
+
+    const Vec3d grad = tet_grad4(v, Tet4View<const int>(tet_nodes, n_tet),
+                                 TetGradView<const float>(g, n_tet), e);
+    const double ex = -grad.x - static_cast<double>(dadt(e, 0));
+    const double ey = -grad.y - static_cast<double>(dadt(e, 1));
+    const double ez = -grad.z - static_cast<double>(dadt(e, 2));
+    out(e, 0) = static_cast<float>(ex);
+    out(e, 1) = static_cast<float>(ey);
+    out(e, 2) = static_cast<float>(ez);
     magn_out[e] = static_cast<float>(sqrt(ex * ex + ey * ey + ez * ez));
 }
 
@@ -38,34 +40,37 @@ __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
+    const Tet4View<const int> tn(tet_nodes, n_tet);
+    const TetGradView<const float> gv(g, n_tet);
+    const Mat2View<const double> v(v_block, kUnsizedRows, k);
+
     int nodes[4];
     float gm[4][3];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        nodes[i] = tet_nodes[e * 4 + i];
-        const int base = (e * 4 + i) * 3;
-        gm[i][0] = g[base + 0];
-        gm[i][1] = g[base + 1];
-        gm[i][2] = g[base + 2];
+        nodes[i] = tn(e, i);
+        gm[i][0] = gv(e, i, 0);
+        gm[i][1] = gv(e, i, 1);
+        gm[i][2] = gv(e, i, 2);
     }
 
     for (int c = 0; c < k; ++c) {
         double gx = 0.0, gy = 0.0, gz = 0.0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const double vi = v_block[static_cast<std::int64_t>(nodes[i]) * k + c];
+            const double vi = v(nodes[i], c);
             gx += vi * static_cast<double>(gm[i][0]);
             gy += vi * static_cast<double>(gm[i][1]);
             gz += vi * static_cast<double>(gm[i][2]);
         }
-        const float* de = dadt_elm[c] + e * 3;
-        const double ex = -gx - static_cast<double>(de[0]);
-        const double ey = -gy - static_cast<double>(de[1]);
-        const double ez = -gz - static_cast<double>(de[2]);
-        float* eo = e_out[c] + e * 3;
-        eo[0] = static_cast<float>(ex);
-        eo[1] = static_cast<float>(ey);
-        eo[2] = static_cast<float>(ez);
+        const Vec3View<const float> dadt(dadt_elm[c], n_tet);
+        const Vec3View<float> out(e_out[c], n_tet);
+        const double ex = -gx - static_cast<double>(dadt(e, 0));
+        const double ey = -gy - static_cast<double>(dadt(e, 1));
+        const double ez = -gz - static_cast<double>(dadt(e, 2));
+        out(e, 0) = static_cast<float>(ex);
+        out(e, 1) = static_cast<float>(ey);
+        out(e, 2) = static_cast<float>(ez);
         magn_out[c][e] = static_cast<float>(sqrt(ex * ex + ey * ey + ez * ez));
     }
 }

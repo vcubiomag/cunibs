@@ -2,6 +2,7 @@
 #include "core/common.hpp"
 
 #include <cuda/std/array>
+#include <cuda/std/mdspan>
 
 // __device__ helpers shared across kernels. .cu only. Keep this out of dadt.cu: that
 // translation unit alone compiles with --use_fast_math, which would give these fp64
@@ -9,6 +10,33 @@
 
 // The K-wide accumulators these helpers move are cuda::std::array. Index them only with
 // compile-time constants from unrolled loops; a runtime index spills one to local memory.
+
+// Views over the flat arrays this directory passes between kernels. Trailing extents are static
+// because they are properties of the mesh rather than of the problem size: a tetrahedron has four
+// corners and a field vector three components.
+//
+// Index is int by default. Spell it std::int64_t wherever the row count times the trailing
+// extents can outgrow an int, which on a head mesh happens well before the counts themselves do.
+template <typename T, typename Index = int>
+using Vec3View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3>>;
+template <typename T, typename Index = int>
+using Tet4View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 4>>;
+// (n_tet, 4, 3): the P1 basis gradient of corner i of tetrahedron e. Also addressable per
+// corner c = 4e + i through a Vec3View, which is how the corner-centric kernels read it.
+template <typename T, typename Index = int>
+using TetGradView =
+    cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 4, 3>>;
+// Dense row-major with both extents known only at run time; the (n, k) block operands are these.
+template <typename T>
+using Mat2View = cuda::std::mdspan<T, cuda::std::dextents<std::int64_t, 2>>;
+// (n, K) row-major with K a compiled width. The CG and V-cycle operands are these.
+template <typename T, int K>
+using WidthView =
+    cuda::std::mdspan<T, cuda::std::extents<std::int64_t, cuda::std::dynamic_extent, K>>;
+
+// Leading extent for a kernel that was never handed its row count: it reaches rows through an
+// incidence list that only names valid ones, and a row-major mapping never reads the extent.
+constexpr int kUnsizedRows = 0;
 
 struct Vec3d {
     double x, y, z;
@@ -21,16 +49,15 @@ __device__ __forceinline__ double dot3(const double* u, const double* v) {
 // grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron. Accumulated in fp64
 // because callers subtract a comparable term from it and lose the leading digits.
 __device__ __forceinline__ Vec3d tet_grad4(const double* __restrict__ v,
-                                           const int* __restrict__ tet_nodes,
-                                           const float* __restrict__ g, int e) {
+                                           Tet4View<const int> tet_nodes,
+                                           TetGradView<const float> g, int e) {
     double gx = 0.0, gy = 0.0, gz = 0.0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const double vi = v[tet_nodes[e * 4 + i]];
-        const int base = (e * 4 + i) * 3;
-        gx += vi * static_cast<double>(g[base + 0]);
-        gy += vi * static_cast<double>(g[base + 1]);
-        gz += vi * static_cast<double>(g[base + 2]);
+        const double vi = v[tet_nodes(e, i)];
+        gx += vi * static_cast<double>(g(e, i, 0));
+        gy += vi * static_cast<double>(g(e, i, 1));
+        gz += vi * static_cast<double>(g(e, i, 2));
     }
     return {gx, gy, gz};
 }

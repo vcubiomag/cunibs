@@ -1,3 +1,4 @@
+#include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
 #include <cstdint>
@@ -42,20 +43,22 @@ __global__ void stiffness_rows_kernel(const double* __restrict__ g,
     const int row_end = indptr[row + 1];
     for (int p = row_begin; p < row_end; ++p) data[p] = 0.0;
 
+    const Vec3View<const double, std::int64_t> gv(g, kUnsizedRows);
+    const Tet4View<const int, std::int64_t> tn(tet_nodes, kUnsizedRows);
+
     const int begin = ptr[row];
     const int end = ptr[row + 1];
     for (int p = begin; p < end; ++p) {
         const int corner = idx[p];
         const int e = corner >> 2;
         const double s = scale[e];
-        const double gi0 = g[static_cast<std::int64_t>(corner) * 3 + 0];
-        const double gi1 = g[static_cast<std::int64_t>(corner) * 3 + 1];
-        const double gi2 = g[static_cast<std::int64_t>(corner) * 3 + 2];
-        const std::int64_t ebase = static_cast<std::int64_t>(e) * 4;
+        const double gi0 = gv(corner, 0);
+        const double gi1 = gv(corner, 1);
+        const double gi2 = gv(corner, 2);
         for (int j = 0; j < 4; ++j) {
-            const std::int64_t cj = ebase + j;
-            const double dot = gi0 * g[cj * 3 + 0] + gi1 * g[cj * 3 + 1] + gi2 * g[cj * 3 + 2];
-            const int col = tet_nodes[cj];
+            const std::int64_t cj = static_cast<std::int64_t>(e) * 4 + j;
+            const double dot = gi0 * gv(cj, 0) + gi1 * gv(cj, 1) + gi2 * gv(cj, 2);
+            const int col = tn(e, j);
             data[find_col(indices, row_begin, row_end, col)] += s * dot;
         }
     }

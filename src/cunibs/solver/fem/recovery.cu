@@ -59,11 +59,12 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
     if (f >= n_face) return;
     const int e = f >> 2, skip = f & 3;
 
+    const Tet4View<const int> tn(tet_nodes, n_face >> 2);
     int a[3];
     int m = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        if (i != skip) a[m++] = tet_nodes[e * 4 + i];
+        if (i != skip) a[m++] = tn(e, i);
     }
 
     // Rotate the shortest incidence list into the pivot slot with scalar selects: indexing a[] by
@@ -135,16 +136,16 @@ __device__ bool solve_spd_columns(const double a[N][N], const int* rhs_rows, int
     return true;
 }
 
-__device__ __forceinline__ void tet_barycentre(const double* __restrict__ nodes_mm,
-                                               const int* __restrict__ tet_nodes, int e,
+__device__ __forceinline__ void tet_barycentre(Vec3View<const double> nodes_mm,
+                                               Tet4View<const int> tet_nodes, int e,
                                                double b[3]) {
     b[0] = b[1] = b[2] = 0.0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const int n = tet_nodes[e * 4 + i];
-        b[0] += nodes_mm[n * 3 + 0];
-        b[1] += nodes_mm[n * 3 + 1];
-        b[2] += nodes_mm[n * 3 + 2];
+        const int n = tet_nodes(e, i);
+        b[0] += nodes_mm(n, 0);
+        b[1] += nodes_mm(n, 1);
+        b[2] += nodes_mm(n, 2);
     }
     b[0] *= 0.25;
     b[1] *= 0.25;
@@ -187,8 +188,9 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     const int count = end - begin;
     if (count <= 0) return;
 
-    const double xn[3] = {nodes_mm[node * 3 + 0], nodes_mm[node * 3 + 1],
-                          nodes_mm[node * 3 + 2]};
+    const Vec3View<const double> nodes(nodes_mm, kUnsizedRows);
+    const Tet4View<const int> tn(tet_nodes, kUnsizedRows);
+    const double xn[3] = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
 
     bool fit = (count >= 4) && !(is_boundary && is_boundary[node]);
     double z[1][4] = {{1.0, 0.0, 0.0, 0.0}};
@@ -198,7 +200,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         h = 0.0;
         for (int p = begin; p < end; ++p) {
             double b[3];
-            tet_barycentre(nodes_mm, tet_nodes, idx[p] >> 2, b);
+            tet_barycentre(nodes, tn, idx[p] >> 2, b);
 #pragma unroll
             for (int c = 0; c < 3; ++c) h = fmax(h, fabs(b[c] - xn[c]));
         }
@@ -208,7 +210,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         double a[4][4] = {};
         for (int p = begin; p < end; ++p) {
             double b[3];
-            tet_barycentre(nodes_mm, tet_nodes, idx[p] >> 2, b);
+            tet_barycentre(nodes, tn, idx[p] >> 2, b);
             const double q[4] = {1.0, (b[0] - xn[0]) / h, (b[1] - xn[1]) / h,
                                  (b[2] - xn[2]) / h};
 #pragma unroll
@@ -230,7 +232,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         double lebesgue = 0.0;
         for (int p = begin; p < end; ++p) {
             double b[3];
-            tet_barycentre(nodes_mm, tet_nodes, idx[p] >> 2, b);
+            tet_barycentre(nodes, tn, idx[p] >> 2, b);
             lebesgue += fabs(spr_corner_weight(z[0], b, xn, h));
         }
         fit = lebesgue <= kMaxLebesgue;
@@ -253,7 +255,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
 
     for (int p = begin; p < end; ++p) {
         double b[3];
-        tet_barycentre(nodes_mm, tet_nodes, idx[p] >> 2, b);
+        tet_barycentre(nodes, tn, idx[p] >> 2, b);
         w[p] = static_cast<float>(spr_corner_weight(z[0], b, xn, h));
     }
 }
@@ -326,14 +328,14 @@ struct LinearBasis {
 // The scaling radius: the patch's half-width in the infinity norm, which is what puts the fit in a
 // frame where the offsets lie in [-1, 1] and the normal matrix is conditioned on shape rather than
 // on head-mesh coordinates.
-__device__ __forceinline__ double patch_radius(const double* __restrict__ nodes_mm,
+__device__ __forceinline__ double patch_radius(Vec3View<const double> nodes_mm,
                                                const int* __restrict__ pidx, int begin, int end,
                                                const double xn[3]) {
     double h = 0.0;
     for (int p = begin; p < end; ++p) {
         const int m = pidx[p];
 #pragma unroll
-        for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_mm[m * 3 + c] - xn[c]));
+        for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_mm(m, c) - xn[c]));
     }
     return h;
 }
@@ -345,9 +347,9 @@ __device__ __forceinline__ double patch_radius(const double* __restrict__ nodes_
 // kMaxGradientAmplification; w may have been written either way, and the caller's next rung
 // overwrites the same entries.
 template <typename Basis>
-__device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
+__device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
                                      const int* __restrict__ pidx, int begin, int end,
-                                     const double xn[3], double h, float* __restrict__ w) {
+                                     const double xn[3], double h, Vec3View<float> wv) {
     constexpr int N = Basis::kTerms;
     if (end - begin < Basis::kMinPatch) return false;
 
@@ -355,8 +357,8 @@ __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
     for (int p = begin; p < end; ++p) {
         const int m = pidx[p];
         double q[N];
-        Basis::eval((nodes_mm[m * 3 + 0] - xn[0]) / h, (nodes_mm[m * 3 + 1] - xn[1]) / h,
-                    (nodes_mm[m * 3 + 2] - xn[2]) / h, q);
+        Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
+                    (nodes_mm(m, 2) - xn[2]) / h, q);
 #pragma unroll
         for (int i = 0; i < N; ++i) {
 #pragma unroll
@@ -377,15 +379,15 @@ __device__ bool fit_gradient_weights(const double* __restrict__ nodes_mm,
     for (int p = begin; p < end; ++p) {
         const int m = pidx[p];
         double q[N];
-        Basis::eval((nodes_mm[m * 3 + 0] - xn[0]) / h, (nodes_mm[m * 3 + 1] - xn[1]) / h,
-                    (nodes_mm[m * 3 + 2] - xn[2]) / h, q);
+        Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
+                    (nodes_mm(m, 2) - xn[2]) / h, q);
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             double acc = 0.0;
 #pragma unroll
             for (int i = 0; i < N; ++i) acc += z[c][i] * q[i];
             sum[c] += fabs(acc);
-            w[p * 3 + c] = static_cast<float>(acc / h);
+            wv(p, c) = static_cast<float>(acc / h);
         }
     }
     return fmax(sum[0], fmax(sum[1], sum[2])) <= kMaxGradientAmplification;
@@ -403,20 +405,22 @@ __global__ void hpr_weights_kernel(const double* __restrict__ nodes_mm,
 
     const int begin = pptr[s], end = pptr[s + 1];
     const int node = slot_node[s];
-    const double xn[3] = {nodes_mm[node * 3 + 0], nodes_mm[node * 3 + 1],
-                          nodes_mm[node * 3 + 2]};
-    const double h = patch_radius(nodes_mm, pidx, begin, end, xn);
+    const Vec3View<const double> nodes(nodes_mm, kUnsizedRows);
+    // One 3-vector per patch entry, so its rows are entries of pptr/pidx, not slots.
+    const Vec3View<float> wv(w, kUnsizedRows);
+    const double xn[3] = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
+    const double h = patch_radius(nodes, pidx, begin, end, xn);
 
     if (h > 0.0) {
-        if (fit_gradient_weights<CubicHarmonicBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
+        if (fit_gradient_weights<CubicHarmonicBasis>(nodes, pidx, begin, end, xn, h, wv)) {
             status[s] = 0;
             return;
         }
-        if (fit_gradient_weights<HarmonicBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
+        if (fit_gradient_weights<HarmonicBasis>(nodes, pidx, begin, end, xn, h, wv)) {
             status[s] = 1;
             return;
         }
-        if (fit_gradient_weights<LinearBasis>(nodes_mm, pidx, begin, end, xn, h, w)) {
+        if (fit_gradient_weights<LinearBasis>(nodes, pidx, begin, end, xn, h, wv)) {
             status[s] = 2;
             return;
         }
@@ -425,7 +429,7 @@ __global__ void hpr_weights_kernel(const double* __restrict__ nodes_mm,
     // Only reachable when the patch is degenerate enough that no gradient is determined, e.g.
     // every node of it coplanar. Zero weights leave E = -dA/dt at that slot rather than a NaN.
     for (int p = begin; p < end; ++p) {
-        w[p * 3 + 0] = w[p * 3 + 1] = w[p * 3 + 2] = 0.f;
+        wv(p, 0) = wv(p, 1) = wv(p, 2) = 0.f;
     }
     status[s] = 3;
 }
@@ -443,19 +447,22 @@ __global__ void hpr_grad_kernel(const double* __restrict__ v_block, const float*
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_slots) return;
 
+    const Vec3View<const float> wv(w, kUnsizedRows);
+    const Mat2View<const double> v(v_block, kUnsizedRows, stride);
+
     double acc[K][3];
 #pragma unroll
     for (int c = 0; c < K; ++c) acc[c][0] = acc[c][1] = acc[c][2] = 0.0;
 
     const int begin = pptr[s], end = pptr[s + 1];
     for (int p = begin; p < end; ++p) {
-        const double wx = static_cast<double>(w[p * 3 + 0]);
-        const double wy = static_cast<double>(w[p * 3 + 1]);
-        const double wz = static_cast<double>(w[p * 3 + 2]);
-        const std::int64_t base = static_cast<std::int64_t>(pidx[p]) * stride;
+        const double wx = static_cast<double>(wv(p, 0));
+        const double wy = static_cast<double>(wv(p, 1));
+        const double wz = static_cast<double>(wv(p, 2));
+        const int m = pidx[p];
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const double vm = v_block[base + c];
+            const double vm = v(m, c);
             acc[c][0] += wx * vm;
             acc[c][1] += wy * vm;
             acc[c][2] += wz * vm;
@@ -465,11 +472,11 @@ __global__ void hpr_grad_kernel(const double* __restrict__ v_block, const float*
     const int node = slot_node[s];
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        const float* da = dadt_nodes[c] + node * 3;
-        float* dst = e_slots[c] + s * 3;
-        dst[0] = static_cast<float>(-acc[c][0] - static_cast<double>(da[0]));
-        dst[1] = static_cast<float>(-acc[c][1] - static_cast<double>(da[1]));
-        dst[2] = static_cast<float>(-acc[c][2] - static_cast<double>(da[2]));
+        const Vec3View<const float> da(dadt_nodes[c], kUnsizedRows);
+        const Vec3View<float> dst(e_slots[c], n_slots);
+        dst(s, 0) = static_cast<float>(-acc[c][0] - static_cast<double>(da(node, 0)));
+        dst(s, 1) = static_cast<float>(-acc[c][1] - static_cast<double>(da(node, 1)));
+        dst(s, 2) = static_cast<float>(-acc[c][2] - static_cast<double>(da(node, 2)));
     }
 }
 
@@ -498,18 +505,18 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
         const int e = idx[p] >> 2;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const float* src = e_in[c] + e * 3;
-            acc[c][0] += wp * src[0];
-            acc[c][1] += wp * src[1];
-            acc[c][2] += wp * src[2];
+            const Vec3View<const float> src(e_in[c], kUnsizedRows);
+            acc[c][0] += wp * src(e, 0);
+            acc[c][1] += wp * src(e, 1);
+            acc[c][2] += wp * src(e, 2);
         }
     }
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        float* dst = e_slots[c] + s * 3;
-        dst[0] = acc[c][0];
-        dst[1] = acc[c][1];
-        dst[2] = acc[c][2];
+        const Vec3View<float> dst(e_slots[c], n_slots);
+        dst(s, 0) = acc[c][0];
+        dst(s, 1) = acc[c][1];
+        dst(s, 2) = acc[c][2];
     }
 }
 
@@ -524,27 +531,28 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
+    const Tet4View<const int> soc(slot_of_corner, n_tet);
     int slots[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) slots[i] = slot_of_corner[e * 4 + i];
+    for (int i = 0; i < 4; ++i) slots[i] = soc(e, i);
 
 #pragma unroll
     for (int c = 0; c < K; ++c) {
+        const Vec3View<const float> src(e_slots[c], kUnsizedRows);
         double sx = 0.0, sy = 0.0, sz = 0.0;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const float* src = e_slots[c] + slots[i] * 3;
-            sx += static_cast<double>(src[0]);
-            sy += static_cast<double>(src[1]);
-            sz += static_cast<double>(src[2]);
+            sx += static_cast<double>(src(slots[i], 0));
+            sy += static_cast<double>(src(slots[i], 1));
+            sz += static_cast<double>(src(slots[i], 2));
         }
         sx *= 0.25;
         sy *= 0.25;
         sz *= 0.25;
-        float* dst = e_out[c] + e * 3;
-        dst[0] = static_cast<float>(sx);
-        dst[1] = static_cast<float>(sy);
-        dst[2] = static_cast<float>(sz);
+        const Vec3View<float> dst(e_out[c], n_tet);
+        dst(e, 0) = static_cast<float>(sx);
+        dst(e, 1) = static_cast<float>(sy);
+        dst(e, 2) = static_cast<float>(sz);
         magn_out[c][e] = static_cast<float>(sqrt(sx * sx + sy * sy + sz * sz));
     }
 }

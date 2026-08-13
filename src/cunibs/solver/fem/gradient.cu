@@ -1,3 +1,4 @@
+#include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
 #include <cstdint>
@@ -31,13 +32,17 @@ __global__ void p1_gradients_kernel(const double* __restrict__ nodes_mm,
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    const double* n0 = nodes_mm + static_cast<std::int64_t>(tet_nodes[e * 4 + 0]) * 3;
+    const Vec3View<const double, std::int64_t> nodes(nodes_mm, kUnsizedRows);
+    const Tet4View<const int> tn(tet_nodes, n_tet);
+    const TetGradView<double, std::int64_t> gv(g, n_tet);
+
+    const int n0 = tn(e, 0);
     double t[3][3];
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
-        const double* ni = nodes_mm + static_cast<std::int64_t>(tet_nodes[e * 4 + i + 1]) * 3;
+        const int ni = tn(e, i + 1);
 #pragma unroll
-        for (int c = 0; c < 3; ++c) t[i][c] = ni[c] - n0[c];
+        for (int c = 0; c < 3; ++c) t[i][c] = nodes(ni, c) - nodes(n0, c);
     }
 
     double adj[3][3];
@@ -47,16 +52,15 @@ __global__ void p1_gradients_kernel(const double* __restrict__ nodes_mm,
     const double det = t[0][0] * adj[0][0] + t[0][1] * adj[0][1] + t[0][2] * adj[0][2];
     const double inv = kGradScale / det;
 
-    double* row = g + static_cast<std::int64_t>(e) * 12;
 #pragma unroll
     for (int c = 0; c < 3; ++c) {
         const double g1 = adj[0][c] * inv;
         const double g2 = adj[1][c] * inv;
         const double g3 = adj[2][c] * inv;
-        row[0 * 3 + c] = -(g1 + g2 + g3);
-        row[1 * 3 + c] = g1;
-        row[2 * 3 + c] = g2;
-        row[3 * 3 + c] = g3;
+        gv(e, 0, c) = -(g1 + g2 + g3);
+        gv(e, 1, c) = g1;
+        gv(e, 2, c) = g2;
+        gv(e, 3, c) = g3;
     }
     vols[e] = fabs(det) * kVolumeScale;
 }

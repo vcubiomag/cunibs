@@ -29,12 +29,17 @@ constexpr int kMinTrisPerChunk = 1024;
 // need no special case.
 constexpr int kNoTri = INT_MAX;
 
+// The three vertices and the outward normal of each scalp triangle, all (n_tri, 3).
 struct Scalp {
-    const double* a;
-    const double* b;
-    const double* c;
-    const double* normals;
+    Vec3View<const double> a;
+    Vec3View<const double> b;
+    Vec3View<const double> c;
+    Vec3View<const double> normals;
 };
+
+// (n_pl, 4, 4) row-major coil-to-head transforms.
+using TransformView =
+    cuda::std::mdspan<double, cuda::std::extents<int, cuda::std::dynamic_extent, 4, 4>>;
 
 struct Candidate {
     double d2;
@@ -114,7 +119,8 @@ __global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scal
     const int per = cuda::ceil_div(n_tri, n_chunks);
     const int lo = chunk * per;
     const int hi = min(lo + per, n_tri);
-    const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
+    const Vec3View<const double> ctr(centers, kUnsizedRows);
+    const double center[3] = {ctr(p, 0), ctr(p, 1), ctr(p, 2)};
 
     // A thread's own candidates arrive in increasing j, so only a strict improvement can win
     // here; ties across threads are settled by the reduction below.
@@ -122,7 +128,7 @@ __global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scal
     double q[3];
     for (int j = lo + threadIdx.x; j < hi; j += kBlock) {
         const double d2 =
-            closest_on_tri(center, &scalp.a[j * 3], &scalp.b[j * 3], &scalp.c[j * 3], q);
+            closest_on_tri(center, &scalp.a(j, 0), &scalp.b(j, 0), &scalp.c(j, 0), q);
         if (d2 < best.d2) best = {d2, j};
     }
 
@@ -161,11 +167,12 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
     }
     const int tri = best.tri;
 
-    const double center[3] = {centers[p * 3], centers[p * 3 + 1], centers[p * 3 + 2]};
+    const Vec3View<const double> ctr(centers, n_pl);
+    const double center[3] = {ctr(p, 0), ctr(p, 1), ctr(p, 2)};
     double proj[3];
-    closest_on_tri(center, &scalp.a[tri * 3], &scalp.b[tri * 3], &scalp.c[tri * 3], proj);
-    const double normal[3] = {scalp.normals[tri * 3], scalp.normals[tri * 3 + 1],
-                              scalp.normals[tri * 3 + 2]};
+    closest_on_tri(center, &scalp.a(tri, 0), &scalp.b(tri, 0), &scalp.c(tri, 0), proj);
+    const double normal[3] = {scalp.normals(tri, 0), scalp.normals(tri, 1),
+                              scalp.normals(tri, 2)};
     const double z[3] = {-normal[0], -normal[1], -normal[2]};
 
     // In-plane axis from the handle. It is undefined when the handle direction has no
@@ -175,7 +182,8 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
     double y[3];
     bool from_handle = false;
     if (handles != nullptr) {
-        for (int i = 0; i < 3; ++i) y[i] = handles[p * 3 + i] - proj[i];
+        const Vec3View<const double> hnd(handles, n_pl);
+        for (int i = 0; i < 3; ++i) y[i] = hnd(p, i) - proj[i];
         if (dot3(y, y) > 0.0) {
             const double inv = rnorm3d(y[0], y[1], y[2]);
             for (int i = 0; i < 3; ++i) y[i] *= inv;
@@ -210,15 +218,17 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
     const double x[3] = {y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2],
                          y[0] * z[1] - y[1] * z[0]};
 
-    double* o = &out[p * 16];
-    for (int i = 0; i < 16; ++i) o[i] = 0.0;
-    for (int r = 0; r < 3; ++r) {
-        o[r * 4 + 0] = x[r];
-        o[r * 4 + 1] = y[r];
-        o[r * 4 + 2] = z[r];
-        o[r * 4 + 3] = proj[r] + dists[p] * normal[r];
+    const TransformView o(out, n_pl);
+    for (int r = 0; r < 4; ++r) {
+        for (int col = 0; col < 4; ++col) o(p, r, col) = 0.0;
     }
-    o[15] = 1.0;
+    for (int r = 0; r < 3; ++r) {
+        o(p, r, 0) = x[r];
+        o(p, r, 1) = y[r];
+        o(p, r, 2) = z[r];
+        o(p, r, 3) = proj[r] + dists[p] * normal[r];
+    }
+    o(p, 3, 3) = 1.0;
 }
 
 // Cached because nothing changes the current device.
@@ -245,7 +255,8 @@ void launch_place(const double* centers, const double* handles, const double* di
     const int for_occupancy = cuda::ceil_div(sm_count(), n_pl);
     const int for_size = cuda::ceil_div(n_tri, kMinTrisPerChunk);
     const int n_chunks = std::min(for_occupancy, for_size);
-    const Scalp scalp{a, b, c, tnorm};
+    const Scalp scalp{Vec3View<const double>(a, n_tri), Vec3View<const double>(b, n_tri),
+                      Vec3View<const double>(c, n_tri), Vec3View<const double>(tnorm, n_tri)};
 
     // cudaMallocAsync is illegal inside a CUDA-graph capture; placement runs outside the
     // solver's captured region.

@@ -33,19 +33,20 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0;
     if (row < n) {
+        const WidthView<const double, K> xv(x, n);
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += kTpr) {
             const double v = vals[j];
-            const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
+            const double* xrow = &xv(col_idx[j], 0);
 #pragma unroll
-            for (int c = 0; c < K; ++c) sum[c] += v * __ldg(x + base + c);
+            for (int c = 0; c < K; ++c) sum[c] += v * __ldg(xrow + c);
         }
     }
     warp_reduce_sum<kTpr>(sum);
     if (row < n && lane == 0) {
-        const std::int64_t base = static_cast<std::int64_t>(row) * K;
+        const WidthView<double, K> yv(y, n);
 #pragma unroll
-        for (int c = 0; c < K; ++c) y[base + c] = sum[c];
+        for (int c = 0; c < K; ++c) yv(row, c) = sum[c];
     }
 }
 
@@ -79,20 +80,17 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     // Walk the row in groups of kTpr so the accumulator index stays a compile-time constant;
     // a running index would spill `part` to local memory. Group g slot l is nonzero
     // row_s + kTpr*g + l, which is exactly the strided kernel's lane-l subsequence.
+    const WidthView<const double, K> xv(x, n);
     const int row_s = row_ptr[row];
     const int row_e = row_ptr[row + 1];
     int j = row_s;
     for (; j + kTpr <= row_e; j += kTpr) {
 #pragma unroll
-        for (int l = 0; l < kTpr; ++l) {
-            part[l] += vals[j + l] * x[static_cast<std::int64_t>(col_idx[j + l]) * K + c];
-        }
+        for (int l = 0; l < kTpr; ++l) part[l] += vals[j + l] * xv(col_idx[j + l], c);
     }
 #pragma unroll
     for (int l = 0; l < kTpr; ++l) {
-        if (j + l < row_e) {
-            part[l] += vals[j + l] * x[static_cast<std::int64_t>(col_idx[j + l]) * K + c];
-        }
+        if (j + l < row_e) part[l] += vals[j + l] * xv(col_idx[j + l], c);
     }
 
     // The same pairing warp_reduce_sum performs above, in registers rather than across lanes,
@@ -102,7 +100,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 #pragma unroll
         for (int l = 0; l < off; ++l) part[l] += part[l + off];
     }
-    y[static_cast<std::int64_t>(row) * K + c] = part[0];
+    WidthView<double, K>(y, n)(row, c) = part[0];
 }
 
 // Rows each thread of a reducing kernel carries. A warp's shuffle tree spends five fp64 adds per
@@ -149,6 +147,9 @@ template <int K, bool KDOT_XY>
 __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
                                     const double* __restrict__ y, double* __restrict__ partials,
                                     int n_blocks) {
+    const WidthView<const double, K> xv(x, n);
+    // Null on the norm path, where KDOT_XY folds the read away.
+    const WidthView<const double, K> yv(y, n);
     cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
@@ -157,11 +158,10 @@ __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
 #pragma unroll
     for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
         if (i >= n) break;
-        const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const double xv = x[base + c];
-            local[c] += KDOT_XY ? xv * y[base + c] : xv * xv;
+            const double xc = xv(i, c);
+            local[c] += KDOT_XY ? xc * yv(i, c) : xc * xc;
         }
     }
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
@@ -232,6 +232,11 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
                                      double* __restrict__ x, double* __restrict__ r,
                                      float* __restrict__ rf, double* __restrict__ partials,
                                      int n_blocks) {
+    const WidthView<const double, K> prows(p, n);
+    const WidthView<const double, K> aprows(ap, n);
+    const WidthView<double, K> xrows(x, n);
+    const WidthView<double, K> rrows(r, n);
+    const WidthView<float, K> rfrows(rf, n);
     cuda::std::array<double, K> rloc;
 #pragma unroll
     for (int c = 0; c < K; ++c) rloc[c] = 0.0;
@@ -240,12 +245,11 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
 #pragma unroll
     for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
         if (i >= n) break;
-        const std::int64_t base = static_cast<std::int64_t>(i) * K;
         cuda::std::array<double, K> pv, apv, xv, rv;
-        load_row<K>(p + base, pv);
-        load_row<K>(ap + base, apv);
-        load_row<K>(x + base, xv);
-        load_row<K>(r + base, rv);
+        load_row<K>(&prows(i, 0), pv);
+        load_row<K>(&aprows(i, 0), apv);
+        load_row<K>(&xrows(i, 0), xv);
+        load_row<K>(&rrows(i, 0), rv);
         cuda::std::array<float, K> rfv;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
@@ -254,9 +258,9 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
             rfv[c] = static_cast<float>(rv[c]);
             rloc[c] += rv[c] * rv[c];
         }
-        store_row<K>(x + base, xv);
-        store_row<K>(r + base, rv);
-        store_row<K>(rf + base, rfv);
+        store_row<K>(&xrows(i, 0), xv);
+        store_row<K>(&rrows(i, 0), rv);
+        store_row<K>(&rfrows(i, 0), rfv);
     }
     bcg_block_reduce_cols<K>(rloc, partials, n_blocks);
 }
@@ -267,6 +271,8 @@ template <int K>
 __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
                                     const double* __restrict__ r,
                                     double* __restrict__ partials, int n_blocks) {
+    const WidthView<const double, K> rv(r, n);
+    const WidthView<const float, K> zfv(zf, n);
     cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
@@ -275,11 +281,8 @@ __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
 #pragma unroll
     for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
         if (i >= n) break;
-        const std::int64_t base = static_cast<std::int64_t>(i) * K;
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            local[c] += r[base + c] * static_cast<double>(zf[base + c]);
-        }
+        for (int c = 0; c < K; ++c) local[c] += rv(i, c) * static_cast<double>(zfv(i, c));
     }
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
 }
@@ -313,10 +316,11 @@ __global__ void bcg_update_p_kernel(int n, const double* __restrict__ beta,
                                     const float* __restrict__ zf, double* __restrict__ p) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const std::int64_t base = static_cast<std::int64_t>(i) * K;
+        const WidthView<double, K> pv(p, n);
+        const WidthView<const float, K> zfv(zf, n);
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            p[base + c] = __ldg(beta + c) * p[base + c] + static_cast<double>(zf[base + c]);
+            pv(i, c) = __ldg(beta + c) * pv(i, c) + static_cast<double>(zfv(i, c));
         }
     }
 }

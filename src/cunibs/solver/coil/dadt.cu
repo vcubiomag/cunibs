@@ -8,6 +8,10 @@
 //   W = Σ_j w_j m_j
 //   P = Σ_j w_j (m_j × s_j)
 //   dA/dt = didt · mu0_4pi · (W × r - P)
+//
+// Offsets are spelled flat here: this translation unit alone compiles with --use_fast_math, so it
+// must not include device_math.cuh, whose fp64 bodies would pick up contraction rules no other
+// caller gets.
 
 namespace {
 

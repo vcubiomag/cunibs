@@ -1,4 +1,5 @@
 #include "coil/coil.hpp"
+#include "core/device_math.cuh"
 
 namespace {
 
@@ -8,18 +9,15 @@ __global__ void dadt_element_average_kernel(const float* __restrict__ dadt_nodes
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    const int n0 = tet_nodes[e * 4 + 0] * 3;
-    const int n1 = tet_nodes[e * 4 + 1] * 3;
-    const int n2 = tet_nodes[e * 4 + 2] * 3;
-    const int n3 = tet_nodes[e * 4 + 3] * 3;
-    const int out = e * 3;
+    const Vec3View<const float> nodal(dadt_nodes, kUnsizedRows);
+    const Tet4View<const int> tn(tet_nodes, n_tet);
+    const Vec3View<float> elm(dadt_elm, n_tet);
 
-    dadt_elm[out + 0] =
-        0.25f * (dadt_nodes[n0 + 0] + dadt_nodes[n1 + 0] + dadt_nodes[n2 + 0] + dadt_nodes[n3 + 0]);
-    dadt_elm[out + 1] =
-        0.25f * (dadt_nodes[n0 + 1] + dadt_nodes[n1 + 1] + dadt_nodes[n2 + 1] + dadt_nodes[n3 + 1]);
-    dadt_elm[out + 2] =
-        0.25f * (dadt_nodes[n0 + 2] + dadt_nodes[n1 + 2] + dadt_nodes[n2 + 2] + dadt_nodes[n3 + 2]);
+    const int n0 = tn(e, 0), n1 = tn(e, 1), n2 = tn(e, 2), n3 = tn(e, 3);
+#pragma unroll
+    for (int c = 0; c < 3; ++c) {
+        elm(e, c) = 0.25f * (nodal(n0, c) + nodal(n1, c) + nodal(n2, c) + nodal(n3, c));
+    }
 }
 
 }  // namespace

@@ -76,12 +76,12 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n) {
+        const WidthView<const float, K> xv_rows(x, n);
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += TPR) {
             const float v = __half2float(vals[j]);
-            const std::int64_t base = static_cast<std::int64_t>(col_idx[j]) * K;
             cuda::std::array<float, K> xv;
-            load_row<K>(x + base, xv);
+            load_row<K>(&xv_rows(col_idx[j], 0), xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
@@ -140,10 +140,11 @@ __global__ void __launch_bounds__(kBlock)
     cuda::std::array<float, K> sum;
     row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x, row, lane, sum);
     if (row < n && lane == 0) {
+        const WidthView<const float, K> bv(b, n);
+        const WidthView<float, K> rv(r, n);
         const float s = row_scale[row];
-        const std::int64_t base = static_cast<std::int64_t>(row) * K;
 #pragma unroll
-        for (int c = 0; c < K; ++c) r[base + c] = b[base + c] - s * sum[c];
+        for (int c = 0; c < K; ++c) rv(row, c) = bv(row, c) - s * sum[c];
     }
 }
 
@@ -173,21 +174,21 @@ __global__ void __launch_bounds__(kBlock)
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n_coarse) {
+        const WidthView<const float, K> fine(r_fine, kUnsizedRows);
         const int row_e = r_row_ptr[row + 1];
         for (int j = r_row_ptr[row] + lane; j < row_e; j += kRestrictTpr) {
             const float v = r_vals[j];
-            const std::int64_t base = static_cast<std::int64_t>(r_col_idx[j]) * K;
             cuda::std::array<float, K> xv;
-            load_row<K>(r_fine + base, xv);
+            load_row<K>(&fine(r_col_idx[j], 0), xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
     }
     warp_reduce_sum<kRestrictTpr>(sum);
     if (row < n_coarse && lane == 0) {
-        const std::int64_t out = static_cast<std::int64_t>(row) * K;
+        const WidthView<float, K> out(b_coarse, n_coarse);
 #pragma unroll
-        for (int c = 0; c < K; ++c) b_coarse[out + c] = sum[c];
+        for (int c = 0; c < K; ++c) out(row, c) = sum[c];
     }
 }
 
@@ -204,17 +205,17 @@ __global__ void __launch_bounds__(kBlock)
     cuda::std::array<float, K> sum;
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    const WidthView<const float, K> coarse(x_coarse, kUnsizedRows);
+    const WidthView<float, K> fine(x_fine, n);
     for (int j = p_row_ptr[row]; j < row_e; ++j) {
         const float v = p_vals[j];
-        const std::int64_t base = static_cast<std::int64_t>(p_col_idx[j]) * K;
         cuda::std::array<float, K> xv;
-        load_row<K>(x_coarse + base, xv);
+        load_row<K>(&coarse(p_col_idx[j], 0), xv);
 #pragma unroll
         for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
     }
-    const std::int64_t out = static_cast<std::int64_t>(row) * K;
 #pragma unroll
-    for (int c = 0; c < K; ++c) x_fine[out + c] += sum[c];
+    for (int c = 0; c < K; ++c) fine(row, c) += sum[c];
 }
 
 // One Chebyshev step, fused with the residual it needs:
@@ -249,21 +250,26 @@ __global__ void __launch_bounds__(kBlock)
     cuda::std::array<float, K> sum;
     row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x_cur, row, lane, sum);
     if (row < n && lane == 0) {
+        const WidthView<const float, K> curv(x_cur, n);
+        const WidthView<const float, K> prevv(x_prev, n);
+        const WidthView<const float, K> bv(b, n);
         const float d = alpha * dinv[row];
         const float s = row_scale[row];
-        const std::int64_t base = static_cast<std::int64_t>(row) * K;
         cuda::std::array<float, K> cur;
         cuda::std::array<float, K> prev;
         cuda::std::array<float, K> rhs;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            cur[c] = x_cur[base + c];
-            prev[c] = x_prev[base + c];
-            rhs[c] = b[base + c];
+            cur[c] = curv(row, c);
+            prev[c] = prevv(row, c);
+            rhs[c] = bv(row, c);
         }
+        // Plain, not __restrict__: x_out is allowed to alias x_prev, and from the second step
+        // of a sweep it always does.
+        const WidthView<float, K> outv(x_out, n);
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            x_out[base + c] = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
+            outv(row, c) = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
         }
     }
 }
@@ -286,20 +292,21 @@ __global__ void __launch_bounds__(kBlock)
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n) {
-        const float* arow = ainv + static_cast<std::int64_t>(row) * n;
+        const Mat2View<const float> a_inv(ainv, n, n);
+        const WidthView<const float, K> brows(b, n);
         for (int j = lane; j < n; j += kWarp) {
-            const float a = arow[j];
+            const float a = a_inv(row, j);
             cuda::std::array<float, K> bv;
-            load_row<K>(b + static_cast<std::int64_t>(j) * K, bv);
+            load_row<K>(&brows(j, 0), bv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += a * bv[c];
         }
     }
     warp_reduce_sum<kWarp>(sum);
     if (row < n && lane == 0) {
-        const std::int64_t out = static_cast<std::int64_t>(row) * K;
+        const WidthView<float, K> out(x, n);
 #pragma unroll
-        for (int c = 0; c < K; ++c) x[out + c] = sum[c];
+        for (int c = 0; c < K; ++c) out(row, c) = sum[c];
     }
 }
 
