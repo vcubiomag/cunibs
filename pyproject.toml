@@ -19,7 +19,7 @@ requires-python = ">=3.12"
 dependencies = [
     "cuda-pathfinder>=1.5,<2",
     "cuda-toolkit[cudart]>=13.0,<14",
-    "cupy-cuda13x>=14.0.0",
+    "cupy-cuda13x[ctx]>=14.0.0",
     "h5py>=3.10.0",
     "numpy>=1.26.0",
 ]
