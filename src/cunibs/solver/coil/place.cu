@@ -1,6 +1,7 @@
 #include "coil/coil.hpp"
 #include "core/device_math.cuh"
 
+#include <cub/block/block_reduce.cuh>
 #include <cuda/cmath>
 
 #include <algorithm>
@@ -50,6 +51,15 @@ struct Candidate {
 __device__ __forceinline__ bool closer(Candidate x, Candidate y) {
     return x.d2 < y.d2 || (x.d2 == y.d2 && x.tri < y.tri);
 }
+
+// A minimum over the total order (d2, triangle index), so it is associative and commutative and
+// cub may combine it in whatever order it likes. Unlike the float sums elsewhere in this
+// directory, no association can change what it returns.
+struct CloserOp {
+    __device__ __forceinline__ Candidate operator()(Candidate x, Candidate y) const {
+        return closer(x, y) ? x : y;
+    }
+};
 
 // Closest point q on triangle (a,b,c) to p; returns squared distance. Full Ericson ordering:
 // vertex A, vertex B, edge AB, vertex C, edge AC, edge BC, interior.
@@ -111,8 +121,8 @@ __device__ double closest_on_tri(const double* p, const double* a, const double*
 // One block per (placement, chunk): the closest triangle in this block's slice of the scan.
 __global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scalp,
                                   Candidate* __restrict__ cand, int n_tri, int n_chunks) {
-    __shared__ double sdist[kBlock];
-    __shared__ int stri[kBlock];
+    using BlockReduce = cub::BlockReduce<Candidate, kBlock>;
+    __shared__ typename BlockReduce::TempStorage temp;
 
     const int p = blockIdx.x;
     const int chunk = blockIdx.y;
@@ -132,22 +142,10 @@ __global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scal
         if (d2 < best.d2) best = {d2, j};
     }
 
-    sdist[threadIdx.x] = best.d2;
-    stri[threadIdx.x] = best.tri;
-    __syncthreads();
-    for (int step = kBlock / 2; step > 0; step >>= 1) {
-        if (threadIdx.x < step) {
-            const Candidate other{sdist[threadIdx.x + step], stri[threadIdx.x + step]};
-            if (closer(other, {sdist[threadIdx.x], stri[threadIdx.x]})) {
-                sdist[threadIdx.x] = other.d2;
-                stri[threadIdx.x] = other.tri;
-            }
-        }
-        __syncthreads();
-    }
+    const Candidate won = BlockReduce(temp).Reduce(best, CloserOp());
 
     if (threadIdx.x == 0) {
-        cand[static_cast<size_t>(p) * n_chunks + chunk] = {sdist[0], stri[0]};
+        cand[static_cast<size_t>(p) * n_chunks + chunk] = won;
     }
 }
 
