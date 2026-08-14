@@ -57,8 +57,10 @@ import cupy as cp
 
 from cunibs.fem.assembly import build_node2corner
 from cunibs.solver import (
-    build_incident_node_csr,
-    build_patch_csr,
+    count_incident_node_csr,
+    count_patch_csr,
+    fill_incident_node_csr,
+    fill_patch_csr,
     hpr_grad,
     hpr_weights,
     mark_outer_boundary,
@@ -238,14 +240,11 @@ def _first_ring(
     tet_nodes: cp.ndarray, ptr: cp.ndarray, idx: cp.ndarray, n_slots: int
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """The distinct nodes of each slot's own tetrahedra, as a CSR over slots."""
+    stream = cp.cuda.get_current_stream().ptr
     r1_ptr = cp.empty(n_slots + 1, dtype=cp.int32)
-    cand = cp.empty(4 * int(idx.shape[0]), dtype=cp.int32)
-    sorted_cand = cp.empty_like(cand)
-    nnz = build_incident_node_csr(
-        tet_nodes, ptr, idx, cand, sorted_cand, r1_ptr, cp.cuda.get_current_stream().ptr
-    )
-    del sorted_cand
-    r1_idx = cp.ascontiguousarray(cand[:nnz])
+    nnz = count_incident_node_csr(tet_nodes, ptr, idx, r1_ptr, stream)
+    r1_idx = cp.empty(nnz, dtype=cp.int32)
+    fill_incident_node_csr(tet_nodes, ptr, idx, r1_ptr, r1_idx, stream)
     return r1_ptr, r1_idx
 
 
@@ -287,29 +286,12 @@ def node_patches(ctx: SolverContext, slots: TissueSlots) -> tuple[cp.ndarray, cp
     slot_key = slots.slot_node.astype(cp.int64) * stride + slots.slot_tag.astype(cp.int64)
     neighbour = _neighbour_slots(r1_ptr, r1_idx, slot_key, slots.slot_tag, stride)
 
-    # Candidate capacity: a grown slot draws one first ring per first-ring node, an ungrown one
-    # only its own. Sampling the running sum at the segment bounds avoids a segmented reduction
-    # that would have to special-case an empty ring.
-    counts = cp.diff(r1_ptr)
-    running = cp.zeros(int(r1_idx.shape[0]) + 1, dtype=cp.int64)
-    cp.cumsum(counts[neighbour], out=running[1:])
-    n_cand = int(cp.where(counts < _MIN_PATCH_NODES, cp.diff(running[r1_ptr]), counts).sum())
-
+    stream = cp.cuda.get_current_stream().ptr
     pptr = cp.empty(n_slots + 1, dtype=cp.int32)
-    cand = cp.empty(n_cand, dtype=cp.int32)
-    sorted_cand = cp.empty_like(cand)
-    nnz = build_patch_csr(
-        r1_ptr,
-        r1_idx,
-        neighbour,
-        _MIN_PATCH_NODES,
-        cand,
-        sorted_cand,
-        pptr,
-        cp.cuda.get_current_stream().ptr,
-    )
-    del sorted_cand
-    return pptr, cp.ascontiguousarray(cand[:nnz])
+    nnz = count_patch_csr(r1_ptr, r1_idx, neighbour, _MIN_PATCH_NODES, pptr, stream)
+    pidx = cp.empty(nnz, dtype=cp.int32)
+    fill_patch_csr(r1_ptr, r1_idx, neighbour, _MIN_PATCH_NODES, pptr, pidx, stream)
+    return pptr, pidx
 
 
 @dataclass(frozen=True)

@@ -244,57 +244,83 @@ NB_MODULE(_solver_ext, m) {
         "Deterministic node-centric RHS assembly, corner pass then gather.");
 
     m.def(
-        "build_incident_node_csr",
-        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda cand, i32_cuda sorted,
-           i32_cuda out_ptr, uintptr_t stream) {
-            const int n_corner = static_cast<int>(idx.shape(0));
-            const int n_seg = static_cast<int>(out_ptr.shape(0)) - 1;
-            const size_t needed = static_cast<size_t>(n_corner) * 4;
-            if (cand.shape(0) < needed || sorted.shape(0) < needed) {
-                throw std::invalid_argument(
-                    "build_incident_node_csr: work buffers must hold 4 * n_corner entries");
-            }
+        "count_incident_node_csr",
+        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda out_ptr,
+           uintptr_t stream) {
             if (ptr.shape(0) != out_ptr.shape(0)) {
                 throw std::invalid_argument(
-                    "build_incident_node_csr: ptr and out_ptr must both be n_seg + 1");
+                    "count_incident_node_csr: ptr and out_ptr must both be n_seg + 1");
             }
-            return build_incident_node_csr(tet_nodes.data(), ptr.data(), idx.data(), cand.data(),
-                                           sorted.data(), out_ptr.data(), n_seg, n_corner,
+            return count_incident_node_csr(tet_nodes.data(), ptr.data(), idx.data(),
+                                           out_ptr.data(),
+                                           static_cast<int>(out_ptr.shape(0)) - 1,
                                            reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
-        nb::arg("cand").noconvert(), nb::arg("sorted").noconvert(),
         nb::arg("out_ptr").noconvert(), nb::arg("stream"),
-        "Distinct nodes of the tetrahedra in each segment of a corner CSR. Fills out_ptr and "
-        "leaves the sorted, distinct entries in the first nnz slots of cand, which it returns. "
+        "Row offsets of the distinct nodes of the tetrahedra in each segment of a corner CSR. "
+        "Fills out_ptr and returns nnz, the length to allocate the column index at. "
         "Synchronises the stream.");
 
     m.def(
-        "build_patch_csr",
-        [](i32_cuda r1_ptr, i32_cuda r1_idx, i32_cuda neighbour, int min_nodes, i32_cuda cand,
-           i32_cuda sorted, i32_cuda out_ptr, uintptr_t stream) {
-            const int n_slots = static_cast<int>(r1_ptr.shape(0)) - 1;
+        "fill_incident_node_csr",
+        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda out_ptr, i32_cuda out_idx,
+           uintptr_t stream) {
+            if (ptr.shape(0) != out_ptr.shape(0)) {
+                throw std::invalid_argument(
+                    "fill_incident_node_csr: ptr and out_ptr must both be n_seg + 1");
+            }
+            fill_incident_node_csr(tet_nodes.data(), ptr.data(), idx.data(), out_ptr.data(),
+                                   out_idx.data(), static_cast<int>(out_ptr.shape(0)) - 1,
+                                   reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("out_ptr").noconvert(), nb::arg("out_idx").noconvert(), nb::arg("stream"),
+        "Fill the column index for the rows count_incident_node_csr sized.");
+
+    m.def(
+        "count_patch_csr",
+        [](i32_cuda r1_ptr, i32_cuda r1_idx, i32_cuda neighbour, int min_nodes, i32_cuda out_ptr,
+           uintptr_t stream) {
             if (neighbour.shape(0) != r1_idx.shape(0)) {
                 throw std::invalid_argument(
-                    "build_patch_csr: neighbour must have one entry per first-ring node");
+                    "count_patch_csr: neighbour must have one entry per first-ring node");
             }
             if (out_ptr.shape(0) != r1_ptr.shape(0)) {
                 throw std::invalid_argument(
-                    "build_patch_csr: r1_ptr and out_ptr must both be n_slots + 1");
+                    "count_patch_csr: r1_ptr and out_ptr must both be n_slots + 1");
             }
-            if (cand.shape(0) != sorted.shape(0)) {
-                throw std::invalid_argument("build_patch_csr: work buffers must match in size");
-            }
-            return build_patch_csr(r1_ptr.data(), r1_idx.data(), neighbour.data(), min_nodes,
-                                   cand.data(), sorted.data(), out_ptr.data(), n_slots,
-                                   static_cast<int>(cand.shape(0)),
+            return count_patch_csr(r1_ptr.data(), r1_idx.data(), neighbour.data(), min_nodes,
+                                   out_ptr.data(), static_cast<int>(r1_ptr.shape(0)) - 1,
                                    reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
-        nb::arg("neighbour").noconvert(), nb::arg("min_nodes"), nb::arg("cand").noconvert(),
-        nb::arg("sorted").noconvert(), nb::arg("out_ptr").noconvert(), nb::arg("stream"),
-        "Recovery patches from the first-ring CSR: a slot reaching fewer than min_nodes grows to "
-        "the union of its neighbours' rings. Same output convention as build_incident_node_csr.");
+        nb::arg("neighbour").noconvert(), nb::arg("min_nodes"), nb::arg("out_ptr").noconvert(),
+        nb::arg("stream"),
+        "Row offsets of the recovery patches: a slot reaching fewer than min_nodes grows to the "
+        "union of its neighbours' rings. Same convention as count_incident_node_csr.");
+
+    m.def(
+        "fill_patch_csr",
+        [](i32_cuda r1_ptr, i32_cuda r1_idx, i32_cuda neighbour, int min_nodes, i32_cuda out_ptr,
+           i32_cuda out_idx, uintptr_t stream) {
+            if (neighbour.shape(0) != r1_idx.shape(0)) {
+                throw std::invalid_argument(
+                    "fill_patch_csr: neighbour must have one entry per first-ring node");
+            }
+            if (out_ptr.shape(0) != r1_ptr.shape(0)) {
+                throw std::invalid_argument(
+                    "fill_patch_csr: r1_ptr and out_ptr must both be n_slots + 1");
+            }
+            fill_patch_csr(r1_ptr.data(), r1_idx.data(), neighbour.data(), min_nodes,
+                           out_ptr.data(), out_idx.data(),
+                           static_cast<int>(r1_ptr.shape(0)) - 1,
+                           reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
+        nb::arg("neighbour").noconvert(), nb::arg("min_nodes"), nb::arg("out_ptr").noconvert(),
+        nb::arg("out_idx").noconvert(), nb::arg("stream"),
+        "Fill the column index for the rows count_patch_csr sized.");
 
     m.def(
         "assemble_stiffness_values",

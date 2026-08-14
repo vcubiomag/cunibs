@@ -1,128 +1,275 @@
 #include "fem/fem.hpp"
 
 #include <cub/device/device_scan.cuh>
-#include <cub/device/device_segmented_sort.cuh>
+#include <cuda/std/bit>
+#include <cuda/std/limits>
 
-#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <stdexcept>
 
-// Segment-wise CSR construction: gather a candidate list per segment, sort the segments, and keep
-// the first of every equal run. Two operators are built this way -- the stiffness sparsity pattern
-// and the recovery patches -- and they differ only in how the candidates are gathered.
+// Segment-wise CSR construction: for every segment, the sorted distinct values of a candidate list
+// it generates for itself. Two operators are built this way -- the stiffness sparsity pattern and
+// the recovery patches -- and they differ only in how the candidates are gathered, which is all a
+// gather policy below says.
 //
-// Sorting a multiset has one answer, so neither result depends on how CUB schedules the work.
+// The candidates never reach global memory. A segment is one node's incident corners or one
+// patch's neighbour rings: a few hundred entries against a segment count in the millions, so it
+// fits in shared memory and one warp sorts it there in a single pass. The price is that each
+// builder runs twice, once to size its rows and once to fill them, since nothing knows how many
+// distinct values a segment has until it has sorted it.
+//
+// Sorting a multiset has one answer and duplicates are dropped by keeping the first of each equal
+// run, so neither pass depends on how the work was scheduled.
 
 namespace {
 
 void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "pattern", what); }
 
-__global__ void scale4_kernel(const int* __restrict__ ptr, int* __restrict__ seg, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) seg[i] = ptr[i] * 4;
+constexpr int kSortWarps = 4;
+// Static shared memory a block may claim without opting in to the dynamic limit.
+constexpr std::size_t kMaxSharedBytes = 48 * 1024;
+// A segment's padded candidate list has to fit in shared memory, and the padding is to a power of
+// two, so this is the largest such width one warp per block can hold. It corresponds to a node of
+// two thousand incident elements; the widest segment on a real head is a few hundred candidates.
+constexpr int kMaxPad = 8192;
+static_assert(static_cast<std::size_t>(kMaxPad) * sizeof(int) <= kMaxSharedBytes);
+static_assert(std::has_single_bit(static_cast<unsigned>(kMaxPad)),
+              "the pad is rounded to a power of two, so its cap must be one");
+
+constexpr unsigned kFullWarp = 0xffffffffu;
+
+// Inclusive prefix sum across a warp; the total is the last lane's. Every lane must reach it.
+__device__ __forceinline__ int warp_scan(int v, int lane) {
+#pragma unroll
+    for (int d = 1; d < kWarp; d <<= 1) {
+        const int t = __shfl_up_sync(kFullWarp, v, d);
+        if (lane >= d) v += t;
+    }
+    return v;
 }
 
-// One thread per corner, copying that corner's tetrahedron as a single 16-byte load: tet_nodes is
-// one contiguous 4 * n_tet block, so a tet's four ids never straddle the boundary.
-__global__ void gather_incident_kernel(const int* __restrict__ tet_nodes,
-                                       const int* __restrict__ idx, int* __restrict__ cand,
-                                       int n_corner) {
-    const int p = blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= n_corner) return;
-    reinterpret_cast<int4*>(cand)[p] =
-        *reinterpret_cast<const int4*>(tet_nodes + static_cast<std::int64_t>(idx[p] >> 2) * 4);
+__device__ __forceinline__ int warp_total(int scan) {
+    return __shfl_sync(kFullWarp, scan, kWarp - 1);
 }
 
-__global__ void patch_counts_kernel(const int* __restrict__ r1_ptr,
-                                    const int* __restrict__ neighbour, int min_nodes,
-                                    int* __restrict__ counts, int n_slots) {
+// --- gather policies --------------------------------------------------------------------------
+//
+// A policy answers `size`, how many candidates a segment has, and `load`, which writes exactly
+// that many into a warp's shared buffer and returns the count. The two must agree: the buffer is
+// reserved from the largest `size` over all segments, and nothing bounds `load` again.
+
+// Row i's columns are the distinct nodes of the tetrahedra incident to node i, so its candidates
+// are the four nodes of every corner in its node2corner segment: ~90 of them for ~14 distinct
+// columns on a head mesh. Each corner writes a fixed slot, so the layout needs no scan.
+struct IncidentGather {
+    const int* __restrict__ tet_nodes;
+    const int* __restrict__ ptr;
+    const int* __restrict__ idx;
+
+    __device__ int size(int s) const { return (ptr[s + 1] - ptr[s]) * 4; }
+
+    __device__ int load(int s, int* __restrict__ out, int lane) const {
+        const int begin = ptr[s], end = ptr[s + 1];
+        for (int c = begin + lane; c < end; c += kWarp) {
+            // A 16-byte load: tet_nodes is one contiguous 4 * n_tet block, so a tet's four ids
+            // never straddle the boundary and the base is an allocation start, not a strided view.
+            const int4 t = *reinterpret_cast<const int4*>(
+                tet_nodes + static_cast<std::int64_t>(idx[c] >> 2) * 4);
+            int* const slot = out + (c - begin) * 4;
+            slot[0] = t.x;
+            slot[1] = t.y;
+            slot[2] = t.z;
+            slot[3] = t.w;
+        }
+        return size(s);
+    }
+};
+
+// A slot whose own tetrahedra reach at least min_nodes nodes keeps that first ring. A smaller one
+// grows to the union of its neighbours' first rings, which is the same set as re-walking the
+// same-tissue tetrahedra around it and needs no second pass over the mesh. The slot is its own
+// neighbour, so the grown patch always contains the first ring. The union is where the duplication
+// the sort exists to remove comes from: on a head mesh 2.8 candidates per distinct patch node.
+struct PatchGather {
+    const int* __restrict__ r1_ptr;
+    const int* __restrict__ r1_idx;
+    const int* __restrict__ neighbour;
+    int min_nodes;
+
+    __device__ int size(int s) const {
+        const int begin = r1_ptr[s], end = r1_ptr[s + 1];
+        if (end - begin >= min_nodes) return end - begin;
+        int total = 0;
+        for (int j = begin; j < end; ++j) {
+            const int nb = neighbour[j];
+            total += r1_ptr[nb + 1] - r1_ptr[nb];
+        }
+        return total;
+    }
+
+    __device__ int load(int s, int* __restrict__ out, int lane) const {
+        const int begin = r1_ptr[s], end = r1_ptr[s + 1];
+        const int ring = end - begin;
+        if (ring >= min_nodes) {
+            for (int i = lane; i < ring; i += kWarp) out[i] = r1_idx[begin + i];
+            return ring;
+        }
+        // Runs of unequal length, so each lane needs where its neighbour's ring starts: a warp
+        // scan of the lengths, chunk by chunk.
+        int n = 0;
+        for (int base = 0; base < ring; base += kWarp) {
+            const int j = base + lane;
+            int len = 0, src = 0;
+            if (j < ring) {
+                const int nb = neighbour[begin + j];
+                src = r1_ptr[nb];
+                len = r1_ptr[nb + 1] - src;
+            }
+            const int scan = warp_scan(len, lane);
+            const int chunk = warp_total(scan);
+            const int at = n + scan - len;
+            for (int t = 0; t < len; ++t) out[at + t] = r1_idx[src + t];
+            n += chunk;
+        }
+        return n;
+    }
+};
+
+// --- the shared pass --------------------------------------------------------------------------
+
+// Max is order-independent, so the atomic costs nothing in reproducibility. Values across a warp
+// are near-identical, which is the case the hardware's atomic coalescing handles well; a block
+// reduction ahead of it measured slower than the writes it saved.
+template <typename Gather>
+__global__ void widest_segment_kernel(Gather g, int* __restrict__ widest, int n_seg) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= n_slots) return;
-    const int begin = r1_ptr[s], end = r1_ptr[s + 1];
-    if (end - begin >= min_nodes) {
-        counts[s] = end - begin;
+    if (s >= n_seg) return;
+    atomicMax(widest, g.size(s));
+}
+
+// One warp per segment: gather into shared memory, sort it there, and keep the first of each equal
+// run. With Fill the distinct values go to out_idx at the row start the sizing pass scanned;
+// without it only the row's length is recorded.
+template <typename Gather, bool Fill>
+__global__ __launch_bounds__(kWarp * kSortWarps) void segment_unique_kernel(
+    Gather g, const int* __restrict__ out_ptr, int* __restrict__ out_idx,
+    int* __restrict__ counts, int n_seg, int pad) {
+    extern __shared__ int scratch[];
+
+    const int warp = threadIdx.x / kWarp;
+    const int lane = threadIdx.x % kWarp;
+    // Off blockDim, not kSortWarps: a segment wide enough to crowd shared memory is launched one
+    // warp per block, and the mapping has to follow.
+    const int s = blockIdx.x * static_cast<int>(blockDim.x / kWarp) + warp;
+    if (s >= n_seg) return;
+    int* const b = scratch + warp * pad;
+
+    const int n = g.load(s, b, lane);
+    if (n == 0) {
+        if (lane == 0 && !Fill) counts[s] = 0;
         return;
     }
-    int total = 0;
-    for (int j = begin; j < end; ++j) {
-        const int nb = neighbour[j];
-        total += r1_ptr[nb + 1] - r1_ptr[nb];
+
+    // A bitonic network over the next power of two at or above n, not over pad: most segments stop
+    // well short of the widest one, and the padding is what the network would otherwise sort.
+    const int m = static_cast<int>(cuda::std::bit_ceil(static_cast<unsigned>(n)));
+    // Node ids are non-negative, so the maximum pads to the tail and never displaces a candidate.
+    for (int i = n + lane; i < m; i += kWarp) {
+        b[i] = cuda::std::numeric_limits<int>::max();
     }
-    counts[s] = total;
+    __syncwarp();
+
+    for (int k = 2; k <= m; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = lane; i < m; i += kWarp) {
+                const int ixj = i ^ j;
+                // Only the lower index of a pair acts, so exactly one lane writes each of the two
+                // slots and the stores within a stage never collide. Both values are read into
+                // registers first: this is the innermost loop of the sort, and re-reading shared
+                // memory inside the comparison costs measurably.
+                if (ixj > i) {
+                    const int x = b[i], y = b[ixj];
+                    if ((x > y) == ((i & k) == 0)) {
+                        b[i] = y;
+                        b[ixj] = x;
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+
+    int* const dst = Fill ? out_idx + out_ptr[s] : nullptr;
+    int kept = 0;
+    for (int base = 0; base < n; base += kWarp) {
+        const int i = base + lane;
+        const int v = (i < n) ? b[i] : 0;
+        const int keep = (i < n && (i == 0 || v != b[i - 1])) ? 1 : 0;
+        const int scan = warp_scan(keep, lane);
+        if (Fill && keep) dst[kept + scan - keep] = v;
+        kept += warp_total(scan);
+    }
+    if (lane == 0 && !Fill) counts[s] = kept;
 }
 
-__global__ void patch_gather_kernel(const int* __restrict__ r1_ptr, const int* __restrict__ r1_idx,
-                                    const int* __restrict__ neighbour, int min_nodes,
-                                    const int* __restrict__ seg, int* __restrict__ cand,
-                                    int n_slots) {
-    const int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= n_slots) return;
-    const int begin = r1_ptr[s], end = r1_ptr[s + 1];
-    int w = seg[s];
-    if (end - begin >= min_nodes) {
-        for (int j = begin; j < end; ++j) cand[w++] = r1_idx[j];
-        return;
+// The padded width every warp reserves, rounded up from the widest segment there is. A max over
+// the segments is order-independent, so both passes reach the same width from the same input.
+template <typename Gather>
+int shared_pad(Gather g, int n_seg, cudaStream_t stream) {
+    DeviceBuffer<int> widest = device_alloc<int>(1, "pattern", "widest segment");
+    check_cuda(cudaMemsetAsync(widest.get(), 0, sizeof(int), stream), "memset(widest segment)");
+    widest_segment_kernel<<<grid_for(n_seg), kBlock, 0, stream>>>(g, widest.get(), n_seg);
+    check_cuda(cudaGetLastError(), "widest segment launch");
+
+    int host = 0;
+    check_cuda(cudaMemcpyAsync(&host, widest.get(), sizeof(int), cudaMemcpyDeviceToHost, stream),
+               "copy(widest segment)");
+    check_cuda(cudaStreamSynchronize(stream), "sync(widest segment)");
+
+    const int pad = static_cast<int>(std::bit_ceil(static_cast<unsigned>(host)));
+    if (pad > kMaxPad) {
+        throw std::invalid_argument(
+            "pattern: a segment of " + std::to_string(host) +
+            " candidates does not fit in shared memory; the mesh has a node of implausible "
+            "valence");
     }
-    for (int j = begin; j < end; ++j) {
-        const int nb = neighbour[j];
-        const int row_e = r1_ptr[nb + 1];
-        for (int p = r1_ptr[nb]; p < row_e; ++p) cand[w++] = r1_idx[p];
-    }
+    return pad;
 }
 
-__global__ void count_distinct_kernel(const int* __restrict__ sorted, const int* __restrict__ seg,
-                                      int* __restrict__ counts, int n_seg) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_seg) return;
-    const int begin = seg[row], end = seg[row + 1];
-    int n = 0;
-    for (int p = begin; p < end; ++p) {
-        if (p == begin || sorted[p] != sorted[p - 1]) ++n;
-    }
-    counts[row] = n;
+template <bool Fill, typename Gather>
+void launch_pass(Gather g, const int* out_ptr, int* out_idx, int* counts, int n_seg, int pad,
+                 cudaStream_t stream) {
+    // A wide segment gets a block to itself rather than a bigger shared allocation than the
+    // hardware will give a block.
+    const std::size_t per_warp = static_cast<std::size_t>(pad) * sizeof(int);
+    const int warps = (per_warp * kSortWarps <= kMaxSharedBytes) ? kSortWarps : 1;
+    const unsigned grid = grid_for(n_seg, warps);
+    if (!grid) return;
+    segment_unique_kernel<Gather, Fill><<<grid, kWarp * warps, per_warp * warps, stream>>>(
+        g, out_ptr, out_idx, counts, n_seg, pad);
+    check_cuda(cudaGetLastError(), "segment unique launch");
 }
 
-__global__ void write_distinct_kernel(const int* __restrict__ sorted, const int* __restrict__ seg,
-                                      const int* __restrict__ out_ptr, int* __restrict__ out_idx,
-                                      int n_seg) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_seg) return;
-    const int begin = seg[row], end = seg[row + 1];
-    int w = out_ptr[row];
-    for (int p = begin; p < end; ++p) {
-        if (p == begin || sorted[p] != sorted[p - 1]) out_idx[w++] = sorted[p];
-    }
-}
+// Distinct counts per segment, exclusive-scanned into out_ptr. Returns the total, which is the
+// length the caller allocates the column index at.
+template <typename Gather>
+int count_rows(Gather g, int* out_ptr, int n_seg, cudaStream_t stream) {
+    if (n_seg <= 0) return 0;
+    const int pad = shared_pad(g, n_seg, stream);
+    DeviceBuffer<int> counts =
+        device_alloc<int>(static_cast<std::size_t>(n_seg) + 1, "pattern", "row counts");
+    launch_pass<false>(g, nullptr, nullptr, counts.get(), n_seg, pad, stream);
+    check_cuda(cudaMemsetAsync(counts.get() + n_seg, 0, sizeof(int), stream), "memset(total)");
 
-// Shared tail: sort each segment of `cand`, then compact the distinct values back into it and
-// leave the row offsets in `out_ptr`. `counts` is scratch of n_seg + 1 entries, whose last slot
-// carries the zero the exclusive scan needs to deposit the total.
-int sort_and_compact(int* cand, int* sorted, const int* seg, int* counts, int* out_ptr, int n_seg,
-                     int n_cand, cudaStream_t stream) {
-    std::size_t sort_bytes = 0;
-    std::size_t scan_bytes = 0;
-    check_cuda(cub::DeviceSegmentedSort::SortKeys(nullptr, sort_bytes, cand, sorted, n_cand,
-                                                  n_seg, seg, seg + 1, stream),
-               "size(segmented sort)");
+    std::size_t bytes = 0;
     check_cuda(
-        cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, counts, out_ptr, n_seg + 1, stream),
+        cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts.get(), out_ptr, n_seg + 1, stream),
         "size(exclusive sum)");
-    DeviceBuffer<std::byte> temp =
-        device_alloc<std::byte>(std::max(sort_bytes, scan_bytes), "pattern", "cub scratch");
-
-    check_cuda(cub::DeviceSegmentedSort::SortKeys(temp.get(), sort_bytes, cand, sorted, n_cand,
-                                                  n_seg, seg, seg + 1, stream),
-               "segmented sort");
-
-    const unsigned blocks = grid_for(n_seg);
-    count_distinct_kernel<<<blocks, kBlock, 0, stream>>>(sorted, seg, counts, n_seg);
-    check_cuda(cudaMemsetAsync(counts + n_seg, 0, sizeof(int), stream), "memset(total)");
-    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), scan_bytes, counts, out_ptr, n_seg + 1,
-                                             stream),
-               "exclusive sum");
-    // The compaction lands in the candidate buffer, which the sort has already consumed.
-    write_distinct_kernel<<<blocks, kBlock, 0, stream>>>(sorted, seg, out_ptr, cand, n_seg);
-    check_cuda(cudaGetLastError(), "compaction launch");
+    DeviceBuffer<std::byte> temp = device_alloc<std::byte>(bytes, "pattern", "scan scratch");
+    check_cuda(
+        cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts.get(), out_ptr, n_seg + 1, stream),
+        "exclusive sum");
 
     int nnz = 0;
     check_cuda(
@@ -132,77 +279,32 @@ int sort_and_compact(int* cand, int* sorted, const int* seg, int* counts, int* o
     return nnz;
 }
 
-}  // namespace
-
-// Row i's columns are the distinct nodes of the tetrahedra incident to node i, so its candidates
-// are the four nodes of every corner in its node2corner segment: ~96 of them for ~14 distinct
-// columns on a head mesh. 4 * ptr is already the exclusive prefix of those counts, so the
-// candidate list needs no scan of its own.
-int build_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx, int* cand,
-                            int* sorted, int* out_ptr, int n_seg, int n_corner,
-                            cudaStream_t stream) {
-    if (n_seg <= 0) return 0;
-    const std::int64_t n_cand = static_cast<std::int64_t>(n_corner) * 4;
-    if (n_cand > static_cast<std::int64_t>(INT32_MAX)) {
-        throw std::invalid_argument("build_incident_node_csr: candidate list exceeds int range");
-    }
-
-    DeviceBuffer<int> seg =
-        device_alloc<int>(static_cast<std::size_t>(n_seg) + 1, "pattern", "segment offsets");
-    DeviceBuffer<int> counts =
-        device_alloc<int>(static_cast<std::size_t>(n_seg) + 1, "pattern", "row counts");
-    scale4_kernel<<<grid_for(n_seg + 1), kBlock, 0, stream>>>(ptr, seg.get(), n_seg + 1);
-    if (const unsigned blocks = grid_for(n_corner)) {
-        gather_incident_kernel<<<blocks, kBlock, 0, stream>>>(tet_nodes, idx, cand, n_corner);
-    }
-    check_cuda(cudaGetLastError(), "candidate launch");
-
-    return sort_and_compact(cand, sorted, seg.get(), counts.get(), out_ptr, n_seg,
-                            static_cast<int>(n_cand), stream);
+template <typename Gather>
+void fill_rows(Gather g, const int* out_ptr, int* out_idx, int n_seg, cudaStream_t stream) {
+    if (n_seg <= 0) return;
+    const int pad = shared_pad(g, n_seg, stream);
+    launch_pass<true>(g, out_ptr, out_idx, nullptr, n_seg, pad, stream);
 }
 
-// A slot whose own tetrahedra reach at least min_nodes nodes keeps that first ring. A smaller one
-// grows to the union of its neighbours' first rings, which is the same set as re-walking the
-// same-tissue tetrahedra around it and needs no second pass over the mesh. The slot is its own
-// neighbour, so the grown patch always contains the first ring.
-int build_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
-                    int* cand, int* sorted, int* out_ptr, int n_slots, int n_cand,
-                    cudaStream_t stream) {
-    if (n_slots <= 0) return 0;
-    DeviceBuffer<int> seg =
-        device_alloc<int>(static_cast<std::size_t>(n_slots) + 1, "pattern", "segment offsets");
-    DeviceBuffer<int> counts =
-        device_alloc<int>(static_cast<std::size_t>(n_slots) + 1, "pattern", "row counts");
+}  // namespace
 
-    const unsigned blocks = grid_for(n_slots);
-    patch_counts_kernel<<<blocks, kBlock, 0, stream>>>(r1_ptr, neighbour, min_nodes, counts.get(),
-                                                       n_slots);
-    check_cuda(cudaMemsetAsync(counts.get() + n_slots, 0, sizeof(int), stream), "memset(total)");
-    std::size_t scan_bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, scan_bytes, counts.get(), seg.get(),
-                                             n_slots + 1, stream),
-               "size(candidate scan)");
-    {
-        DeviceBuffer<std::byte> temp =
-            device_alloc<std::byte>(scan_bytes, "pattern", "candidate scan scratch");
-        check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), scan_bytes, counts.get(), seg.get(),
-                                                 n_slots + 1, stream),
-                   "candidate scan");
-    }
+int count_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx, int* out_ptr,
+                            int n_seg, cudaStream_t stream) {
+    return count_rows(IncidentGather{tet_nodes, ptr, idx}, out_ptr, n_seg, stream);
+}
 
-    int total = 0;
-    check_cuda(cudaMemcpyAsync(&total, seg.get() + n_slots, sizeof(int), cudaMemcpyDeviceToHost,
-                               stream),
-               "copy(candidate total)");
-    check_cuda(cudaStreamSynchronize(stream), "sync(candidate total)");
-    if (total > n_cand) {
-        throw std::invalid_argument("build_patch_csr: work buffers too small for the candidates");
-    }
+void fill_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx,
+                            const int* out_ptr, int* out_idx, int n_seg, cudaStream_t stream) {
+    fill_rows(IncidentGather{tet_nodes, ptr, idx}, out_ptr, out_idx, n_seg, stream);
+}
 
-    patch_gather_kernel<<<blocks, kBlock, 0, stream>>>(r1_ptr, r1_idx, neighbour, min_nodes,
-                                                       seg.get(), cand, n_slots);
-    check_cuda(cudaGetLastError(), "patch gather launch");
+int count_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
+                    int* out_ptr, int n_slots, cudaStream_t stream) {
+    return count_rows(PatchGather{r1_ptr, r1_idx, neighbour, min_nodes}, out_ptr, n_slots, stream);
+}
 
-    return sort_and_compact(cand, sorted, seg.get(), counts.get(), out_ptr, n_slots, total,
-                            stream);
+void fill_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
+                    const int* out_ptr, int* out_idx, int n_slots, cudaStream_t stream) {
+    fill_rows(PatchGather{r1_ptr, r1_idx, neighbour, min_nodes}, out_ptr, out_idx, n_slots,
+              stream);
 }

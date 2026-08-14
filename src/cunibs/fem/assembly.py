@@ -7,7 +7,8 @@ import cupyx.scipy.sparse as csp
 
 from cunibs.solver import (
     assemble_stiffness_values,
-    build_incident_node_csr,
+    count_incident_node_csr,
+    fill_incident_node_csr,
     p1_gradients,
 )
 
@@ -98,18 +99,15 @@ def stiffness_pattern(
     mesh builds it once and refills ``.data`` per conductivity with ``fill_stiffness_values``.
     ``ptr``/``idx`` is the mesh's node2corner CSR.
 
-    The candidate column list is 16 entries per tetrahedron, so this holds two int32 buffers of
-    that size while it runs: ~500 MB on a 4M-tetrahedron mesh, released on return.
+    Sizing the rows takes a pass of its own, because nothing knows how many distinct columns a row
+    has until its candidates are sorted, so the column index is allocated at exactly its own
+    length. The candidates themselves never leave the kernel's shared memory.
     """
+    stream = cp.cuda.get_current_stream().ptr
     indptr = cp.empty(n_nodes + 1, dtype=cp.int32)
-    cand = cp.empty(4 * int(idx.shape[0]), dtype=cp.int32)
-    sorted_cand = cp.empty_like(cand)
-    nnz = build_incident_node_csr(
-        tet_nodes, ptr, idx, cand, sorted_cand, indptr, cp.cuda.get_current_stream().ptr
-    )
-    del sorted_cand
-    indices = cp.ascontiguousarray(cand[:nnz])
-    del cand
+    nnz = count_incident_node_csr(tet_nodes, ptr, idx, indptr, stream)
+    indices = cp.empty(nnz, dtype=cp.int32)
+    fill_incident_node_csr(tet_nodes, ptr, idx, indptr, indices, stream)
     return csp.csr_matrix(
         (cp.empty(nnz, dtype=cp.float64), indices, indptr), shape=(n_nodes, n_nodes)
     )
@@ -145,9 +143,11 @@ def build_node2corner(tet_nodes: cp.ndarray, n_nodes: int) -> tuple[cp.ndarray, 
     """Build the node-to-corner CSR used by RHS assembly.
 
     A stable sort fixes the reduction order for each node and makes the result reproducible.
-    ``idx`` stores corner IDs ``c = 4e + i``.
+    ``idx`` stores corner IDs ``c = k*e + i``, where ``k`` is the element's corner count: four for
+    the tetrahedra this is usually called on, three for the skin triangles the smoothed normals
+    reduce over.
     """
-    n_corner = int(tet_nodes.shape[0]) * 4
+    n_corner = int(tet_nodes.shape[0]) * int(tet_nodes.shape[1])
     ptr = cp.zeros(n_nodes + 1, dtype=cp.int32)
     if n_corner == 0:
         # cupy's bincount reduces over the keys to size its output rather than trusting

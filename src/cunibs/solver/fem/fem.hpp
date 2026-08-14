@@ -25,22 +25,27 @@ void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const
                              int n_tet, int k, cudaStream_t stream);
 
 // --- pattern.cu: segment-wise CSR construction ----------------------------------------------
-// Both entry points take two caller-owned int32 work buffers and leave the result CSR as out_ptr
-// plus the first nnz entries of cand, which they return. Both synchronise the stream.
+// Each builder comes in two halves, because how many distinct values a segment holds is not known
+// until it has been sorted. `count` fills out_ptr with the exclusive scan of the row lengths and
+// returns nnz, which is the length the caller then allocates out_idx at; `fill` writes the rows
+// out_ptr describes. The candidates themselves never reach global memory. Both halves synchronise
+// the stream.
 
 // Distinct nodes of the tetrahedra in each segment of a corner CSR (c = 4e + i). ptr/idx is
 // rhs.cu's node2corner map for the stiffness pattern, or a per-(node, tissue) corner CSR for the
-// recovery slots. cand and sorted must hold 4 * n_corner entries.
-int build_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx, int* cand,
-                            int* sorted, int* out_ptr, int n_seg, int n_corner,
-                            cudaStream_t stream);
+// recovery slots.
+int count_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx, int* out_ptr,
+                            int n_seg, cudaStream_t stream);
+void fill_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx,
+                            const int* out_ptr, int* out_idx, int n_seg, cudaStream_t stream);
 
 // Recovery patches over the first-ring CSR built above. neighbour[j] is the slot of the same
 // tissue centred on r1_idx[j]. A slot reaching fewer than min_nodes grows to the union of its
-// neighbours' rings. n_cand is the capacity of cand and sorted.
-int build_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
-                    int* cand, int* sorted, int* out_ptr, int n_slots, int n_cand,
-                    cudaStream_t stream);
+// neighbours' rings.
+int count_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
+                    int* out_ptr, int n_slots, cudaStream_t stream);
+void fill_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
+                    const int* out_ptr, int* out_idx, int n_slots, cudaStream_t stream);
 
 // --- stiffness.cu: conductivity stiffness values over a prebuilt CSR pattern ----------------
 // indptr/indices must have sorted column indices per row and cover every (i, j) the tets touch;

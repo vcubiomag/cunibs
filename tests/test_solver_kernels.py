@@ -693,3 +693,37 @@ def test_exported_block_widths_are_the_ones_the_solver_accepts(cp, cube_subject)
             raise
         accepted.append(k)
     assert tuple(accepted) == tuple(BLOCK_SIZES)
+
+
+def test_pattern_handles_a_segment_too_wide_for_the_shared_block(cp):
+    """A high-valence node forces the one-warp-per-block path, which no head mesh reaches.
+
+    The segment CSR builders sort each segment in shared memory, reserving the widest segment's
+    padded width per warp. Past what four warps can hold they fall to a warp per block; a head mesh
+    stays two orders of magnitude under that, so only a fixture like this covers the branch.
+    """
+    from cunibs.fem.assembly import build_node2corner, stiffness_pattern
+
+    # A fan of tetrahedra all sharing node 0, so its segment is four candidates per tet.
+    n_fan = 900
+    angle = np.linspace(0.0, 2.0 * np.pi, n_fan + 1)[:-1]
+    ring = np.stack([np.cos(angle), np.sin(angle), np.zeros(n_fan)], axis=1)
+    nodes = np.vstack([[0.0, 0.0, 0.0], ring, [0.0, 0.0, 1.0]])
+    apex = len(nodes) - 1
+    tets = np.array(
+        [[0, apex, 1 + i, 1 + ((i + 1) % n_fan)] for i in range(n_fan)], dtype=np.int32
+    )
+
+    d_tets = cp.asarray(tets)
+    ptr, idx = build_node2corner(d_tets, len(nodes))
+    # Four warps sharing 48 KB get 3072 int32 slots each, and the buffer is padded to a power of
+    # two, so this fixture's widest segment is over the line.
+    widest = int(cp.diff(ptr).max()) * 4
+    assert 1 << (widest - 1).bit_length() > 3072
+
+    a = stiffness_pattern(d_tets, len(nodes), ptr, idx)
+    expected = [np.unique(tets[np.any(tets == n, axis=1)]) for n in range(len(nodes))]
+    np.testing.assert_array_equal(
+        cp.asnumpy(a.indptr), np.concatenate([[0], np.cumsum([len(e) for e in expected])])
+    )
+    np.testing.assert_array_equal(cp.asnumpy(a.indices), np.concatenate(expected))

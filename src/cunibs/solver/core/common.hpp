@@ -12,8 +12,8 @@
 
 // A reduction whose association order is unspecified cannot stand in for one of these kernels:
 // results are required to be bit-reproducible, so every summation tree is written out here.
-// Library calls are confined to setup (cub::DeviceScan, cub::DeviceSegmentedSort) and to
-// place.cu's minimum over a total order, which no order of combination can change.
+// Library calls are confined to setup (cub::DeviceScan) and to place.cu's minimum over a total
+// order, which no order of combination can change.
 
 constexpr int kBlock = 256;
 constexpr int kWarp = 32;
