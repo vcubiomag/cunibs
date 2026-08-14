@@ -2,6 +2,8 @@
 #include "fem/fem.hpp"
 
 #include <cuda/atomic>
+#include <cuda/cmath>
+#include <cuda/std/array>
 
 #include <cstdint>
 
@@ -18,9 +20,11 @@
 //     E*[s] = Σ_{c ∋ s} w[c] · E[c>>2]
 // See fem/recovery.py for the derivation and for how w is built.
 //
-// Every reduction here is a fixed-order walk of ptr/idx with one thread per output slot, which
-// is what keeps the recovered field bit-reproducible and independent of the block width. The
-// only atomic is the integer fallback counter.
+// Every reduction here walks ptr/idx in a fixed order, which is what keeps the recovered field
+// bit-reproducible and independent of the block width. The SPR kernels give each output slot a
+// thread and walk its segment in one loop; the harmonic fit gives each slot a warp and deals the
+// normal matrix's entries round the lanes, so each entry is still summed over the segment in order
+// while no lane has to hold the whole matrix. The only atomic is the integer fallback counter.
 
 namespace {
 
@@ -37,9 +41,16 @@ constexpr double kMaxLebesgue = 8.0;
 // field error. Rejection drops a rung rather than failing; the rung below is still a fit.
 constexpr double kMaxGradientAmplification = 50.0;
 
-// Threads per block for the potential fit. Its 16x16 register Cholesky spills ~4 KB of local
-// memory per thread, so a block narrower than kBlock keeps more of that spill inside L1.
-constexpr int kFitBlock = 64;
+// The potential fit runs one warp per slot. Two warps per block, because the fit's shared scratch
+// is what caps blocks per SM and a narrower block leaves room for more of them. Patch entries are
+// staged a chunk at a time so the basis is evaluated once per entry and read by every lane.
+constexpr int kFitWarps = 2;
+constexpr int kFitBlock = kWarp * kFitWarps;
+constexpr int kFitChunk = kWarp;
+
+constexpr unsigned kFullWarp = 0xffffffffu;
+
+using Vec3 = cuda::std::array<double, 3>;
 
 // --- outer-boundary detection ---------------------------------------------------------------
 
@@ -98,8 +109,10 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
 // --- patch fitting --------------------------------------------------------------------------
 
 // Cholesky-solve A X = [e_r : r in rhs_rows] for an N x N SPD A held in registers. Returns false
-// on a non-positive pivot, which is how a coplanar or under-filled patch reports itself. N <= 16,
-// so the factor sits in local memory.
+// on a non-positive pivot, which is how a coplanar or under-filled patch reports itself. Only the
+// SPR modes use this, at N = 4, where the factor is 16 doubles and stays in registers. The
+// harmonic rungs go up to N = 16, whose factor does not, and factor per warp instead; see
+// fit_gradient_weights.
 template <int N>
 __device__ bool solve_spd_columns(const double a[N][N], const int* rhs_rows, int n_rhs,
                                   double out[][N]) {
@@ -333,111 +346,221 @@ struct LinearBasis {
 
 // The scaling radius: the patch's half-width in the infinity norm, which is what puts the fit in a
 // frame where the offsets lie in [-1, 1] and the normal matrix is conditioned on shape rather than
-// on head-mesh coordinates.
+// on head-mesh coordinates. One warp walks the patch; fmax is exact, so splitting the walk across
+// lanes and folding the results reaches the same radius a single thread's walk would.
 __device__ __forceinline__ double patch_radius(Vec3View<const double> nodes_mm,
                                                const int* __restrict__ pidx, int begin, int end,
-                                               const double xn[3]) {
+                                               const Vec3& xn, int lane) {
     double h = 0.0;
-    for (int p = begin; p < end; ++p) {
+    for (int p = begin + lane; p < end; p += kWarp) {
         const int m = pidx[p];
 #pragma unroll
         for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_mm(m, c) - xn[c]));
     }
+#pragma unroll
+    for (int d = kWarp / 2; d; d >>= 1) h = fmax(h, __shfl_xor_sync(kFullWarp, h, d));
     return h;
 }
 
-// Fit the potential over one slot's node patch in Basis, then write the three gradient weights
-// per patch node. The gradient at the node is the linear coefficients divided by the scaling
-// radius, because every term above linear has zero derivative at the centre. Returns false when
-// the normal matrix is not positive definite or the fit amplifies beyond
+// Per-warp scratch for one rung of the fit. Sized for the widest basis and reused by the narrower
+// rungs, since a warp runs them one after another and never needs two at once.
+struct FitScratch {
+    double* q;     // kFitChunk x N, the staged basis of one chunk of patch entries
+    double* a;     // N x N, the normal matrix, overwritten by its Cholesky factor
+    double* yz;    // 3 x N forward-substitution vectors, then 3 x N solution rows
+    int* singular; // set when a pivot fails, so the whole warp leaves the rung together
+};
+
+// Fit the potential over one slot's node patch in Basis with one warp, then write the three
+// gradient weights per patch node. The gradient at the node is the linear coefficients divided by
+// the scaling radius, because every term above linear has zero derivative at the centre. Returns
+// false when the normal matrix is not positive definite or the fit amplifies beyond
 // kMaxGradientAmplification; w may have been written either way, and the caller's next rung
 // overwrites the same entries.
+//
+// The normal matrix lives in shared memory, one copy per warp, because the cubic rung's 16x16 does
+// not fit in one thread's registers and spills to local memory if it is held there. Only its lower
+// triangle is ever read, so 136 entries are dealt four or five to a lane.
+//
+// Each a[i][j] is summed over patch entries in pptr order and each substitution runs its k in
+// order, so the arithmetic and its sequence are what a per-thread fit would do, not a
+// reassociation of it. Only the Lebesgue sums are reassociated, and they decide a threshold rather
+// than enter a weight.
 template <typename Basis>
 __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
                                      const int* __restrict__ pidx, int begin, int end,
-                                     const double xn[3], double h, Vec3View<float> wv) {
+                                     const Vec3& xn, double h, Vec3View<float> wv,
+                                     const FitScratch& s, int lane) {
     constexpr int N = Basis::kTerms;
+    // Lower-triangle entries, and how many of them a lane owns once they are dealt round the warp.
+    constexpr int kEntries = N * (N + 1) / 2;
+    constexpr int kPerLane = cuda::ceil_div(kEntries, kWarp);
     if (end - begin < Basis::kMinPatch) return false;
 
-    double a[N][N] = {};
-    for (int p = begin; p < end; ++p) {
-        const int m = pidx[p];
-        double q[N];
-        Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
-                    (nodes_mm(m, 2) - xn[2]) / h, q);
+    cuda::std::array<int, kPerLane> row, col;
+    cuda::std::array<double, kPerLane> acc;
+    int mine = 0;
 #pragma unroll
-        for (int i = 0; i < N; ++i) {
-#pragma unroll
-            for (int j = 0; j < N; ++j) a[i][j] += q[i] * q[j];
+    for (int e = 0; e < kPerLane; ++e) {
+        const int k = lane + kWarp * e;
+        acc[e] = 0.0;
+        row[e] = 0;
+        col[e] = 0;
+        if (k < kEntries) {
+            // Invert k = i(i+1)/2 + j. The square root lands on the right row or one either side
+            // of it, so the two walks below are a fixup rather than a search.
+            int i = static_cast<int>((sqrt(8.0 * k + 1.0) - 1.0) * 0.5);
+            while ((i * (i + 1)) / 2 > k) --i;
+            while (((i + 1) * (i + 2)) / 2 <= k) ++i;
+            row[e] = i;
+            col[e] = k - (i * (i + 1)) / 2;
+            ++mine;
         }
     }
 
+    for (int base = begin; base < end; base += kFitChunk) {
+        const int n = min(kFitChunk, end - base);
+        if (lane < n) {
+            const int m = pidx[base + lane];
+            Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
+                        (nodes_mm(m, 2) - xn[2]) / h, s.q + lane * N);
+        }
+        __syncwarp();
+        for (int p = 0; p < n; ++p) {
+            const double* __restrict__ q = s.q + p * N;
+#pragma unroll
+            for (int e = 0; e < kPerLane; ++e) {
+                if (e < mine) acc[e] = fma(q[row[e]], q[col[e]], acc[e]);
+            }
+        }
+        __syncwarp();
+    }
+#pragma unroll
+    for (int e = 0; e < kPerLane; ++e) {
+        if (e < mine) s.a[row[e] * N + col[e]] = acc[e];
+    }
+    if (lane == 0) *s.singular = 0;
+    __syncwarp();
+
+    // Cholesky in place: a[i][j] is read exactly once, at the moment l[i][j] is formed, so the
+    // factor may overwrite it. Lane i owns row i. a[0][0] is the patch size, so it sets the pivot
+    // scale, and it has to be read before the first column overwrites it.
+    const double floor_pivot = 1e-12 * s.a[0];
+    for (int j = 0; j < N; ++j) {
+        if (lane == j) {
+            double d = s.a[j * N + j];
+            for (int k = 0; k < j; ++k) d -= s.a[j * N + k] * s.a[j * N + k];
+            if (!(d > floor_pivot)) *s.singular = 1;
+            else s.a[j * N + j] = sqrt(d);
+        }
+        __syncwarp();
+        if (*s.singular) return false;
+        const double ljj = s.a[j * N + j];
+        if (lane > j && lane < N) {
+            double v = s.a[lane * N + j];
+            for (int k = 0; k < j; ++k) v -= s.a[lane * N + k] * s.a[j * N + k];
+            s.a[lane * N + j] = v / ljj;
+        }
+        __syncwarp();
+    }
+
     // Rows 1..3 of the inverse are the coefficients of u, v, t, i.e. the gradient in the scaled
-    // frame.
-    const int grad_rows[3] = {1, 2, 3};
-    double z[3][N];
-    if (!solve_spd_columns<N>(a, grad_rows, 3, z)) return false;
+    // frame. One right-hand side per lane; the three are independent given the factor.
+    double* const z = s.yz + 3 * N;
+    if (lane < 3) {
+        double* const y = s.yz + lane * N;
+        double* const zc = z + lane * N;
+        const int rhs_row = lane + 1;
+        for (int i = 0; i < N; ++i) {
+            double v = (i == rhs_row) ? 1.0 : 0.0;
+            for (int k = 0; k < i; ++k) v -= s.a[i * N + k] * y[k];
+            y[i] = v / s.a[i * N + i];
+        }
+        for (int i = N - 1; i >= 0; --i) {
+            double v = y[i];
+            for (int k = i + 1; k < N; ++k) v -= s.a[k * N + i] * zc[k];
+            zc[i] = v / s.a[i * N + i];
+        }
+    }
+    __syncwarp();
 
     // sum accumulates h * sum_m |w[m,c]|, since w is acc / h. Kept in the same walk that writes
     // w rather than in a pass of its own: the guard needs every entry anyway, and the alternative
     // is a second evaluation of the basis over the whole patch.
-    double sum[3] = {0.0, 0.0, 0.0};
-    for (int p = begin; p < end; ++p) {
+    Vec3 sum{};
+    for (int p = begin + lane; p < end; p += kWarp) {
         const int m = pidx[p];
         double q[N];
         Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
                     (nodes_mm(m, 2) - xn[2]) / h, q);
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
-            double acc = 0.0;
+            double grad = 0.0;
 #pragma unroll
-            for (int i = 0; i < N; ++i) acc += z[c][i] * q[i];
-            sum[c] += fabs(acc);
-            wv(p, c) = static_cast<float>(acc / h);
+            for (int i = 0; i < N; ++i) grad = fma(z[c * N + i], q[i], grad);
+            sum[c] += fabs(grad);
+            wv(p, c) = static_cast<float>(grad / h);
         }
+    }
+#pragma unroll
+    for (int d = kWarp / 2; d; d >>= 1) {
+#pragma unroll
+        for (int c = 0; c < 3; ++c) sum[c] += __shfl_xor_sync(kFullWarp, sum[c], d);
     }
     return fmax(sum[0], fmax(sum[1], sum[2])) <= kMaxGradientAmplification;
 }
 
-// One thread per slot over the node patch, taking the widest basis the patch can carry and
+// One warp per slot over the node patch, taking the widest basis the patch can carry and
 // dropping a rung where it cannot. status records which rung each slot took, counted down from
 // the widest: 0 cubic, 1 quadratic, 2 linear, 3 no gradient determined.
-__global__ void hpr_weights_kernel(const double* __restrict__ nodes_mm,
-                                   const int* __restrict__ pptr, const int* __restrict__ pidx,
-                                   const int* __restrict__ slot_node, float* __restrict__ w,
-                                   int* __restrict__ status, int n_slots) {
-    const int s = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
+    const double* __restrict__ nodes_mm, const int* __restrict__ pptr,
+    const int* __restrict__ pidx, const int* __restrict__ slot_node, float* __restrict__ w,
+    int* __restrict__ status, int n_slots) {
+    constexpr int kMaxTerms = CubicHarmonicBasis::kTerms;
+    __shared__ double warp_q[kFitWarps][kFitChunk * kMaxTerms];
+    __shared__ double warp_a[kFitWarps][kMaxTerms * kMaxTerms];
+    __shared__ double warp_yz[kFitWarps][6 * kMaxTerms];
+    __shared__ int warp_singular[kFitWarps];
+
+    const int warp = threadIdx.x / kWarp;
+    const int lane = threadIdx.x % kWarp;
+    // Every lane of a warp takes the same slot, so this exit and every rung decision below are
+    // warp-uniform and the __syncwarp calls inside a fit always meet the whole warp.
+    const int s = blockIdx.x * kFitWarps + warp;
     if (s >= n_slots) return;
+    const FitScratch scratch{warp_q[warp], warp_a[warp], warp_yz[warp], &warp_singular[warp]};
 
     const int begin = pptr[s], end = pptr[s + 1];
     const int node = slot_node[s];
     const Vec3View<const double> nodes(nodes_mm, kUnsizedRows);
     // One 3-vector per patch entry, so its rows are entries of pptr/pidx, not slots.
     const Vec3View<float> wv(w, kUnsizedRows);
-    const double xn[3] = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
-    const double h = patch_radius(nodes, pidx, begin, end, xn);
+    const Vec3 xn = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
+    const double h = patch_radius(nodes, pidx, begin, end, xn, lane);
 
+    int rung = 3;
     if (h > 0.0) {
-        if (fit_gradient_weights<CubicHarmonicBasis>(nodes, pidx, begin, end, xn, h, wv)) {
-            status[s] = 0;
-            return;
-        }
-        if (fit_gradient_weights<HarmonicBasis>(nodes, pidx, begin, end, xn, h, wv)) {
-            status[s] = 1;
-            return;
-        }
-        if (fit_gradient_weights<LinearBasis>(nodes, pidx, begin, end, xn, h, wv)) {
-            status[s] = 2;
-            return;
+        if (fit_gradient_weights<CubicHarmonicBasis>(nodes, pidx, begin, end, xn, h, wv, scratch,
+                                                     lane)) {
+            rung = 0;
+        } else if (fit_gradient_weights<HarmonicBasis>(nodes, pidx, begin, end, xn, h, wv, scratch,
+                                                       lane)) {
+            rung = 1;
+        } else if (fit_gradient_weights<LinearBasis>(nodes, pidx, begin, end, xn, h, wv, scratch,
+                                                     lane)) {
+            rung = 2;
         }
     }
 
-    // Only reachable when the patch is degenerate enough that no gradient is determined, e.g.
-    // every node of it coplanar. Zero weights leave E = -dA/dt at that slot rather than a NaN.
-    for (int p = begin; p < end; ++p) {
-        wv(p, 0) = wv(p, 1) = wv(p, 2) = 0.f;
+    if (rung == 3) {
+        // Only reachable when the patch is degenerate enough that no gradient is determined, e.g.
+        // every node of it coplanar. Zero weights leave E = -dA/dt at that slot rather than a NaN.
+        for (int p = begin + lane; p < end; p += kWarp) {
+            wv(p, 0) = wv(p, 1) = wv(p, 2) = 0.f;
+        }
     }
-    status[s] = 3;
+    if (lane == 0) status[s] = rung;
 }
 
 // One thread per slot, K placements at a time.
@@ -600,7 +723,8 @@ void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const floa
 void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
                         const int* slot_node, float* w, int* status, int n_slots,
                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_slots, kFitBlock)) {
+    // One warp per slot, so the grid is sized in slots per block rather than in threads.
+    if (const unsigned blocks = grid_for(n_slots, kFitWarps)) {
         hpr_weights_kernel<<<blocks, kFitBlock, 0, stream>>>(nodes_mm, pptr, pidx, slot_node, w,
                                                              status, n_slots);
     }
