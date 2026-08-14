@@ -727,3 +727,18 @@ def test_pattern_handles_a_segment_too_wide_for_the_shared_block(cp):
         cp.asnumpy(a.indptr), np.concatenate([[0], np.cumsum([len(e) for e in expected])])
     )
     np.testing.assert_array_equal(cp.asnumpy(a.indices), np.concatenate(expected))
+
+
+def test_tet_lowest_node_matches_a_numpy_gather(cp):
+    """The Morton sort key: the smallest permuted node index over a tetrahedron's four nodes."""
+    from cunibs.solver import tet_lowest_node
+
+    rng = np.random.default_rng(3)
+    inverse = rng.permutation(N_NODES).astype(np.int32)
+    tets = rng.integers(0, N_NODES, size=(N_TET, 4), dtype=np.int32)
+
+    lowest = cp.empty(N_TET, dtype=cp.int32)
+    tet_lowest_node(
+        cp.asarray(inverse), cp.asarray(tets), lowest, cp.cuda.get_current_stream().ptr
+    )
+    np.testing.assert_array_equal(cp.asnumpy(lowest), inverse[tets].min(axis=1))

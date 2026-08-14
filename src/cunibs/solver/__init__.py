@@ -33,6 +33,7 @@ try:
         rhs_assemble_staged_block,
         select_size4,
         spr_weights,
+        tet_lowest_node,
     )
 except ImportError as exc:
     raise ImportError(_cuda_preload.describe_failure(exc)) from exc
@@ -68,4 +69,5 @@ __all__ = [
     "rhs_assemble_staged_block",
     "select_size4",
     "spr_weights",
+    "tet_lowest_node",
 ]

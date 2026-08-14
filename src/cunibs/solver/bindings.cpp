@@ -244,6 +244,21 @@ NB_MODULE(_solver_ext, m) {
         "Deterministic node-centric RHS assembly, corner pass then gather.");
 
     m.def(
+        "tet_lowest_node",
+        [](i32_cuda inverse, i32_cuda_2d tet_nodes, i32_cuda lowest, uintptr_t stream) {
+            const int n_tet = static_cast<int>(tet_nodes.shape(0));
+            if (tet_nodes.shape(1) != 4 || static_cast<int>(lowest.shape(0)) != n_tet) {
+                throw std::invalid_argument(
+                    "tet_lowest_node: tet_nodes must be (n_tet, 4) and lowest (n_tet,)");
+            }
+            launch_tet_lowest_node(inverse.data(), tet_nodes.data(), lowest.data(), n_tet,
+                                   reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("inverse").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("lowest").noconvert(), nb::arg("stream"),
+        "Smallest permuted node index of each tetrahedron, the sort key of the Morton layout.");
+
+    m.def(
         "count_incident_node_csr",
         [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda out_ptr,
            uintptr_t stream) {

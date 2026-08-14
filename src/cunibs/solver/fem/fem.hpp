@@ -24,6 +24,12 @@ void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const
                              const int* ptr, const int* idx, float* b_block, int n_nodes,
                              int n_tet, int k, cudaStream_t stream);
 
+// --- reorder.cu: keys for the Morton layout -------------------------------------------------
+// inverse maps a mesh node to its position in the node permutation; lowest[e] is the smallest such
+// position over tetrahedron e's four nodes, which is the key its own permutation sorts by.
+void launch_tet_lowest_node(const int* inverse, const int* tet_nodes, int* lowest, int n_tet,
+                            cudaStream_t stream);
+
 // --- pattern.cu: segment-wise CSR construction ----------------------------------------------
 // Each builder comes in two halves, because how many distinct values a segment holds is not known
 // until it has been sorted. `count` fills out_ptr with the exclusive scan of the row lengths and

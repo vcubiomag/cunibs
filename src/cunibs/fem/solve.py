@@ -42,6 +42,7 @@ from cunibs.solver import (
     rhs_assemble_staged,
     rhs_assemble_staged_block,
     select_size4,
+    tet_lowest_node,
 )
 
 if TYPE_CHECKING:
@@ -338,7 +339,10 @@ def spatial_order(nodes_mm: cp.ndarray, tet_nodes: cp.ndarray) -> tuple[cp.ndarr
     A mesh already in this order sorts to the identity, so reordering is idempotent.
     """
     node_perm = morton_order(nodes_mm)
-    lowest = invert_permutation(node_perm)[tet_nodes].min(axis=1)
+    inverse = invert_permutation(node_perm)
+    tets = cp.ascontiguousarray(tet_nodes, dtype=cp.int32)
+    lowest = cp.empty(int(tets.shape[0]), dtype=cp.int32)
+    tet_lowest_node(inverse, tets, lowest, cp.cuda.get_current_stream().ptr)
     tet_perm = cp.argsort(lowest, kind="stable").astype(cp.int32)
     return node_perm, tet_perm
 
