@@ -643,12 +643,11 @@ class SolverContext:
 
 def _spatially_ordered(
     mesh: HeadMesh,
-) -> tuple[HeadMesh, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Reorder a mesh along a Morton curve and return it with its device arrays.
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Reorder a mesh along a Morton curve, as device arrays.
 
-    The returned mesh is the order every array in the context carries, host and device alike,
-    and so the one a caller reads results against. Surface rows keep their file order; only the
-    node ids they name move.
+    This order is the one every array in the context carries, and so the one a caller reads
+    results against. Surface rows keep their file order; only the node ids they name move.
     """
     nodes_mm = cp.asarray(mesh.nodes_mm)
     tet_nodes = cp.asarray(mesh.tet_nodes)
@@ -659,14 +658,7 @@ def _spatially_ordered(
     tet_nodes = cp.ascontiguousarray(inverse[tet_nodes[tet_perm]])
     tet_tags = cp.ascontiguousarray(cp.asarray(mesh.tet_tags)[tet_perm])
     skin_tris = cp.ascontiguousarray(inverse[cp.asarray(mesh.skin_tris)])
-
-    ordered = HeadMesh(
-        nodes_mm=cp.asnumpy(nodes_mm),
-        tet_nodes=cp.asnumpy(tet_nodes),
-        tet_tags=cp.asnumpy(tet_tags),
-        skin_tris=cp.asnumpy(skin_tris),
-    )
-    return ordered, nodes_mm, tet_nodes, tet_tags, skin_tris
+    return nodes_mm, tet_nodes, tet_tags, skin_tris
 
 
 def build_context(mesh: HeadMesh) -> SolverContext:
@@ -678,11 +670,15 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     Assemble ``g``, volumes, and stiffness in float64. Store ``g``, volumes, and
     ``-volume * conductivity`` in float32 for placement kernels.
     """
-    mesh, nodes_mm, tet_nodes, tet_tags, skin_tris = _spatially_ordered(mesh)
+    nodes_mm, tet_nodes, tet_tags, skin_tris = _spatially_ordered(mesh)
+    n_nodes = int(nodes_mm.shape[0])
+    # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
+    # rather than a cost of building the context.
+    mesh = HeadMesh(nodes_mm, tet_nodes, tet_tags, skin_tris)
 
     g, vols = gradient_operator(nodes_mm, tet_nodes)
     cond = conductivity_per_tet(tet_tags)
-    stiffness = assemble_stiffness(g, vols, cond, mesh.n_nodes, tet_nodes)
+    stiffness = assemble_stiffness(g, vols, cond, n_nodes, tet_nodes)
     ground_node = ground_node_of(nodes_mm)
     solver = prepare_grounded_solver(stiffness, nodes_mm, ground_node)
     del stiffness
@@ -691,7 +687,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
     vols = cp.ascontiguousarray(vols.astype(cp.float32))
     del cond
-    ptr, idx = build_node2corner(tet_nodes, mesh.n_nodes)
+    ptr, idx = build_node2corner(tet_nodes, n_nodes)
     barycenters = cp.ascontiguousarray(nodes_mm[tet_nodes].mean(axis=1))
 
     skin_a = cp.ascontiguousarray(nodes_mm[skin_tris[:, 0]])
@@ -703,7 +699,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         nodes_mm,
         tet_nodes,
         tet_tags,
-        mesh.n_nodes,
+        n_nodes,
         g,
         vols,
         barycenters,

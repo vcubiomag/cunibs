@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import mmap
 import struct
-from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Literal, NamedTuple, NoReturn
+from typing import Any, Literal, NamedTuple, NoReturn
 
 import numpy as np
 import numpy.typing as npt
@@ -296,26 +295,63 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         return MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surface.tags)
 
 
-@dataclass
+def _on_host(array: Any) -> npt.NDArray[Any]:
+    """Copy a device-resident array to the host, passing a host array straight through.
+
+    Duck-typed on cupy's ``.get()`` so that this module stays importable without cupy.
+    """
+    return array if isinstance(array, np.ndarray) else array.get()
+
+
 class HeadMesh:
     """Store a tetrahedral head mesh.
 
     Node coordinates use millimetres. Element indices are zero-based.
+
+    Each array may be given on the device instead of on the host, in which case it is copied down
+    the first time something reads it and not before. :func:`~cunibs.fem.solve.build_context`
+    builds the reordered mesh that way: a forward run reads neither the connectivity nor the tags
+    on the host, so nothing pays for a copy back.
     """
 
-    nodes_mm: npt.NDArray[np.float64]
-    tet_nodes: npt.NDArray[np.int32]
-    tet_tags: npt.NDArray[np.int32]
-    skin_tris: npt.NDArray[np.int32]
+    def __init__(
+        self,
+        nodes_mm: npt.NDArray[np.float64],
+        tet_nodes: npt.NDArray[np.int32],
+        tet_tags: npt.NDArray[np.int32],
+        skin_tris: npt.NDArray[np.int32],
+    ) -> None:
+        self._nodes_mm = nodes_mm
+        self._tet_nodes = tet_nodes
+        self._tet_tags = tet_tags
+        self._skin_tris = skin_tris
+
+    # None of the cached_property members below holds a lock. cached_property has held none since
+    # 3.12, so under the free-threaded build two threads racing on one can both compute it. All are
+    # pure functions of the arrays handed to __init__, so the loser's result is identical and the
+    # dict store that publishes it is atomic. A lock would buy nothing here and would make HeadMesh
+    # unpicklable.
+    @cached_property
+    def nodes_mm(self) -> npt.NDArray[np.float64]:
+        return _on_host(self._nodes_mm)
+
+    @cached_property
+    def tet_nodes(self) -> npt.NDArray[np.int32]:
+        return _on_host(self._tet_nodes)
+
+    @cached_property
+    def tet_tags(self) -> npt.NDArray[np.int32]:
+        return _on_host(self._tet_tags)
+
+    @cached_property
+    def skin_tris(self) -> npt.NDArray[np.int32]:
+        return _on_host(self._skin_tris)
 
     @property
     def n_nodes(self) -> int:
-        return self.nodes_mm.shape[0]
+        # Off the source array, so asking a device-backed mesh its size does not fetch it.
+        return int(self._nodes_mm.shape[0])
 
-    # cached_property holds no lock as of 3.12, so under the free-threaded build two threads
-    # racing on either of these can both compute it. Both are pure functions of the arrays
-    # above, so the loser's result is identical and the dict store that publishes it is atomic.
-    # A lock would buy nothing here and would make HeadMesh unpicklable.
     @cached_property
     def skin_triangle_normals(self) -> npt.NDArray[np.float64]:
         return _skin_smoothed_triangle_normals(self.nodes_mm, self.skin_tris)
@@ -324,6 +360,9 @@ class HeadMesh:
     def tet_barycenters_mm(self) -> npt.NDArray[np.float64]:
         """Per-tetrahedron barycentre in mm."""
         return self.nodes_mm[self.tet_nodes].mean(axis=1)
+
+    def __repr__(self) -> str:
+        return f"HeadMesh(n_nodes={self.n_nodes}, n_tets={int(self._tet_nodes.shape[0])})"
 
 
 def load_mesh(mesh_file: str | Path) -> HeadMesh:
