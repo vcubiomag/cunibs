@@ -15,8 +15,7 @@ wheels/
 .ruff_cache
 compile_commands.json
 
-# Benchmarking
-benchmarks
+# Evaluation
 metrics
 reference_data
 manuscripts
