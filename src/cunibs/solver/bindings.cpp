@@ -483,6 +483,29 @@ NB_MODULE(_solver_ext, m) {
         "is_boundary=None to fit every slot, n_fallback=None to skip the counter.");
 
     m.def(
+        "skin_normals",
+        [](f64_cuda_2d nodes_mm, i32_cuda_2d tris, i32_cuda node_ptr, i32_cuda node_idx,
+           f64_cuda_2d out, uintptr_t stream) {
+            const int n_tri = static_cast<int>(tris.shape(0));
+            const int n_nodes = static_cast<int>(node_ptr.shape(0)) - 1;
+            if (tris.shape(1) != 3 || out.shape(1) != 3 ||
+                static_cast<int>(out.shape(0)) != n_tri) {
+                throw std::invalid_argument("skin_normals: tris and out must be (n_tri, 3)");
+            }
+            if (static_cast<int>(node_idx.shape(0)) != 3 * n_tri) {
+                throw std::invalid_argument("skin_normals: node_idx must hold every corner");
+            }
+            launch_skin_normals(nodes_mm.data(), tris.data(), node_ptr.data(), node_idx.data(),
+                                out.data(), n_tri, n_nodes,
+                                reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("nodes_mm").noconvert(), nb::arg("tris").noconvert(),
+        nb::arg("node_ptr").noconvert(), nb::arg("node_idx").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("stream"),
+        "Smoothed outward skin-triangle normals. node_ptr/node_idx is a node-to-corner CSR over "
+        "the triangles, and its order is the order every node's smoothing sums in.");
+
+    m.def(
         "hpr_weights",
         [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node, f32_cuda_2d w,
            i32_cuda status, uintptr_t stream) {

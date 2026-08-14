@@ -80,7 +80,9 @@ def test_transform_frame_is_orthonormal_right_handed(cube_subject):
     np.testing.assert_array_equal(tf[3], [0, 0, 0, 1])
 
 
-def test_transform_columns_follow_the_documented_convention(cube_subject, cube_mesh):
+def test_transform_columns_follow_the_documented_convention(
+    cube_subject, cube_mesh, cube_skin_normals
+):
     """[x | y | z | c] with y = in-plane handle, z = −normal, x = y × z, c = proj + d·normal.
 
     The reference normal is read back from the mesh rather than assumed: skin normals are
@@ -91,7 +93,7 @@ def test_transform_columns_follow_the_documented_convention(cube_subject, cube_m
     tf = compute_coil_transform(cube_subject.context, center, handle, dist)
 
     proj, tri = project_to_skin(cube_mesh, center)
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
 
     x, y, z, c = tf[:3, 0], tf[:3, 1], tf[:3, 2], tf[:3, 3]
     np.testing.assert_allclose(z, -normal, atol=1e-12)
@@ -113,7 +115,9 @@ def test_transform_orthogonalizes_the_handle(cube_subject):
     assert y[1] > 0  # still points along +y, the in-plane part of the handle
 
 
-def test_transform_rejects_a_handle_along_the_normal(cube_subject, cube_mesh):
+def test_transform_rejects_a_handle_along_the_normal(
+    cube_subject, cube_mesh, cube_skin_normals
+):
     """A handle straight above the projected centre leaves the in-plane axis undefined.
 
     Placement cannot catch this one: the degeneracy is against the scalp projection of
@@ -122,7 +126,7 @@ def test_transform_rejects_a_handle_along_the_normal(cube_subject, cube_mesh):
     ctx = cube_subject.context
     center = np.array([50.0, 50.0, 120.0])
     proj, tri = project_to_skin(cube_mesh, center)
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
 
     with pytest.raises(ValueError, match="Degenerate coil placement"):
         compute_coil_transform(ctx, center, proj + 10.0 * normal, 4.0)
@@ -135,11 +139,13 @@ def test_transform_rejects_a_handle_on_the_projected_centre(cube_subject, cube_m
         compute_coil_transform(cube_subject.context, center, proj, 4.0)
 
 
-def test_transform_batch_names_the_degenerate_placement(cube_subject, cube_mesh):
+def test_transform_batch_names_the_degenerate_placement(
+    cube_subject, cube_mesh, cube_skin_normals
+):
     ctx = cube_subject.context
     center = np.array([50.0, 50.0, 120.0])
     proj, tri = project_to_skin(cube_mesh, center)
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
 
     centers = np.stack([center, center])
     handles = np.stack([np.array([50.0, 150.0, 100.0]), proj + 10.0 * normal])
@@ -147,7 +153,9 @@ def test_transform_batch_names_the_degenerate_placement(cube_subject, cube_mesh)
         compute_coil_transforms(ctx, centers, handles, np.array([4.0, 4.0]))
 
 
-def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(cp, cube_subject, cube_mesh):
+def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(
+    cp, cube_subject, cube_mesh, cube_skin_normals
+):
     """Show the failure the guard exists for, by reading the kernel's raw output.
 
     Two handles that differ only in their (annihilated) in-plane component must describe two
@@ -159,7 +167,7 @@ def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(cp, cube_subjec
     ctx = cube_subject.context
     center = np.array([50.0, 50.0, 120.0])
     proj, tri = project_to_skin(cube_mesh, center)
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
 
     # Both handles sit on the outward normal through proj, so neither carries an in-plane
     # direction; a caller could reasonably expect them to mean different rotations.
@@ -188,7 +196,9 @@ def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(cp, cube_subjec
     np.testing.assert_allclose(tf[0, :3, :3], tf[1, :3, :3], atol=1e-15)
 
 
-def test_near_degenerate_handle_is_rejected_before_it_becomes_noise(cube_subject, cube_mesh):
+def test_near_degenerate_handle_is_rejected_before_it_becomes_noise(
+    cube_subject, cube_mesh, cube_skin_normals
+):
     """The tolerance has to catch handles that are merely *nearly* along the normal.
 
     At 1e-9 rad off the normal the in-plane component is pure rounding error, so the resulting
@@ -197,7 +207,7 @@ def test_near_degenerate_handle_is_rejected_before_it_becomes_noise(cube_subject
     ctx = cube_subject.context
     center = np.array([50.0, 50.0, 120.0])
     proj, tri = project_to_skin(cube_mesh, center)
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
     tangent = np.cross(normal, [1.0, 0.0, 0.0])
     tangent /= np.linalg.norm(tangent)
 
@@ -225,7 +235,9 @@ def test_transform_without_a_handle_is_orthonormal(cp, cube_subject):
         np.testing.assert_allclose(tf[i, :3, 2], withhandle[:3, 2], atol=1e-12)
 
 
-def test_transform_distance_offsets_along_the_outward_normal(cube_subject, cube_mesh):
+def test_transform_distance_offsets_along_the_outward_normal(
+    cube_subject, cube_mesh, cube_skin_normals
+):
     """distance_mm slides the origin along the outward normal and rotates nothing."""
     ctx = cube_subject.context
     center = np.array([50.0, 50.0, 120.0])
@@ -233,7 +245,7 @@ def test_transform_distance_offsets_along_the_outward_normal(cube_subject, cube_
     far = compute_coil_transform(ctx, center, [50, 150, 100], 10.0)
 
     proj, tri = project_to_skin(cube_mesh, center)
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
     np.testing.assert_allclose(near[:3, 3], proj, atol=1e-11)
     np.testing.assert_allclose(far[:3, 3] - near[:3, 3], 10.0 * normal, atol=1e-11)
     np.testing.assert_allclose(near[:3, :3], far[:3, :3], atol=1e-14)
@@ -249,11 +261,13 @@ def test_transform_distance_offsets_along_the_outward_normal(cube_subject, cube_
     ],
     ids=["face", "edge", "vertex", "offcentre"],
 )
-def test_transform_projection_matches_numpy_closest_point(cube_subject, cube_mesh, center):
+def test_transform_projection_matches_numpy_closest_point(
+    cube_subject, cube_mesh, center, cube_skin_normals
+):
     """Every branch of the closest-point ladder, against an independent NumPy transcription."""
     tf = compute_coil_transform(cube_subject.context, center, np.add(center, [0, 50, 0]), 4.0)
     expected_q, tri = project_to_skin(cube_mesh, np.asarray(center, float))
-    normal = cube_mesh.skin_triangle_normals[tri]
+    normal = cube_skin_normals[tri]
     np.testing.assert_allclose(tf[:3, 3] - 4.0 * normal, expected_q, atol=1e-11)
     np.testing.assert_allclose(tf[:3, 2], -normal, atol=1e-12)
 

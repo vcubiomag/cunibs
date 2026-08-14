@@ -312,6 +312,10 @@ class HeadMesh:
     the first time something reads it and not before. :func:`~cunibs.fem.solve.build_context`
     builds the reordered mesh that way: a forward run reads neither the connectivity nor the tags
     on the host, so nothing pays for a copy back.
+
+    Derived surface geometry is not here. The smoothed skin normals a placement projects against
+    are built on the device with the rest of the solver context; see
+    :func:`~cunibs.fem.solve.skin_triangle_normals` and ``SolverContext.skin_tri_normals``.
     """
 
     def __init__(
@@ -353,10 +357,6 @@ class HeadMesh:
         return int(self._nodes_mm.shape[0])
 
     @cached_property
-    def skin_triangle_normals(self) -> npt.NDArray[np.float64]:
-        return _skin_smoothed_triangle_normals(self.nodes_mm, self.skin_tris)
-
-    @cached_property
     def tet_barycenters_mm(self) -> npt.NDArray[np.float64]:
         """Per-tetrahedron barycentre in mm."""
         return self.nodes_mm[self.tet_nodes].mean(axis=1)
@@ -375,34 +375,3 @@ def load_mesh(mesh_file: str | Path) -> HeadMesh:
         tet_tags=np.ascontiguousarray(arrays.tet_tags, dtype=np.int32),
         skin_tris=np.ascontiguousarray(skin_tris, dtype=np.int32),
     )
-
-
-def _skin_smoothed_triangle_normals(
-    nodes_mm: npt.NDArray[np.float64], skin_tris: npt.NDArray[np.int32]
-) -> npt.NDArray[np.float64]:
-    """Compute smoothed unit normals for skin triangles.
-
-    Sum area-weighted face normals at each node, smooth once, then average the three
-    node normals for each triangle. Reindex skin nodes to limit the bincount arrays.
-    """
-    local_nodes, faces = np.unique(skin_tris, return_inverse=True)
-    faces = faces.reshape(-1, 3)
-    coords = nodes_mm[local_nodes]
-    n_local = local_nodes.shape[0]
-
-    side_a = coords[faces[:, 1]] - coords[faces[:, 0]]
-    side_b = coords[faces[:, 2]] - coords[faces[:, 0]]
-    face_normals = np.cross(side_a, side_b)
-
-    nd = np.zeros((n_local, 3))
-    normals = face_normals
-    for _ in range(2):
-        for i in range(3):
-            nd[:, i] = np.bincount(faces.reshape(-1), np.repeat(normals[:, i], 3), n_local)
-        normals = np.sum(nd[faces], axis=1)
-        normals /= np.linalg.norm(normals, axis=1)[:, None]
-    nd /= np.linalg.norm(nd, axis=1)[:, None]
-
-    tri_normals = np.mean(nd[faces], axis=1)
-    tri_normals /= np.linalg.norm(tri_normals, axis=1)[:, None]
-    return tri_normals

@@ -32,6 +32,7 @@ try:
         rhs_assemble_staged,
         rhs_assemble_staged_block,
         select_size4,
+        skin_normals,
         spr_weights,
         tet_lowest_node,
     )
@@ -68,6 +69,7 @@ __all__ = [
     "rhs_assemble_staged",
     "rhs_assemble_staged_block",
     "select_size4",
+    "skin_normals",
     "spr_weights",
     "tet_lowest_node",
 ]

@@ -2,8 +2,7 @@
 
 The ``Subject`` fixtures are session-scoped so the GPU context and UQ precompute are built
 once for the whole run. Never call ``.free()`` on one, and never mutate its ``HeadMesh``
-(``skin_triangle_normals`` and ``tet_barycenters_mm`` are ``cached_property``) — take the
-``fresh_subject`` factory instead.
+(``tet_barycenters_mm`` is a ``cached_property``) — take the ``fresh_subject`` factory instead.
 """
 
 from __future__ import annotations
@@ -101,6 +100,33 @@ def cp():
     import cupy
 
     return cupy
+
+
+def _skin_normals_of(mesh: HeadMesh) -> np.ndarray:
+    """Smoothed skin-triangle normals for ``mesh``, through the device path that builds them.
+
+    A ``HeadMesh`` carries no normals of its own; a solver context does, as ``skin_tri_normals``.
+    The fixtures below are for tests that want only the surface geometry, not a whole context.
+    """
+    import cupy as cp
+
+    from cunibs.fem.solve import skin_triangle_normals
+
+    return cp.asnumpy(
+        skin_triangle_normals(cp.asarray(mesh.nodes_mm), cp.asarray(mesh.skin_tris))
+    )
+
+
+@pytest.fixture(scope="session")
+def cube_skin_normals(cube_mesh) -> np.ndarray:
+    """Smoothed skin-triangle normals of ``cube_mesh``."""
+    return _skin_normals_of(cube_mesh)
+
+
+@pytest.fixture(scope="session")
+def patch_skin_normals(patch_mesh) -> np.ndarray:
+    """Smoothed skin-triangle normals of the cropped real-head patch."""
+    return _skin_normals_of(patch_mesh)
 
 
 @pytest.fixture(scope="session", autouse=True)

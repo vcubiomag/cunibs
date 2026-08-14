@@ -235,4 +235,3 @@ def test_load_mesh_is_deterministic(patch_mesh_path):
     np.testing.assert_array_equal(first.tet_nodes, second.tet_nodes)
     np.testing.assert_array_equal(first.tet_tags, second.tet_tags)
     np.testing.assert_array_equal(first.skin_tris, second.skin_tris)
-    np.testing.assert_array_equal(first.skin_triangle_normals, second.skin_triangle_normals)

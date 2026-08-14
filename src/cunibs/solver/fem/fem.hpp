@@ -96,6 +96,13 @@ void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const floa
 void launch_recover_nodes(const float* const* e_in, const float* w, const int* ptr, const int* idx,
                           float* const* e_slots, int n_slots, int k, cudaStream_t stream);
 
+// Smoothed outward normals for the skin surface, one per triangle. node_ptr/node_idx is a CSR
+// over mesh nodes whose entries are triangle corner ids c = 3t + i, and whose order fixes the
+// summation order every node's smoothing runs in.
+void launch_skin_normals(const double* nodes_mm, const int* tris, const int* node_ptr,
+                         const int* node_idx, double* out_tri_normals, int n_tri, int n_nodes,
+                         cudaStream_t stream);
+
 // Harmonic-constrained potential recovery. pptr/pidx is a CSR of patch NODES per slot, not
 // corners, and w carries a 3-vector per entry: grad_v[s] = sum_m w[s,m] * v[m].
 //

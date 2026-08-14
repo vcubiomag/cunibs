@@ -42,6 +42,7 @@ from cunibs.solver import (
     rhs_assemble_staged,
     rhs_assemble_staged_block,
     select_size4,
+    skin_normals,
     tet_lowest_node,
 )
 
@@ -661,6 +662,31 @@ def _spatially_ordered(
     return nodes_mm, tet_nodes, tet_tags, skin_tris
 
 
+def skin_triangle_normals(nodes_mm: cp.ndarray, skin_tris: cp.ndarray) -> cp.ndarray:
+    """Smoothed outward normal per skin triangle, the surface a placement projects onto.
+
+    Area-weighted face normals are spread to the triangles' nodes and gathered back twice, and the
+    result is the normalised mean of each triangle's three node normals. The spread is a reduction
+    over the triangles meeting at a node: it runs over a node-to-corner CSR built by a stable sort,
+    in that CSR's order, so it reduces in the same order on every run. Scattering with atomics
+    would be shorter and would not.
+    """
+    tris = cp.ascontiguousarray(skin_tris, dtype=cp.int32)
+    out = cp.empty((int(tris.shape[0]), 3), dtype=cp.float64)
+    if tris.shape[0] == 0:
+        return out
+    ptr, idx = build_node2corner(tris, int(nodes_mm.shape[0]))
+    skin_normals(
+        cp.ascontiguousarray(nodes_mm, dtype=cp.float64),
+        tris,
+        ptr,
+        idx,
+        out,
+        cp.cuda.get_current_stream().ptr,
+    )
+    return out
+
+
 def build_context(mesh: HeadMesh) -> SolverContext:
     """Build the GPU state shared by all placements.
 
@@ -672,9 +698,6 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     """
     nodes_mm, tet_nodes, tet_tags, skin_tris = _spatially_ordered(mesh)
     n_nodes = int(nodes_mm.shape[0])
-    # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
-    # rather than a cost of building the context.
-    mesh = HeadMesh(nodes_mm, tet_nodes, tet_tags, skin_tris)
 
     g, vols = gradient_operator(nodes_mm, tet_nodes)
     cond = conductivity_per_tet(tet_tags)
@@ -693,7 +716,10 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     skin_a = cp.ascontiguousarray(nodes_mm[skin_tris[:, 0]])
     skin_b = cp.ascontiguousarray(nodes_mm[skin_tris[:, 1]])
     skin_c = cp.ascontiguousarray(nodes_mm[skin_tris[:, 2]])
-    skin_tri_normals = cp.asarray(mesh.skin_triangle_normals)
+    skin_tri_normals = skin_triangle_normals(nodes_mm, skin_tris)
+    # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
+    # rather than a cost of building the context.
+    mesh = HeadMesh(nodes_mm, tet_nodes, tet_tags, skin_tris)
     ctx = SolverContext(
         mesh,
         nodes_mm,

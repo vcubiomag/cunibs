@@ -48,10 +48,6 @@ def test_load_mesh_selects_skin_and_derives_geometry(tmp_path):
     mesh = load_mesh(_write(tmp_path))
     assert mesh.n_nodes == 4
     assert mesh.skin_tris.shape == (1, 3)
-    assert mesh.skin_triangle_normals.shape == (1, 3)
-    np.testing.assert_allclose(
-        np.linalg.norm(mesh.skin_triangle_normals, axis=1), 1.0, atol=1e-12
-    )
     assert mesh.tet_barycenters_mm.shape == (1, 3)
     np.testing.assert_allclose(mesh.tet_barycenters_mm[0], _NODES[:4].mean(0))
 
@@ -228,14 +224,14 @@ def test_parser_rejects_unexpected_tag_count(tmp_path):
         parse_msh_binary(path)
 
 
-def test_skin_normals_unit_and_outward_on_cube(cube_mesh):
+@pytest.mark.gpu
+def test_skin_normals_unit_and_outward_on_cube(cube_mesh, cube_skin_normals):
     """Two-pass normal smoothing on a closed surface: unit length, all pointing outward."""
-    normals = cube_mesh.skin_triangle_normals
-    assert normals.shape == cube_mesh.skin_tris.shape
-    np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-12)
+    assert cube_skin_normals.shape == cube_mesh.skin_tris.shape
+    np.testing.assert_allclose(np.linalg.norm(cube_skin_normals, axis=1), 1.0, atol=1e-12)
     centroids = cube_mesh.nodes_mm[cube_mesh.skin_tris].mean(axis=1)
     outward = centroids - cube_mesh.nodes_mm.mean(axis=0)
-    assert np.all((outward * normals).sum(axis=1) > 0)
+    assert np.all((outward * cube_skin_normals).sum(axis=1) > 0)
 
 
 def test_empty_surface_block(tmp_path):
@@ -245,7 +241,6 @@ def test_empty_surface_block(tmp_path):
     )
     mesh = load_mesh(path)
     assert mesh.skin_tris.shape == (0, 3)
-    assert mesh.skin_triangle_normals.shape == (0, 3)
 
 
 def test_region_labels_cover_every_documented_tag(tmp_path):

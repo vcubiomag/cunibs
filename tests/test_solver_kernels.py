@@ -729,6 +729,58 @@ def test_pattern_handles_a_segment_too_wide_for_the_shared_block(cp):
     np.testing.assert_array_equal(cp.asnumpy(a.indices), np.concatenate(expected))
 
 
+def _smoothed_skin_normals(nodes_mm, tris, *, rounds=2):
+    """NumPy transcription of skin.cu.
+
+    Area-weighted face normals are summed at each node and gathered back per face, ``rounds``
+    times; the node vectors are then normalised and each triangle takes its three, normalised.
+    """
+    local, faces = np.unique(tris, return_inverse=True)
+    faces = faces.reshape(-1, 3)
+    coords = nodes_mm[local]
+
+    side_a = coords[faces[:, 1]] - coords[faces[:, 0]]
+    side_b = coords[faces[:, 2]] - coords[faces[:, 0]]
+    normals = np.cross(side_a, side_b)
+
+    node_vec = np.zeros((local.shape[0], 3))
+    for _ in range(rounds):
+        for i in range(3):
+            node_vec[:, i] = np.bincount(
+                faces.reshape(-1), np.repeat(normals[:, i], 3), local.shape[0]
+            )
+        normals = np.sum(node_vec[faces], axis=1)
+        normals /= np.linalg.norm(normals, axis=1)[:, None]
+    node_vec /= np.linalg.norm(node_vec, axis=1)[:, None]
+
+    tri = np.sum(node_vec[faces], axis=1)
+    return tri / np.linalg.norm(tri, axis=1)[:, None]
+
+
+@pytest.mark.realmesh
+def test_skin_normals_match_a_numpy_transcription(patch_mesh, patch_skin_normals):
+    """The whole smoothing chain against a transcription of it, on a real surface.
+
+    Not bitwise: the kernel sums each node's faces in node2corner order and ``bincount`` sums them
+    in triangle order, which lands a third of the components one ulp apart. The tolerance is a few
+    ulp, tight enough that a wrong corner, weighting, or round count is nowhere near it -- one
+    smoothing round instead of two moves this surface by more than 1e-3.
+    """
+    expected = _smoothed_skin_normals(patch_mesh.nodes_mm, patch_mesh.skin_tris)
+    np.testing.assert_allclose(patch_skin_normals, expected, rtol=1e-13, atol=1e-15)
+
+    one_round = _smoothed_skin_normals(patch_mesh.nodes_mm, patch_mesh.skin_tris, rounds=1)
+    assert np.abs(one_round - expected).max() > 1e-3
+
+
+def test_skin_normals_on_an_empty_surface(cp):
+    """A mesh with no skin triangles returns an empty (0, 3) rather than launching anything."""
+    from cunibs.fem.solve import skin_triangle_normals
+
+    out = skin_triangle_normals(cp.zeros((4, 3), dtype=cp.float64), cp.empty((0, 3), cp.int32))
+    assert out.shape == (0, 3)
+
+
 def test_tet_lowest_node_matches_a_numpy_gather(cp):
     """The Morton sort key: the smallest permuted node index over a tetrahedron's four nodes."""
     from cunibs.solver import tet_lowest_node

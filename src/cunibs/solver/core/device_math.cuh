@@ -21,6 +21,10 @@ template <typename T, typename Index = int>
 using Vec3View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3>>;
 template <typename T, typename Index = int>
 using Tet4View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 4>>;
+// (n_tri, 3) surface connectivity. Same shape as a Vec3View, spelled apart from it because its
+// entries are node ids rather than components of one vector.
+template <typename T, typename Index = int>
+using Tri3View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3>>;
 // (n_tet, 4, 3): the P1 basis gradient of corner i of tetrahedron e. Also addressable per
 // corner c = 4e + i through a Vec3View, which is how the corner-centric kernels read it.
 template <typename T, typename Index = int>

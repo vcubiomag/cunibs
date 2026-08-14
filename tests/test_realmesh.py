@@ -75,9 +75,9 @@ def test_patch_multi_tissue_conductivity_mapping(cp, patch_subject):
 
 
 @pytest.mark.realmesh
-def test_patch_skin_normals_point_outward(patch_mesh, patch_manifest):
+def test_patch_skin_normals_point_outward(patch_mesh, patch_manifest, patch_skin_normals):
     """All 1125 smoothed normals face away from the crop centre — no inverted triangles."""
-    normals = patch_mesh.skin_triangle_normals
+    normals = patch_skin_normals
     centroids = patch_mesh.nodes_mm[patch_mesh.skin_tris].mean(axis=1)
     outward = centroids - np.asarray(patch_manifest["center_mm"])
     np.testing.assert_allclose(np.linalg.norm(normals, axis=1), 1.0, atol=1e-12)
