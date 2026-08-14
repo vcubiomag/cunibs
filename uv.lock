@@ -54,7 +54,7 @@ dev = [
 requires-dist = [
     { name = "cuda-pathfinder", specifier = ">=1.5,<2" },
     { name = "cuda-toolkit", extras = ["cudart"], specifier = ">=13.0,<14" },
-    { name = "cupy-cuda13x", specifier = ">=14.0.0" },
+    { name = "cupy-cuda13x", extras = ["ctx"], specifier = ">=14.0.0" },
     { name = "h5py", specifier = ">=3.10.0" },
     { name = "numpy", specifier = ">=1.26.0" },
 ]
