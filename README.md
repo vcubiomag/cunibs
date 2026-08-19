@@ -348,8 +348,9 @@ uq_result.tissue_sensitivity("peak")  # variance share per tissue tag
 ```
 
 `tissue_sensitivity` regresses the log of a per-draw scalar (`"peak"`,
-`"focality"`, or an ROI name) on the log conductivity draws. It is a first-order
-linear-in-log index on the i.i.d. ensemble, not a Saltelli Sobol estimate.
+`"focality"`, or an ROI name) on the log conductivity draws. It is a
+prior-weighted linear-in-log index on the i.i.d. ensemble, not a Sobol estimator;
+it does not capture interactions or departures from log-linearity.
 
 Results save to HDF5 with `uq_result.save(path)` and load with
 `ConductivityUQResult.load(path)`.

@@ -33,8 +33,9 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
 
     Regresses ``log`` of the chosen per-draw scalar on the ``log`` conductivity draws. Because the
     ensemble is i.i.d., the inputs are independent, so ``beta_j^2·Var(log σ_j)/Var(log y)`` is tag
-    ``j``'s first-order (Sobol) share of the output variance under a local log-linear response. It
-    is not a Saltelli Sobol estimate and captures only the linear-in-log part of the sensitivity.
+    ``j``'s prior-weighted contribution under the fitted log-linear response, normalized by the
+    observed log-output variance. It is not a Sobol estimator and captures neither interactions nor
+    departures from log-linearity.
     """
     if output == "peak":
         y = result.peak_samples
@@ -156,9 +157,9 @@ class ConductivityUQResult:
         """First-order share of each perturbed tissue in a per-draw output's variance.
 
         ``output`` is ``"peak"``, ``"focality"``, or the name of an ROI the run recorded.
-        Regressing the log output on the log conductivity draws gives each tag's first-order
-        share under a local log-linear response; it captures only the linear-in-log part of
-        the sensitivity and is not a Saltelli Sobol estimate.
+        Regressing the log output on the log conductivity draws gives each tag's prior-weighted
+        contribution under the fitted log-linear response. It is not a Sobol estimator and
+        captures neither interactions nor departures from log-linearity.
         """
         return _tissue_sensitivity(self, output)
 
