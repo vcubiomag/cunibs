@@ -2,15 +2,11 @@
 
 [![pypi](https://img.shields.io/pypi/v/cunibs)](https://pypi.python.org/pypi/cunibs)
 
-cuNIBS computes the electric field induced by transcranial magnetic stimulation
-(TMS) in a tetrahedral head model. It solves the magneto-quasistatic
-finite-element problem on the GPU with first-order elements, magnetic dipole coil
-models, and a mixed-precision conjugate-gradient solve preconditioned by an
-aggregation-AMG V-cycle. The mesh and the AMG hierarchy stay on the GPU and are
-reused across coil placements, so a sweep pays the setup cost once.
-
-It supports isotropic conductivity models, conductivity uncertainty
-quantification, coil-placement optimization, and NVIDIA GPUs.
+cuNIBS computes transcranial magnetic stimulation (TMS) electric fields in
+tetrahedral head models. Use it for a single placement simulation, repeated
+placement studies, conductivity uncertainty analysis, and coil-placement
+optimization on NVIDIA GPUs. See the accompanying manuscript for the numerical
+method and its validation.
 
 ## Installation
 
@@ -18,12 +14,13 @@ quantification, coil-placement optimization, and NVIDIA GPUs.
 python -m pip install cunibs
 ```
 
-Requires Python 3.12 or later and an NVIDIA GPU. Wheels are published for x86-64
-Linux and Windows, for CPython 3.12 through 3.14 including free-threaded 3.14.
-The install pulls the CUDA 13 toolkit wheels and cupy, so no system CUDA
-installation is needed, but the driver must support CUDA 13 (r580 or later).
+cuNIBS requires Python 3.12 or later, an NVIDIA GPU, and a driver compatible
+with CUDA 13 (r580 or later). Wheels are available for x86-64 Linux and Windows,
+for CPython 3.12 through 3.14, including free-threaded Python 3.14. The package
+installs the required CUDA and CuPy wheels; a separate CUDA toolkit installation
+is not required.
 
-## Quickstart
+## Quick start
 
 ```python
 from cunibs import Placement, Subject
@@ -45,27 +42,26 @@ print(result.peak_location_mm())
 print(result.focality(frac=0.5))
 ```
 
-`center_mm` is the scalp target and `handle_mm` is a point in the positive
-handle direction. cuNIBS projects the target onto the scalp, builds the coil
-frame from the local surface normal, and offsets by `distance_mm` along that
-normal. A handle lying on the normal itself leaves the rotation about the normal
-undefined and is rejected.
+`center_mm` is the intended scalp target and `handle_mm` specifies the positive
+handle direction. cuNIBS projects the target onto the scalp and places the coil
+`distance_mm` above the local surface. The handle point must not lie on the
+surface normal through the target.
 
-`didt` is the stimulator's current rate of change in A/s. The field is linear in
-it. Each bundled coil carries its rated peak as `coil.didt_max`.
+`didt` is the coil-current rate of change in A/s. Fields scale linearly with
+this value. Bundled coil models provide their rated peak value as
+`coil.didt_max`.
 
 ## Input data
 
 ### Head mesh
 
-`Subject.from_mesh` reads binary Gmsh 2.2 files with first-order tetrahedra and
-an oriented scalp surface (tag `1005`). Coordinates are read as millimetres.
-Volume tags select the built-in conductivities. Unrecognized volume tags,
-invalid node references, and non-finite coordinates are rejected during loading;
-solver setup rejects zero-volume tetrahedra. Surface triangles with unrelated
-tags are ignored.
+`Subject.from_mesh` reads binary Gmsh 2.2 meshes containing first-order
+tetrahedra and an oriented scalp surface with tag `1005`. Coordinates must be in
+millimetres. The volume tag selects the built-in tissue conductivity; unrelated
+surface triangles are ignored. Invalid mesh references, non-finite coordinates,
+and zero-volume tetrahedra are rejected.
 
-Generate individualized models with the SimNIBS
+Create individualized head models with the SimNIBS
 [CHARM](https://simnibs.github.io/simnibs/build/html/documentation/command_line/charm.html)
 pipeline:
 
@@ -73,11 +69,11 @@ pipeline:
 charm subject_id T1w.nii.gz T2w.nii.gz
 ```
 
-CHARM writes `m2m_subject_id/subject_id.msh`. A T1-weighted scan is enough, but
-a T2-weighted scan improves skull segmentation. Inspect the segmentation before
-simulating.
+CHARM writes `m2m_subject_id/subject_id.msh`. A T1-weighted image is sufficient;
+a T2-weighted image can improve skull segmentation. Inspect the segmentation
+before simulation.
 
-Conductivities follow the standard SimNIBS values:
+The built-in conductivities match the standard SimNIBS values.
 
 | Tag | Tissue | Conductivity (S/m) | Source |
 | ---: | --- | ---: | --- |
@@ -92,13 +88,12 @@ Conductivities follow the standard SimNIBS values:
 | 9 | Blood | 0.600 | Gabriel et al. (2009) |
 | 10 | Muscle | 0.160 | Gabriel et al. (2009) |
 
-### Coil model
+### Coil models
 
-The package bundles the 25 validated coil models of Drakaki et al. (2022),
-available as constants in `cunibs.coil` and loaded with `Coil.load`. Dipole
-positions are in metres and moments in A m².
-
-Convert a SimNIBS CCD coil to the HDF5 dipole format:
+The package includes the 25 validated coil models from Drakaki et al. (2022).
+Import a bundled-model constant from `cunibs.coil` and pass it to `Coil.load`.
+Custom coil models use an HDF5 dipole format, with positions in metres and
+moments in A m². Convert a SimNIBS CCD coil as follows:
 
 ```python
 from pathlib import Path
@@ -109,10 +104,10 @@ encode_ccd(Path("coil.ccd"), Path("coil.h5"))
 coil = Coil.load("coil.h5")
 ```
 
-## Sweeping placements
+## Simulating placements
 
-`simulate` takes one placement. `iter_simulate` streams many, reusing the
-assembled system and the AMG hierarchy:
+Use `simulate` for one placement. Use `iter_simulate` for a sequence; it yields
+results in input order and reuses the subject setup.
 
 ```python
 placements = [
@@ -124,15 +119,13 @@ for result in subject.iter_simulate(coil, placements, didt=1.0e6):
     print(result.peak_magnE())
 ```
 
-It is a generator: nothing is computed until you iterate, results come back in
-the order given, and each is freed as the loop advances. Peak memory is bounded
-by one block rather than by the sweep length. Wrap it in `list()` to collect
-everything, which is always safe for summaries.
+The iterator computes results only as they are requested. It releases each
+result as the loop advances unless you retain it. Use `list(...)` when all
+results are needed in memory.
 
-Placements are solved in blocks that share one stiffness and hierarchy read per
-block. `block_k` sets the block width (default 8, `1` solves one at a time) and
-also caps peak memory when fields are retained. It is a throughput and memory
-knob only; the same placement returns the same field at any width, bit for bit.
+`block_k` controls how many placements are processed together (default `8`).
+Reduce it to lower peak memory use, or increase it when GPU memory permits. It
+does not change the field returned for a placement.
 
 ```python
 for result in subject.iter_simulate(coil, placements, didt=1.0e6, block_k=4):
@@ -141,9 +134,8 @@ for result in subject.iter_simulate(coil, placements, didt=1.0e6, block_k=4):
 
 ### Many subjects
 
-A `Subject` holds its solver context and AMG hierarchy on the GPU for its
-lifetime. Use the context manager (or `subject.free()`) to release that memory
-between subjects:
+A `Subject` retains GPU resources until it is freed. Use a context manager, or
+call `subject.free()`, when processing multiple meshes.
 
 ```python
 from pathlib import Path
@@ -151,12 +143,12 @@ from pathlib import Path
 for mesh_file in Path("subjects").glob("m2m_*/*.msh"):
     with Subject.from_mesh(mesh_file) as subject:
         result = subject.simulate(coil, placement, didt=1.0e6)
-        ...  # collect results
+        print(result.peak_magnE())
 ```
 
 ## Results
 
-Every `FieldResult` carries `summary`, the gray-matter metrics:
+Each `FieldResult` provides gray-matter summary metrics by default:
 
 ```python
 result.peak_magnE()
@@ -164,16 +156,13 @@ result.focality(0.5)
 result.summary["distribution"]["p99"]
 ```
 
-The metric API reports the peak field, peak location, stimulated volume,
+The metric API includes peak field and location, stimulated volume,
 field-weighted centre of gravity, and volume-weighted distribution statistics.
-`peak_magnE()` is the true maximum of `|E|`. Focality is measured against the
-volume-weighted 99.9th percentile instead, since on a tetrahedral mesh the true
-maximum is routinely set by a single sliver element at a tissue boundary:
-`focality(0.5)` is the volume with `|E|` at or above half that percentile.
+`peak_magnE()` reports the maximum `|E|`. `focality(frac)` reports the volume at
+or above `frac` times the volume-weighted 99.9th percentile of `|E|`.
 
-Full-volume arrays are opt-in, because they are what makes a result large. On a
-4M-tetrahedron model the three together are about 70 MB (`E` 69%, `magnE` 23%,
-`v` 8%); with none of them a result is about a kilobyte. Ask for what you need:
+Full-volume arrays are not retained unless requested. Request only the data
+needed for downstream analysis:
 
 ```python
 result = subject.simulate(coil, placement, didt=1.0e6, magnitude=True)
@@ -184,39 +173,35 @@ for result in subject.iter_simulate(
     ...
 ```
 
-`result.magnE`, `result.E` and `result.v` are `None` when not requested.
-Retaining `magnitude` also unlocks the two metrics a precomputed summary cannot
-answer, `summary_for(region)` for a non-default tissue and `focality(frac)` at an
-arbitrary fraction:
+`result.magnE`, `result.E`, and `result.v` are `None` unless the corresponding
+array was requested. Retaining `magnitude` also enables `summary_for(region)`
+for a non-default tissue and `focality(frac)` at an arbitrary fraction.
 
 ```python
 gray_matter = result.summary_for("gray_matter")
 whole_model = result.summary_for("all")
 ```
 
-Results are always NumPy. For device-resident fields, call
+Results are returned as NumPy arrays. For device-resident fields, use
 `cunibs.fem.solve_placements_block` directly.
-
-`FieldResult` contains:
 
 | Attribute | Description | Units |
 | --- | --- | --- |
 | `E` | Electric field per tetrahedron | V/m |
 | `magnE` | Electric-field magnitude per tetrahedron | V/m |
 | `v` | Electric scalar potential per node | V |
-| `transform` | Coil-to-head affine matrix | translation in mm |
+| `transform` | Coil-to-head affine transform | translation in mm |
 | `vols` | Tetrahedron volumes | m³ |
 | `tet_tags` | Volume tissue tags | dimensionless |
 | `barycenters_mm` | Tetrahedron barycentres | mm |
-| `didt` | Coil current rate of change | A/s |
-| `recovery` | Which post-processing produced `E`/`magnE`/`summary` | dimensionless |
-| `E_slots` | Recovered field per slot, with `nodal=True` | V/m |
-| `slot_node` | Mesh node each slot belongs to, with `nodal=True` | dimensionless |
-| `slot_tag` | Tissue tag each slot belongs to, or `None` when slots are nodes | dimensionless |
-| `n_nodes` | Mesh node count, so `nodal_field` can size its output | dimensionless |
+| `didt` | Coil-current rate of change | A/s |
+| `recovery` | Recovery method used for `E`, `magnE`, and `summary` | dimensionless |
+| `E_slots` | Recovered field per slot when `nodal=True` | V/m |
+| `slot_node` | Mesh node for each slot when `nodal=True` | dimensionless |
+| `slot_tag` | Tissue tag for each slot, or `None` for node slots | dimensionless |
+| `n_nodes` | Mesh node count | dimensionless |
 
-Save a result and its metric inputs to HDF5. Fields that were not retained are
-absent from the file and load back as `None`:
+Save a result and its retained fields to HDF5:
 
 ```python
 result.save("placement.h5")
@@ -226,80 +211,52 @@ from cunibs import FieldResult
 loaded = FieldResult.load("placement.h5")
 ```
 
+Fields that were not retained are absent from the file and load as `None`.
+
 ## Field recovery
 
-The raw finite-element field is constant over each tetrahedron. `recovery=`
-post-processes it by fitting a local patch around each node and interpolating
-from there, the same step SimNIBS applies before mapping a field to a surface or
-volume.
+The raw finite-element field is constant within each tetrahedron. The
+`recovery` argument selects the reported field:
+
+| `recovery` | Use case |
+| --- | --- |
+| `"harmonic"` | Default. Use for cuNIBS analyses, particularly near tissue interfaces. |
+| `"raw"` | Use the unprocessed per-tetrahedron field. |
+| `"spr_tissue"` | Use when comparing with SimNIBS surface or volume overlays. |
+| `"spr_global"` | Use the SimNIBS `continuous=True` convention. |
 
 ```python
 result = subject.simulate(coil, placement, didt=1.0e6, magnitude=True)
-
-result.magnE  # |E| of the recovered field
-result.recovery  # "harmonic"
-
 raw = subject.simulate(coil, placement, didt=1.0e6, magnitude=True, recovery="raw")
 ```
 
-`E`, `magnE` and `summary` all describe whichever field the mode selected. The
-raw field is not additionally retained.
-
-| `recovery` | What it does |
-| --- | --- |
-| `"harmonic"` | Recovers the potential in the space of harmonic polynomials and differentiates it. **The default**, and the most accurate mode at a tissue interface. |
-| `"raw"` | The per-tetrahedron field straight from the solve. Its peak is the largest element average rather than a value at a point, so it reads high and moves with mesh resolution. |
-| `"spr_tissue"` | Zienkiewicz-Zhu superconvergent patch recovery (Zienkiewicz and Zhu, 1992) with each patch restricted to one tissue. **What SimNIBS's surface and volume overlays report**, so use it when comparing against them. Its boundary rule is SimNIBS's too: wherever the cropped tissue ends, including at every tissue interface, each side takes its own one-sided volume-weighted average rather than a fit. |
-| `"spr_global"` | The same fit over patches spanning every incident tetrahedron regardless of tissue. Corresponds to SimNIBS's `continuous=True`. |
-
-`E` is discontinuous at a tissue boundary, since `J_n = σE_n` is
-continuous and the normal component of `E` jumps by the conductivity ratio. A
-single value per node cannot represent a two-valued field, so `"spr_global"` does
-not converge there however fine the mesh. `"spr_tissue"` averages instead of
-fitting there and converges at first order; `"harmonic"` fits and converges at
-roughly 1.7. On a reference head mesh 62% of nodes have a mixed-tissue patch and
-90% of gray-matter tetrahedra touch one, so 81% of `"spr_tissue"`'s slots are
-volume averages.
-
-Inside a region of constant conductivity the potential is harmonic, so the fit
-runs in the harmonic polynomials rather than all of them: 16 of the 20 cubics,
-dropping to 9 of the 10 quadratics on a patch too small to carry the cubic. That
-constraint is also what makes the fit well posed at an interface, where the
-same-tissue patch is a half-ball and cannot see the curvature normal to the flat
-side. The assumption is specific to this formulation, with the source outside the
-head; it would not carry to a problem with interior current sources.
-
-Recovery costs one extra pass over the mesh per placement. Its patch weights are
-built once per subject on first use and reused across placements.
+`E`, `magnE`, and `summary` always describe the selected recovery method. The
+raw field is not retained alongside a recovered field.
 
 ### Nodal fields
 
-A recovered field also exists on the mesh nodes, which interpolating onto
-a cortical surface needs:
+Request `nodal=True` when interpolating a recovered field to a cortical surface
+or another node-based representation:
 
 ```python
 result = subject.simulate(coil, placement, magnitude=True, nodal=True)
 
-result.nodal_field()  # (n_nodes, 3) gray matter, NaN where it does not reach
-result.nodal_field("csf")  # the CSF-side value at the same nodes
+gray_field = result.nodal_field()
+csf_field = result.nodal_field("csf")
 ```
 
-For the tissue-restricted modes the field lives on (node, tissue) slots rather
-than nodes, since it is two-valued at a boundary. `nodal_field` returns one row
-per mesh node carrying the requested tissue's value, and NaN where that tissue
-does not reach. `region="all"` is rejected for those modes rather than silently
-picking one of the two values. `E_slots`, `slot_node` and `slot_tag` expose the
-underlying slot arrays.
+For tissue-restricted recovery, a boundary node can hold one value for each
+incident tissue. `nodal_field(region)` returns the requested tissue value and
+uses `NaN` where that tissue does not reach the node. `region="all"` is not
+available for these recovery modes. `E_slots`, `slot_node`, and `slot_tag`
+provide the underlying arrays.
 
 ## Conductivity uncertainty quantification
 
-`simulate_conductivity_uq` runs a Monte Carlo analysis over tissue
-conductivities for one placement or a sequence, configured by a
-`ConductivityUQConfig`. Each tissue is an independent random variable with the
-nominal conductivity as its mean and a coefficient of variation you supply;
-draws are lognormal by default, which keeps conductivities positive. The result
-reports per-tetrahedron mean, standard deviation, and coefficient of variation of
-`|E|`.
+`simulate_conductivity_uq` estimates the effect of uncertain tissue
+conductivities for one placement or a placement sequence. Configure independent
+tissue distributions with `ConductivityUQConfig`; conductivities are sampled
+from lognormal distributions by default.
 
 ```python
 from cunibs import ConductivityUQConfig, Placement, Subject
@@ -320,18 +277,12 @@ print(uq_result.peak_mean_magnE())
 print(uq_result.max_local_cov())
 ```
 
-The result carries its `summary` the same way a `FieldResult` does. Pass
-`moments=True` to also retain the per-tetrahedron moment arrays; they are kept or
-dropped together, since the metrics need both the mean and the CoV and the third
-follows from those two. `mean_magnE`, `std_magnE` and `cov_magnE` then use the
-same tetrahedron ordering as `FieldResult.magnE`.
-`iter_simulate_conductivity_uq` streams a sequence of placements the same way
-`iter_simulate` does.
+The result includes summary metrics for the per-tetrahedron mean field. Pass
+`moments=True` to retain `mean_magnE`, `std_magnE`, and `cov_magnE` arrays.
+Use `iter_simulate_conductivity_uq` to stream placements.
 
-`peak_mean_magnE` and `max_local_cov` are metrics *of* the moment fields, not
-moments of a metric. For a nonlinear metric such as the peak or focality, the
-metric of the mean is not the mean of the metric over the ensemble. Use the
-per-draw arrays to characterize how a scalar is distributed across draws:
+For statistics of scalar outcomes across draws, record regions of interest or
+use the supplied sample arrays:
 
 ```python
 m1 = subject.roi([-45.0, -5.0, 25.0], radius_mm=5.0, region="gray_matter")
@@ -340,29 +291,25 @@ uq_result = subject.simulate_conductivity_uq(
     coil, placement, config, didt=1.0e6, record_rois={"M1": m1}
 )
 
-uq_result.roi_samples["M1"]  # (n_samples,) per-draw ROI mean |E| (V/m)
-uq_result.peak_samples  # (n_samples,) per-draw gray-matter peak |E|
-uq_result.focality_samples  # (n_samples,) per-draw stimulated volume (m³)
-uq_result.peak_location_samples  # (n_samples, 3) per-draw peak location (mm)
-uq_result.tissue_sensitivity("peak")  # variance share per tissue tag
+uq_result.roi_samples["M1"]
+uq_result.peak_samples
+uq_result.focality_samples
+uq_result.peak_location_samples
+uq_result.tissue_sensitivity("peak")
 ```
 
-`tissue_sensitivity` regresses the log of a per-draw scalar (`"peak"`,
-`"focality"`, or an ROI name) on the log conductivity draws. It is a
-prior-weighted linear-in-log index on the i.i.d. ensemble, not a Sobol estimator;
-it does not capture interactions or departures from log-linearity.
+`peak_mean_magnE` and `max_local_cov` summarize the moment fields, rather than
+the distribution of a metric across draws. `tissue_sensitivity` is a
+prior-weighted linear-in-log sensitivity index, not a Sobol estimator.
 
-Results save to HDF5 with `uq_result.save(path)` and load with
+Save and load uncertainty results with `uq_result.save(path)` and
 `ConductivityUQResult.load(path)`.
 
 ## Coil-placement optimization
 
-`cunibs.adm` implements the Auxiliary Dipole Method (Gomez et al., 2021). A few
-one-time adjoint solves, reusing the forward AMG hierarchy, sample a reciprocity
-field on a regular grid. The target E-field of any placement is then a trilinear
-interpolation plus a dipole sum, with no further FEM solve. This evaluates
-candidates orders of magnitude faster than a forward solve each, and matches a
-forward solve at the optimum to a relative error of 4e-4.
+`cunibs.adm` implements the Auxiliary Dipole Method (Gomez et al., 2021) for
+searching candidate coil positions and in-plane rotations without a forward FEM
+solve for every candidate.
 
 ```python
 import numpy as np
@@ -373,52 +320,43 @@ from cunibs.coil import Coil, MAGSTIM_D70
 subject = Subject.from_mesh("subject.msh")
 coil = Coil.load(MAGSTIM_D70)
 
-# Omit `direction` to maximize |E| (three adjoint solves), or pass one to
-# maximize a directional component.
 target = Target(position_mm=[-45.0, -5.0, 25.0], region="gray_matter")
-
-# Candidate scalp positions to search (each is projected onto the scalp).
 centers = np.array([[x, y, 80.0] for x in range(-30, 31, 5) for y in range(-30, 31, 5)])
 
 result = adm.optimize(subject.context, coil, target, centers)
 
-result.best_objective  # peak |E| at the target (V/m)
-result.best_center_mm  # optimal scalp position
-result.best_angle_rad  # optimal in-plane rotation
+result.best_objective
+result.best_center_mm
+result.best_angle_rad
 ```
 
-The in-plane rotation is optimized in closed form: the target E-field is a rigid
-rotation of the coil, so each component is band-limited in the angle. It is
-sampled at `n_samples` angles, trigonometrically interpolated, and `|E(θ)|²` is
-maximized analytically.
+Omit `Target.direction` to maximize `|E|`; provide a direction to maximize its
+component along that direction. Candidate centres are projected onto the scalp.
 
-For repeated queries against a fixed target, build the reciprocity field once and
-reuse it:
+For repeated searches with the same target and candidate centres, build and
+reuse the reciprocity field:
 
 ```python
 recip = adm.build_reciprocity(subject.context, coil, target, centers)
-E = adm.evaluate(recip, coil, placements, didt=1.0e6)  # (P, D) target E-vectors
+E = adm.evaluate(recip, coil, placements, didt=1.0e6)
 ```
 
 ## Reproducibility
 
-A placement's field is a function of the mesh, the coil, the placement, `didt`,
-the solve tolerance and the `recovery` mode, and of nothing else. It does not
-depend on `block_k`, on which other placements shared its block, or on where it
-fell in the sweep. Repeating a run reproduces it bitwise. Splitting a sweep
-across calls, resuming an interrupted one, or retuning `block_k` for a different
-GPU all leave the numbers unchanged. A conductivity-UQ draw depends on its own
-conductivity vector and not on the ensemble size or the other draws, so the same
-seed reproduces the same draws at any `n_samples`.
+A placement result is determined by the mesh, coil model, placement, `didt`,
+solve tolerance, and recovery method. It is independent of `block_k`, placement
+order, and other placements in a sweep. Repeating the same calculation on the
+same software and hardware configuration reproduces the result bitwise.
 
-Results can still differ across GPU architectures, CUDA versions, compiler
-versions, and dependency versions.
+Results can differ across GPU architectures, CUDA versions, compiler versions,
+and dependency versions. A conductivity-UQ draw depends only on its conductivity
+vector; the same seed reproduces the same draws at any `n_samples`.
 
 ## Citation
 
-No archival citation is provided yet. For reproducible academic use, cite the
-software by name, author, version, and Git commit, and archive the exact input
-mesh, coil model, and placement parameters used.
+No archival citation is available yet. For reproducible academic use, cite the
+software name, author, version, and Git commit. Archive the input mesh, coil
+model, placement parameters, and analysis settings with the study data.
 
 ## References
 
@@ -438,7 +376,7 @@ mesh, coil model, and placement parameters used.
 - Gomez, L. J., Dannhauer, M., and Peterchev, A. V. (2021). [Fast computational
   optimization of TMS coil placement for individualized electric field
   targeting](https://doi.org/10.1016/j.neuroimage.2020.117696). *NeuroImage*,
-  228, 117696. (Auxiliary Dipole Method.)
+  228, 117696.
 - Zienkiewicz, O. C., and Zhu, J. Z. (1992). [The superconvergent patch recovery
   and a posteriori error estimates. Part 1: The recovery
   technique](https://doi.org/10.1002/nme.1620330702). *International Journal for
@@ -455,8 +393,3 @@ mesh, coil model, and placement parameters used.
   (2022). [Database of 25 validated coil models for electric field simulations
   for TMS](https://doi.org/10.1016/j.brs.2022.04.017). *Brain Stimulation*,
   15(3), 697-706.
-- Naumov, M., Arsaev, M., Castonguay, P., et al. (2015). [AmgX: A library for
-  GPU accelerated algebraic multigrid and preconditioned iterative
-  methods](https://doi.org/10.1137/140980260). *SIAM Journal on Scientific
-  Computing*, 37(5), S602-S626. The aggregation selector and l1-Jacobi V-cycle
-  used here follow the algorithms described there.
