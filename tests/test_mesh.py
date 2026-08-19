@@ -54,7 +54,9 @@ def test_load_mesh_selects_skin_and_derives_geometry(tmp_path):
 
 def _disjoint_mesh(n_tets: int, tags):
     """``n_tets`` tetrahedra on disjoint node quadruples, so no node is ever reindexed away."""
-    nodes = np.arange(4 * n_tets * 3, dtype=np.float64).reshape(-1, 3)
+    unit = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    offsets = np.arange(n_tets, dtype=np.float64)[:, None, None] * np.array([2.0, 0.0, 0.0])
+    nodes = (unit + offsets).reshape(-1, 3)
     tets = np.arange(4 * n_tets, dtype=np.int32).reshape(n_tets, 4)
     return nodes, tets, np.asarray(tags, dtype=np.int32)
 
@@ -141,6 +143,22 @@ def test_parser_rejects_unknown_volume_tags(tmp_path):
         pack_msh(nodes, tets + 1, tags, np.empty((0, 3), np.int32), np.empty(0, np.int32))
     )
     with pytest.raises(ValueError, match=r"2 tetrahedra carry volume tags.*\(77: 2\)"):
+        parse_msh_binary(path)
+
+
+def test_parser_rejects_nonfinite_referenced_nodes(tmp_path):
+    nodes = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, np.nan, 0.0], [0.0, 0.0, 1.0]])
+    path = tmp_path / "invalid-geometry.msh"
+    path.write_bytes(
+        pack_msh(
+            nodes,
+            _TETS_1B,
+            _TET_TAGS,
+            np.empty((0, 3), np.int32),
+            np.empty(0, np.int32),
+        )
+    )
+    with pytest.raises(ValueError, match="1 referenced node has non-finite coordinates"):
         parse_msh_binary(path)
 
 

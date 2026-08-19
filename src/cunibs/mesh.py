@@ -269,6 +269,14 @@ def _reindex_nodes(
     return np.ascontiguousarray(nodes_xyz[unique_ids]), node_index[tet_nodes], surf_tris
 
 
+def _reject_nonfinite_nodes(nodes_mm: npt.NDArray[np.float64], path: Path) -> None:
+    """Reject referenced coordinates that cannot define finite element geometry."""
+    if not np.isfinite(nodes_mm).all():
+        n_bad = int((~np.isfinite(nodes_mm).all(axis=1)).sum())
+        subject = "referenced node has" if n_bad == 1 else "referenced nodes have"
+        raise ValueError(f"{path}: {n_bad} {subject} non-finite coordinates")
+
+
 def parse_msh_binary(mesh_file: Path) -> MeshArrays:
     """Parse a binary Gmsh 2.2 .msh file.
 
@@ -292,6 +300,7 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         nodes_mm, tet_nodes, surf_tris = _reindex_nodes(
             nodes_xyz, num_nodes, tet.nodes - 1, surface.nodes - 1, mesh_file
         )
+        _reject_nonfinite_nodes(nodes_mm, mesh_file)
         return MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surface.tags)
 
 

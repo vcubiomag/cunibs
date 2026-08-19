@@ -31,6 +31,27 @@ def test_gradient_operator_reference_tet(cp):
     np.testing.assert_allclose(cp.asnumpy(g[0].sum(0)), [0, 0, 0], atol=1e-9)
 
 
+@pytest.mark.parametrize(
+    "nodes",
+    [
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+    ],
+)
+def test_build_context_rejects_zero_volume_tetrahedra(nodes):
+    from cunibs.fem import build_context
+    from cunibs.mesh import HeadMesh
+
+    mesh = HeadMesh(
+        np.asarray(nodes),
+        np.array([[0, 1, 2, 3]], dtype=np.int32),
+        np.array([2], dtype=np.int32),
+        np.empty((0, 3), dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="1 tetrahedron has zero or non-finite volume"):
+        build_context(mesh)
+
+
 def test_stiffness_symmetric_zero_rowsum(cp, cube_mesh):
     from cunibs.fem.assembly import (
         assemble_stiffness,

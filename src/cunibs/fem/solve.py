@@ -700,6 +700,10 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     n_nodes = int(nodes_mm.shape[0])
 
     g, vols = gradient_operator(nodes_mm, tet_nodes)
+    n_invalid = int(cp.count_nonzero((vols <= 0.0) | ~cp.isfinite(vols)))
+    if n_invalid:
+        subject = "tetrahedron has" if n_invalid == 1 else "tetrahedra have"
+        raise ValueError(f"{n_invalid} {subject} zero or non-finite volume")
     cond = conductivity_per_tet(tet_tags)
     stiffness = assemble_stiffness(g, vols, cond, n_nodes, tet_nodes)
     ground_node = ground_node_of(nodes_mm)

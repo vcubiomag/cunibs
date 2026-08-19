@@ -60,8 +60,10 @@ it. Each bundled coil carries its rated peak as `coil.didt_max`.
 
 `Subject.from_mesh` reads binary Gmsh 2.2 files with first-order tetrahedra and
 an oriented scalp surface (tag `1005`). Coordinates are read as millimetres.
-Volume tags select the built-in conductivities; unrecognized volume tags and
-surface triangles are dropped on load.
+Volume tags select the built-in conductivities. Unrecognized volume tags,
+invalid node references, and non-finite coordinates are rejected during loading;
+solver setup rejects zero-volume tetrahedra. Surface triangles with unrelated
+tags are ignored.
 
 Generate individualized models with the SimNIBS
 [CHARM](https://simnibs.github.io/simnibs/build/html/documentation/command_line/charm.html)
