@@ -101,7 +101,8 @@ def stiffness_pattern(
 
     Sizing the rows takes a pass of its own, because nothing knows how many distinct columns a row
     has until its candidates are sorted, so the column index is allocated at exactly its own
-    length. The candidates themselves never leave the kernel's shared memory.
+    length. A row's candidates stay in shared memory unless its node's valence is far past a head
+    mesh's, which is the only case that materialises them.
     """
     stream = cp.cuda.get_current_stream().ptr
     indptr = cp.empty(n_nodes + 1, dtype=cp.int32)

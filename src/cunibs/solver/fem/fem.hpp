@@ -34,8 +34,8 @@ void launch_tet_lowest_node(const int* inverse, const int* tet_nodes, int* lowes
 // Each builder comes in two halves, because how many distinct values a segment holds is not known
 // until it has been sorted. `count` fills out_ptr with the exclusive scan of the row lengths and
 // returns nnz, which is the length the caller then allocates out_idx at; `fill` writes the rows
-// out_ptr describes. The candidates themselves never reach global memory. Both halves synchronise
-// the stream.
+// out_ptr describes. A segment's candidates stay in shared memory unless it is far wider than a
+// head mesh's, which is the only case that materialises them. Both halves synchronise the stream.
 
 // Distinct nodes of the tetrahedra in each segment of a corner CSR (c = 4e + i). ptr/idx is
 // rhs.cu's node2corner map for the stiffness pattern, or a per-(node, tissue) corner CSR for the

@@ -695,38 +695,120 @@ def test_exported_block_widths_are_the_ones_the_solver_accepts(cp, cube_subject)
     assert tuple(accepted) == tuple(BLOCK_SIZES)
 
 
-def test_pattern_handles_a_segment_too_wide_for_the_shared_block(cp):
-    """A high-valence node forces the one-warp-per-block path, which no head mesh reaches.
+def _fan_mesh(n_fan, *, extra_tets=0):
+    """A centre node joined to a ring of ``n_fan`` triangles, so its valence is ``n_fan``.
 
-    The segment CSR builders sort each segment in shared memory, reserving the widest segment's
-    padded width per warp. Past what four warps can hold they fall to a warp per block; a head mesh
-    stays two orders of magnitude under that, so only a fixture like this covers the branch.
+    This is how an analytic sphere is built -- ``metrics/_analytic.ball_mesh`` fills the core with
+    exactly this fan -- which is why the shape has to work rather than merely not crash. The
+    centre's segment is four candidates per incident tetrahedron.
+
+    ``extra_tets`` appends disjoint unit tetrahedra whose nodes have ordinary valence, so one mesh
+    carries segments from both width classes.
     """
-    from cunibs.fem.assembly import build_node2corner, stiffness_pattern
-
-    # A fan of tetrahedra all sharing node 0, so its segment is four candidates per tet.
-    n_fan = 900
     angle = np.linspace(0.0, 2.0 * np.pi, n_fan + 1)[:-1]
     ring = np.stack([np.cos(angle), np.sin(angle), np.zeros(n_fan)], axis=1)
     nodes = np.vstack([[0.0, 0.0, 0.0], ring, [0.0, 0.0, 1.0]])
     apex = len(nodes) - 1
-    tets = np.array(
-        [[0, apex, 1 + i, 1 + ((i + 1) % n_fan)] for i in range(n_fan)], dtype=np.int32
-    )
+    tets = [[0, apex, 1 + i, 1 + ((i + 1) % n_fan)] for i in range(n_fan)]
+
+    unit = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    for e in range(extra_tets):
+        base = len(nodes)
+        nodes = np.vstack([nodes, unit + np.array([10.0 + 2.0 * e, 0.0, 0.0])])
+        tets.append([base, base + 1, base + 2, base + 3])
+    return nodes, np.array(tets, dtype=np.int32)
+
+
+def _expected_pattern(n_nodes, tets):
+    """The same CSR by a different route: every (corner, corner) pair of every tetrahedron.
+
+    Written without a per-node scan of the mesh so the widest fixtures below stay quick -- the
+    obvious ``tets[np.any(tets == n)]`` loop is quadratic and dominates their runtime.
+    """
+    owner = np.repeat(tets, 4, axis=1).reshape(-1)
+    other = np.tile(tets, (1, 4)).reshape(-1)
+    pairs = np.unique(owner.astype(np.int64) * n_nodes + other)
+    rows, cols = np.divmod(pairs, n_nodes)
+    counts = np.bincount(rows, minlength=n_nodes)
+    return np.concatenate([[0], np.cumsum(counts)]), cols.astype(np.int32)
+
+
+def _assert_pattern_matches_numpy(cp, nodes, tets):
+    """Build the stiffness pattern on the device and return the mesh's widest segment."""
+    from cunibs.fem.assembly import build_node2corner, stiffness_pattern
 
     d_tets = cp.asarray(tets)
     ptr, idx = build_node2corner(d_tets, len(nodes))
-    # Four warps sharing 48 KB get 3072 int32 slots each, and the buffer is padded to a power of
-    # two, so this fixture's widest segment is over the line.
-    widest = int(cp.diff(ptr).max()) * 4
-    assert 1 << (widest - 1).bit_length() > 3072
-
     a = stiffness_pattern(d_tets, len(nodes), ptr, idx)
-    expected = [np.unique(tets[np.any(tets == n, axis=1)]) for n in range(len(nodes))]
-    np.testing.assert_array_equal(
-        cp.asnumpy(a.indptr), np.concatenate([[0], np.cumsum([len(e) for e in expected])])
+    want_ptr, want_idx = _expected_pattern(len(nodes), tets)
+    np.testing.assert_array_equal(cp.asnumpy(a.indptr), want_ptr)
+    np.testing.assert_array_equal(cp.asnumpy(a.indices), want_idx)
+    return int(cp.diff(ptr).max()) * 4
+
+
+# kFastPad in pattern.cu: the widest padded segment four warps hold in 48 KB, and so the boundary
+# between the shared-memory class and the global-memory one.
+_FAST_PAD = 2048
+
+# Fan sizes on both sides of that boundary. 400 sorts in shared memory at 1600 candidates; 20480 is
+# the centre node of ball_mesh(5), the finest rung of the analytic sphere ladder, at 81920.
+_FAN_SIZES = [400, 900, 20480]
+
+
+def test_fan_sizes_straddle_the_segment_class_boundary():
+    """The widths below only cover both classes as long as they sit either side of kFastPad."""
+    assert 4 * min(_FAN_SIZES) <= _FAST_PAD < 4 * max(_FAN_SIZES)
+
+
+@pytest.mark.parametrize("n_fan", _FAN_SIZES)
+def test_pattern_builds_segments_of_any_width(cp, n_fan):
+    """Node valence is not capped: a segment of any width builds the row a numpy scan gives."""
+    nodes, tets = _fan_mesh(n_fan)
+    assert _assert_pattern_matches_numpy(cp, nodes, tets) == 4 * n_fan
+
+
+def test_pattern_wide_segment_does_not_widen_the_narrow_ones(cp):
+    """A mesh carrying both classes: the wide segment must not disturb the ordinary rows.
+
+    The two classes sort by different primitives, so a mesh whose widest node is far past the
+    boundary is what shows the narrow rows still come out right beside it.
+    """
+    nodes, tets = _fan_mesh(6000, extra_tets=64)
+    _assert_pattern_matches_numpy(cp, nodes, tets)
+
+
+def test_patch_csr_builds_a_wide_segment(cp):
+    """The patch gather reaches the same sort through a different gather, so it needs its own
+    segment past the shared-memory class."""
+    from cunibs.solver import count_patch_csr, fill_patch_csr
+
+    # One slot whose first ring is wide enough to land in the global class, plus narrow ones.
+    wide, narrow = 5000, 8
+    r1_ptr = np.array([0, wide, wide + narrow, wide + 2 * narrow], dtype=np.int32)
+    rng = np.random.default_rng(0)
+    r1_idx = np.concatenate(
+        [
+            rng.permutation(wide).astype(np.int32),
+            rng.integers(0, wide, narrow).astype(np.int32),
+            rng.integers(0, wide, narrow).astype(np.int32),
+        ]
     )
-    np.testing.assert_array_equal(cp.asnumpy(a.indices), np.concatenate(expected))
+    # Each entry's neighbour slot; only consulted for rings under min_nodes, which is 0 here.
+    neighbour = np.zeros(r1_idx.shape[0], dtype=np.int32)
+
+    d_ptr, d_idx = cp.asarray(r1_ptr), cp.asarray(r1_idx)
+    d_nb = cp.asarray(neighbour)
+    stream = cp.cuda.get_current_stream().ptr
+    out_ptr = cp.empty(len(r1_ptr), dtype=cp.int32)
+    nnz = count_patch_csr(d_ptr, d_idx, d_nb, 0, out_ptr, stream)
+    out_idx = cp.empty(nnz, dtype=cp.int32)
+    fill_patch_csr(d_ptr, d_idx, d_nb, 0, out_ptr, out_idx, stream)
+
+    expected = [np.unique(r1_idx[r1_ptr[s] : r1_ptr[s + 1]]) for s in range(len(r1_ptr) - 1)]
+    np.testing.assert_array_equal(
+        cp.asnumpy(out_ptr), np.concatenate([[0], np.cumsum([len(e) for e in expected])])
+    )
+    np.testing.assert_array_equal(cp.asnumpy(out_idx), np.concatenate(expected))
 
 
 def _smoothed_skin_normals(nodes_mm, tris, *, rounds=2):
