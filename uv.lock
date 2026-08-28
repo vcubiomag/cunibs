@@ -58,7 +58,7 @@ nvrtc = [
 
 [[package]]
 name = "cunibs"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "cuda-pathfinder" },
