@@ -8,9 +8,13 @@ import numpy as np
 import pytest
 
 from cunibs import coil as coil_registry
-from cunibs.coil import Coil, _decode_attr, encode_ccd
+from cunibs.coil import Coil, _decode_attr, bundled_coils, encode_ccd
 
-BUNDLED = sorted(
+BUNDLED = sorted(bundled_coils().items())
+
+# The module constants are the documented way to name a coil, so they have to agree with what the
+# directory holds; a renamed file would leave a constant pointing at nothing.
+_CONSTANTS = sorted(
     (name, value)
     for name, value in vars(coil_registry).items()
     if not name.startswith("_") and name.isupper() and isinstance(value, Path)
@@ -67,6 +71,28 @@ def test_bundled_didt_max_is_in_a_per_s():
 
 def test_registry_is_not_empty():
     assert len(BUNDLED) >= 25
+
+
+def test_registry_and_module_constants_agree():
+    """Both name the same set, so neither can drift without the other."""
+    assert {p for _, p in _CONSTANTS} == set(bundled_coils().values())
+
+
+def test_bundled_coils_is_reachable_from_the_top_level():
+    """Enumerating the models is the discovery path, so it has to be visible on `cunibs`."""
+    import cunibs
+
+    assert cunibs.bundled_coils() == bundled_coils()
+    assert "bundled_coils" in cunibs.__all__
+
+
+def test_repr_names_the_coil_rather_than_dumping_its_dipoles():
+    """A dataclass repr prints both tables in full, which is what enumerating the set would show."""
+    c = Coil.load(coil_registry.MAGSTIM_D70)
+    text = repr(c)
+    assert text == f"Coil(name={c.name!r}, n_dipoles={c.n_dipoles}, didt_max={c.didt_max!r})"
+    assert c.n_dipoles == c.positions_m.shape[0]
+    assert "array" not in text
 
 
 @pytest.mark.parametrize("path", [p for _, p in BUNDLED], ids=[n for n, _ in BUNDLED])

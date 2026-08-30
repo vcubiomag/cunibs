@@ -63,6 +63,15 @@ class Coil:
     didt_max: float | None = None
     metadata: dict[str, str | int | float] | None = None
 
+    @property
+    def n_dipoles(self) -> int:
+        return int(self.positions_m.shape[0])
+
+    def __repr__(self) -> str:
+        return (
+            f"Coil(name={self.name!r}, n_dipoles={self.n_dipoles}, didt_max={self.didt_max!r})"
+        )
+
     @classmethod
     def load(cls, source: str | Path) -> Coil:
         """Load a coil from a bundled/encoded ``.h5`` file (see :func:`encode_ccd`)."""
@@ -80,6 +89,16 @@ class Coil:
             didt_max=None if didt_raw is None else float(didt_raw) * _CCD_DIDTMAX_TO_A_PER_S,
             metadata=attrs,
         )
+
+
+def bundled_coils() -> dict[str, Path]:
+    """Every bundled coil model, by file stem.
+
+    The stem is the name to pass :meth:`Coil.load`, and matches the module constants above. Reads
+    the directory, so it is the whole set even where a constant is missing. Load one for its
+    metadata: ``brand``, ``stimulator`` and the rest of the header live in :attr:`Coil.metadata`.
+    """
+    return {p.stem: p for p in sorted(_COILS_ROOT.glob("*.h5"))}
 
 
 def encode_ccd(ccd_file: Path, output_h5: Path) -> None:
