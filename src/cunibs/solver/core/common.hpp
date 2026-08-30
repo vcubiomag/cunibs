@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,10 @@
 
 constexpr int kBlock = 256;
 constexpr int kWarp = 32;
+
+// Every lane of a warp. No shuffle or vote in this directory is reached by a divergent subset of
+// one, so this is the mask all of them carry.
+constexpr unsigned kFullWarp = 0xffffffffu;
 
 static_assert(kBlock % kWarp == 0, "a block must be a whole number of warps");
 
@@ -48,6 +53,40 @@ inline void check_cuda(cudaError_t err, const char* origin, const char* what) {
 inline unsigned grid_for(std::int64_t total, int per = kBlock) {
     if (total <= 0) return 0;
     return static_cast<unsigned>((total + per - 1) / per);
+}
+
+// Multiprocessor count of the current device, cached because nothing here changes it. Callers use
+// it only to decide how far to split work for occupancy, so a failed query falls back to one SM
+// and costs throughput, nothing more.
+inline int sm_count() {
+    static const int count = [] {
+        int device = 0, sms = 0;
+        if (cudaGetDevice(&device) != cudaSuccess) return 1;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+            return 1;
+        }
+        return sms > 0 ? sms : 1;
+    }();
+    return count;
+}
+
+// How many blocks to split one query's brute-force scan of a triangle surface across. Such a scan
+// runs a block per (query, chunk) and reduces the chunks afterwards under an order-independent
+// rule, so this trades occupancy against reduction overhead and never changes what it returns.
+//
+// Split only while the queries alone leave SMs idle, and never past a block per
+// kMinTrisPerChunk triangles, below which the block reduction outweighs the scan it covers. A
+// surface with no triangles still gets one chunk, so that every query is written its miss.
+inline int scan_chunks(int n_queries, int n_tri) {
+    constexpr int kMinTrisPerChunk = 1024;
+    if (n_queries <= 0 || n_tri <= 0) return 1;
+    // Both round up without forming `a + b - 1`, whose overflow on a count near INT_MAX would be
+    // undefined. cuda::ceil_div avoids it by dividing unsigned; spelling it out instead keeps this
+    // header to the CUDA runtime, which is what lets the .cpp translation units include it.
+    const int sms = sm_count();
+    const int for_occupancy = sms / n_queries + (sms % n_queries != 0);
+    const int for_size = n_tri / kMinTrisPerChunk + (n_tri % kMinTrisPerChunk != 0);
+    return std::max(1, std::min(for_occupancy, for_size));
 }
 
 // Runtime k to a compile-time K. The allowed widths are spelled as template arguments so

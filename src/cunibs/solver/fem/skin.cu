@@ -1,7 +1,6 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
-#include <cuda/std/array>
 #include <cuda/std/cmath>
 
 // Smoothed outward normals for the skin surface.
@@ -19,8 +18,6 @@
 namespace {
 
 void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "skin", what); }
-
-using Vec3 = cuda::std::array<double, 3>;
 
 // Unit vector, leaving a zero vector alone. Only skin nodes are reached through the CSR, but the
 // accumulators are indexed by mesh node, so the rest stay zero and must not become NaN.
@@ -59,9 +56,9 @@ __global__ void face_normals_kernel(const double* __restrict__ nodes_mm,
         u[i] = b[i] - a[i];
         v[i] = c[i] - a[i];
     }
-    const Vec3 cross = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
-                        u[0] * v[1] - u[1] * v[0]};
-    store_vec3(Vec3View<double>(out, kUnsizedRows), t, cross);
+    Vec3 normal;
+    cross3(u.data(), v.data(), normal.data());
+    store_vec3(Vec3View<double>(out, kUnsizedRows), t, normal);
 }
 
 // One thread per node, summing the per-face vector of every triangle corner in the node's segment.

@@ -46,8 +46,20 @@ struct Vec3d {
     double x, y, z;
 };
 
+// The same three components where a caller wants to pass them around by value rather than reach
+// them by name; the geometry kernels build and fold these, the ones below take plain pointers.
+using Vec3 = cuda::std::array<double, 3>;
+
 __device__ __forceinline__ double dot3(const double* u, const double* v) {
     return u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+}
+
+// out = u x v. `out` must not alias either input: every component is written before the last is
+// read, which is why the callers that overwrite an operand stage the result first.
+__device__ __forceinline__ void cross3(const double* u, const double* v, double* out) {
+    out[0] = u[1] * v[2] - u[2] * v[1];
+    out[1] = u[2] * v[0] - u[0] * v[2];
+    out[2] = u[0] * v[1] - u[1] * v[0];
 }
 
 // grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron. Accumulated in fp64
@@ -70,6 +82,20 @@ __device__ __forceinline__ Vec3d tet_grad4(const double* __restrict__ v,
 using ConstPtrPack = cuda::std::array<const float*, kMaxStageBlock>;
 using PtrPack = cuda::std::array<float*, kMaxStageBlock>;
 
+// Host side of the same: a launcher fills the first k slots from its caller's array and leaves the
+// rest null, since a kernel only ever reads the columns it was given a k for.
+inline ConstPtrPack const_ptr_pack(const float* const* src, int k) {
+    ConstPtrPack out{};
+    for (int c = 0; c < k; ++c) out[c] = src[c];
+    return out;
+}
+
+inline PtrPack ptr_pack(float* const* src, int k) {
+    PtrPack out{};
+    for (int c = 0; c < k; ++c) out[c] = src[c];
+    return out;
+}
+
 // Fixed-order shuffle reduction of K per-lane accumulators into lane 0 of each WIDTH-wide group.
 //
 // The pairing is load-bearing: block_cg.cu's two SpMV kernels land on the same association, and a
@@ -86,7 +112,7 @@ __device__ __forceinline__ void warp_reduce_sum(cuda::std::array<T, K>& sum) {
     for (int off = WIDTH / 2; off > 0; off >>= 1) {
 #pragma unroll
         for (cuda::std::size_t c = 0; c < K; ++c) {
-            sum[c] += __shfl_down_sync(0xffffffffu, sum[c], off, WIDTH);
+            sum[c] += __shfl_down_sync(kFullWarp, sum[c], off, WIDTH);
         }
     }
 }

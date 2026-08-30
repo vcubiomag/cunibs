@@ -89,14 +89,9 @@ void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
 void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const float* g,
                               const float* const* dadt_elm, float* const* e_out,
                               float* const* magn_out, int n_tet, int k, cudaStream_t stream) {
-    ConstPtrPack in{};
-    PtrPack eo{};
-    PtrPack mo{};
-    for (int c = 0; c < k; ++c) {
-        in[c] = dadt_elm[c];
-        eo[c] = e_out[c];
-        mo[c] = magn_out[c];
-    }
+    const ConstPtrPack in = const_ptr_pack(dadt_elm, k);
+    const PtrPack eo = ptr_pack(e_out, k);
+    const PtrPack mo = ptr_pack(magn_out, k);
     if (const unsigned blocks = grid_for(n_tet)) {
         reconstruct_block_kernel<<<blocks, kBlock, 0, stream>>>(v_block, tet_nodes, g, in, eo, mo,
                                                                 n_tet, k);

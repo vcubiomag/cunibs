@@ -89,18 +89,6 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
     warp_reduce_sum<TPR>(sum);
 }
 
-// Setup-only. This only ever decides how wide to split a row, so a failed query falls back to one
-// SM and costs throughput on a small level, nothing more.
-inline int sm_count() {
-    int device = 0;
-    int count = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) return 1;
-    if (cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
-        return 1;
-    }
-    return count > 0 ? count : 1;
-}
-
 // Threads per row for one level, from that level's shape alone: deterministic, and independent of
 // k, so the same operator always gets the same split and a solve reproduces across block widths.
 inline int choose_tpr(int n_rows, int nnz, int n_sm) {

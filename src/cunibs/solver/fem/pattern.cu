@@ -43,8 +43,6 @@ static_assert(static_cast<std::size_t>(kFastPad) * sizeof(int) * kSortWarps <= k
 static_assert(std::has_single_bit(static_cast<unsigned>(kFastPad)),
               "the pad is rounded to a power of two, so the class boundary must be one");
 
-constexpr unsigned kFullWarp = 0xffffffffu;
-
 // Inclusive prefix sum across a warp; the total is the last lane's. Every lane must reach it.
 __device__ __forceinline__ int warp_scan(int v, int lane) {
 #pragma unroll

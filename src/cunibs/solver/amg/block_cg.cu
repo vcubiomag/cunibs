@@ -167,11 +167,13 @@ __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
 }
 
-// Stage 2: one block per column reduces that column's partials.
-__global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blocks,
-                                  double* __restrict__ out) {
+// Stage 2: one block per column folds that column's partials into a single total, returned to
+// every thread of the block. The two kernels below differ only in what they then do with it, and
+// the sum order here is the same for both, so which one ran cannot move a result. Every thread of
+// the block must reach this.
+__device__ __forceinline__ double bcg_reduce_column(const double* __restrict__ partials,
+                                                    int n_blocks, int c) {
     __shared__ double sdata[kBlock];
-    const int c = blockIdx.x;
     double local = 0.0;
     for (int b = threadIdx.x; b < n_blocks; b += kBlock) {
         local += partials[static_cast<std::int64_t>(c) * n_blocks + b];
@@ -182,7 +184,14 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
         if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
         __syncthreads();
     }
-    if (threadIdx.x == 0) out[c] = sdata[0];
+    return sdata[0];
+}
+
+__global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blocks,
+                                  double* __restrict__ out) {
+    const int c = blockIdx.x;
+    const double total = bcg_reduce_column(partials, n_blocks, c);
+    if (threadIdx.x == 0) out[c] = total;
 }
 
 // A column freezes at the iteration its own residual first meets tolerance, rather than at the
@@ -290,20 +299,9 @@ __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
 __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int n_blocks,
                                        const double* __restrict__ converged,
                                        double* __restrict__ rz, double* __restrict__ beta) {
-    __shared__ double sdata[kBlock];
     const int c = blockIdx.x;
-    double local = 0.0;
-    for (int b = threadIdx.x; b < n_blocks; b += kBlock) {
-        local += partials[static_cast<std::int64_t>(c) * n_blocks + b];
-    }
-    sdata[threadIdx.x] = local;
-    __syncthreads();
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
+    const double total = bcg_reduce_column(partials, n_blocks, c);
     if (threadIdx.x == 0) {
-        const double total = sdata[0];
         // beta = 0 on a frozen column pins p at zf. Left at total/rz it would be 1, since r has
         // not moved, and p would grow by zf every remaining iteration for no purpose.
         beta[c] = frozen(converged, c) ? 0.0 : total / rz[c];

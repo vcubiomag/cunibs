@@ -4,7 +4,6 @@
 #include <cub/block/block_reduce.cuh>
 #include <cuda/cmath>
 
-#include <algorithm>
 #include <cfloat>
 #include <climits>
 
@@ -22,9 +21,6 @@ namespace {
 // still defines an in-plane axis: (1e-6 rad)^2. Below it the tangential component is numerical
 // noise and the coil's rotation about the normal is arbitrary.
 constexpr double kMinSin2 = 1e-12;
-
-// Fewest triangles worth a block of its own; below this the block reduction outweighs the scan.
-constexpr int kMinTrisPerChunk = 1024;
 
 // Loses the (distance^2, index) comparison to every real triangle, so threads that scan nothing
 // need no special case.
@@ -206,15 +202,13 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
         if (fabs(z[2]) < fabs(z[m])) m = 2;
         double ref[3] = {0.0, 0.0, 0.0};
         ref[m] = 1.0;
-        y[0] = z[1] * ref[2] - z[2] * ref[1];
-        y[1] = z[2] * ref[0] - z[0] * ref[2];
-        y[2] = z[0] * ref[1] - z[1] * ref[0];
+        cross3(z, ref, y);
         const double inv = rnorm3d(y[0], y[1], y[2]);
         for (int i = 0; i < 3; ++i) y[i] *= inv;
     }
     if (degenerate != nullptr) degenerate[p] = from_handle ? 0 : 1;
-    const double x[3] = {y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2],
-                         y[0] * z[1] - y[1] * z[0]};
+    double x[3];
+    cross3(y, z, x);
 
     const TransformView o(out, n_pl);
     for (int r = 0; r < 4; ++r) {
@@ -229,18 +223,6 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
     o(p, 3, 3) = 1.0;
 }
 
-// Cached because nothing changes the current device.
-int sm_count() {
-    static const int count = [] {
-        int device = 0, sms = 0;
-        check_cuda(cudaGetDevice(&device), "place", "getDevice");
-        check_cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "place",
-                   "getAttribute(multiProcessorCount)");
-        return sms;
-    }();
-    return count;
-}
-
 }  // namespace
 
 void launch_place(const double* centers, const double* handles, const double* dists,
@@ -248,11 +230,7 @@ void launch_place(const double* centers, const double* handles, const double* di
                   double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream) {
     if (n_pl <= 0 || n_tri <= 0) return;
 
-    // Split a placement's scan across blocks only while the placements alone leave SMs idle, and
-    // never past a block per kMinTrisPerChunk triangles. Both terms are at least 1.
-    const int for_occupancy = cuda::ceil_div(sm_count(), n_pl);
-    const int for_size = cuda::ceil_div(n_tri, kMinTrisPerChunk);
-    const int n_chunks = std::min(for_occupancy, for_size);
+    const int n_chunks = scan_chunks(n_pl, n_tri);
     const Scalp scalp{Vec3View<const double>(a, n_tri), Vec3View<const double>(b, n_tri),
                       Vec3View<const double>(c, n_tri), Vec3View<const double>(tnorm, n_tri)};
 

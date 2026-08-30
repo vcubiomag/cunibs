@@ -48,10 +48,6 @@ constexpr int kFitWarps = 2;
 constexpr int kFitBlock = kWarp * kFitWarps;
 constexpr int kFitChunk = kWarp;
 
-constexpr unsigned kFullWarp = 0xffffffffu;
-
-using Vec3 = cuda::std::array<double, 3>;
-
 // --- outer-boundary detection ---------------------------------------------------------------
 
 // One thread per face. The four faces of a tet are its four 3-subsets of local corners; which
@@ -686,18 +682,6 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
     }
 }
 
-ConstPtrPack pack_const(const float* const* src, int k) {
-    ConstPtrPack out{};
-    for (int c = 0; c < k; ++c) out[c] = src[c];
-    return out;
-}
-
-PtrPack pack(float* const* src, int k) {
-    PtrPack out{};
-    for (int c = 0; c < k; ++c) out[c] = src[c];
-    return out;
-}
-
 }  // namespace
 
 void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int* idx,
@@ -733,8 +717,8 @@ void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
                      int n_slots, int k, int stride, cudaStream_t stream) {
-    const ConstPtrPack da = pack_const(dadt_nodes, k);
-    const PtrPack out = pack(e_slots, k);
+    const ConstPtrPack da = const_ptr_pack(dadt_nodes, k);
+    const PtrPack out = ptr_pack(e_slots, k);
     const unsigned blocks = grid_for(n_slots);
     if (!blocks) return;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "hpr_grad: unsupported block width", [&](auto kk) {
@@ -745,8 +729,8 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
 
 void launch_recover_nodes(const float* const* e_in, const float* w, const int* ptr, const int* idx,
                           float* const* e_slots, int n_slots, int k, cudaStream_t stream) {
-    const ConstPtrPack in = pack_const(e_in, k);
-    const PtrPack out = pack(e_slots, k);
+    const ConstPtrPack in = const_ptr_pack(e_in, k);
+    const PtrPack out = ptr_pack(e_slots, k);
     const unsigned blocks = grid_for(n_slots);
     if (!blocks) return;
     // Every width up to kMaxStageBlock is compiled, not just the solver's {1,2,4,8}: a chunk
@@ -761,9 +745,9 @@ void launch_recover_nodes(const float* const* e_in, const float* w, const int* p
 void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,
                              float* const* e_out, float* const* magn_out, int n_tet, int k,
                              cudaStream_t stream) {
-    const ConstPtrPack in = pack_const(e_slots, k);
-    const PtrPack eo = pack(e_out, k);
-    const PtrPack mo = pack(magn_out, k);
+    const ConstPtrPack in = const_ptr_pack(e_slots, k);
+    const PtrPack eo = ptr_pack(e_out, k);
+    const PtrPack mo = ptr_pack(magn_out, k);
     const unsigned blocks = grid_for(n_tet);
     if (!blocks) return;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(

@@ -20,12 +20,6 @@ namespace {
 constexpr double kGradScale = 1e3;
 constexpr double kVolumeScale = 1e-9 / 6.0;
 
-__device__ __forceinline__ void cross3(const double* a, const double* b, double* out) {
-    out[0] = a[1] * b[2] - a[2] * b[1];
-    out[1] = a[2] * b[0] - a[0] * b[2];
-    out[2] = a[0] * b[1] - a[1] * b[0];
-}
-
 __global__ void p1_gradients_kernel(const double* __restrict__ nodes_mm,
                                     const int* __restrict__ tet_nodes, double* __restrict__ g,
                                     double* __restrict__ vols, int n_tet) {

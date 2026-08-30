@@ -132,8 +132,7 @@ void launch_rhs_staged(const float* dadt_elm, const float* g, const float* neg_v
 void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const float* neg_vc,
                              const int* ptr, const int* idx, float* b_block, int n_nodes,
                              int n_tet, int k, cudaStream_t stream) {
-    ConstPtrPack in{};
-    for (int i = 0; i < k; ++i) in[i] = dadt_elm[i];
+    const ConstPtrPack in = const_ptr_pack(dadt_elm, k);
     const int n_corner = 4 * n_tet;
     float* q_block = nullptr;
     // Outside any CUDA-graph capture (same constraint as launch_rhs_staged).
