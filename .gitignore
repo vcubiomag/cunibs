@@ -6,6 +6,8 @@ dist/
 wheels/
 *.egg-info
 
+src/cunibs/solver/_solver_ext.pyi
+
 # Virtual environments
 .venv
 .python-version

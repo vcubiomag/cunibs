@@ -157,11 +157,17 @@ nanobind_add_stub(
   OUTPUT solver/_solver_ext.pyi
   PYTHON_PATH "${_stub_root}"
   DEPENDS _solver_ext
-  MARKER_FILE solver/py.typed
 )
 
-install(FILES
-  ${CMAKE_CURRENT_BINARY_DIR}/solver/_solver_ext.pyi
-  ${CMAKE_CURRENT_BINARY_DIR}/solver/py.typed
-  DESTINATION cunibs/solver
+# The stub is copied into src/ (gitignored) rather than installed from the build tree.
+# Type checkers resolve cunibs to src/ and cannot follow the editable install's import
+# hook, so a stub that exists only in site-packages is invisible to them.
+# scikit-build-core copies package files after the CMake install, so the wheel ships this
+# copy.
+add_custom_target(_solver_ext_stub_sync ALL
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_CURRENT_BINARY_DIR}/solver/_solver_ext.pyi"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/cunibs/solver/_solver_ext.pyi"
+  VERBATIM
 )
+add_dependencies(_solver_ext_stub_sync _solver_ext_stub)
