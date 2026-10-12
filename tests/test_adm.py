@@ -496,3 +496,37 @@ def test_optimize_matches_brute_force_on_patch(
     best_angle = angles[int(brute.argmax())]
     delta = abs((result.best_angle_rad - best_angle + np.pi) % (2 * np.pi) - np.pi)
     assert delta <= 2 * np.pi / 360 * 1.5
+
+
+def test_adjoint_solver_is_cached_on_the_context(
+    patch_subject, d70_coil, patch_target, patch_top_mm
+):
+    """A second search on the same subject must not rebuild the float64 stiffness and hierarchy.
+
+    build_adjoint_solver reassembles the stiffness in float64 and builds its own tight-tolerance
+    AMG hierarchy. Neither depends on the target, so a sweep has to share one setup.
+    """
+    from cunibs.adm import Target, build_reciprocity, ensure_adjoint_solver
+
+    ctx = patch_subject.context
+    ctx.adjoint.clear()
+
+    first = ensure_adjoint_solver(ctx)
+    assert len(ctx.adjoint) == 1
+    assert ensure_adjoint_solver(ctx) is first
+
+    # build_reciprocity must go through the cache too, or optimize pays per call.
+    build_reciprocity(
+        ctx,
+        d70_coil,
+        Target(patch_target, region="gray_matter"),
+        patch_top_mm[None],
+        spacing_mm=4.0,
+    )
+    assert len(ctx.adjoint) == 1
+    assert ctx.adjoint[next(iter(ctx.adjoint))] is first
+
+    # A different tolerance is a different solver, not a silent reuse of the cached one.
+    assert ensure_adjoint_solver(ctx, tolerance=1e-7) is not first
+    assert len(ctx.adjoint) == 2
+    ctx.adjoint.clear()

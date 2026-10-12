@@ -63,6 +63,26 @@ def build_adjoint_solver(
     return solver
 
 
+def ensure_adjoint_solver(
+    ctx: SolverContext,
+    tolerance: float = ADJOINT_TOLERANCE,
+    max_iters: int = ADJOINT_MAX_ITERS,
+) -> GroundedSolver:
+    """Return ``ctx``'s adjoint solver, building and caching it on first use.
+
+    The solver depends on the mesh and the tolerance, never on the target, so a sweep over targets
+    or a second ``optimize`` call on the same subject shares one float64 assembly and one AMG
+    setup. Built on demand rather than in ``build_context``, so a run that never touches ADM pays
+    for neither.
+    """
+    key = (float(tolerance), int(max_iters))
+    cached = ctx.adjoint.get(key)
+    if cached is None:
+        cached = build_adjoint_solver(ctx, tolerance, max_iters)
+        ctx.adjoint[key] = cached
+    return cached
+
+
 def _adjoint_rhs(
     ctx: SolverContext, elem_idx: cp.ndarray, weights: cp.ndarray, direction: cp.ndarray
 ) -> cp.ndarray:
@@ -130,11 +150,11 @@ def solve_adjoint(
 ) -> AdjointField:
     """Run one adjoint solve per direction and return the nodal weight fields ``W_n``.
 
-    ``solver`` defaults to a freshly built tight-tolerance solver (:func:`build_adjoint_solver`);
-    pass a cached one to amortise its setup across targets on the same mesh.
+    ``solver`` defaults to the context's cached tight-tolerance solver
+    (:func:`ensure_adjoint_solver`), so targets on the same mesh share one setup.
     """
     if solver is None:
-        solver = build_adjoint_solver(ctx)
+        solver = ensure_adjoint_solver(ctx)
     directions = target.directions
     node_w = cp.empty((directions.shape[0], ctx.n_nodes, 3), dtype=cp.float64)
     for d in range(directions.shape[0]):
@@ -239,7 +259,7 @@ def build_reciprocity(
     """
     resolved = resolve_target(ctx, target)
     if adjoint_solver is None:
-        adjoint_solver = build_adjoint_solver(ctx)
+        adjoint_solver = ensure_adjoint_solver(ctx)
     adjoint = solve_adjoint(ctx, resolved, adjoint_solver)
     grid = _coverage_grid(ctx, coil, coverage_centers_mm, distance_mm, spacing_mm, margin_mm)
     return sample_qfield(adjoint, grid)

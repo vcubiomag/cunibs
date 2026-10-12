@@ -643,6 +643,10 @@ class SolverContext:
     # Filled on first use by ensure_recovery, never by build_context, so a run that asks for no
     # recovery pays neither the build nor the memory. Subject populates it under its own lock.
     recovery: dict[Recovery, RecoveryOperator] = field(default_factory=dict)
+    # Same discipline for the reciprocity adjoint solver, keyed by (tolerance, max_iters). It
+    # reassembles the stiffness in float64 and builds its own tight-tolerance hierarchy, neither of
+    # which depends on the target.
+    adjoint: dict[tuple[float, int], GroundedSolver] = field(default_factory=dict)
 
 
 def _spatially_ordered(
