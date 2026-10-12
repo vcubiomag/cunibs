@@ -211,6 +211,15 @@ result = subject.simulate(coil, placement, didt=1.0e6, record_rois={"M1": m1})
 result.roi_means["M1"]
 ```
 
+Saved results carry a provenance block: the cuNIBS and dependency versions, the GPU and its
+compute capability, the mesh content hash and element counts, the coil, and the solve tolerance
+and residual. Attribute names follow the openPMD base standard.
+
+```python
+result.provenance["mesh_content_hash"] == subject_mesh.content_hash
+result.iterations, result.relative_residual
+```
+
 Results are returned as NumPy arrays. For device-resident fields, use
 `cunibs.fem.solve_placements_block` directly.
 

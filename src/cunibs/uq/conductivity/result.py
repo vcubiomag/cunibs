@@ -18,7 +18,9 @@ from cunibs.simulation import (
     _check_format_version,
     _opt_array,
     _read_metrics,
+    _read_provenance,
     _write_metrics,
+    _write_provenance,
 )
 
 if TYPE_CHECKING:
@@ -110,6 +112,9 @@ class ConductivityUQResult:
     summary: ConductivityUQSummary | None = None
     # Which post-processing every array above describes. Provenance, not a switch.
     recovery: Recovery = "raw"
+    # What produced this result: versions, GPU, and the identity of the mesh and coil. ``None`` on
+    # a result loaded from a file that carries none.
+    provenance: dict[str, Any] | None = None
 
     def compute_summary(
         self, region: metrics.Region = _DEFAULT_REGION
@@ -221,6 +226,8 @@ class ConductivityUQResult:
             h5f.attrs["placement_center_mm"] = self.placement.center_mm
             h5f.attrs["placement_handle_mm"] = self.placement.handle_mm
             h5f.attrs["placement_distance_mm"] = self.placement.distance_mm
+            if self.provenance is not None:
+                _write_provenance(h5f, self.provenance)
 
     @classmethod
     def load(cls, path: str | Path) -> ConductivityUQResult:
@@ -245,6 +252,7 @@ class ConductivityUQResult:
                 coil_name=str(h5f.attrs["coil_name"]),
                 didt=float(h5f.attrs["didt"]),
                 recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
+                provenance=_read_provenance(h5f),
                 summary=ConductivityUQSummary(
                     mean_field=_read_metrics(h5f["summary"]["mean_field"]),
                     max_local_cov=float(h5f["summary"].attrs["max_local_cov"]),

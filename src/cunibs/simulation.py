@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import threading
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from functools import cache
+from importlib.metadata import version
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -41,6 +45,21 @@ if TYPE_CHECKING:
 
 _FORMAT_VERSION = 1
 
+# Root attributes that describe the run rather than the result, read back as a unit. Additive, so
+# a file written before they existed still loads and reports None.
+_PROVENANCE_KEYS = (
+    "software",
+    "softwareVersion",
+    "softwareDependencies",
+    "date",
+    "machine",
+    "mesh_content_hash",
+    "mesh_n_nodes",
+    "mesh_n_tets",
+    "coil_n_dipoles",
+    "solver_tolerance",
+)
+
 # The region every result is summarised over up front. Others are computed on demand from
 # a retained magnE.
 _DEFAULT_REGION: metrics.Region = "gray_matter"
@@ -54,6 +73,63 @@ type _HostMetricInputs = tuple[
 
 # One ROI's name and the element indices and volume weights it reduces over.
 type _RoiProbe = tuple[str, cp.ndarray, cp.ndarray]
+
+
+@cache
+def _environment() -> dict[str, str]:
+    """The code, its dependencies and the hardware, probed once per process.
+
+    Keys follow the openPMD base standard's root attributes, the convention for a simulation code
+    stamping HDF5 output. ``machine`` carries the GPU and its compute capability because that is
+    what a result depends on: the same inputs reproduce bitwise on the same hardware and software,
+    and may differ across GPU architectures or CUDA versions.
+
+    Provenance must never be the reason a save fails, so anything that cannot be probed is left
+    out rather than fabricated.
+    """
+    info: dict[str, str] = {"software": "cuNIBS"}
+    with suppress(Exception):
+        info["softwareVersion"] = version("cunibs")
+
+    deps: list[str] = []
+    for module in ("numpy", "h5py"):
+        with suppress(Exception):
+            deps.append(f"{module}-{version(module)}")
+    with suppress(Exception):
+        deps.append(f"cupy-{cp.__version__}")
+    with suppress(Exception):
+        runtime = cp.cuda.runtime
+        deps.append(f"cuda-runtime-{runtime.runtimeGetVersion()}")
+        deps.append(f"cuda-driver-{runtime.driverGetVersion()}")
+    with suppress(Exception):
+        props = cp.cuda.runtime.getDeviceProperties(cp.cuda.runtime.getDevice())
+        name = props["name"]
+        info["machine"] = (
+            f"{name.decode() if isinstance(name, bytes) else name}; "
+            f"sm_{props['major']}{props['minor']}"
+        )
+    if deps:
+        info["softwareDependencies"] = "; ".join(deps)
+    return info
+
+
+def _write_provenance(h5f: h5py.File, provenance: Mapping[str, object]) -> None:
+    """Stamp the provenance as root attributes, beside the inputs already written there."""
+    for key, value in provenance.items():
+        if value is not None:
+            h5f.attrs[key] = value
+
+
+def _plain(value: Any) -> Any:
+    """An HDF5 attribute as a plain Python value."""
+    if isinstance(value, bytes):
+        return value.decode()
+    return value.item() if hasattr(value, "item") else value
+
+
+def _read_provenance(h5f: h5py.File) -> dict[str, Any] | None:
+    """The provenance attributes, or ``None`` for a file that carries none."""
+    return {k: _plain(h5f.attrs[k]) for k in _PROVENANCE_KEYS if k in h5f.attrs} or None
 
 
 def _roi_means(magn: cp.ndarray, probes: Sequence[_RoiProbe]) -> dict[str, float] | None:
@@ -308,6 +384,23 @@ class Subject:
                 self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
             return self._conductivity_uq_pre[tags]
 
+    def _provenance(self, coil: Coil) -> dict[str, Any]:
+        """What produced this run: the environment, and the mesh, coil and tolerance it used.
+
+        Hashes ``self._mesh``, the mesh as loaded. ``self.mesh`` is the Morton reordering
+        ``build_context`` produced, which would force a context build and would digest arrays the
+        input file does not contain; the identity worth recording is the file's.
+        """
+        return {
+            **_environment(),
+            "date": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "mesh_content_hash": self._mesh.content_hash,
+            "mesh_n_nodes": self._mesh.n_nodes,
+            "mesh_n_tets": self._mesh.n_tets,
+            "coil_n_dipoles": coil.n_dipoles,
+            "solver_tolerance": float(self.context.solver.tolerance),
+        }
+
     def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
         """The field-independent half of a summary, gathered once per region.
 
@@ -360,6 +453,7 @@ class Subject:
         recovery: Recovery,
         op: RecoveryOperator | None,
         rois: Sequence[_RoiProbe] = (),
+        provenance: dict[str, Any] | None = None,
     ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
@@ -390,6 +484,9 @@ class Subject:
                 tet_tags=host[1] if host else None,
                 barycenters_mm=host[2] if host else None,
                 recovery=recovery,
+                iterations=int(out["iterations"]),
+                relative_residual=float(out["relative_residual"]),
+                provenance=provenance,
                 n_nodes=n_nodes,
                 E_slots=cp.asnumpy(out["E_slots"]) if retain.nodal else None,
                 slot_node=slot_node,
@@ -451,6 +548,7 @@ class Subject:
         # Same reason: the patch weights outlive the chunk that first needs them.
         op = self._recovery_operator(recovery)
         rois = _roi_probes(record_rois)
+        provenance = self._provenance(coil)
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
@@ -470,7 +568,7 @@ class Subject:
                         nodal=retain.nodal,
                     )
                     batch = self._reduce_chunk(
-                        chunk, outs, coil, didt, retain, region, recovery, op, rois
+                        chunk, outs, coil, didt, retain, region, recovery, op, rois, provenance
                     )
                     del outs
                 yield from batch
@@ -602,6 +700,7 @@ class Subject:
         # Outside the pool below, for the same reason the precompute is: the patch weights are
         # cached on the context and outlive the placement that first asked for them.
         op = self._recovery_operator(recovery)
+        provenance = self._provenance(coil)
         temp_pool = _scratch_pool()
         try:
             for site in sites:
@@ -620,6 +719,7 @@ class Subject:
                         vols=host[0] if host else None,
                         tet_tags=host[1] if host else None,
                         barycenters_mm=host[2] if host else None,
+                        provenance=provenance,
                     )
                     del result
                 yield reduced
@@ -714,6 +814,13 @@ class FieldResult:
     ``recovery`` records which post-processing produced ``E``/``magnE``/``summary``. It is
     provenance, not a switch: a result carries one field, not several.
 
+    ``iterations`` and ``relative_residual`` are this placement's own linear solve, not its
+    block's: in a k-RHS solve every column freezes at its own residual.
+
+    ``provenance`` records what produced the result, so a saved file can be tied back to its
+    inputs: cuNIBS and dependency versions, the GPU, and the identity of the mesh and coil. It is
+    ``None`` on a result loaded from a file that carries none.
+
     ``roi_means`` is the volume-weighted mean ``|E|`` over each ROI the run named in
     ``record_rois``, and is ``None`` when it named none. It describes the same recovered field as
     ``summary``.
@@ -739,6 +846,9 @@ class FieldResult:
     barycenters_mm: npt.NDArray[np.float64] | None
     recovery: Recovery = "raw"
     roi_means: dict[str, float] | None = None
+    iterations: int | None = None
+    relative_residual: float | None = None
+    provenance: dict[str, Any] | None = None
     n_nodes: int | None = None
     E_slots: npt.NDArray[np.float32] | None = None
     slot_node: npt.NDArray[np.int32] | None = None
@@ -875,6 +985,12 @@ class FieldResult:
             h5f.attrs["placement_center_mm"] = self.placement.center_mm
             h5f.attrs["placement_handle_mm"] = self.placement.handle_mm
             h5f.attrs["placement_distance_mm"] = self.placement.distance_mm
+            if self.iterations is not None:
+                h5f.attrs["iterations"] = self.iterations
+            if self.relative_residual is not None:
+                h5f.attrs["relative_residual"] = self.relative_residual
+            if self.provenance is not None:
+                _write_provenance(h5f, self.provenance)
             if self.roi_means is not None:
                 grp = h5f.create_group("roi_means")
                 for name, value in self.roi_means.items():
@@ -902,6 +1018,13 @@ class FieldResult:
                 tet_tags=_opt_array(h5f, "tet_tags"),
                 barycenters_mm=_opt_array(h5f, "barycenters_mm"),
                 recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
+                iterations=int(h5f.attrs["iterations"]) if "iterations" in h5f.attrs else None,
+                relative_residual=(
+                    float(h5f.attrs["relative_residual"])
+                    if "relative_residual" in h5f.attrs
+                    else None
+                ),
+                provenance=_read_provenance(h5f),
                 roi_means=(
                     {k: float(v) for k, v in h5f["roi_means"].attrs.items()}
                     if "roi_means" in h5f

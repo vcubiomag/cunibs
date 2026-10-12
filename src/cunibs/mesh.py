@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import mmap
 import struct
 from dataclasses import dataclass
@@ -422,6 +423,23 @@ class HeadMesh:
     def tet_barycenters_mm(self) -> npt.NDArray[np.float64]:
         """Per-tetrahedron barycentre in mm."""
         return self.nodes_mm[self.tet_nodes].mean(axis=1)
+
+    @cached_property
+    def content_hash(self) -> str:
+        """A digest of the arrays that define this mesh, for tying a result to its input.
+
+        Covers coordinates, connectivity and every tag array, each with its shape and dtype, so
+        two meshes agree here only if they would produce the same field.
+
+        The mesh :func:`~cunibs.fem.solve.build_context` returns is a Morton reordering of the
+        loaded one and so hashes differently; the identity worth recording is the loaded mesh's.
+        """
+        h = hashlib.blake2b(digest_size=16)
+        for name in ("nodes_mm", "tet_nodes", "tet_tags", "surf_tris", "surf_tags"):
+            a = np.ascontiguousarray(getattr(self, name))
+            h.update(f"{name}{a.shape}{a.dtype.str}".encode())
+            h.update(a.tobytes())
+        return h.hexdigest()
 
     def __repr__(self) -> str:
         return f"HeadMesh(n_nodes={self.n_nodes}, n_tets={self.n_tets})"

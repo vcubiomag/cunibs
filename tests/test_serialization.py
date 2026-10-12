@@ -245,3 +245,60 @@ def test_uq_summary_from_loaded_result(tmp_path):
     np.testing.assert_array_equal(
         before.mean_field["peak_location_mm"], after.mean_field["peak_location_mm"]
     )
+
+
+@pytest.mark.realmesh
+def test_provenance_ties_a_saved_result_to_its_inputs(
+    patch_subject, patch_mesh, d70_coil, patch_placement, tmp_path
+):
+    """A saved result has to say what produced it, or it cannot be tied to a head model.
+
+    The attribute names follow the openPMD base standard, which is the established convention for
+    a simulation code stamping HDF5, and they sit at the root beside the inputs already written
+    there rather than in a group of their own.
+    """
+    result = patch_subject.simulate(d70_coil, patch_placement)
+    path = tmp_path / "prov.h5"
+    result.save(path)
+
+    with h5py.File(path, "r") as h5f:
+        attrs = dict(h5f.attrs)
+    assert attrs["software"] == "cuNIBS"
+    for key in ("softwareVersion", "date", "mesh_content_hash", "solver_tolerance"):
+        assert key in attrs, key
+    # The identity is the loaded mesh's, not the Morton reordering the context holds.
+    assert attrs["mesh_content_hash"] == patch_mesh.content_hash
+    assert attrs["mesh_n_nodes"] == patch_mesh.n_nodes
+    assert attrs["mesh_n_tets"] == patch_mesh.n_tets
+    assert attrs["coil_n_dipoles"] == d70_coil.n_dipoles
+
+    loaded = FieldResult.load(path)
+    assert loaded.provenance["mesh_content_hash"] == patch_mesh.content_hash
+    assert loaded.iterations == result.iterations > 0
+    assert loaded.relative_residual == pytest.approx(result.relative_residual)
+
+
+@pytest.mark.realmesh
+def test_a_file_without_provenance_still_loads(
+    patch_subject, d70_coil, patch_placement, tmp_path
+):
+    """A file that carries no provenance attributes stays readable, reporting None."""
+    path = tmp_path / "old.h5"
+    patch_subject.simulate(d70_coil, patch_placement).save(path)
+    with h5py.File(path, "a") as h5f:
+        for key in list(h5f.attrs):
+            if key not in (
+                "format_version",
+                "recovery",
+                "coil_name",
+                "didt",
+                "placement_center_mm",
+                "placement_handle_mm",
+                "placement_distance_mm",
+            ):
+                del h5f.attrs[key]
+
+    loaded = FieldResult.load(path)
+    assert loaded.provenance is None
+    assert loaded.iterations is None and loaded.relative_residual is None
+    assert loaded.coil_name and loaded.summary["peak_magnE"] > 0.0
