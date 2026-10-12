@@ -52,6 +52,28 @@ type _HostMetricInputs = tuple[
     npt.NDArray[np.float32], npt.NDArray[np.int32], npt.NDArray[np.float64]
 ]
 
+# One ROI's name and the element indices and volume weights it reduces over.
+type _RoiProbe = tuple[str, cp.ndarray, cp.ndarray]
+
+
+def _roi_means(magn: cp.ndarray, probes: Sequence[_RoiProbe]) -> dict[str, float] | None:
+    """Volume-weighted mean ``|E|`` per ROI, reduced on the device against the solved field."""
+    if not probes:
+        return None
+    return {name: float((magn[idx].astype(cp.float64) * w).sum()) for name, idx, w in probes}
+
+
+def _roi_probes(record_rois: Mapping[str, ResolvedTarget]) -> list[_RoiProbe]:
+    """The element indices and weights each ROI reduces over, as the UQ path prepares them."""
+    return [
+        (
+            name,
+            cp.ascontiguousarray(target.elem_idx.astype(cp.int64)),
+            cp.ascontiguousarray(target.weights.astype(cp.float64)),
+        )
+        for name, target in record_rois.items()
+    ]
+
 
 def _write_metrics(grp: h5py.Group, m: metrics.FieldMetrics) -> None:
     grp.attrs["region"] = m["region"]
@@ -337,6 +359,7 @@ class Subject:
         region: metrics.RegionSlice,
         recovery: Recovery,
         op: RecoveryOperator | None,
+        rois: Sequence[_RoiProbe] = (),
     ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
@@ -355,6 +378,7 @@ class Subject:
         return [
             FieldResult(
                 summary=region.summarize(out["magnE"]),
+                roi_means=_roi_means(out["magnE"], rois),
                 magnE=cp.asnumpy(out["magnE"]) if retain.magnitude else None,
                 E=cp.asnumpy(out["E"]) if retain.vectors else None,
                 v=cp.asnumpy(out["v"]) if retain.potential else None,
@@ -411,6 +435,7 @@ class Subject:
         block_k: int | None,
         retain: _Retain,
         recovery: Recovery,
+        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     ) -> Iterator[FieldResult]:
         """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
 
@@ -425,6 +450,7 @@ class Subject:
         region = self._region_slice(_DEFAULT_REGION)
         # Same reason: the patch weights outlive the chunk that first needs them.
         op = self._recovery_operator(recovery)
+        rois = _roi_probes(record_rois)
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
@@ -444,7 +470,7 @@ class Subject:
                         nodal=retain.nodal,
                     )
                     batch = self._reduce_chunk(
-                        chunk, outs, coil, didt, retain, region, recovery, op
+                        chunk, outs, coil, didt, retain, region, recovery, op, rois
                     )
                     del outs
                 yield from batch
@@ -462,6 +488,7 @@ class Subject:
         potential: bool = False,
         nodal: bool = False,
         recovery: Recovery = "harmonic",
+        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
         block_k: int | None = None,
     ) -> Iterator[FieldResult]:
         """Stream one :class:`FieldResult` per placement, in the order given.
@@ -486,6 +513,12 @@ class Subject:
         to a surface needs; read it back per tissue with :meth:`FieldResult.nodal_field`. It
         requires a recovery mode.
 
+        ``record_rois``, a ``{name: ResolvedTarget}`` mapping of ROIs from :meth:`roi` /
+        :meth:`depth_probes` / ``resolve_target``, adds each ROI's volume-weighted mean ``|E|``
+        to ``result.roi_means``. The reduction runs on the device against the field the solve
+        already holds, so a scalar per ROI needs no retained array. Same definition as the UQ
+        path's ``record_rois``.
+
         Placements are solved in blocks of ``block_k`` that share a single stiffness and
         hierarchy read. It defaults to ``MAX_BLOCK`` and is clamped to ``[1, MAX_BLOCK]``.
         A block is solved and reduced as a unit, so it also caps peak memory: only
@@ -506,7 +539,7 @@ class Subject:
                 "cunibs.RECOVERY_MODES."
             )
         retain = _Retain(magnitude, vectors, potential, nodal)
-        return self._iter_reduced(coil, sites, didt, block_k, retain, recovery)
+        return self._iter_reduced(coil, sites, didt, block_k, retain, recovery, record_rois)
 
     def simulate(
         self,
@@ -519,6 +552,7 @@ class Subject:
         potential: bool = False,
         nodal: bool = False,
         recovery: Recovery = "harmonic",
+        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
         block_k: int | None = None,
     ) -> FieldResult:
         """Solve a single placement, taking the same flags as :meth:`iter_simulate`.
@@ -541,6 +575,7 @@ class Subject:
             potential=potential,
             nodal=nodal,
             recovery=recovery,
+            record_rois=record_rois,
             block_k=block_k,
         )
         return result
@@ -679,6 +714,10 @@ class FieldResult:
     ``recovery`` records which post-processing produced ``E``/``magnE``/``summary``. It is
     provenance, not a switch: a result carries one field, not several.
 
+    ``roi_means`` is the volume-weighted mean ``|E|`` over each ROI the run named in
+    ``record_rois``, and is ``None`` when it named none. It describes the same recovered field as
+    ``summary``.
+
     ``E_slots`` and the arrays that map it back to the mesh are present only when the run
     passed ``nodal=True``. A *slot* is whatever the recovery fitted a patch around: a plain
     node for ``"spr_global"``, a (node, tissue) pair for the tissue-restricted modes, where the
@@ -699,6 +738,7 @@ class FieldResult:
     tet_tags: npt.NDArray[np.int32] | None
     barycenters_mm: npt.NDArray[np.float64] | None
     recovery: Recovery = "raw"
+    roi_means: dict[str, float] | None = None
     n_nodes: int | None = None
     E_slots: npt.NDArray[np.float32] | None = None
     slot_node: npt.NDArray[np.int32] | None = None
@@ -835,6 +875,10 @@ class FieldResult:
             h5f.attrs["placement_center_mm"] = self.placement.center_mm
             h5f.attrs["placement_handle_mm"] = self.placement.handle_mm
             h5f.attrs["placement_distance_mm"] = self.placement.distance_mm
+            if self.roi_means is not None:
+                grp = h5f.create_group("roi_means")
+                for name, value in self.roi_means.items():
+                    grp.attrs[name] = float(value)
 
     @classmethod
     def load(cls, path: str | Path) -> FieldResult:
@@ -858,6 +902,11 @@ class FieldResult:
                 tet_tags=_opt_array(h5f, "tet_tags"),
                 barycenters_mm=_opt_array(h5f, "barycenters_mm"),
                 recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
+                roi_means=(
+                    {k: float(v) for k, v in h5f["roi_means"].attrs.items()}
+                    if "roi_means" in h5f
+                    else None
+                ),
                 n_nodes=int(h5f.attrs["n_nodes"]) if "n_nodes" in h5f.attrs else None,
                 E_slots=_opt_array(h5f, "E_slots"),
                 slot_node=_opt_array(h5f, "slot_node"),

@@ -235,3 +235,50 @@ def test_load_mesh_is_deterministic(patch_mesh_path):
     np.testing.assert_array_equal(first.tet_nodes, second.tet_nodes)
     np.testing.assert_array_equal(first.tet_tags, second.tet_tags)
     np.testing.assert_array_equal(first.skin_tris, second.skin_tris)
+
+
+@pytest.mark.realmesh
+def test_record_rois_matches_a_host_reduction_of_the_retained_field(
+    cp, patch_subject, d70_coil, patch_placement
+):
+    """An ROI scalar must be the same number a retained array would have given.
+
+    Recording ROIs on the forward path avoids keeping a per-tetrahedron array to extract a few
+    numbers from; it does not approximate the reduction, so the two must agree exactly.
+    """
+    rois = {
+        "near": patch_subject.roi(
+            patch_placement.center_mm, radius_mm=5.0, region="gray_matter"
+        ),
+        "point": patch_subject.roi(patch_placement.center_mm, region="gray_matter"),
+    }
+    result = patch_subject.simulate(d70_coil, patch_placement, magnitude=True, record_rois=rois)
+
+    assert set(result.roi_means) == {"near", "point"}
+    for name, target in rois.items():
+        idx = cp.asnumpy(target.elem_idx)
+        w = cp.asnumpy(target.weights)
+        want = float((result.magnE[idx].astype(np.float64) * w).sum())
+        assert result.roi_means[name] == want
+
+    # Recording an ROI must not require retaining anything.
+    lean = patch_subject.simulate(d70_coil, patch_placement, record_rois=rois)
+    assert lean.magnE is None and lean.E is None
+    assert lean.roi_means == result.roi_means
+
+
+@pytest.mark.realmesh
+def test_roi_means_round_trip_through_hdf5(patch_subject, d70_coil, patch_placement, tmp_path):
+    from cunibs import FieldResult
+
+    rois = {"m1": patch_subject.roi(patch_placement.center_mm, radius_mm=5.0)}
+    result = patch_subject.simulate(d70_coil, patch_placement, record_rois=rois)
+    path = tmp_path / "roi.h5"
+    result.save(path)
+    assert FieldResult.load(path).roi_means == result.roi_means
+
+    # A run that named no ROI carries no group, and loads back as None rather than {}.
+    plain = patch_subject.simulate(d70_coil, patch_placement)
+    plain.save(path)
+    assert plain.roi_means is None
+    assert FieldResult.load(path).roi_means is None

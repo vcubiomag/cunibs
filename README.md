@@ -200,6 +200,17 @@ gray_matter = result.summary_for("gray_matter")
 whole_model = result.summary_for("all")
 ```
 
+To reduce the field over regions of interest without retaining an array, name them with
+`record_rois`. Each becomes a volume-weighted mean `|E|` on `result.roi_means`, computed on the
+device from the field the solve already holds:
+
+```python
+m1 = subject.roi([-45.0, -5.0, 25.0], radius_mm=5.0, region="gray_matter")
+
+result = subject.simulate(coil, placement, didt=1.0e6, record_rois={"M1": m1})
+result.roi_means["M1"]
+```
+
 Results are returned as NumPy arrays. For device-resident fields, use
 `cunibs.fem.solve_placements_block` directly.
 
