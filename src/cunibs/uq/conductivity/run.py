@@ -342,7 +342,7 @@ def run_conductivity_uq(
                 raise SolverConvergenceError(int(retry_iters), float(rel), pre.tolerance)
 
         v[pre.idx] = x_red
-        if e_buf is not None:
+        if e_buf is not None and magn is not None:
             reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
         if recover is not None:
             apply_recovery_into(
