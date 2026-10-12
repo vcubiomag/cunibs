@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from cunibs.mesh import HeadMesh
+from cunibs.mesh import SKIN_SURFACE_TAG, HeadMesh
 
 DATA_DIR = Path(__file__).parent / "data"
 PATCH_GZ = DATA_DIR / "head_patch_r25.msh.gz"
@@ -138,25 +138,35 @@ def _free_gpu_pool():
         cupy.get_default_memory_pool().free_all_blocks()
 
 
+def scalp_surface(tris: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(surf_tris, surf_tags)`` for a mesh whose only surface is its scalp."""
+    tris = np.ascontiguousarray(tris, dtype=np.int32)
+    return tris, np.full(tris.shape[0], SKIN_SURFACE_TAG, dtype=np.int32)
+
+
 @pytest.fixture(scope="session")
 def cube_mesh() -> HeadMesh:
     """A solvable 100 mm all-gray-matter cube."""
+    surf_tris, surf_tags = scalp_surface(_CUBE_TRIS)
     return HeadMesh(
         nodes_mm=np.ascontiguousarray(_CUBE_CORNERS * 100.0),
         tet_nodes=_CUBE_TETS.copy(),
         tet_tags=np.full(_CUBE_TETS.shape[0], 2, dtype=np.int32),
-        skin_tris=_CUBE_TRIS.copy(),
+        surf_tris=surf_tris,
+        surf_tags=surf_tags,
     )
 
 
 @pytest.fixture(scope="session")
 def two_tissue_cube_mesh() -> HeadMesh:
     """A 100 mm cube split into gray matter (2) and CSF (3) so |E| depends on the σ ratio."""
+    surf_tris, surf_tags = scalp_surface(_CUBE_TRIS)
     return HeadMesh(
         nodes_mm=np.ascontiguousarray(_CUBE_CORNERS * 100.0),
         tet_nodes=_CUBE_TETS.copy(),
         tet_tags=np.array([2, 2, 2, 3, 3, 3], dtype=np.int32),
-        skin_tris=_CUBE_TRIS.copy(),
+        surf_tris=surf_tris,
+        surf_tags=surf_tags,
     )
 
 
@@ -234,11 +244,13 @@ def _grid_tet_mesh(
 
 
 def _grid_head_mesh(nodes: np.ndarray, tets: np.ndarray, tags: np.ndarray) -> HeadMesh:
+    surf_tris, surf_tags = scalp_surface(_boundary_faces(tets, nodes))
     return HeadMesh(
         nodes_mm=nodes,
         tet_nodes=tets,
         tet_tags=tags,
-        skin_tris=np.ascontiguousarray(_boundary_faces(tets, nodes), dtype=np.int32),
+        surf_tris=surf_tris,
+        surf_tags=surf_tags,
     )
 
 

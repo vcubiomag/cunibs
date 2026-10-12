@@ -47,6 +47,7 @@ def test_build_context_rejects_zero_volume_tetrahedra(nodes):
         np.array([[0, 1, 2, 3]], dtype=np.int32),
         np.array([2], dtype=np.int32),
         np.empty((0, 3), dtype=np.int32),
+        np.empty(0, dtype=np.int32),
     )
     with pytest.raises(ValueError, match="1 tetrahedron has zero or non-finite volume"):
         build_context(mesh)
@@ -404,4 +405,23 @@ def test_reconstruct_matches_numpy_reference(cp, cube_mesh):
     e_ref = -grad_v - dadt
     np.testing.assert_allclose(
         cp.asnumpy(out["E"]), e_ref, rtol=1e-3, atol=1e-4 * np.abs(e_ref).max()
+    )
+
+
+@pytest.mark.realmesh
+def test_context_exposes_skin_triangles_on_the_device(patch_subject):
+    """Device-side scalp work should not have to fetch the triangles back through HeadMesh.
+
+    ctx.mesh.skin_tris copies to the host on first read, so reaching the connectivity from a
+    kernel through it would round-trip the whole array.
+    """
+    import cupy as cp
+
+    ctx = patch_subject.context
+    assert isinstance(ctx.skin_tris, cp.ndarray)
+    assert ctx.skin_tris.shape == (ctx.skin_a.shape[0], 3)
+    np.testing.assert_array_equal(cp.asnumpy(ctx.skin_tris), ctx.mesh.skin_tris)
+    # The gathered coordinates are the same triangles, so the two views must agree.
+    np.testing.assert_array_equal(
+        cp.asnumpy(ctx.nodes_mm[ctx.skin_tris[:, 0]]), cp.asnumpy(ctx.skin_a)
     )

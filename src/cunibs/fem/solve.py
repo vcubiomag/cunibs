@@ -28,7 +28,7 @@ from cunibs.fem.recovery import (
     apply_recovery,
     apply_recovery_into,
 )
-from cunibs.mesh import HeadMesh
+from cunibs.mesh import SKIN_SURFACE_TAG, HeadMesh
 from cunibs.solver import (
     BLOCK_SIZES as _BLOCK_SIZES,
 )
@@ -637,6 +637,9 @@ class SolverContext:
     skin_b: cp.ndarray
     skin_c: cp.ndarray
     skin_tri_normals: cp.ndarray
+    # The same triangles as skin_a/b/c, as node indices rather than gathered coordinates, and on
+    # the device: mesh.skin_tris fetches to the host on first read.
+    skin_tris: cp.ndarray
     # Filled on first use by ensure_recovery, never by build_context, so a run that asks for no
     # recovery pays neither the build nor the memory. Subject populates it under its own lock.
     recovery: dict[Recovery, RecoveryOperator] = field(default_factory=dict)
@@ -644,11 +647,12 @@ class SolverContext:
 
 def _spatially_ordered(
     mesh: HeadMesh,
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Reorder a mesh along a Morton curve, as device arrays.
 
     This order is the one every array in the context carries, and so the one a caller reads
-    results against. Surface rows keep their file order; only the node ids they name move.
+    results against. Surface rows keep their file order; only the node ids they name move, so the
+    surface tags do not move at all.
     """
     nodes_mm = cp.asarray(mesh.nodes_mm)
     tet_nodes = cp.asarray(mesh.tet_nodes)
@@ -658,8 +662,9 @@ def _spatially_ordered(
     nodes_mm = cp.ascontiguousarray(nodes_mm[node_perm])
     tet_nodes = cp.ascontiguousarray(inverse[tet_nodes[tet_perm]])
     tet_tags = cp.ascontiguousarray(cp.asarray(mesh.tet_tags)[tet_perm])
-    skin_tris = cp.ascontiguousarray(inverse[cp.asarray(mesh.skin_tris)])
-    return nodes_mm, tet_nodes, tet_tags, skin_tris
+    surf = cp.asarray(mesh.surf_tris)
+    surf_tris = cp.ascontiguousarray(inverse[surf]) if surf.shape[0] else surf
+    return nodes_mm, tet_nodes, tet_tags, surf_tris, cp.asarray(mesh.surf_tags)
 
 
 def skin_triangle_normals(nodes_mm: cp.ndarray, skin_tris: cp.ndarray) -> cp.ndarray:
@@ -696,7 +701,8 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     Assemble ``g``, volumes, and stiffness in float64. Store ``g``, volumes, and
     ``-volume * conductivity`` in float32 for placement kernels.
     """
-    nodes_mm, tet_nodes, tet_tags, skin_tris = _spatially_ordered(mesh)
+    nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags = _spatially_ordered(mesh)
+    skin_tris = cp.ascontiguousarray(surf_tris[surf_tags == SKIN_SURFACE_TAG])
     n_nodes = int(nodes_mm.shape[0])
 
     g, vols = gradient_operator(nodes_mm, tet_nodes)
@@ -723,7 +729,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     skin_tri_normals = skin_triangle_normals(nodes_mm, skin_tris)
     # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
     # rather than a cost of building the context.
-    mesh = HeadMesh(nodes_mm, tet_nodes, tet_tags, skin_tris)
+    mesh = HeadMesh(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags)
     ctx = SolverContext(
         mesh,
         nodes_mm,
@@ -741,6 +747,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         skin_b,
         skin_c,
         skin_tri_normals,
+        skin_tris,
     )
     cp.get_default_memory_pool().free_all_blocks()
     return ctx

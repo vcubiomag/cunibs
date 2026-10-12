@@ -322,6 +322,10 @@ class HeadMesh:
     builds the reordered mesh that way: a forward run reads neither the connectivity nor the tags
     on the host, so nothing pays for a copy back.
 
+    Every tissue boundary the file carries is held as the parser produced it, one triangle array
+    and one tag array. :meth:`surface` and :attr:`skin_tris` split out a tag on demand, so a
+    forward run pays for none of the surfaces it does not touch.
+
     Derived surface geometry is not here. The smoothed skin normals a placement projects against
     are built on the device with the rest of the solver context; see
     :func:`~cunibs.fem.solve.skin_triangle_normals` and ``SolverContext.skin_tri_normals``.
@@ -332,12 +336,15 @@ class HeadMesh:
         nodes_mm: npt.NDArray[np.float64],
         tet_nodes: npt.NDArray[np.int32],
         tet_tags: npt.NDArray[np.int32],
-        skin_tris: npt.NDArray[np.int32],
+        surf_tris: npt.NDArray[np.int32],
+        surf_tags: npt.NDArray[np.int32],
     ) -> None:
         self._nodes_mm = nodes_mm
         self._tet_nodes = tet_nodes
         self._tet_tags = tet_tags
-        self._skin_tris = skin_tris
+        self._surf_tris = surf_tris
+        self._surf_tags = surf_tags
+        self._surfaces: dict[int, npt.NDArray[np.int32]] = {}
 
     # None of the cached_property members below holds a lock. cached_property has held none since
     # 3.12, so under the free-threaded build two threads racing on one can both compute it. All are
@@ -356,14 +363,58 @@ class HeadMesh:
     def tet_tags(self) -> npt.NDArray[np.int32]:
         return _on_host(self._tet_tags)
 
-    @cached_property
+    @property
     def skin_tris(self) -> npt.NDArray[np.int32]:
-        return _on_host(self._skin_tris)
+        """The scalp triangles, on the host, or empty where the mesh carries no scalp surface.
+
+        Empty rather than an error, unlike :meth:`surface`: a mesh without a scalp loads and
+        solves, and it is only a coil placement that has nothing to project onto.
+        """
+        return self._tagged(SKIN_SURFACE_TAG)
 
     @property
     def n_nodes(self) -> int:
         # Off the source array, so asking a device-backed mesh its size does not fetch it.
         return int(self._nodes_mm.shape[0])
+
+    @property
+    def n_tets(self) -> int:
+        return int(self._tet_nodes.shape[0])
+
+    @cached_property
+    def surf_tags(self) -> npt.NDArray[np.int32]:
+        """Surface tag per triangle in :attr:`surf_tris`, on the host."""
+        return _on_host(self._surf_tags)
+
+    @cached_property
+    def surf_tris(self) -> npt.NDArray[np.int32]:
+        """Every surface triangle, of every tag, on the host."""
+        return _on_host(self._surf_tris)
+
+    @property
+    def surface_tags(self) -> tuple[int, ...]:
+        """Surface tags this mesh carries, in ascending order."""
+        return tuple(int(t) for t in np.unique(self.surf_tags))
+
+    def surface(self, tag: int) -> npt.NDArray[np.int32]:
+        """The triangles of one surface tag, on the host.
+
+        ``tag`` is a surface tag (1001-1010, 1099), not a volume tag; see
+        :data:`SURFACE_KEY_TO_LABEL`. Raises when the mesh carries no such surface.
+        """
+        tris = self._tagged(tag)
+        if tris.shape[0] == 0:
+            known = ", ".join(str(t) for t in self.surface_tags) or "none"
+            raise KeyError(f"this mesh carries no surface with tag {tag} (has: {known})")
+        return tris
+
+    def _tagged(self, tag: int) -> npt.NDArray[np.int32]:
+        """Triangles of one tag, split out of :attr:`surf_tris` on first request and cached."""
+        cached = self._surfaces.get(tag)
+        if cached is None:
+            cached = np.ascontiguousarray(self.surf_tris[self.surf_tags == tag])
+            self._surfaces[tag] = cached
+        return cached
 
     @cached_property
     def tet_barycenters_mm(self) -> npt.NDArray[np.float64]:
@@ -371,16 +422,16 @@ class HeadMesh:
         return self.nodes_mm[self.tet_nodes].mean(axis=1)
 
     def __repr__(self) -> str:
-        return f"HeadMesh(n_nodes={self.n_nodes}, n_tets={int(self._tet_nodes.shape[0])})"
+        return f"HeadMesh(n_nodes={self.n_nodes}, n_tets={self.n_tets})"
 
 
 def load_mesh(mesh_file: str | Path) -> HeadMesh:
     """Load a binary Gmsh 2.2 tetrahedral head mesh."""
     arrays = parse_msh_binary(Path(mesh_file))
-    skin_tris = arrays.surf_tris[arrays.surf_tags == SKIN_SURFACE_TAG]
     return HeadMesh(
         nodes_mm=np.ascontiguousarray(arrays.nodes_mm, dtype=np.float64),
         tet_nodes=np.ascontiguousarray(arrays.tet_nodes, dtype=np.int32),
         tet_tags=np.ascontiguousarray(arrays.tet_tags, dtype=np.int32),
-        skin_tris=np.ascontiguousarray(skin_tris, dtype=np.int32),
+        surf_tris=np.ascontiguousarray(arrays.surf_tris, dtype=np.int32),
+        surf_tags=np.ascontiguousarray(arrays.surf_tags, dtype=np.int32),
     )
