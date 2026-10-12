@@ -506,6 +506,33 @@ NB_MODULE(_solver_ext, m) {
         "the triangles, and its order is the order every node's smoothing sums in.");
 
     m.def(
+        "ray_first_hit",
+        [](f64_cuda_2d origins, f64_cuda_2d directions, f64_cuda_3d verts, f64_cuda out_t,
+           double min_t, uintptr_t stream) {
+            const int n_rays = static_cast<int>(origins.shape(0));
+            if (origins.shape(1) != 3 || directions.shape(0) != origins.shape(0) ||
+                directions.shape(1) != 3) {
+                throw std::invalid_argument(
+                    "ray_first_hit: origins and directions must both be (n_rays, 3)");
+            }
+            if (verts.shape(1) != 3 || verts.shape(2) != 3) {
+                throw std::invalid_argument("ray_first_hit: verts must be (n_tri, 3, 3)");
+            }
+            if (static_cast<int>(out_t.shape(0)) != n_rays) {
+                throw std::invalid_argument("ray_first_hit: out_t must have one entry per ray");
+            }
+            launch_ray_first_hit(origins.data(), directions.data(), verts.data(), out_t.data(),
+                                 n_rays, static_cast<int>(verts.shape(0)), min_t,
+                                 reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("origins").noconvert(), nb::arg("directions").noconvert(),
+        nb::arg("verts").noconvert(), nb::arg("out_t").noconvert(), nb::arg("min_t"),
+        nb::arg("stream"),
+        "Moller-Trumbore first-hit distance per ray against a triangle surface; +inf where the "
+        "ray misses. Hits nearer than min_t are skipped, so a ray leaving one surface does not "
+        "hit the one it started on.");
+
+    m.def(
         "hpr_weights",
         [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node, f32_cuda_2d w,
            i32_cuda status, uintptr_t stream) {

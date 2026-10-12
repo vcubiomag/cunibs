@@ -124,6 +124,14 @@ void launch_recover_elements(const float* const* e_slots, const int* slot_of_cor
                              float* const* e_out, float* const* magn_out, int n_tet, int k,
                              cudaStream_t stream);
 
+// --- raycast.cu: first hit of a ray against a tissue surface --------------------------------
+// verts is (n_tri, 3, 3), the three corner coordinates of each triangle; out_t is one distance
+// per ray, in the units origins and verts carry, and is +inf where the ray misses. Hits nearer
+// than min_t are skipped, so a ray leaving one surface does not hit the one it started on.
+void launch_ray_first_hit(const double* origins, const double* directions, const double* verts,
+                          double* out_t, int n_rays, int n_tri, double min_t,
+                          cudaStream_t stream);
+
 // --- adm.cu: ADM reciprocity weights -------------------------------------------------------
 void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
                            const float* neg_vc, double* w_e, int n_tet, cudaStream_t stream);
