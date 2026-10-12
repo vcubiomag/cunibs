@@ -438,3 +438,130 @@ def test_mesh_arrays_is_a_named_tuple(tmp_path):
     assert tet_tags is arrays.tet_tags
     assert surf_tris is arrays.surf_tris
     assert surf_tags is arrays.surf_tags
+
+
+def _write_mesh(tmp_path, nodes, tets, tags, tris=None, tri_tags=None, name="m.msh"):
+    path = tmp_path / name
+    path.write_bytes(
+        pack_msh(
+            np.asarray(nodes, dtype=np.float64),
+            np.asarray(tets, dtype=np.int32) + 1,
+            np.asarray(tags, dtype=np.int32),
+            np.empty((0, 3), np.int32) if tris is None else np.asarray(tris, np.int32) + 1,
+            np.empty(0, np.int32) if tri_tags is None else np.asarray(tri_tags, np.int32),
+        )
+    )
+    return path
+
+
+_UNIT_TET = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _head_like(n_tets=8, scale=1.0):
+    """Disjoint unit tetrahedra carrying the tags a head model must have."""
+    tags = [1, 2, 3, 5, 7, 8, 9, 2][:n_tets]
+    nodes = np.vstack(
+        [(_UNIT_TET + np.array([40.0 * i, 0.0, 0.0])) * scale for i in range(n_tets)]
+    )
+    tets = np.arange(4 * n_tets, dtype=np.int32).reshape(n_tets, 4)
+    return nodes, tets, np.asarray(tags, dtype=np.int32)
+
+
+def test_validate_mesh_accepts_a_sound_mesh(tmp_path):
+    from cunibs import validate_mesh
+
+    nodes, tets, tags = _head_like()
+    report = validate_mesh(
+        _write_mesh(tmp_path, nodes, tets, tags, tets[:, :3], [1005] * len(tets))
+    )
+    assert report.ok and not report.errors and not report.warnings
+    assert report.n_tets == len(tets) and report.n_skin_tris == len(tets)
+    assert report.tags_present == (1, 2, 3, 5, 7, 8, 9)
+    # A unit tetrahedron is far from regular but nowhere near degenerate.
+    assert 0.0 < report.min_flatness < 1.0
+
+
+def test_validate_mesh_reports_a_degenerate_tet_without_a_gpu(tmp_path):
+    """The check build_context only reaches after a CUDA context and a full upload."""
+    from cunibs import validate_mesh
+
+    nodes, tets, tags = _head_like()
+    nodes[3] = nodes[2]  # collapse the first tetrahedron onto a face
+    report = validate_mesh(_write_mesh(tmp_path, nodes, tets, tags))
+    assert not report.ok
+    assert report.n_nonpositive_volume == 1
+    assert "zero, negative or non-finite volume" in report.errors[0]
+
+
+@pytest.mark.gpu
+def test_validate_mesh_volume_verdict_agrees_with_build_context(tmp_path):
+    """Two implementations of one predicate must not drift.
+
+    validate_mesh computes volumes on the host and build_context on the device, so a mesh either
+    passes both or fails both; otherwise screening a cohort would admit meshes the solver rejects.
+    """
+    from cunibs import load_mesh, validate_mesh
+    from cunibs.fem import build_context
+
+    nodes, tets, tags = _head_like()
+    good = _write_mesh(tmp_path, nodes, tets, tags, name="good.msh")
+    assert validate_mesh(good).ok
+    build_context(load_mesh(good))  # must not raise
+
+    nodes[3] = nodes[2]
+    bad = _write_mesh(tmp_path, nodes, tets, tags, name="bad.msh")
+    assert not validate_mesh(bad).ok
+    with pytest.raises(ValueError, match="zero or non-finite volume"):
+        build_context(load_mesh(bad))
+
+
+def test_validate_mesh_flatness_is_one_for_a_regular_tetrahedron(tmp_path):
+    """The quality measure has to be scale-free and normalised, or a threshold means nothing."""
+    from cunibs import validate_mesh
+
+    a = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, np.sqrt(3) / 2, 0.0],
+            [0.5, np.sqrt(3) / 6, np.sqrt(2 / 3)],
+        ]
+    )
+    for scale in (1.0, 137.0):
+        report = validate_mesh(
+            _write_mesh(tmp_path, a * scale, [[0, 1, 2, 3]], [2], name=f"reg{scale}.msh")
+        )
+        assert report.min_flatness == pytest.approx(1.0)
+
+
+def test_validate_mesh_warns_rather_than_raises_on_a_usable_but_odd_mesh(tmp_path):
+    from cunibs import validate_mesh
+
+    # No scalp surface: loads fine, then has nothing for a placement to project onto.
+    nodes, tets, tags = _head_like()
+    report = validate_mesh(_write_mesh(tmp_path, nodes, tets, tags, name="noskin.msh"))
+    assert report.ok and any("1005" in w for w in report.warnings)
+
+    # Metres instead of millimetres, the classic silent unit error.
+    nodes, tets, tags = _head_like(scale=1e-3)
+    report = validate_mesh(_write_mesh(tmp_path, nodes, tets, tags, name="metres.msh"))
+    assert report.ok and any("millimetres" in w for w in report.warnings)
+
+    # A brain with no skull is not a head model.
+    nodes, tets, tags = _head_like(n_tets=4)
+    report = validate_mesh(_write_mesh(tmp_path, nodes, tets, tags, name="nobone.msh"))
+    assert report.ok and any("bone" in w for w in report.warnings)
+
+
+def test_validate_mesh_returns_a_reason_instead_of_raising(tmp_path):
+    """A cohort driver needs a verdict per mesh, not an exception on the first bad one."""
+    from cunibs import validate_mesh
+
+    missing = validate_mesh(tmp_path / "absent.msh")
+    assert not missing.ok and missing.errors
+
+    truncated = tmp_path / "trunc.msh"
+    nodes, tets, tags = _head_like()
+    truncated.write_bytes(_write_mesh(tmp_path, nodes, tets, tags).read_bytes()[:200])
+    report = validate_mesh(truncated)
+    assert not report.ok and report.errors

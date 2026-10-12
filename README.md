@@ -73,6 +73,24 @@ CHARM writes `m2m_subject_id/subject_id.msh`. A T1-weighted image is sufficient;
 a T2-weighted image can improve skull segmentation. Inspect the segmentation
 before simulation.
 
+Screen a mesh before committing GPU time to it with `validate_mesh`, which parses and checks
+geometry on the CPU and returns a report rather than raising, so a cohort can be checked up front
+instead of failing mid-run.
+
+```python
+from cunibs import validate_mesh
+
+report = validate_mesh("subject.msh")
+if not report.ok:
+    print(report.errors)
+print(report.n_tets, report.tags_present, report.min_flatness)
+```
+
+`min_flatness` is a scale-free element quality, 1 for a regular tetrahedron and tending to 0 as one
+flattens. Quality is reported this way rather than as a volume because element size is graded
+across tissues: the smallest tetrahedron on a healthy mesh is smaller than a degenerate one
+elsewhere, so no volume threshold separates them, while flatness does.
+
 The built-in conductivities match the standard SimNIBS values.
 
 | Tag | Tissue | Conductivity (S/m) | Source |

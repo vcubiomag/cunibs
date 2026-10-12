@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import mmap
 import struct
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, NoReturn
@@ -434,4 +436,144 @@ def load_mesh(mesh_file: str | Path) -> HeadMesh:
         tet_tags=np.ascontiguousarray(arrays.tet_tags, dtype=np.int32),
         surf_tris=np.ascontiguousarray(arrays.surf_tris, dtype=np.int32),
         surf_tags=np.ascontiguousarray(arrays.surf_tags, dtype=np.int32),
+    )
+
+
+# Tissues a head model has to have for a TMS field to mean anything. Deliberately not the whole
+# table: CHARM emits no tag 4 (it splits bone into 7 and 8), and a cropped patch legitimately has
+# no eyes or muscle, so requiring every tag would warn on every real mesh.
+_ESSENTIAL_TAGS = (1, 2, 3, 5)
+# Bone is required as a group rather than by tag: 4 is the legacy single-compartment tag and 7/8
+# are what CHARM writes.
+_BONE_TAGS = (4, 7, 8)
+
+# A head in millimetres spans a few hundred; one in metres spans a fraction of one. Anything inside
+# this is not a head at either scale, and the likeliest explanation is the unit.
+_MIN_PLAUSIBLE_EXTENT_MM = 20.0
+
+
+@dataclass(frozen=True)
+class MeshReport:
+    """What :func:`validate_mesh` found, without a GPU and without raising.
+
+    ``ok`` is false when ``errors`` is non-empty; those are the conditions that would make
+    :func:`load_mesh` or :func:`~cunibs.fem.build_context` refuse the mesh. ``warnings`` are things
+    that load and solve but are usually not what was intended.
+
+    ``missing_tags`` names only the tissues a head model has to have, not every tag in the table.
+
+    ``min_flatness`` is a scale-free element quality, ``12·(3V)^(2/3) / Σ|edge|²``, which is 1 for
+    a regular tetrahedron and tends to 0 as one flattens. Quality is reported this way rather than
+    as a volume because element size is graded across tissues: the smallest tetrahedron on a
+    healthy head mesh is smaller than a degenerate one elsewhere, so no volume threshold separates
+    them, while flatness does by orders of magnitude.
+    """
+
+    path: Path
+    ok: bool
+    errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    n_nodes: int = 0
+    n_tets: int = 0
+    n_skin_tris: int = 0
+    tag_counts: dict[int, int] = dataclass_field(default_factory=dict)
+    tags_present: tuple[int, ...] = ()
+    missing_tags: tuple[int, ...] = ()
+    bbox_mm: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    n_nonpositive_volume: int = 0
+    min_abs_volume_mm3: float | None = None
+    min_flatness: float | None = None
+
+
+def _volumes_and_flatness(
+    nodes_mm: npt.NDArray[np.float64], tet_nodes: npt.NDArray[np.int32]
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Signed volumes and flatness in one pass; the ``nodes_mm[tet_nodes]`` gather dominates.
+
+    The volume sign convention is the one ``build_context`` checks.
+    """
+    p0 = nodes_mm[tet_nodes[:, 0]]
+    e1 = nodes_mm[tet_nodes[:, 1]] - p0
+    e2 = nodes_mm[tet_nodes[:, 2]] - p0
+    e3 = nodes_mm[tet_nodes[:, 3]] - p0
+    vols = np.einsum("ij,ij->i", np.cross(e1, e2), e3) / 6.0
+
+    def sq(d: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        return np.einsum("ij,ij->i", d, d)
+
+    edges_sq = sq(e1) + sq(e2) + sq(e3) + sq(e2 - e1) + sq(e3 - e1) + sq(e3 - e2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        flatness = 12.0 * np.cbrt(3.0 * np.abs(vols)) ** 2 / edges_sq
+    return vols, np.where(np.isfinite(flatness), flatness, 0.0)
+
+
+def validate_mesh(mesh_file: str | Path) -> MeshReport:
+    """Check a mesh on the host, without building a solver context.
+
+    Screens for everything a mesh can be rejected for, including the zero and inverted tetrahedra
+    that :func:`~cunibs.fem.build_context` otherwise only catches after a CUDA context, a full
+    upload and a Morton reorder.
+
+    Problems are collected rather than raised, so a cohort driver gets a reason per mesh instead of
+    an exception on the first bad one. ``build_context`` remains the authority on the volume test:
+    host float64 and the device kernel can disagree in the last bit on an element that is
+    degenerate either way.
+    """
+    path = Path(mesh_file)
+    try:
+        arrays = parse_msh_binary(path)
+    except (ValueError, OSError) as exc:
+        return MeshReport(path=path, ok=False, errors=(str(exc),))
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    nodes_mm, tet_nodes = arrays.nodes_mm, arrays.tet_nodes
+    vols, flatness = _volumes_and_flatness(nodes_mm, tet_nodes)
+
+    n_bad = int(np.count_nonzero((vols <= 0.0) | ~np.isfinite(vols)))
+    if n_bad:
+        subject = "tetrahedron has" if n_bad == 1 else "tetrahedra have"
+        errors.append(f"{n_bad} {subject} zero, negative or non-finite volume")
+
+    tags, counts = np.unique(arrays.tet_tags, return_counts=True)
+    tag_counts = {int(t): int(c) for t, c in zip(tags, counts, strict=True)}
+    missing = tuple(t for t in _ESSENTIAL_TAGS if t not in tag_counts)
+    if missing:
+        named = ", ".join(f"{t} ({VOLUME_KEY_TO_LABEL[t]})" for t in missing)
+        warnings.append(f"no tetrahedra carry volume tags {named}")
+    if not any(t in tag_counts for t in _BONE_TAGS):
+        warnings.append(
+            "no tetrahedra carry a bone tag (4 average, or 7 cortical and 8 cancellous); the "
+            "skull is what shapes the field"
+        )
+
+    skin = arrays.surf_tris[arrays.surf_tags == SKIN_SURFACE_TAG]
+    if skin.shape[0] == 0:
+        warnings.append(
+            f"no surface triangles carry the scalp tag {SKIN_SURFACE_TAG}; the mesh loads but a "
+            "coil placement has nothing to project onto"
+        )
+
+    lo, hi = nodes_mm.min(axis=0), nodes_mm.max(axis=0)
+    if float((hi - lo).max()) < _MIN_PLAUSIBLE_EXTENT_MM:
+        warnings.append(
+            f"the mesh spans {float((hi - lo).max()):.3g} in its longest axis; coordinates are "
+            "read as millimetres, so a head given in metres would look like this"
+        )
+
+    return MeshReport(
+        path=path,
+        ok=not errors,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+        n_nodes=int(nodes_mm.shape[0]),
+        n_tets=int(tet_nodes.shape[0]),
+        n_skin_tris=int(skin.shape[0]),
+        tag_counts=tag_counts,
+        tags_present=tuple(sorted(tag_counts)),
+        missing_tags=missing,
+        bbox_mm=(tuple(lo.tolist()), tuple(hi.tolist())),
+        n_nonpositive_volume=n_bad,
+        min_abs_volume_mm3=float(np.abs(vols).min()) if vols.size else None,
+        min_flatness=float(flatness.min()) if flatness.size else None,
     )
