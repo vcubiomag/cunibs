@@ -248,7 +248,7 @@ def _reindex_nodes(
     # Viewing as unsigned turns a negative index, meaning a node id of 0 or less in the
     # file, into a huge one, so numpy's own bounds check covers both ends in one pass.
     try:
-        used[tet_nodes.view(np.uint32)] = True
+        used[tet_nodes.view(np.dtype(np.uint32))] = True
     except IndexError:
         raise _node_id_error(path, "a tetrahedron") from None
 
@@ -261,7 +261,7 @@ def _reindex_nodes(
     node_index = np.full(num_nodes, -1, dtype=np.int32)
     node_index[unique_ids] = np.arange(unique_ids.size, dtype=np.int32)
     try:
-        surf_tris = node_index[surf_tris.view(np.uint32)]
+        surf_tris = node_index[surf_tris.view(np.dtype(np.uint32))]
     except IndexError:
         raise _node_id_error(path, "a surface triangle") from None
     if (orphaned := surf_tris < 0).any():
