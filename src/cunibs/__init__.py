@@ -2,7 +2,7 @@
 
 from importlib.metadata import version
 
-from cunibs import adm, coil, metrics, uq
+from cunibs import adm, coil, head, metrics, uq
 from cunibs.adm import ResolvedTarget, Target, resolve_target
 from cunibs.coil import Coil, bundled_coils
 from cunibs.fem import RECOVERY_MODES, Recovery
@@ -30,6 +30,7 @@ __all__ = [
     "adm",
     "bundled_coils",
     "coil",
+    "head",
     "load_mesh",
     "metrics",
     "resolve_target",

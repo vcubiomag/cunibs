@@ -350,16 +350,14 @@ searching candidate coil positions and in-plane rotations without a forward FEM
 solve for every candidate.
 
 ```python
-import numpy as np
-
-from cunibs import Subject, Target, adm
+from cunibs import Subject, Target, adm, head
 from cunibs.coil import Coil, MAGSTIM_D70
 
 subject = Subject.from_mesh("subject.msh")
 coil = Coil.load(MAGSTIM_D70)
 
 target = Target(position_mm=[-45.0, -5.0, 25.0], region="gray_matter")
-centers = np.array([[x, y, 80.0] for x in range(-30, 31, 5) for y in range(-30, 31, 5)])
+centers = head.scalp_grid(subject.context, [-50.0, -10.0, 80.0], radius_mm=20.0, spacing_mm=2.0)
 
 result = adm.optimize(subject.context, coil, target, centers)
 
@@ -371,6 +369,10 @@ result.best_angle_rad
 Omit `Target.direction` to maximize `|E|`; provide a direction to maximize its
 component along that direction. Candidate centres are projected onto the scalp.
 
+`head.scalp_grid` samples the scalp surface itself within the radius, so every candidate already
+lies on it and none has to be discarded. Where the requested spacing is finer than the mesh's own
+facets it subdivides them, and `grid.achieved_spacing_mm` reports what came back.
+
 For repeated searches with the same target and candidate centres, build and
 reuse the reciprocity field:
 
@@ -378,6 +380,36 @@ reuse the reciprocity field:
 recip = adm.build_reciprocity(subject.context, coil, target, centers)
 E = adm.evaluate(recip, coil, placements, didt=1.0e6)
 ```
+
+## Head geometry and CHARM companion files
+
+`cunibs.head` covers the derived quantities a placement study needs around the solve.
+
+Scalp-to-cortex distance and tissue thickness are measured by casting the inward scalp normal
+against the tissue surfaces CHARM writes into the mesh (tags `1001`-`1010`), from the same scalp
+point and normal a coil placement uses:
+
+```python
+from cunibs import head
+
+scd = head.scalp_to_cortex_mm(subject.context, [[-45.0, -5.0, 70.0]])
+depths = head.tissue_depths_mm(subject.context, points, ["cortical_bone", "csf", "gray_matter"])
+```
+
+Values are `NaN` where the normal leaves the head without crossing that surface. Note that a
+midline point such as `Cz` gives a much larger distance than a lateral one, because its inward
+normal runs down the interhemispheric fissure before reaching cortex.
+
+CHARM writes electrode positions beside the mesh, in the same subject coordinates:
+
+```python
+cap = head.read_subject_cap("m2m_subject_id")
+c3 = cap["C3"]
+```
+
+`read_cap` returns `Electrode` and `ReferenceElectrode` rows. The distinction matters: `Cz` is a
+`ReferenceElectrode` row in every cap file CHARM writes, so filtering on `Electrode` alone drops
+the vertex silently. Anatomical landmarks (`Nz`, `Iz`, `LPA`, `RPA`) come from `read_fiducials`.
 
 ## Reproducibility
 
