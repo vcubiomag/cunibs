@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "amg/cg_kernels.hpp"
 #include "amg/slot_csr.hpp"
 #include "core/common.hpp"
 
@@ -149,6 +150,9 @@ public:
 
 private:
     void ensure_block_buffers(int k);
+    Deflation deflation() const;
+    // Sets the deflation state from values_.
+    void deflation_from_values(cudaStream_t stream);
 
     int n_ = 0;
     int nnz_ = 0;
@@ -163,11 +167,18 @@ private:
     DeviceBuffer<double> x_int_;
     DeviceBuffer<float> rf_;
     DeviceBuffer<float> zf_;
-    // CG scalars kept on-device: [rz, pap, alpha, neg_alpha, norm, beta]. Only the residual norm
-    // is copied back, into pinned host memory, once/iter.
+    // CG scalars kept on-device: [rz, pap, alpha, neg_alpha, norm, rsum, beta, shift]. norm and
+    // rsum are adjacent because one reduction writes both. Only the residual norm is copied back,
+    // into pinned host memory, once/iter.
     DeviceBuffer<double> scalars_;
-    // Per-block partial sums for the fused deterministic reductions (‖r‖², r·z).
+    // Per-block partial sums for the fused deterministic reductions, two columns each.
     DeviceBuffer<double> partials_;
+    // Deflation of the constant vector (block_cg.cu): the rows where A 1 is nonzero, chosen once
+    // from the pattern's values, then Aw on them per column and 1/E per column.
+    int defl_n_ = 0;
+    DeviceBuffer<int> defl_rows_;
+    DeviceBuffer<double> defl_aw_;
+    DeviceBuffer<double> defl_inv_e_;
     PinnedBuffer<double> h_norm_;
     // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
     // un-capturable legacy default stream; b/x are handed off via join_event_. The iteration body
@@ -184,7 +195,8 @@ private:
     DeviceBuffer<double> x_int_blk_;
     DeviceBuffer<float> rf_blk_;
     DeviceBuffer<float> zf_blk_;
-    // Layout: [rz | pap | alpha | neg_alpha | norm | beta | ref_sq | converged], each k wide.
+    // Layout: [rz | pap | alpha | neg_alpha | norm | rsum | beta | shift | ref_sq | converged],
+    // each k wide.
     DeviceBuffer<double> scalars_blk_;
     DeviceBuffer<double> partials_blk_;
     PinnedBuffer<double> h_norms_blk_;  // pinned, k residual norms + k reference norms

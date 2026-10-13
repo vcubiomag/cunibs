@@ -3,6 +3,7 @@
 #include "amg/cg_kernels.hpp"
 #include "amg/vcycle.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -44,8 +45,8 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     x_int_ = alloc<double>(n_, "x_int");
     rf_ = alloc<float>(n_, "rf");
     zf_ = alloc<float>(n_, "zf");
-    scalars_ = alloc<double>(6, "scalars");
-    partials_ = alloc<double>(static_cast<size_t>(bcg_partials_blocks(n_)), "partials");
+    scalars_ = alloc<double>(8, "scalars");
+    partials_ = alloc<double>(static_cast<size_t>(2) * bcg_partials_blocks(n_), "partials");
     h_norm_ = pinned_alloc<double>(1, "solver", "norm");
 
     cudaStream_t stream = nullptr;
@@ -54,17 +55,60 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     cudaEvent_t event = nullptr;
     check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create(join_event)");
     join_event_.reset(event);
-    // The scatter above is on the legacy stream, which a non-blocking solve_stream_ does not wait
-    // for, so it is drained before any solve can start.
-    check_cuda(cudaStreamSynchronize(nullptr), "sync(values)");
+
+    // The deflation support: rows whose sum is more than a rounding residue of their l1 norm. On a
+    // grounded conductivity operator that is the ground node's neighbours. Chosen once, from the
+    // values this was built with: it is a property of the pattern, and update_values keeps it.
+    // Everything here is on the legacy stream the clones above are ordered on, which a
+    // non-blocking solve_stream_ does not wait for, so it is drained before any solve can start.
+    constexpr double kSupportTol = 1e-10;
+    {
+        DeviceBuffer<double> sums = alloc<double>(n_, "row sums");
+        DeviceBuffer<double> l1 = alloc<double>(n_, "row l1");
+        launch_bcg_row_sums(n_, slots_.ptr.get(), values_.get(), sums.get(), l1.get(), nullptr);
+        std::vector<double> h_sums(n_), h_l1(n_);
+        check_cuda(cudaMemcpy(h_sums.data(), sums.get(), n_ * sizeof(double),
+                              cudaMemcpyDeviceToHost),
+                   "copy(row sums)");
+        check_cuda(cudaMemcpy(h_l1.data(), l1.get(), n_ * sizeof(double), cudaMemcpyDeviceToHost),
+                   "copy(row l1)");
+        std::vector<int> rows;
+        for (int i = 0; i < n_; ++i) {
+            if (std::fabs(h_sums[i]) > kSupportTol * h_l1[i]) rows.push_back(i);
+        }
+        defl_n_ = static_cast<int>(rows.size());
+        defl_rows_ = alloc<int>(std::max<size_t>(rows.size(), 1), "deflation rows");
+        if (!rows.empty()) {
+            check_cuda(cudaMemcpy(defl_rows_.get(), rows.data(), rows.size() * sizeof(int),
+                                  cudaMemcpyHostToDevice),
+                       "copy(deflation rows)");
+        }
+    }
+    defl_aw_ = alloc<double>(std::max<size_t>(defl_n_, 1) * kMaxStageBlock, "deflation aw");
+    defl_inv_e_ = alloc<double>(kMaxStageBlock, "deflation inv_e");
+    deflation_from_values(nullptr);
+    check_cuda(cudaStreamSynchronize(nullptr), "sync(deflation setup)");
 }
 
 PcgAmgSolver::~PcgAmgSolver() = default;
+
+Deflation PcgAmgSolver::deflation() const {
+    return Deflation{defl_n_, defl_rows_.get(), defl_aw_.get(), defl_inv_e_.get()};
+}
+
+void PcgAmgSolver::deflation_from_values(cudaStream_t stream) {
+    // A low-half slot's value is zero, so a row sum over slots is the row sum over entries.
+    launch_bcg_defl_from_values(defl_n_, defl_rows_.get(), slots_.ptr.get(), values_.get(),
+                                defl_aw_.get(), defl_inv_e_.get(), stream);
+    check_cuda(cudaGetLastError(), "deflation");
+}
 
 void PcgAmgSolver::update_values(const double* values, cudaStream_t stream) {
     launch_slot_scatter(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values,
                         values_.get(), stream);
     check_cuda(cudaGetLastError(), "scatter(values)");
+    // A solve then waits on its caller's stream, which is this one, before touching either.
+    deflation_from_values(stream);
 }
 
 void PcgAmgSolver::ensure_block_buffers(int k) {
@@ -79,9 +123,9 @@ void PcgAmgSolver::ensure_block_buffers(int k) {
     x_int_blk_ = alloc<double>(nk, "X_int_blk");
     rf_blk_ = alloc<float>(nk, "RF_blk");
     zf_blk_ = alloc<float>(nk, "ZF_blk");
-    scalars_blk_ = alloc<double>(static_cast<size_t>(8) * k, "scalars_blk");
+    scalars_blk_ = alloc<double>(static_cast<size_t>(10) * k, "scalars_blk");
     partials_blk_ =
-        alloc<double>(static_cast<size_t>(k) * bcg_partials_blocks(n_), "partials_blk");
+        alloc<double>(static_cast<size_t>(2) * k * bcg_partials_blocks(n_), "partials_blk");
     h_norms_blk_ = pinned_alloc<double>(static_cast<size_t>(2) * k, "solver", "norms_blk");
     block_k_ = k;
 }
@@ -106,9 +150,12 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     double* const d_alpha = scalars + 2 * k;
     double* const d_neg_alpha = scalars + 3 * k;
     double* const d_norm = scalars + 4 * k;
-    double* const d_beta = scalars + 5 * k;
-    double* const d_ref_sq = scalars + 6 * k;
-    double* const d_converged = scalars + 7 * k;
+    double* const d_rsum = scalars + 5 * k;
+    double* const d_beta = scalars + 6 * k;
+    double* const d_shift = scalars + 7 * k;
+    double* const d_ref_sq = scalars + 8 * k;
+    double* const d_converged = scalars + 9 * k;
+    const Deflation defl = deflation();
     double* const h_norm = h_norms_blk_.get();
     double* const h_ref = h_norms_blk_.get() + k;
     double* const partials = partials_blk_.get();
@@ -150,10 +197,9 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                    "block:copy(B,R)");
     }
 
-    launch_bcg_d2f(nk_signed, R, RF, s);
+    launch_bcg_deflate_start(n_, k, defl, X_int, R, RF, partials, d_rsum, s);
     preconditioner.apply_block(n_, k, RF, ZF, s);
-    launch_bcg_cast_dot_init(n_, k, ZF, R, partials, d_rz, s);
-    launch_bcg_f2d(nk_signed, ZF, P, s);
+    launch_bcg_cast_dot_init(n_, k, ZF, R, defl, d_rsum, partials, d_rz, d_shift, P, s);
 
     auto run_body = [&]() {
         launch_bcsrmv_f64_block(n_, k, slots_.ptr.get(), slots_.cols.get(), values_.get(), P, AP,
@@ -166,8 +212,9 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                    cudaMemcpyDeviceToHost, s),
                    "block:copy(norms)");
         preconditioner.apply_block(n_, k, RF, ZF, s);
-        launch_bcg_cast_dot_beta(n_, k, ZF, R, d_converged, partials, d_rz, d_beta, s);
-        launch_bcg_update_p(n_, k, d_alpha, d_beta, ZF, P, X_int, s);
+        launch_bcg_cast_dot_beta(n_, k, ZF, R, defl, d_converged, d_rsum, partials, d_rz, d_beta,
+                                 d_shift, s);
+        launch_bcg_update_p(n_, k, d_alpha, d_beta, d_shift, ZF, P, X_int, s);
     };
 
     const GraphCache::Key key{&preconditioner, preconditioner.generation(), k};
@@ -217,7 +264,10 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     double* const d_alpha = scalars_.get() + 2;
     double* const d_neg_alpha = scalars_.get() + 3;
     double* const d_norm = scalars_.get() + 4;
-    double* const d_beta = scalars_.get() + 5;
+    double* const d_rsum = scalars_.get() + 5;
+    double* const d_beta = scalars_.get() + 6;
+    double* const d_shift = scalars_.get() + 7;
+    const Deflation defl = deflation();
     double* const r = r_.get();
     double* const p = p_.get();
     double* const ap = ap_.get();
@@ -274,12 +324,11 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
                                    cudaMemcpyDeviceToDevice, s),
                    "copy(b,r)");
     }
-    launch_bcg_d2f(n_, r, rf, s);
+    launch_bcg_deflate_start(n_, 1, defl, x_int, r, rf, partials, d_rsum, s);
     preconditioner.apply(n_, rf, zf, s);
-    // p0 = z0 = (double)zf directly; the fp64 z vector is never materialized (the loop
+    // p0 = z0 = (double)zf + shift directly; the fp64 z vector is never materialized (the loop
     // consumes zf on the fly in cast_dot_beta and update_p).
-    launch_bcg_f2d(n_, zf, p, s);
-    launch_bcg_cast_dot_init(n_, 1, zf, r, partials, d_rz, s);
+    launch_bcg_cast_dot_init(n_, 1, zf, r, defl, d_rsum, partials, d_rz, d_shift, p, s);
 
     // Identical every iteration (fixed buffers updated in place), so it is captured once and
     // replayed; the residual readback is inside the body but the host convergence test stays outside.
@@ -290,16 +339,17 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
                                 s);
         launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
         launch_bcg_alpha(1, d_rz, d_pap, nullptr, d_alpha, d_neg_alpha, s);
-        // r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)
+        // r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt), d_rsum = Σr
         launch_bcg_update_r_norm(n_, 1, d_neg_alpha, ap, r, rf, partials, d_norm, s);
         check_cuda(
             cudaMemcpyAsync(h_norm_.get(), d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
             "copy(norm)");
         preconditioner.apply(n_, rf, zf, s);
-        // rz' = r·(double)zf; beta = rz'/rz; rz <- rz' (no fp64 z vector)
-        launch_bcg_cast_dot_beta(n_, 1, zf, r, nullptr, partials, d_rz, d_beta, s);
-        // x += α p; p = β p + (double)zf
-        launch_bcg_update_p(n_, 1, d_alpha, d_beta, zf, p, x_int, s);
+        // z = (double)zf + shift; rz' = r·z; beta = rz'/rz; rz <- rz' (no fp64 z vector)
+        launch_bcg_cast_dot_beta(n_, 1, zf, r, defl, nullptr, d_rsum, partials, d_rz, d_beta,
+                                 d_shift, s);
+        // x += α p; p = β p + z
+        launch_bcg_update_p(n_, 1, d_alpha, d_beta, d_shift, zf, p, x_int, s);
     };
 
     // The body references only solver-owned buffers plus the preconditioner's hierarchy, so a graph
