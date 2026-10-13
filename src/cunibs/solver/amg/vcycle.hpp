@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "core/common.hpp"
 
 #include <cuda_fp16.h>
@@ -79,9 +80,10 @@ private:
         // own shape (see choose_tpr). Never a function of k, so a placement's result does not
         // depend on the block width it was solved at.
         int tpr = 0;
+        // The level operator as a slot CSR (amg/slot_csr.hpp): row_ptr indexes slots.
         Buffer<int> row_ptr;
-        Buffer<int> col_idx;
-        Buffer<__half> values;    // a_ij / row_scale[i]
+        Buffer<std::int16_t> cols;
+        Buffer<__half> values;    // a_ij / row_scale[i], in slot order
         Buffer<float> row_scale;  // max_j |a_ij|, or 1 for an empty row
         Buffer<float> dinv;
         // P (n, n_coarse) and R = P^T (n_coarse, n), both CSR with indices sorted at setup so

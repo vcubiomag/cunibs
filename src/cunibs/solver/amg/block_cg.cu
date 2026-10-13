@@ -9,6 +9,7 @@
 
 #include "amg/cg_kernels.hpp"
 #include "core/device_math.cuh"
+#include "core/slot_csr.cuh"
 
 namespace {
 
@@ -25,7 +26,7 @@ constexpr int kSpmvMinBlocks = 6;
 template <int K>
 __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     bcsrmv_f64_kernel(int n, const int* __restrict__ row_ptr,
-                      const int* __restrict__ col_idx, const double* __restrict__ vals,
+                      const std::int16_t* __restrict__ cols, const double* __restrict__ vals,
                       const double* __restrict__ x, double* __restrict__ y) {
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = threadIdx.x % kTpr;
@@ -37,7 +38,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += kTpr) {
             const double v = vals[j];
-            const double* xrow = &xv(col_idx[j], 0);
+            const double* xrow = &xv(slot_column(cols, j, row), 0);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * __ldg(xrow + c);
         }
@@ -66,8 +67,9 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 template <int K>
 __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     bcsrmv_f64_collane_kernel(int n, const int* __restrict__ row_ptr,
-                              const int* __restrict__ col_idx, const double* __restrict__ vals,
-                              const double* __restrict__ x, double* __restrict__ y) {
+                              const std::int16_t* __restrict__ cols,
+                              const double* __restrict__ vals, const double* __restrict__ x,
+                              double* __restrict__ y) {
     const std::int64_t tid =
         static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int row = static_cast<int>(tid / K);
@@ -86,11 +88,13 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     int j = row_s;
     for (; j + kTpr <= row_e; j += kTpr) {
 #pragma unroll
-        for (int l = 0; l < kTpr; ++l) part[l] += vals[j + l] * xv(col_idx[j + l], c);
+        for (int l = 0; l < kTpr; ++l) {
+            part[l] += vals[j + l] * xv(slot_column(cols, j + l, row), c);
+        }
     }
 #pragma unroll
     for (int l = 0; l < kTpr; ++l) {
-        if (j + l < row_e) part[l] += vals[j + l] * xv(col_idx[j + l], c);
+        if (j + l < row_e) part[l] += vals[j + l] * xv(slot_column(cols, j + l, row), c);
     }
 
     // The same pairing warp_reduce_sum performs above, in registers rather than across lanes,
@@ -348,7 +352,7 @@ constexpr const char* kBadK = "block CG supports k in {1, 2, 4, 8}";
 
 int bcg_partials_blocks(int n) { return static_cast<int>(grid_for(n, kBlock * kRowsPerThread)); }
 
-void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
+void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const std::int16_t* cols,
                              const double* vals, const double* x, double* y,
                              cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
@@ -357,10 +361,10 @@ void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_id
         if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kThreadsPerRow)) {
             if constexpr (K >= 4) {
                 bcsrmv_f64_collane_kernel<K>
-                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, vals, x, y);
             } else {
                 bcsrmv_f64_kernel<K>
-                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, vals, x, y);
+                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, vals, x, y);
             }
         }
     });

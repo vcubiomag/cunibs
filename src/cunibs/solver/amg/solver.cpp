@@ -34,8 +34,10 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     if (nnz_ < 0) throw std::invalid_argument("PcgAmgSolver: nnz must not be negative");
 
     row_ptr_ = clone(row_ptr, static_cast<size_t>(n_) + 1, "row_ptr");
-    col_idx_ = clone(col_idx, static_cast<size_t>(nnz_), "col_idx");
-    values_ = clone(values, static_cast<size_t>(nnz_), "values");
+    slots_ = build_slot_csr(n_, row_ptr, col_idx, "solver");
+    values_ = alloc<double>(static_cast<size_t>(slots_.n_slots), "values");
+    launch_slot_scatter(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values,
+                        values_.get(), nullptr);
     r_ = alloc<double>(n_, "r");
     p_ = alloc<double>(n_, "p");
     ap_ = alloc<double>(n_, "ap");
@@ -52,14 +54,17 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     cudaEvent_t event = nullptr;
     check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create(join_event)");
     join_event_.reset(event);
+    // The scatter above is on the legacy stream, which a non-blocking solve_stream_ does not wait
+    // for, so it is drained before any solve can start.
+    check_cuda(cudaStreamSynchronize(nullptr), "sync(values)");
 }
 
 PcgAmgSolver::~PcgAmgSolver() = default;
 
 void PcgAmgSolver::update_values(const double* values, cudaStream_t stream) {
-    check_cuda(cudaMemcpyAsync(values_.get(), values, static_cast<size_t>(nnz_) * sizeof(double),
-                               cudaMemcpyDeviceToDevice, stream),
-               "copy(values)");
+    launch_slot_scatter(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values,
+                        values_.get(), stream);
+    check_cuda(cudaGetLastError(), "scatter(values)");
 }
 
 void PcgAmgSolver::ensure_block_buffers(int k) {
@@ -136,8 +141,8 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     if (X0 != nullptr) {
         check_cuda(cudaMemcpyAsync(X_int, X0, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
                    "block:copy(X0)");
-        launch_bcsrmv_f64_block(n_, k, row_ptr_.get(), col_idx_.get(), values_.get(), X_int, AP,
-                                s);
+        launch_bcsrmv_f64_block(n_, k, slots_.ptr.get(), slots_.cols.get(), values_.get(), X_int,
+                                AP, s);
         launch_bcg_residual(nk_signed, B, AP, R, s);
     } else {
         check_cuda(cudaMemsetAsync(X_int, 0, nk * sizeof(double), s), "block:memset(X)");
@@ -151,7 +156,8 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     launch_bcg_f2d(nk_signed, ZF, P, s);
 
     auto run_body = [&]() {
-        launch_bcsrmv_f64_block(n_, k, row_ptr_.get(), col_idx_.get(), values_.get(), P, AP, s);
+        launch_bcsrmv_f64_block(n_, k, slots_.ptr.get(), slots_.cols.get(), values_.get(), P, AP,
+                                s);
         launch_bcg_dot(n_, k, P, AP, partials, d_pap, s);
         launch_bcg_alpha(k, d_rz, d_pap, d_converged, d_alpha, d_neg_alpha, s);
         launch_bcg_update_xr_norm(n_, k, d_alpha, d_neg_alpha, P, AP, X_int, R, RF, partials,
@@ -251,8 +257,8 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
                                    cudaMemcpyDeviceToDevice, s),
                    "copy(x0,x_int)");
         // r0 = b - A x0
-        launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), x_int, ap,
-                                s);
+        launch_bcsrmv_f64_block(n_, 1, slots_.ptr.get(), slots_.cols.get(), values_.get(), x_int,
+                                ap, s);
         launch_bcg_residual(n_, b, ap, r, s);
         const double norm_r0 = host_norm(r, "setup:norm(r0)");
         if (norm_r0 / norm_ref <= tolerance) {
@@ -281,7 +287,8 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
     auto run_body = [&]() {
         // p·(Ap) stays a separate pass: folding it into the SpMV epilogue would make the
         // block-wide reduction tree stall the SpMV's memory pipeline.
-        launch_bcsrmv_f64_block(n_, 1, row_ptr_.get(), col_idx_.get(), values_.get(), p, ap, s);
+        launch_bcsrmv_f64_block(n_, 1, slots_.ptr.get(), slots_.cols.get(), values_.get(), p, ap,
+                                s);
         launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
         launch_bcg_alpha(1, d_rz, d_pap, nullptr, d_alpha, d_neg_alpha, s);
         // x += α p; r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)

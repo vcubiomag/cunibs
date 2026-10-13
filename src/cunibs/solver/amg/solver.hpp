@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "amg/slot_csr.hpp"
 #include "core/common.hpp"
 
 // Only ever held by reference or pointer here; solver.cpp includes vcycle.hpp for the calls.
@@ -151,8 +152,10 @@ private:
 
     int n_ = 0;
     int nnz_ = 0;
+    // The entry CSR's row pointer, kept to lay new values into slots, and the slot CSR the
+    // SpMV streams. values_ is in slot order.
     DeviceBuffer<int> row_ptr_;
-    DeviceBuffer<int> col_idx_;
+    SlotCsr slots_;
     DeviceBuffer<double> values_;
     DeviceBuffer<double> r_;
     DeviceBuffer<double> p_;

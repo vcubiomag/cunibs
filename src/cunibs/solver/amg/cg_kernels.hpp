@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "core/common.hpp"
 
 // Launchers for the mixed-precision CG kernels (block_cg.cu), for k in {1, 2, 4, 8}. All dense
@@ -6,7 +7,8 @@
 // solve runs the same kernels in the same summation order as a wider block.
 
 int bcg_partials_blocks(int n);
-void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const int* col_idx,
+// row_ptr/cols/vals are a slot CSR (amg/slot_csr.hpp), vals laid out in its slots.
+void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const std::int16_t* cols,
                              const double* vals, const double* x, double* y,
                              cudaStream_t stream);
 void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,

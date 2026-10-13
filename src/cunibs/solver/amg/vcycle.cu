@@ -2,7 +2,9 @@
 // the single-RHS cycle is the K = 1 instantiation: for K = 1 the row-major (n, K) operands
 // collapse to plain vectors and the compiler folds the column loops away.
 #include "amg/vcycle.hpp"
+#include "amg/slot_csr.hpp"
 #include "core/device_math.cuh"
+#include "core/slot_csr.cuh"
 
 #include <atomic>
 #include <cstddef>
@@ -69,7 +71,7 @@ static_assert(tpr_choices_are_shuffle_widths(),
 // block width.
 template <int K, int TPR>
 __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
-                                         const int* __restrict__ col_idx,
+                                         const std::int16_t* __restrict__ cols,
                                          const __half* __restrict__ vals,
                                          const float* __restrict__ x, int row, int lane,
                                          cuda::std::array<float, K>& sum) {
@@ -81,7 +83,7 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
         for (int j = row_ptr[row] + lane; j < row_e; j += TPR) {
             const float v = __half2float(vals[j]);
             cuda::std::array<float, K> xv;
-            load_row<K>(&xv_rows(col_idx[j], 0), xv);
+            load_row<K>(&xv_rows(slot_column(cols, j, row), 0), xv);
 #pragma unroll
             for (int c = 0; c < K; ++c) sum[c] += v * xv[c];
         }
@@ -119,14 +121,15 @@ __global__ void __launch_bounds__(kBlock)
 
 template <int K, int TPR>
 __global__ void __launch_bounds__(kBlock)
-    vc_residual_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
-                       const __half* __restrict__ vals, const float* __restrict__ row_scale,
+    vc_residual_kernel(int n, const int* __restrict__ row_ptr,
+                       const std::int16_t* __restrict__ cols, const __half* __restrict__ vals,
+                       const float* __restrict__ row_scale,
                        const float* __restrict__ x, const float* __restrict__ b,
                        float* __restrict__ r) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
     cuda::std::array<float, K> sum;
-    row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x, row, lane, sum);
+    row_spmv<K, TPR>(n, row_ptr, cols, vals, x, row, lane, sum);
     if (row < n && lane == 0) {
         const WidthView<const float, K> bv(b, n);
         const WidthView<float, K> rv(r, n);
@@ -228,7 +231,8 @@ __global__ void __launch_bounds__(kBlock)
 // of a zero-initial-guess sweep, so this is the only smoother kernel there is.
 template <int K, int TPR>
 __global__ void __launch_bounds__(kBlock)
-    vc_cheby_step_kernel(int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
+    vc_cheby_step_kernel(int n, const int* __restrict__ row_ptr,
+                         const std::int16_t* __restrict__ cols,
                          const __half* __restrict__ vals, const float* __restrict__ row_scale,
                          const float* __restrict__ dinv, const float* __restrict__ b,
                          const float* __restrict__ x_cur, const float* x_prev, float c_cur,
@@ -236,7 +240,7 @@ __global__ void __launch_bounds__(kBlock)
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
     cuda::std::array<float, K> sum;
-    row_spmv<K, TPR>(n, row_ptr, col_idx, vals, x_cur, row, lane, sum);
+    row_spmv<K, TPR>(n, row_ptr, cols, vals, x_cur, row, lane, sum);
     if (row < n && lane == 0) {
         const WidthView<const float, K> curv(x_cur, n);
         const WidthView<const float, K> prevv(x_prev, n);
@@ -323,14 +327,15 @@ void dispatch_tpr(int tpr, F&& f) {
 }
 
 template <int K>
-void launch_residual(int n, int tpr, const int* row_ptr, const int* col_idx, const __half* values,
+void launch_residual(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
+                     const __half* values,
                      const float* row_scale, const float* x, const float* b, float* r,
                      cudaStream_t stream) {
     dispatch_tpr(tpr, [&](auto tc) {
         constexpr int TPR = decltype(tc)::value;
         if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
             vc_residual_kernel<K, TPR>
-                <<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, values, row_scale, x, b, r);
+                <<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, values, row_scale, x, b, r);
         }
     });
 }
@@ -355,7 +360,7 @@ void launch_prolongate(int n, const int* p_row_ptr, const int* p_col_idx, const 
 }
 
 template <int K>
-void launch_cheby_step(int n, int tpr, const int* row_ptr, const int* col_idx,
+void launch_cheby_step(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
                        const __half* values, const float* row_scale, const float* dinv,
                        const float* b, const float* x_cur, const float* x_prev, float c_cur,
                        float c_prev, float alpha, float* x_out, cudaStream_t stream) {
@@ -363,7 +368,7 @@ void launch_cheby_step(int n, int tpr, const int* row_ptr, const int* col_idx,
         constexpr int TPR = decltype(tc)::value;
         if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
             vc_cheby_step_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                n, row_ptr, col_idx, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
+                n, row_ptr, cols, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
                 alpha, x_out);
         }
     });
@@ -377,10 +382,12 @@ void launch_coarse_gemv(int n, const float* ainv, const float* b, float* x,
     }
 }
 
-// Setup-only: one thread per row takes the row's max |a_ij| as its scale, then rewrites the row
-// as a_ij / scale in fp16. An all-zero row keeps a scale of 1 so the reciprocal stays finite.
+// Setup-only: one thread per row takes the row's max |a_ij| as its scale, then lays the row out
+// in its slots as a_ij / scale in fp16, with a zero in each far column's low-half slot. An
+// all-zero row keeps a scale of 1 so the reciprocal stays finite.
 __global__ void __launch_bounds__(kBlock)
     vc_pack_values_kernel(int n, const int* __restrict__ row_ptr,
+                          const int* __restrict__ slot_ptr, const std::int16_t* __restrict__ cols,
                           const float* __restrict__ src, __half* __restrict__ dst,
                           float* __restrict__ row_scale) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -392,7 +399,10 @@ __global__ void __launch_bounds__(kBlock)
     if (!(scale > 0.0f)) scale = 1.0f;
     row_scale[row] = scale;
     const float inv = 1.0f / scale;
-    for (int j = row_b; j < row_e; ++j) dst[j] = __float2half(src[j] * inv);
+    int j = row_b;
+    for (int s = slot_ptr[row]; s < slot_ptr[row + 1]; ++s) {
+        dst[s] = (cols[s] > kSlotNearMax) ? __float2half(0.0f) : __float2half(src[j++] * inv);
+    }
 }
 
 constexpr const char* kBadK = "V-cycle block apply supports k in {2, 4, 8}";
@@ -464,13 +474,15 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     lvl.n = n_rows;
     lvl.n_coarse = n_coarse;
     lvl.tpr = choose_tpr(n_rows, nnz, sm_count());
-    lvl.row_ptr = device_clone(row_ptr, static_cast<std::size_t>(n_rows) + 1, "level row_ptr");
-    lvl.col_idx = device_clone(col_idx, static_cast<std::size_t>(nnz), "level col_idx");
-    lvl.values = device_alloc<__half>(static_cast<std::size_t>(nnz), "level values");
+    SlotCsr slots = build_slot_csr(n_rows, row_ptr, col_idx, "vcycle");
+    lvl.row_ptr = std::move(slots.ptr);
+    lvl.cols = std::move(slots.cols);
+    lvl.values = device_alloc<__half>(static_cast<std::size_t>(slots.n_slots), "level values");
     lvl.row_scale = device_alloc<float>(static_cast<std::size_t>(n_rows), "level row_scale");
     if (const unsigned blocks = grid_for(n_rows)) {
-        vc_pack_values_kernel<<<blocks, kBlock>>>(n_rows, lvl.row_ptr.get(), values,
-                                                  lvl.values.get(), lvl.row_scale.get());
+        vc_pack_values_kernel<<<blocks, kBlock>>>(n_rows, row_ptr, lvl.row_ptr.get(),
+                                                  lvl.cols.get(), values, lvl.values.get(),
+                                                  lvl.row_scale.get());
         check_cuda(cudaGetLastError(), "vcycle", "pack values");
         // Setup only, and it is what lets the caller drop its fp32 values on return.
         check_cuda(cudaDeviceSynchronize(), "vcycle", "pack values");
@@ -579,7 +591,7 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         if (x0 == nullptr) {
             launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, cheby_.alpha0, target(0), stream);
         } else {
-            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.col_idx.get(),
+            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
                                  lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, x0,
                                  x0, 1.0f, 0.0f, cheby_.alpha0, target(0), stream);
         }
@@ -594,7 +606,7 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         for (int s = 1; s < degree_; ++s) {
             float* out = target(s);
             const float c_prev = (s == 1 && x0 == nullptr) ? 0.0f : cheby_.c_prev[s - 1];
-            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.col_idx.get(),
+            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
                                  lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, cur,
                                  prev, cheby_.c_cur[s - 1], c_prev, cheby_.alpha[s - 1], out,
                                  stream);
@@ -614,7 +626,7 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         const float* bi = (i == 0) ? b : level_b(lvl);
         smooth(lvl, bi, nullptr, odd ? level_x(lvl) : level_r(lvl),
                odd ? level_r(lvl) : level_x(lvl), nullptr);
-        launch_residual<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.col_idx.get(),
+        launch_residual<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
                            lvl.values.get(), lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl),
                            stream);
         float* next_b = (i + 1 < n_levels) ? level_b(levels_[i + 1]) : coarse_b;

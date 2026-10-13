@@ -73,6 +73,7 @@ nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/amg/aggregate.cu
   src/cunibs/solver/amg/block_cg.cu
   src/cunibs/solver/amg/l1.cu
+  src/cunibs/solver/amg/slot_csr.cu
   src/cunibs/solver/fem/gradient.cu
   src/cunibs/solver/fem/pattern.cu
   src/cunibs/solver/fem/rhs.cu
