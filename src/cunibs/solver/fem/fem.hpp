@@ -185,3 +185,8 @@ void launch_accumulate_moments_block(const float* const* magn, int k, double* su
 // out (n, k) = a (n, p) times s (k, p) transposed, each entry summed in term order.
 void launch_row_dot(const double* a, const double* s, double* out, int n, int p, int k,
                     cudaStream_t stream);
+// x0 (n, k) = q (q^T b) for an A-orthonormal fp32 basis q (n, m) and b (n, k), each column's
+// arithmetic independent of k. work holds sweep_seed_work_size(n, m, k) doubles.
+std::int64_t sweep_seed_work_size(int n, int m, int k);
+void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, double* work,
+                       double* x0, cudaStream_t stream);

@@ -1,0 +1,103 @@
+#include "core/device_math.cuh"
+#include "fem/fem.hpp"
+
+#include <cstdint>
+
+// Seeding a block solve from a sweep basis: x0 = Q (Q^T b) per column, with Q (n, m) fp32 and
+// A-orthonormal, which makes x0 the Galerkin solution over span(Q). The guess only sets where CG
+// starts, so fp32 products are plenty; what matters is that a column's x0 is the same arithmetic
+// whatever block it is in. Every column is summed in a fixed order of rows and basis vectors that
+// does not involve k.
+
+namespace {
+
+// Rows one block of the projection folds before writing its partial. Long enough that the
+// cross-tile pass is short, short enough that the grid covers the device.
+constexpr int kSeedTileRows = 1024;
+
+int seed_tiles(int n) { return (n + kSeedTileRows - 1) / kSeedTileRows; }
+
+// b in fp32, converted once: converting inside the loops below would do it once per basis vector,
+// and fp64 conversion runs at the fp64 rate, which made both kernels four times slower.
+__global__ void seed_narrow_kernel(const double* __restrict__ b, std::int64_t total,
+                                   float* __restrict__ out) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < total) out[i] = static_cast<float>(b[i]);
+}
+
+// partials[tile][j][c] = sum over the tile's rows of q[r, j] b[r, c], one thread per basis
+// vector. The row's k values are a broadcast across the block, and q's row is one coalesced read.
+template <int K>
+__global__ void seed_project_kernel(const float* __restrict__ q, const float* __restrict__ b,
+                                    int n, int m, double* __restrict__ partials) {
+    const int j = threadIdx.x;
+    if (j >= m) return;
+    const int r0 = blockIdx.x * kSeedTileRows;
+    const int r1 = min(n, r0 + kSeedTileRows);
+    float acc[K];
+#pragma unroll
+    for (int c = 0; c < K; ++c) acc[c] = 0.0f;
+    for (int r = r0; r < r1; ++r) {
+        const float qv = q[static_cast<std::int64_t>(r) * m + j];
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+            acc[c] = fmaf(qv, b[static_cast<std::int64_t>(r) * K + c], acc[c]);
+        }
+    }
+    double* out = partials + (static_cast<std::int64_t>(blockIdx.x) * m + j) * K;
+#pragma unroll
+    for (int c = 0; c < K; ++c) out[c] = static_cast<double>(acc[c]);
+}
+
+// y[j][c] = the tiles' partials summed in tile order, narrowed for the expansion.
+template <int K>
+__global__ void seed_reduce_kernel(const double* __restrict__ partials, int n_tiles, int m,
+                                   float* __restrict__ y) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * K) return;
+    double s = 0.0;
+    for (int t = 0; t < n_tiles; ++t) s += partials[static_cast<std::int64_t>(t) * m * K + idx];
+    y[idx] = static_cast<float>(s);
+}
+
+// x0[r][c] = sum over j of q[r, j] y[j][c], one thread per entry, basis vectors in order.
+template <int K>
+__global__ void seed_expand_kernel(const float* __restrict__ q, const float* __restrict__ y,
+                                   int n, int m, double* __restrict__ x0) {
+    const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<std::int64_t>(n) * K) return;
+    const std::int64_t r = idx / K;
+    const int c = static_cast<int>(idx - r * K);
+    const float* row = q + r * m;
+    float acc = 0.0f;
+    for (int j = 0; j < m; ++j) acc = fmaf(row[j], __ldg(y + j * K + c), acc);
+    x0[idx] = static_cast<double>(acc);
+}
+
+}  // namespace
+
+// work holds the tiles' partials, then y and b narrowed to fp32, two floats to a double.
+std::int64_t sweep_seed_work_size(int n, int m, int k) {
+    const std::int64_t floats = static_cast<std::int64_t>(m) * k + static_cast<std::int64_t>(n) * k;
+    return static_cast<std::int64_t>(seed_tiles(n)) * m * k + (floats + 1) / 2;
+}
+
+void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, double* work,
+                       double* x0, cudaStream_t stream) {
+    const int n_tiles = seed_tiles(n);
+    float* const y = reinterpret_cast<float*>(work + static_cast<std::int64_t>(n_tiles) * m * k);
+    float* const b32 = y + static_cast<std::int64_t>(m) * k;
+    const std::int64_t total = static_cast<std::int64_t>(n) * k;
+    if (const unsigned blocks = grid_for(total)) {
+        seed_narrow_kernel<<<blocks, kBlock, 0, stream>>>(b, total, b32);
+    }
+    dispatch_k<1, 2, 4, 8>(k, "sweep_seed: k must be in {1, 2, 4, 8}", [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        const int threads = ((m + kWarp - 1) / kWarp) * kWarp;
+        seed_project_kernel<K><<<n_tiles, threads, 0, stream>>>(q, b32, n, m, work);
+        seed_reduce_kernel<K><<<grid_for(m * K), kBlock, 0, stream>>>(work, n_tiles, m, y);
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
+            seed_expand_kernel<K><<<blocks, kBlock, 0, stream>>>(q, y, n, m, x0);
+        }
+    });
+}

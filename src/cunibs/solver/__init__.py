@@ -44,6 +44,8 @@ try:
         select_size4,
         skin_normals,
         spr_weights,
+        sweep_seed,
+        sweep_seed_work_size,
         tet_lowest_node,
     )
 except ImportError as exc:
@@ -91,5 +93,7 @@ __all__ = [
     "select_size4",
     "skin_normals",
     "spr_weights",
+    "sweep_seed",
+    "sweep_seed_work_size",
     "tet_lowest_node",
 ]

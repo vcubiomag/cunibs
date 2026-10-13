@@ -963,6 +963,32 @@ NB_MODULE(_solver_ext, m) {
         "does not depend on k.");
 
     m.def(
+        "sweep_seed_work_size",
+        [](int n, int m_basis, int k) { return sweep_seed_work_size(n, m_basis, k); },
+        nb::arg("n"), nb::arg("m"), nb::arg("k"),
+        "Doubles of scratch sweep_seed needs for an (n, m) basis and k columns.");
+
+    m.def(
+        "sweep_seed",
+        [](f32_cuda_2d q, f64_cuda_2d b, f64_cuda work, f64_cuda_2d x0, uintptr_t stream) {
+            const int n = static_cast<int>(q.shape(0));
+            const int m_basis = static_cast<int>(q.shape(1));
+            const int k = static_cast<int>(b.shape(1));
+            if (static_cast<int>(b.shape(0)) != n || static_cast<int>(x0.shape(0)) != n ||
+                static_cast<int>(x0.shape(1)) != k ||
+                static_cast<std::int64_t>(work.shape(0)) < sweep_seed_work_size(n, m_basis, k)) {
+                throw std::invalid_argument(
+                    "sweep_seed: q (n, m), b and x0 (n, k), work sweep_seed_work_size(n, m, k)");
+            }
+            launch_sweep_seed(q.data(), b.data(), n, m_basis, k, work.data(), x0.data(),
+                              reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("q").noconvert(), nb::arg("b").noconvert(), nb::arg("work").noconvert(),
+        nb::arg("x0").noconvert(), nb::arg("stream"),
+        "x0 = q (q^T b) per column for an A-orthonormal fp32 basis; a column's result does not "
+        "depend on k.");
+
+    m.def(
         "place_transforms",
         [](f64_cuda_2d centers, std::optional<f64_cuda_2d> handles, f64_cuda dists, f64_cuda_2d a,
            f64_cuda_2d b, f64_cuda_2d c, f64_cuda_2d tnorm, f64_cuda_2d out,

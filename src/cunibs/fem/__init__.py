@@ -48,6 +48,7 @@ from cunibs.fem.solve import (
     solve_placement,
     solve_placements_block,
 )
+from cunibs.fem.sweep import SweepBasis, build_sweep_basis, ensure_sweep_basis
 
 __all__ = [
     "DEFAULT_MAX_ITERS",
@@ -66,17 +67,20 @@ __all__ = [
     "RecoveryOperator",
     "SolverContext",
     "SolverConvergenceError",
+    "SweepBasis",
     "apply_recovery",
     "apply_recovery_into",
     "assemble_stiffness",
     "build_context",
     "build_node2corner",
     "build_recovery_operator",
+    "build_sweep_basis",
     "coil_dadt_at_nodes",
     "compute_coil_transform",
     "compute_coil_transforms",
     "conductivity_per_tet",
     "ensure_recovery",
+    "ensure_sweep_basis",
     "gradient_operator",
     "ground_node_of",
     "grounded_index",

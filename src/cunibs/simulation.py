@@ -26,6 +26,7 @@ from cunibs.fem import (
     SolverContext,
     build_context,
     ensure_recovery,
+    ensure_sweep_basis,
     solve_placements_block,
     validate_recovery,
 )
@@ -574,6 +575,24 @@ class Subject:
                 yield from batch
         finally:
             temp_pool.free_all_blocks()
+
+    def prepare_sweep(self, coil: Coil, size: int = 128) -> None:
+        """Seed every later solve on this subject from a basis of ``size`` scalp placements.
+
+        Each solve then starts from the Galerkin solution over those placements' solutions
+        rather than from zero, which on a head mesh takes a dense sweep about one target from 19
+        CG iterations a placement to 13 and from 8.2 to 6.8 ms a placement. Building the basis
+        costs ``size`` solves (about 0.9 s) and ``size`` fp32 vectors of device memory (about
+        360 MB at the default on a 700k-node mesh), so it pays from several hundred placements
+        and is never built implicitly.
+
+        A placement's result does not depend on the other placements in its sweep, with or
+        without a basis. It does change, within the solver tolerance, once a basis is present,
+        so prepare before the first solve of a sweep whose results will be compared. A second
+        call keeps the basis already built.
+        """
+        with self._lock:
+            ensure_sweep_basis(self.context, coil, size)
 
     def iter_simulate(
         self,

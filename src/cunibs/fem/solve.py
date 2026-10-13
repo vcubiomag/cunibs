@@ -50,6 +50,8 @@ from cunibs.solver import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from cunibs.fem.sweep import SweepBasis
+
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
 
@@ -507,7 +509,7 @@ MAX_BLOCK = BLOCK_SIZES[-1]
 
 
 def _solve_grounded_block_mat(
-    solver: GroundedSolver, B: cp.ndarray, k: int
+    solver: GroundedSolver, B: cp.ndarray, k: int, X0: cp.ndarray | None = None
 ) -> tuple[cp.ndarray, list[ColumnTelemetry]]:
     """Block-solve a padded (n_red, k_pad) RHS matrix; returns X and the k columns' telemetry.
 
@@ -520,7 +522,7 @@ def _solve_grounded_block_mat(
     X = cp.empty_like(B)
     stream = cp.cuda.get_current_stream().ptr
     iters, rels, col_iters = solver.pcg.solve_mixed_block(
-        solver.precond, B, X, solver.tolerance, solver.max_iters, stream
+        solver.precond, B, X, solver.tolerance, solver.max_iters, stream, X0
     )
     telemetry = [ColumnTelemetry(int(col_iters[c]), float(rels[c])) for c in range(k)]
     solver.last_iterations = int(iters)
@@ -673,10 +675,12 @@ class SolverContext:
     # Filled on first use by ensure_recovery, never by build_context, so a run that asks for no
     # recovery pays neither the build nor the memory. Subject populates it under its own lock.
     recovery: dict[Recovery, RecoveryOperator] = field(default_factory=dict)
-    # Same discipline for the reciprocity adjoint solver, keyed by (tolerance, max_iters). It
-    # reassembles the stiffness in float64 and builds its own tight-tolerance hierarchy, neither of
-    # which depends on the target.
+    # Same discipline for the reciprocity adjoint solver, keyed by (tolerance, max_iters): the
+    # forward solver with a tighter stopping rule, which does not depend on the target.
     adjoint: dict[tuple[float, int], GroundedSolver] = field(default_factory=dict)
+    # Set only by ensure_sweep_basis. While present, every placement block solve starts from its
+    # Galerkin seed rather than from zero.
+    sweep_basis: SweepBasis | None = None
 
 
 def _spatially_ordered(
@@ -970,7 +974,8 @@ def solve_placements_block(
     del dadt_block
 
     B_pad = _pad_block(b_block[solver.idx, :].astype(cp.float64), k)
-    X, telemetry = _solve_grounded_block_mat(solver, B_pad, k)
+    X0 = None if ctx.sweep_basis is None else ctx.sweep_basis.seed(B_pad)
+    X, telemetry = _solve_grounded_block_mat(solver, B_pad, k, X0)
 
     v_block = cp.zeros((solver.n, k), dtype=cp.float64)
     v_block[solver.idx, :] = X[:, :k]
