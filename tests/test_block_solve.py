@@ -423,3 +423,40 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     # identical and the solve must repeat exactly.
     assert ctx.solver.last_iterations == good_iters
     assert rel_l2(rebuilt["magnE"], reference["magnE"]) <= PARITY
+
+
+@pytest.mark.realmesh
+def test_a_block_solve_honours_its_own_tolerance(cp, fresh_subject, patch_mesh):
+    """A solve must stop on its own tolerance whatever tolerance the solver last ran at.
+
+    The iteration body is captured once and replayed, so anything it bakes in from one solve
+    reaches the next. The ADM adjoint shares the forward solver at a tolerance a thousand times
+    tighter, so both orders matter: a loose capture replayed at a tight tolerance freezes columns
+    the host still waits on and runs to max_iters, and a tight one replayed loose carries columns
+    past their own crossing, which makes them depend on their block.
+    """
+    n = int(fresh_subject(patch_mesh).context.solver.idx.shape[0])
+    b = cp.ascontiguousarray(
+        cp.stack(
+            [cp.sin(cp.arange(n, dtype=cp.float64) * 0.5) + 2.0, cp.cos(cp.arange(n) * 0.3)], 1
+        )
+    )
+    stream = cp.cuda.get_current_stream().ptr
+
+    def solve(solver, tol):
+        x = cp.empty_like(b)
+        iters, rels, _ = solver.pcg.solve_mixed_block(
+            solver.precond, b, x, tol, solver.max_iters, stream
+        )
+        return x, int(iters), max(rels)
+
+    for first, second in [(1e-3, 1e-9), (1e-9, 1e-3)]:
+        shared = fresh_subject(patch_mesh).context.solver
+        solve(shared, first)
+        got, iters, rel = solve(shared, second)
+        ref, ref_iters, _ = solve(fresh_subject(patch_mesh).context.solver, second)
+        assert rel <= second, (
+            f"after a solve at {first}, a solve at {second} ended at {rel:.2e}"
+        )
+        assert iters == ref_iters
+        np.testing.assert_array_equal(cp.asnumpy(got), cp.asnumpy(ref))

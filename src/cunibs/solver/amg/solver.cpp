@@ -154,7 +154,7 @@ void PcgAmgSolver::ensure_block_buffers(int k) {
     x_int_blk_ = alloc<double>(nk, "X_int_blk");
     rf_blk_ = alloc<float>(nk, "RF_blk");
     zf_blk_ = alloc<float>(nk, "ZF_blk");
-    scalars_blk_ = alloc<double>(static_cast<size_t>(10) * k, "scalars_blk");
+    scalars_blk_ = alloc<double>(static_cast<size_t>(10) * k + 1, "scalars_blk");
     partials_blk_ =
         alloc<double>(static_cast<size_t>(2) * k * bcg_partials_blocks(n_), "partials_blk");
     h_norms_blk_ = pinned_alloc<double>(static_cast<size_t>(2) * k, "solver", "norms_blk");
@@ -220,6 +220,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     double* const d_shift = scalars + 7 * k;
     double* const d_ref_sq = scalars + 8 * k;
     double* const d_converged = scalars + 9 * k;
+    double* const d_tolerance = scalars + 10 * k;
     const Deflation defl = deflation();
     double* const h_norm = h_norms_blk_.get();
     double* const h_ref = h_norms_blk_.get() + k;
@@ -235,6 +236,10 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     // squares stay on the device for the per-column freeze; the host copy drives the block's
     // stopping test and the reported residuals.
     launch_bcg_norm2(n_, k, B, partials, d_ref_sq, s);
+    // The freeze reads the tolerance from the device: a captured body replays whatever it was
+    // launched with, and the graph is shared by every solve at this width whatever its tolerance.
+    check_cuda(cudaMemcpyAsync(d_tolerance, &tolerance, sizeof(double), cudaMemcpyHostToDevice, s),
+               "block:copy(tolerance)");
     check_cuda(cudaMemcpyAsync(h_ref, d_ref_sq, static_cast<size_t>(k) * sizeof(double),
                                cudaMemcpyDeviceToHost, s),
                "block:copy(ref_norms)");
@@ -270,7 +275,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
         launch_bcg_dot(n_, k, P, AP, partials, d_pap, s);
         launch_bcg_alpha(k, d_rz, d_pap, d_converged, d_alpha, d_neg_alpha, s);
         launch_bcg_update_r_norm(n_, k, d_neg_alpha, AP, R, RF, partials, d_norm, s);
-        launch_bcg_mark_converged(k, d_norm, d_ref_sq, tolerance, d_converged, s);
+        launch_bcg_mark_converged(k, d_norm, d_ref_sq, d_tolerance, d_converged, s);
         check_cuda(cudaMemcpyAsync(h_norm, d_norm, static_cast<size_t>(k) * sizeof(double),
                                    cudaMemcpyDeviceToHost, s),
                    "block:copy(norms)");

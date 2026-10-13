@@ -61,7 +61,7 @@ void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, double* r
 void launch_bcg_alpha(int k, const double* rz, const double* pap, const double* converged,
                       double* alpha, double* neg_alpha, cudaStream_t stream);
 void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_sq,
-                               double tolerance, double* converged, cudaStream_t stream);
+                               const double* tolerance, double* converged, cudaStream_t stream);
 // r -= alpha Ap and rf = (float)r. norms_sums is 2k wide: |r|^2 per column, then sum(r).
 void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const double* ap, double* r,
                               float* rf, double* partials, double* norms_sums,

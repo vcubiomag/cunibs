@@ -214,7 +214,7 @@ private:
     DeviceBuffer<float> rf_blk_;
     DeviceBuffer<float> zf_blk_;
     // Layout: [rz | pap | alpha | neg_alpha | norm | rsum | beta | shift | ref_sq | converged],
-    // each k wide.
+    // each k wide, then the solve's tolerance.
     DeviceBuffer<double> scalars_blk_;
     DeviceBuffer<double> partials_blk_;
     PinnedBuffer<double> h_norms_blk_;  // pinned, k residual norms + k reference norms

@@ -412,7 +412,8 @@ __device__ __forceinline__ bool frozen(const double* __restrict__ converged, int
 }
 
 __global__ void bcg_mark_converged_kernel(int k, const double* __restrict__ norm_sq,
-                                          const double* __restrict__ ref_sq, double tolerance,
+                                          const double* __restrict__ ref_sq,
+                                          const double* __restrict__ tolerance,
                                           double* __restrict__ converged) {
     const int c = threadIdx.x;
     if (c < k) {
@@ -421,7 +422,7 @@ __global__ void bcg_mark_converged_kernel(int k, const double* __restrict__ norm
         // sides agree bit for bit on the same inputs. If they could disagree by an ulp at the
         // boundary, a column the device had frozen but the host still called unconverged would
         // stop improving and run the block to max_iters.
-        converged[c] = (sqrt(norm_sq[c]) / sqrt(ref_sq[c]) <= tolerance) ? 1.0 : 0.0;
+        converged[c] = (sqrt(norm_sq[c]) / sqrt(ref_sq[c]) <= *tolerance) ? 1.0 : 0.0;
     }
 }
 
@@ -734,7 +735,7 @@ void launch_bcg_alpha(int k, const double* rz, const double* pap, const double* 
 }
 
 void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_sq,
-                               double tolerance, double* converged, cudaStream_t stream) {
+                               const double* tolerance, double* converged, cudaStream_t stream) {
     bcg_mark_converged_kernel<<<1, k, 0, stream>>>(k, norm_sq, ref_sq, tolerance, converged);
 }
 
