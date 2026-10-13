@@ -10,6 +10,7 @@ with ``W_n = ¼ Σ_{e∋n} w_e``, evaluable as a node-sourced N-body with no ext
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -17,17 +18,12 @@ import cupy as cp
 
 from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
-from cunibs.fem.assembly import (
-    assemble_stiffness,
-    conductivity_per_tet,
-    gradient_operator,
-)
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.fem.solve import (
     GroundedSolver,
     SolverContext,
-    prepare_grounded_solver,
-    solve_grounded,
+    _pad_block,
+    _solve_grounded_block_mat,
 )
 from cunibs.solver import dadt_nbody, element_weight, node_gather, node_scatter3
 
@@ -49,18 +45,20 @@ def build_adjoint_solver(
     tolerance: float = ADJOINT_TOLERANCE,
     max_iters: int = ADJOINT_MAX_ITERS,
 ) -> GroundedSolver:
-    """Assemble a dedicated tight-tolerance grounded solver for the adjoint (reciprocity) solves.
+    """A tight-tolerance grounded solver for the adjoint (reciprocity) solves.
 
-    Reassembles the stiffness in float64 (``ctx.g`` is float32) and grounds the same DOF the forward
-    solver uses, so the adjoint is consistent with the forward system.
+    The adjoint system is the forward one: the context's stiffness is already assembled in
+    float64 from float64 gradients and grounds the same DOF, so its operator and hierarchy are
+    shared and only the stopping rule differs. Reassembling them gave a bitwise-identical matrix
+    for the cost of a second assembly, AMG setup and copy of both on the device.
     """
-    g64, vols = gradient_operator(ctx.nodes_mm, ctx.tet_nodes)
-    cond = conductivity_per_tet(ctx.tet_tags)
-    stiffness = assemble_stiffness(g64, vols, cond, ctx.n_nodes, ctx.tet_nodes)
-    ground_node = int(cp.argmin(ctx.nodes_mm[:, 2]))
-    solver = prepare_grounded_solver(stiffness, ctx.nodes_mm, ground_node, tolerance, max_iters)
-    del stiffness, g64, vols, cond
-    return solver
+    return dataclasses.replace(
+        ctx.solver,
+        tolerance=tolerance,
+        max_iters=max_iters,
+        last_iterations=0,
+        last_relative_residual=0.0,
+    )
 
 
 def ensure_adjoint_solver(
@@ -71,9 +69,7 @@ def ensure_adjoint_solver(
     """Return ``ctx``'s adjoint solver, building and caching it on first use.
 
     The solver depends on the mesh and the tolerance, never on the target, so a sweep over targets
-    or a second ``optimize`` call on the same subject shares one float64 assembly and one AMG
-    setup. Built on demand rather than in ``build_context``, so a run that never touches ADM pays
-    for neither.
+    or a second ``optimize`` call on the same subject shares one.
     """
     key = (float(tolerance), int(max_iters))
     cached = ctx.adjoint.get(key)
@@ -148,20 +144,35 @@ class AdjointField:
 def solve_adjoint(
     ctx: SolverContext, target: ResolvedTarget, solver: GroundedSolver | None = None
 ) -> AdjointField:
-    """Run one adjoint solve per direction and return the nodal weight fields ``W_n``.
+    """Run the adjoint solves, every direction in one block, and return the nodal weights ``W_n``.
 
-    ``solver`` defaults to the context's cached tight-tolerance solver
-    (:func:`ensure_adjoint_solver`), so targets on the same mesh share one setup.
+    The directions share the operator, so they go through the block solver as columns sharing each
+    stiffness and hierarchy read. A column's result does not depend on the block it was solved in,
+    so this is the same answer one solve per direction gives. ``solver`` defaults to the context's
+    cached tight-tolerance solver (:func:`ensure_adjoint_solver`), so targets on the same mesh
+    share one setup.
     """
     if solver is None:
         solver = ensure_adjoint_solver(ctx)
     directions = target.directions
-    node_w = cp.empty((directions.shape[0], ctx.n_nodes, 3), dtype=cp.float64)
-    for d in range(directions.shape[0]):
-        ehat = directions[d]
-        c = _adjoint_rhs(ctx, target.elem_idx, target.weights, ehat)
-        lam = solve_grounded(solver, c)
-        node_w[d] = _node_weights(ctx, lam, target.elem_idx, target.weights, ehat)
+    n_dir = int(directions.shape[0])
+    rhs = [
+        _adjoint_rhs(ctx, target.elem_idx, target.weights, directions[d]) for d in range(n_dir)
+    ]
+    lams = [cp.zeros(ctx.n_nodes, dtype=cp.float64) for _ in range(n_dir)]
+    reduced = cp.ascontiguousarray(cp.stack(rhs, axis=1)[solver.idx])
+    # The block solver refuses an all-zero column; a direction the target cannot see solves to
+    # zero, which is what the single-RHS path returns for it.
+    live = [d for d in range(n_dir) if bool(cp.any(reduced[:, d]))]
+    if live:
+        x, _ = _solve_grounded_block_mat(
+            solver, _pad_block(cp.ascontiguousarray(reduced[:, live]), len(live)), len(live)
+        )
+        for j, d in enumerate(live):
+            lams[d][solver.idx] = x[:, j]
+    node_w = cp.empty((n_dir, ctx.n_nodes, 3), dtype=cp.float64)
+    for d in range(n_dir):
+        node_w[d] = _node_weights(ctx, lams[d], target.elem_idx, target.weights, directions[d])
     return AdjointField(ctx=ctx, target=target, node_weights=node_w)
 
 
