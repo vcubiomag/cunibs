@@ -26,8 +26,8 @@ constexpr int kNodesPerThread = 4;
 template <int K>
 __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict__ mp,
                             const float* __restrict__ sn, const float* __restrict__ r,
-                            float* __restrict__ out, int n_dip, int n_nodes, float didt,
-                            float mu0_4pi) {
+                            float* __restrict__ out, int out_stride, int n_dip, int n_nodes,
+                            float didt, float mu0_4pi) {
     __shared__ float s_s[kDipTile * 3];
     __shared__ float s_mp[kDipTile * 6];
     __shared__ float s_sn[kDipTile];
@@ -94,9 +94,10 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
 #pragma unroll
     for (int k = 0; k < K; ++k) {
         if (node[k] < n_nodes) {
-            out[node[k] * 3 + 0] = scale * ((wy[k] * rz[k] - wz[k] * ry[k]) - px[k]);
-            out[node[k] * 3 + 1] = scale * ((wz[k] * rx[k] - wx[k] * rz[k]) - py[k]);
-            out[node[k] * 3 + 2] = scale * ((wx[k] * ry[k] - wy[k] * rx[k]) - pz[k]);
+            float* const o = out + static_cast<std::int64_t>(node[k]) * out_stride;
+            o[0] = scale * ((wy[k] * rz[k] - wz[k] * ry[k]) - px[k]);
+            o[1] = scale * ((wz[k] * rx[k] - wx[k] * rz[k]) - py[k]);
+            o[2] = scale * ((wx[k] * ry[k] - wy[k] * rx[k]) - pz[k]);
         }
     }
 }
@@ -104,10 +105,11 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
 }  // namespace
 
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
-                 int n_dip, int n_nodes, float didt, float mu0_4pi, cudaStream_t stream) {
+                 int out_stride, int n_dip, int n_nodes, float didt, float mu0_4pi,
+                 cudaStream_t stream) {
     const std::int64_t threads = grid_for(n_nodes, kNodesPerThread);
     if (const unsigned blocks = grid_for(threads, kDadtBlock)) {
-        dadt_kernel<kNodesPerThread><<<blocks, kDadtBlock, 0, stream>>>(s, mp, sn, r, out, n_dip,
-                                                                        n_nodes, didt, mu0_4pi);
+        dadt_kernel<kNodesPerThread><<<blocks, kDadtBlock, 0, stream>>>(
+            s, mp, sn, r, out, out_stride, n_dip, n_nodes, didt, mu0_4pi);
     }
 }

@@ -174,21 +174,16 @@ def test_patch_multilevel_solve_true_residual(
     import cupyx.scipy.sparse as csp
 
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-    from cunibs.fem.solve import (
-        _assemble_rhs_kernel,
-        _dadt_node_to_elm,
-        solve_grounded,
-    )
+    from cunibs.fem.solve import _assemble_rhs, solve_grounded
 
     ctx = fresh_subject(patch_mesh).context
     tf = compute_coil_transform(
         ctx, patch_placement.center_mm, patch_placement.handle_mm, patch_placement.distance_mm
     )
-    dadt_elm = _dadt_node_to_elm(
-        coil_dadt_at_nodes(d70_coil.positions_m, d70_coil.moments, tf, 1e6, ctx.nodes_mm),
-        ctx.tet_nodes,
+    dadt_nodes = coil_dadt_at_nodes(
+        d70_coil.positions_m, d70_coil.moments, tf, 1e6, ctx.nodes_mm
     )
-    b = _assemble_rhs_kernel(ctx, dadt_elm)
+    b = _assemble_rhs(ctx, dadt_nodes.reshape(ctx.n_nodes, 1, 3)).ravel()
 
     solver = ctx.solver
     v = solve_grounded(solver, b)

@@ -194,16 +194,85 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "dadt_nbody",
         [](f32_cuda_2d s, f32_cuda_2d mp, f32_cuda_1d sn, f32_cuda_2d r, f32_cuda_2d out,
-           float didt, float mu0_4pi, uintptr_t stream) {
+           float didt, float mu0_4pi, uintptr_t stream, int column) {
             int n_dip = static_cast<int>(s.shape(0));
             int n_nodes = static_cast<int>(r.shape(0));
-            launch_dadt(s.data(), mp.data(), sn.data(), r.data(), out.data(), n_dip, n_nodes,
-                        didt, mu0_4pi, reinterpret_cast<cudaStream_t>(stream));
+            const int stride = static_cast<int>(out.shape(1));
+            if (static_cast<int>(out.shape(0)) != n_nodes || stride % 3 != 0 || column < 0 ||
+                3 * column >= stride) {
+                throw std::invalid_argument(
+                    "dadt_nbody: out must be (n_nodes, 3k) with column < k");
+            }
+            launch_dadt(s.data(), mp.data(), sn.data(), r.data(), out.data() + 3 * column, stride,
+                        n_dip, n_nodes, didt, mu0_4pi, reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
         nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
-        nb::arg("stream"),
-        "Fused dA/dt at nodes from placed magnetic dipoles; writes into caller-allocated out.");
+        nb::arg("stream"), nb::arg("column") = 0,
+        "Fused dA/dt at nodes from placed magnetic dipoles; writes into caller-allocated out. out "
+        "is (n_nodes, 3k), an interleaved (n_nodes, k, 3) block, and this fills placement column.");
+
+    m.def(
+        "dadt_node_to_element_block",
+        [](f32_cuda_3d dadt_nodes, i32_cuda_2d tet_nodes, std::vector<f32_cuda_2d> out,
+           uintptr_t stream) {
+            const int k = static_cast<int>(out.size());
+            if (k < 1 || k > kMaxStageBlock || static_cast<int>(dadt_nodes.shape(1)) != k ||
+                dadt_nodes.shape(2) != 3) {
+                throw std::invalid_argument("dadt_node_to_element_block: bad block shape");
+            }
+            const int n_tet = static_cast<int>(tet_nodes.shape(0));
+            float* out_ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                if (static_cast<int>(out[c].shape(0)) != n_tet || out[c].shape(1) != 3) {
+                    throw std::invalid_argument("dadt_node_to_element_block: bad output shape");
+                }
+                out_ptrs[c] = out[c].data();
+            }
+            launch_dadt_element_average_block(dadt_nodes.data(), tet_nodes.data(), out_ptrs,
+                                              n_tet, k, reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("dadt_nodes").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("stream"),
+        "Average an interleaved (n_nodes, k, 3) nodal dA/dt onto tetrahedra, one (n_tet, 3) "
+        "output per placement; tet_nodes is read once for the block.");
+
+    m.def(
+        "rhs_operator_fill",
+        [](f64_cuda_3d g, f64_cuda scale, i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx,
+           i32_cuda indptr, i32_cuda indices, f32_cuda_2d op, uintptr_t stream) {
+            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
+            if (op.shape(0) != indices.shape(0) || op.shape(1) != 4 ||
+                static_cast<int>(ptr.shape(0)) != n_rows + 1) {
+                throw std::invalid_argument("rhs_operator_fill: shape mismatch");
+            }
+            launch_rhs_operator_fill(g.data(), scale.data(), tet_nodes.data(), ptr.data(),
+                                     idx.data(), indptr.data(), indices.data(), op.data(), n_rows,
+                                     reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("g").noconvert(), nb::arg("scale").noconvert(), nb::arg("tet_nodes").noconvert(),
+        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("indptr").noconvert(),
+        nb::arg("indices").noconvert(), nb::arg("op").noconvert(), nb::arg("stream"),
+        "Build the forward RHS operator over the stiffness pattern: op is (nnz, 4), each row a "
+        "packed (Bx, By, Bz, column); scale is neg_vc / 4 in float64.");
+
+    m.def(
+        "rhs_operator_apply",
+        [](i32_cuda indptr, f32_cuda_2d op, f32_cuda_3d a, f32_cuda_2d b, uintptr_t stream) {
+            const int n_nodes = static_cast<int>(indptr.shape(0)) - 1;
+            const int k = static_cast<int>(a.shape(1));
+            if (k < 1 || k > kMaxStageBlock || static_cast<int>(a.shape(0)) != n_nodes ||
+                a.shape(2) != 3 || static_cast<int>(b.shape(0)) != n_nodes ||
+                static_cast<int>(b.shape(1)) != k || op.shape(1) != 4) {
+                throw std::invalid_argument("rhs_operator_apply: shape mismatch");
+            }
+            launch_rhs_operator(indptr.data(), op.data(), a.data(), b.data(), n_nodes, k,
+                                reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("indptr").noconvert(), nb::arg("op").noconvert(), nb::arg("a").noconvert(),
+        nb::arg("b").noconvert(), nb::arg("stream"),
+        "b = B a for an interleaved (n_nodes, k, 3) nodal dA/dt; writes row-major (n_nodes, k) "
+        "float32. Each column's sum order is independent of k.");
 
     m.def(
         "dadt_node_to_element",

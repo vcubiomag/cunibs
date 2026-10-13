@@ -36,11 +36,12 @@ from cunibs.solver import (
     NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
+    dadt_node_to_element_block,
     l1_dinv,
     reconstruct_e,
     reconstruct_e_block,
-    rhs_assemble_staged,
-    rhs_assemble_staged_block,
+    rhs_operator_apply,
+    rhs_operator_fill,
     select_size4,
     skin_normals,
     tet_lowest_node,
@@ -576,18 +577,44 @@ def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarr
     return dadt_elm
 
 
-def _assemble_rhs_kernel(ctx: SolverContext, dadt_elm: cp.ndarray) -> cp.ndarray:
-    b = cp.empty(ctx.n_nodes, dtype=cp.float32)
-    rhs_assemble_staged(
-        cp.ascontiguousarray(dadt_elm),
-        ctx.g,
-        ctx.neg_vc,
-        ctx.node2corner_ptr,
-        ctx.node2corner_idx,
-        b,
-        cp.cuda.get_current_stream().ptr,
+def _assemble_rhs(ctx: SolverContext, dadt_block: cp.ndarray) -> cp.ndarray:
+    """``(n_nodes, k)`` float32 RHS from an interleaved ``(n_nodes, k, 3)`` nodal dA/dt."""
+    n, k, _ = dadt_block.shape
+    b = cp.empty((n, k), dtype=cp.float32)
+    rhs_operator_apply(
+        ctx.rhs_indptr, ctx.rhs_op, dadt_block, b, cp.cuda.get_current_stream().ptr
     )
     return b
+
+
+def build_rhs_operator(
+    a: csp.csr_matrix,
+    g: cp.ndarray,
+    neg_vc: cp.ndarray,
+    tet_nodes: cp.ndarray,
+    ptr: cp.ndarray,
+    idx: cp.ndarray,
+) -> cp.ndarray:
+    """The forward RHS as an operator on nodal dA/dt, packed over the stiffness pattern of ``a``.
+
+    The RHS is linear in the nodal field once dA/dt reaches an element as the mean of its nodes,
+    so ``b_i = sum_j B_ij . a_j`` with ``B_ij = sum_{e owns i, j} (neg_vc_e / 4) g[e, i]``. The
+    result is ``(nnz, 4)`` float32, a nonzero's three components and then its column's bits.
+    ``g`` and ``neg_vc`` are float64 so that B is contracted before it is rounded.
+    """
+    op = cp.empty((int(a.indices.shape[0]), 4), dtype=cp.float32)
+    rhs_operator_fill(
+        cp.ascontiguousarray(g, dtype=cp.float64),
+        cp.ascontiguousarray(neg_vc * 0.25, dtype=cp.float64),
+        tet_nodes,
+        ptr,
+        idx,
+        a.indptr,
+        a.indices,
+        op,
+        cp.cuda.get_current_stream().ptr,
+    )
+    return op
 
 
 def _reconstruct_e_kernel(
@@ -633,6 +660,9 @@ class SolverContext:
     solver: GroundedSolver
     node2corner_ptr: cp.ndarray
     node2corner_idx: cp.ndarray
+    # The forward RHS operator from build_rhs_operator, over the stiffness pattern's rows.
+    rhs_indptr: cp.ndarray
+    rhs_op: cp.ndarray
     skin_a: cp.ndarray
     skin_b: cp.ndarray
     skin_c: cp.ndarray
@@ -718,13 +748,15 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     stiffness = assemble_stiffness(g, vols, cond, n_nodes, tet_nodes)
     ground_node = ground_node_of(nodes_mm)
     solver = prepare_grounded_solver(stiffness, nodes_mm, ground_node)
+    ptr, idx = build_node2corner(tet_nodes, n_nodes)
+    rhs_op = build_rhs_operator(stiffness, g, -(vols * cond), tet_nodes, ptr, idx)
+    rhs_indptr = stiffness.indptr
     del stiffness
 
     g = cp.ascontiguousarray(g.astype(RESIDENT_G_DTYPE))
     neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
     vols = cp.ascontiguousarray(vols.astype(cp.float32))
     del cond
-    ptr, idx = build_node2corner(tet_nodes, n_nodes)
     barycenters = cp.ascontiguousarray(nodes_mm[tet_nodes].mean(axis=1))
 
     skin_a = cp.ascontiguousarray(nodes_mm[skin_tris[:, 0]])
@@ -747,6 +779,8 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         solver,
         ptr,
         idx,
+        rhs_indptr,
+        rhs_op,
         skin_a,
         skin_b,
         skin_c,
@@ -833,7 +867,7 @@ def solve_placement(
     dadt_nodes = coil_dadt_at_nodes(dip_pos_m, dip_moment, transform, didt, ctx.nodes_mm)
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
 
-    b = _assemble_rhs_kernel(ctx, dadt_elm)
+    b = _assemble_rhs(ctx, dadt_nodes.reshape(ctx.n_nodes, 1, 3)).ravel()
 
     v = solve_grounded(ctx.solver, b)
     # The solver's last-solve state belongs to the call above only until the next solve on this
@@ -917,32 +951,23 @@ def solve_placements_block(
         )
     )
 
-    # dA/dt node->element stays per placement: a k-wide version would gather from k separate
-    # nodal arrays at once and overflow L2, which costs more than the shared tet_nodes read
-    # it would amortize.
-    dadt_elms = []
+    # Staged interleaved, so that a node's k values are one contiguous gather for both the
+    # element average and the RHS operator.
+    dadt_block = cp.empty((ctx.n_nodes, k, 3), dtype=cp.float32)
+    for i in range(k):
+        coil_dadt_at_nodes(
+            dip_pos_m, dip_moment, transforms[i], didt, ctx.nodes_mm, out=dadt_block, column=i
+        )
+    dadt_elms = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
+    dadt_node_to_element_block(dadt_block, ctx.tet_nodes, dadt_elms, stream)
     # A potential-consuming operator adds dA/dt back at the nodes, where it is exact, so that
     # path keeps the nodal field the others average away.
-    dadt_nodal: list[cp.ndarray] = []
-    for i in range(k):
-        dadt_nodes = coil_dadt_at_nodes(
-            dip_pos_m, dip_moment, transforms[i], didt, ctx.nodes_mm
-        )
-        dadt_elms.append(_dadt_node_to_elm(dadt_nodes, ctx.tet_nodes))
-        if on_potential:
-            dadt_nodal.append(cp.ascontiguousarray(dadt_nodes))
-        del dadt_nodes
-
-    b_block = cp.empty((ctx.n_nodes, k), dtype=cp.float32)
-    rhs_assemble_staged_block(
-        dadt_elms,
-        ctx.g,
-        ctx.neg_vc,
-        ctx.node2corner_ptr,
-        ctx.node2corner_idx,
-        b_block,
-        stream,
+    dadt_nodal: list[cp.ndarray] = (
+        [cp.ascontiguousarray(dadt_block[:, i, :]) for i in range(k)] if on_potential else []
     )
+
+    b_block = _assemble_rhs(ctx, dadt_block)
+    del dadt_block
 
     B_pad = _pad_block(b_block[solver.idx, :].astype(cp.float64), k)
     X, telemetry = _solve_grounded_block_mat(solver, B_pad, k)

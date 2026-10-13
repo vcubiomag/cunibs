@@ -24,6 +24,15 @@ void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const
                              const int* ptr, const int* idx, float* b_block, int n_nodes,
                              int n_tet, int k, cudaStream_t stream);
 
+// The forward path's RHS as an assembled operator on the nodal dA/dt (see rhs.cu). op is
+// (nnz, 4) float32 over the stiffness pattern indptr/indices, one packed (Bx, By, Bz, column)
+// per nonzero; scale[e] = neg_vc[e] / 4 in float64. a is (n_nodes, k, 3) and b is (n_nodes, k).
+void launch_rhs_operator_fill(const double* g, const double* scale, const int* tet_nodes,
+                              const int* ptr, const int* idx, const int* indptr,
+                              const int* indices, float* op, int n_rows, cudaStream_t stream);
+void launch_rhs_operator(const int* indptr, const float* op, const float* a, float* b,
+                         int n_nodes, int k, cudaStream_t stream);
+
 // --- reorder.cu: keys for the Morton layout -------------------------------------------------
 // inverse maps a mesh node to its position in the node permutation; lowest[e] is the smallest such
 // position over tetrahedron e's four nodes, which is the key its own permutation sorts by.

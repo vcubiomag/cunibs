@@ -120,6 +120,9 @@ def coil_dadt_at_nodes(
     transform: npt.NDArray[np.float64],
     didt: float,
     target_nodes_mm: cp.ndarray,
+    *,
+    out: cp.ndarray | None = None,
+    column: int = 0,
 ) -> cp.ndarray:
     """Compute dA/dt at each target node.
 
@@ -128,6 +131,10 @@ def coil_dadt_at_nodes(
         dA/dt = didt · A(r)
 
     Apply the full affine to positions and only its rotation to moments.
+
+    ``out`` is an optional C-contiguous ``(n_nodes, k, 3)`` float32 block, of which this fills
+    placement ``column`` and returns that view. The block solve stages its placements this way so
+    that a node's k values sit together for the RHS gather.
     """
     rot = cp.asarray(transform[:3, :3])
     trans = cp.asarray(transform[:3, 3])
@@ -150,6 +157,11 @@ def coil_dadt_at_nodes(
     mp = cp.ascontiguousarray(mp.astype(DADT_COMPUTE_DTYPE))
     sn = cp.ascontiguousarray((s * s).sum(1))
 
-    out = cp.empty_like(r)
-    dadt_nbody(s, mp, sn, r, out, float(didt), MU0_OVER_4PI, cp.cuda.get_current_stream().ptr)
-    return out
+    stream = cp.cuda.get_current_stream().ptr
+    if out is None:
+        field = cp.empty_like(r)
+        dadt_nbody(s, mp, sn, r, field, float(didt), MU0_OVER_4PI, stream)
+        return field
+    n = int(r.shape[0])
+    dadt_nbody(s, mp, sn, r, out.reshape(n, -1), float(didt), MU0_OVER_4PI, stream, column)
+    return out[:, column, :]

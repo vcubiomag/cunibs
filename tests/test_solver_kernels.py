@@ -163,6 +163,78 @@ def test_rhs_assemble_staged_block_matches_single(cp, dev, stream, k):
         )
 
 
+def _rhs_operator(cp, dev, mesh_arrays):
+    """The forward RHS operator over the fixture mesh, built the way build_context builds it."""
+    from cunibs.fem.assembly import stiffness_pattern
+    from cunibs.fem.solve import build_rhs_operator
+
+    a = stiffness_pattern(dev["tet_nodes"], N_NODES, dev["ptr"], dev["idx"])
+    op = build_rhs_operator(
+        a,
+        cp.asarray(mesh_arrays["g"].astype(np.float64)),
+        cp.asarray(mesh_arrays["neg_vc"].astype(np.float64)),
+        dev["tet_nodes"],
+        dev["ptr"],
+        dev["idx"],
+    )
+    return a.indptr, op
+
+
+def test_rhs_operator_matches_the_staged_assembly(cp, dev, mesh_arrays, stream):
+    """B a must equal the staged path fed the element average of the same nodal field."""
+    from cunibs.solver import dadt_node_to_element, rhs_assemble_staged, rhs_operator_apply
+
+    indptr, op = _rhs_operator(cp, dev, mesh_arrays)
+    rng = np.random.default_rng(4)
+    nodal = cp.asarray(rng.standard_normal((N_NODES, 3)).astype(np.float32))
+
+    b = cp.empty((N_NODES, 1), dtype=cp.float32)
+    rhs_operator_apply(indptr, op, nodal.reshape(N_NODES, 1, 3), b, stream)
+
+    elm = cp.empty((N_TET, 3), dtype=cp.float32)
+    dadt_node_to_element(nodal, dev["tet_nodes"], elm, stream)
+    staged = cp.empty(N_NODES, dtype=cp.float32)
+    rhs_assemble_staged(elm, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], staged, stream)
+    np.testing.assert_allclose(cp.asnumpy(b[:, 0]), cp.asnumpy(staged), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 8])
+def test_rhs_operator_block_matches_single(cp, dev, mesh_arrays, stream, k):
+    """Each column of a k-wide apply must equal the k = 1 apply on that column, bit for bit."""
+    from cunibs.solver import rhs_operator_apply
+
+    indptr, op = _rhs_operator(cp, dev, mesh_arrays)
+    rng = np.random.default_rng(5)
+    block = cp.asarray(rng.standard_normal((N_NODES, k, 3)).astype(np.float32))
+    b_block = cp.empty((N_NODES, k), dtype=cp.float32)
+    rhs_operator_apply(indptr, op, block, b_block, stream)
+    for c in range(k):
+        single = cp.empty((N_NODES, 1), dtype=cp.float32)
+        column = cp.ascontiguousarray(block[:, c : c + 1, :])
+        rhs_operator_apply(indptr, op, column, single, stream)
+        np.testing.assert_array_equal(
+            cp.asnumpy(b_block[:, c]), cp.asnumpy(single[:, 0]), err_msg=f"column {c}"
+        )
+
+
+@pytest.mark.parametrize("k", [1, 3, 8])
+def test_dadt_node_to_element_block_matches_single(cp, dev, stream, k):
+    from cunibs.solver import dadt_node_to_element, dadt_node_to_element_block
+
+    rng = np.random.default_rng(6)
+    block = cp.asarray(rng.standard_normal((N_NODES, k, 3)).astype(np.float32))
+    outs = [cp.empty((N_TET, 3), dtype=cp.float32) for _ in range(k)]
+    dadt_node_to_element_block(block, dev["tet_nodes"], outs, stream)
+    for c in range(k):
+        single = cp.empty((N_TET, 3), dtype=cp.float32)
+        dadt_node_to_element(
+            cp.ascontiguousarray(block[:, c, :]), dev["tet_nodes"], single, stream
+        )
+        np.testing.assert_array_equal(
+            cp.asnumpy(outs[c]), cp.asnumpy(single), err_msg=f"col {c}"
+        )
+
+
 def test_rhs_assembly_is_bit_reproducible(cp, dev, stream):
     """Node-centric, atomic-free, fixed summation order — repeated calls must be identical."""
     from cunibs.solver import rhs_assemble_staged
