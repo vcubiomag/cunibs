@@ -20,24 +20,28 @@ namespace {
 constexpr int kDadtBlock = 128;
 constexpr int kDipTile = 128;
 // Nodes each thread carries, not a node count: the register tiling that lets one dipole
-// tile load amortize over K nodes.
-constexpr int kNodesPerThread = 4;
+// tile load amortize over K nodes. Measured with a 128-thread block on a head mesh: 2 / 4 / 6 / 8
+// / 12 nodes gave 831 (at 256 threads) / 836 / 853 / 807 / 880 us; 8 at 256 threads was 821.
+constexpr int kNodesPerThread = 8;
 
 template <int K>
 __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict__ mp,
                             const float* __restrict__ sn, const float* __restrict__ r,
                             float* __restrict__ out, int out_stride, int n_dip, int n_nodes,
                             float didt, float mu0_4pi) {
-    __shared__ float s_s[kDipTile * 3];
-    __shared__ float s_mp[kDipTile * 6];
-    __shared__ float s_sn[kDipTile];
+    // A dipole is three vector reads from the tile, not ten scalar ones: shared-memory issue was
+    // most of what the FMA pipe waited on.
+    __shared__ float4 s_pos[kDipTile];  // (s, |s|^2)
+    __shared__ float4 s_mlo[kDipTile];  // m, (m x s).x
+    __shared__ float2 s_mhi[kDipTile];  // (m x s).y, (m x s).z
 
     // This mapping keeps node loads contiguous within each warp and preserves dipole sum order.
     const int T = gridDim.x * blockDim.x;
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
 
     int node[K];
-    float rx[K], ry[K], rz[K], rn[K];
+    // q = -2 r, so |r - s|^2 = (|r|^2 + |s|^2) + q.s is one add and three FMAs.
+    float rx[K], ry[K], rz[K], rn[K], qx[K], qy[K], qz[K];
     float wx[K], wy[K], wz[K];
     float px[K], py[K], pz[K];
 #pragma unroll
@@ -50,41 +54,40 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
             rz[k] = r[node[k] * 3 + 2];
             rn[k] = rx[k] * rx[k] + ry[k] * ry[k] + rz[k] * rz[k];
         }
+        qx[k] = -2.f * rx[k];
+        qy[k] = -2.f * ry[k];
+        qz[k] = -2.f * rz[k];
         wx[k] = wy[k] = wz[k] = px[k] = py[k] = pz[k] = 0.f;
     }
 
     for (int base = 0; base < n_dip; base += kDipTile) {
         const int tile = min(kDipTile, n_dip - base);
-        // Flat copies make adjacent lanes read adjacent values.
-        for (int i = threadIdx.x; i < tile * 3; i += kDadtBlock) s_s[i] = s[base * 3 + i];
-        for (int i = threadIdx.x; i < tile * 6; i += kDadtBlock) s_mp[i] = mp[base * 6 + i];
-        for (int i = threadIdx.x; i < tile; i += kDadtBlock) s_sn[i] = sn[base + i];
+        for (int i = threadIdx.x; i < tile; i += kDadtBlock) {
+            const int j = base + i;
+            s_pos[i] = make_float4(s[j * 3 + 0], s[j * 3 + 1], s[j * 3 + 2], sn[j]);
+            s_mlo[i] = make_float4(mp[j * 6 + 0], mp[j * 6 + 1], mp[j * 6 + 2], mp[j * 6 + 3]);
+            s_mhi[i] = make_float2(mp[j * 6 + 4], mp[j * 6 + 5]);
+        }
         __syncthreads();
 
 #pragma unroll 4
         for (int j = 0; j < tile; ++j) {
-            const float sx = s_s[j * 3 + 0];
-            const float sy = s_s[j * 3 + 1];
-            const float sz = s_s[j * 3 + 2];
-            const float snj = s_sn[j];
-            const float m0 = s_mp[j * 6 + 0];
-            const float m1 = s_mp[j * 6 + 1];
-            const float m2 = s_mp[j * 6 + 2];
-            const float m3 = s_mp[j * 6 + 3];
-            const float m4 = s_mp[j * 6 + 4];
-            const float m5 = s_mp[j * 6 + 5];
+            const float4 sp = s_pos[j];
+            const float4 ml = s_mlo[j];
+            const float2 mh = s_mhi[j];
 #pragma unroll
             for (int k = 0; k < K; ++k) {
-                const float d2 = rn[k] + snj - 2.f * (rx[k] * sx + ry[k] * sy + rz[k] * sz);
+                const float d2 =
+                    fmaf(qx[k], sp.x, fmaf(qy[k], sp.y, fmaf(qz[k], sp.z, rn[k] + sp.w)));
                 // The coil-scalp gap keeps d2 positive.
                 const float inv = rsqrtf(d2);
                 const float w = inv * inv * inv;
-                wx[k] += w * m0;
-                wy[k] += w * m1;
-                wz[k] += w * m2;
-                px[k] += w * m3;
-                py[k] += w * m4;
-                pz[k] += w * m5;
+                wx[k] += w * ml.x;
+                wy[k] += w * ml.y;
+                wz[k] += w * ml.z;
+                px[k] += w * ml.w;
+                py[k] += w * mh.x;
+                pz[k] += w * mh.y;
             }
         }
         __syncthreads();
