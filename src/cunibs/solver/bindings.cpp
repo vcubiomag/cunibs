@@ -722,6 +722,7 @@ NB_MODULE(_solver_ext, m) {
             const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
             launch_hpr_grad(v_block.data(), w.data(), pptr.data(), pidx.data(), slot_node.data(),
                             da_ptrs, out_ptrs, n_slots, k, stride,
+                            static_cast<int>(v_block.shape(0)),
                             reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("v_block").noconvert(), nb::arg("w").noconvert(), nb::arg("pptr").noconvert(),

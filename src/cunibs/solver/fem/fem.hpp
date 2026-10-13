@@ -128,7 +128,7 @@ void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx
 // stride is the block width the potential was solved at, which is k except on the serial path.
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
-                     int n_slots, int k, int stride, cudaStream_t stream);
+                     int n_slots, int k, int stride, int n_nodes, cudaStream_t stream);
 
 // slot_of_corner is (4 * n_tet,): the slot each corner reads back from.
 void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,

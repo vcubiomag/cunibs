@@ -559,49 +559,88 @@ __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
     if (lane == 0) status[s] = rung;
 }
 
+// The potential as a pair of floats per value, v ~ hi + lo to 2^-48 of v. Built once per call so
+// that hpr_grad's inner loop has no fp64 in it at all.
+template <int K>
+__global__ void split_potential_kernel(const double* __restrict__ v_block, int stride, int n,
+                                       float* __restrict__ hi, float* __restrict__ lo) {
+    const std::int64_t t = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= static_cast<std::int64_t>(n) * K) return;
+    const std::int64_t node = t / K;
+    const int c = static_cast<int>(t % K);
+    const double v = v_block[node * stride + c];
+    const float h = static_cast<float>(v);
+    hi[t] = h;
+    lo[t] = static_cast<float>(v - static_cast<double>(h));
+}
+
 // One thread per slot, K placements at a time.
-//   grad_v[s] = Σ_m W[s,m] · v[m]        (fp64: the difference against dA/dt cancels)
+//   grad_v[s] = Σ_m W[s,m] · (v[m] − v[n_s])
 //   E[s]      = −grad_v[s] − dA/dt(x_n)
 // The nodal dA/dt is used exactly here rather than the element average the raw path builds, so
 // the only approximated part of E is the one the FEM actually approximates.
+//
+// A patch's gradient weights reproduce constants, so differencing against the slot's own node
+// changes nothing in exact arithmetic and removes the potential's common level, which the fp32
+// weights' rounding otherwise leaks into the gradient at |v| |W| eps (the same leak reconstruct.cu
+// had). The difference comes from the float pairs: hi_m − hi_0 is exact whenever the two are
+// within a factor of two (Sterbenz) and otherwise the difference is as large as the values, so
+// either way it carries a float's relative precision. The sum over the patch is compensated, so
+// its error does not grow with the patch. Done in fp64 instead, this kernel was fp64-bound at
+// 93% on a 1:64 part.
+//
+// Every operation is an explicit round-to-nearest intrinsic. nvcc may otherwise fuse a multiply
+// into the add after it in one instantiation and not another, which made the result depend on K.
 template <int K>
-__global__ void hpr_grad_kernel(const double* __restrict__ v_block, const float* __restrict__ w,
-                                const int* __restrict__ pptr, const int* __restrict__ pidx,
-                                const int* __restrict__ slot_node, ConstPtrPack dadt_nodes,
-                                PtrPack e_slots, int n_slots, int stride) {
+__global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __restrict__ v_lo,
+                                const float* __restrict__ w, const int* __restrict__ pptr,
+                                const int* __restrict__ pidx, const int* __restrict__ slot_node,
+                                ConstPtrPack dadt_nodes, PtrPack e_slots, int n_slots) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_slots) return;
 
     const Vec3View<const float> wv(w, kUnsizedRows);
-    const Mat2View<const double> v(v_block, kUnsizedRows, stride);
+    const WidthView<const float, K> hi(v_hi, kUnsizedRows);
+    const WidthView<const float, K> lo(v_lo, kUnsizedRows);
+    const int node = slot_node[s];
 
-    double acc[K][3];
+    float h0[K], l0[K];
+    float acc[K][3], comp[K][3];
 #pragma unroll
-    for (int c = 0; c < K; ++c) acc[c][0] = acc[c][1] = acc[c][2] = 0.0;
+    for (int c = 0; c < K; ++c) {
+        h0[c] = hi(node, c);
+        l0[c] = lo(node, c);
+        acc[c][0] = acc[c][1] = acc[c][2] = 0.f;
+        comp[c][0] = comp[c][1] = comp[c][2] = 0.f;
+    }
 
     const int begin = pptr[s], end = pptr[s + 1];
     for (int p = begin; p < end; ++p) {
-        const double wx = static_cast<double>(wv(p, 0));
-        const double wy = static_cast<double>(wv(p, 1));
-        const double wz = static_cast<double>(wv(p, 2));
+        const float wx = wv(p, 0), wy = wv(p, 1), wz = wv(p, 2);
         const int m = pidx[p];
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const double vm = v(m, c);
-            acc[c][0] += wx * vm;
-            acc[c][1] += wy * vm;
-            acc[c][2] += wz * vm;
+            const float d = __fadd_rn(__fsub_rn(hi(m, c), h0[c]), __fsub_rn(lo(m, c), l0[c]));
+            const float wd[3] = {__fmul_rn(wx, d), __fmul_rn(wy, d), __fmul_rn(wz, d)};
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                // Kahan: comp carries what the running sum dropped.
+                const float y = __fsub_rn(wd[i], comp[c][i]);
+                const float t = __fadd_rn(acc[c][i], y);
+                comp[c][i] = __fsub_rn(__fsub_rn(t, acc[c][i]), y);
+                acc[c][i] = t;
+            }
         }
     }
 
-    const int node = slot_node[s];
 #pragma unroll
     for (int c = 0; c < K; ++c) {
         const Vec3View<const float> da(dadt_nodes[c], kUnsizedRows);
         const Vec3View<float> dst(e_slots[c], n_slots);
-        dst(s, 0) = static_cast<float>(-acc[c][0] - static_cast<double>(da(node, 0)));
-        dst(s, 1) = static_cast<float>(-acc[c][1] - static_cast<double>(da(node, 1)));
-        dst(s, 2) = static_cast<float>(-acc[c][2] - static_cast<double>(da(node, 2)));
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            dst(s, i) = __fadd_rn(__fsub_rn(-acc[c][i], da(node, i)), comp[c][i]);
+        }
     }
 }
 
@@ -645,10 +684,21 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
     }
 }
 
+// TwoSum: s + e == a + b exactly.
+__device__ __forceinline__ float two_sum(float a, float b, float& e) {
+    const float s = a + b;
+    const float bb = s - a;
+    e = (a - (s - bb)) + (b - bb);
+    return s;
+}
+
 // One thread per tet: sample the recovered field at the barycentre, which for P1 is the mean of
 // the four corner slots. slot_of_corner is the identity on tet_nodes for the node-slot modes and
-// the (node, tissue) map for the tissue-restricted ones. Accumulated in fp64 before the fp32
-// store, matching reconstruct.cu.
+// the (node, tissue) map for the tissue-restricted ones.
+//
+// The four-term sum is formed exactly as a float plus its error terms and rounded once, which is
+// what an fp64 accumulation followed by an fp32 store gives, without the fp64 that made this
+// kernel fp64-bound at 87% on a 1:64 part. |E| is the norm of the stored components.
 template <int K>
 __global__ void recover_elements_kernel(ConstPtrPack e_slots,
                                         const int* __restrict__ slot_of_corner, PtrPack e_out,
@@ -664,21 +714,18 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
 #pragma unroll
     for (int c = 0; c < K; ++c) {
         const Vec3View<const float> src(e_slots[c], kUnsizedRows);
-        double sx = 0.0, sy = 0.0, sz = 0.0;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            sx += static_cast<double>(src(slots[i], 0));
-            sy += static_cast<double>(src(slots[i], 1));
-            sz += static_cast<double>(src(slots[i], 2));
-        }
-        sx *= 0.25;
-        sy *= 0.25;
-        sz *= 0.25;
         const Vec3View<float> dst(e_out[c], n_tet);
-        dst(e, 0) = static_cast<float>(sx);
-        dst(e, 1) = static_cast<float>(sy);
-        dst(e, 2) = static_cast<float>(sz);
-        magn_out[c][e] = static_cast<float>(sqrt(sx * sx + sy * sy + sz * sz));
+        float m[3];
+#pragma unroll
+        for (int d = 0; d < 3; ++d) {
+            float e1, e2, e3;
+            const float s1 = two_sum(src(slots[0], d), src(slots[1], d), e1);
+            const float s2 = two_sum(src(slots[2], d), src(slots[3], d), e2);
+            const float s = two_sum(s1, s2, e3);
+            m[d] = 0.25f * (s + ((e1 + e2) + e3));
+            dst(e, d) = m[d];
+        }
+        magn_out[c][e] = sqrtf(fmaf(m[0], m[0], fmaf(m[1], m[1], m[2] * m[2])));
     }
 }
 
@@ -716,15 +763,28 @@ void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx
 
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
-                     int n_slots, int k, int stride, cudaStream_t stream) {
+                     int n_slots, int k, int stride, int n_nodes, cudaStream_t stream) {
     const ConstPtrPack da = const_ptr_pack(dadt_nodes, k);
     const PtrPack out = ptr_pack(e_slots, k);
     const unsigned blocks = grid_for(n_slots);
     if (!blocks) return;
+    const std::size_t count = static_cast<std::size_t>(n_nodes) * k;
+    float* split = nullptr;
+    // Outside any graph capture, like the RHS staging buffers.
+    check_cuda(cudaMallocAsync(&split, 2 * count * sizeof(float), stream), "hpr_grad",
+               "mallocAsync(split)");
+    float* const v_hi = split;
+    float* const v_lo = split + count;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "hpr_grad: unsupported block width", [&](auto kk) {
-        hpr_grad_kernel<decltype(kk)::value><<<blocks, kBlock, 0, stream>>>(
-            v_block, w, pptr, pidx, slot_node, da, out, n_slots, stride);
+        constexpr int K = decltype(kk)::value;
+        if (const unsigned sb = grid_for(static_cast<std::int64_t>(count))) {
+            split_potential_kernel<K>
+                <<<sb, kBlock, 0, stream>>>(v_block, stride, n_nodes, v_hi, v_lo);
+        }
+        hpr_grad_kernel<K><<<blocks, kBlock, 0, stream>>>(v_hi, v_lo, w, pptr, pidx, slot_node,
+                                                          da, out, n_slots);
     });
+    check_cuda(cudaFreeAsync(split, stream), "hpr_grad", "freeAsync(split)");
 }
 
 void launch_recover_nodes(const float* const* e_in, const float* w, const int* ptr, const int* idx,
