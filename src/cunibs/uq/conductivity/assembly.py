@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cupy as cp
+import numpy as np
+import numpy.typing as npt
 
 from cunibs.fem.assembly import (
     TISSUE_CONDUCTIVITY,
@@ -51,6 +53,14 @@ class ConductivityUQPrecompute:
     nominal_data: (
         cp.ndarray
     )  # (nnz,) f64 — reduced values at nominal σ (frozen-preconditioner point)
+    affine_has_base: bool  # whether pcg's affine parts lead with the fixed base
+
+    def affine_coefficients(self, sigmas: cp.ndarray) -> npt.NDArray[np.float64]:
+        """Host ``(k, n_terms)`` coefficients of the affine operator for draws ``sigmas``."""
+        sig = cp.asnumpy(sigmas).astype(np.float64)
+        if not self.affine_has_base:
+            return np.ascontiguousarray(sig)
+        return np.ascontiguousarray(np.hstack([np.ones((sig.shape[0], 1)), sig]))
 
     def combine(self, sigma: cp.ndarray) -> cp.ndarray:
         """Assemble the reduced matrix values for one conductivity sample."""
@@ -127,6 +137,13 @@ def build_conductivity_uq_precompute(
     nominal_f32 = cp.ascontiguousarray(nominal_data.astype(cp.float32))
     precond = build_native_vcycle(row_ptr, col_idx, nominal_f32)
     pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data)
+    # The draws' operators, A(sigma) = base + sum_t sigma_t A_t, as one affine operator: a block of
+    # draws then shares every part's read and no draw's matrix is ever assembled. The base is a
+    # part whose coefficient is always 1, and is left out when nothing is held fixed.
+    has_base = bool(cp.any(base_data))
+    terms = cp.concatenate([base_data[None], tissue_data]) if has_base else tissue_data
+    pcg.set_affine_terms(cp.ascontiguousarray(terms))
+    del terms
     tolerance = DEFAULT_TOLERANCE
     max_iters = DEFAULT_MAX_ITERS
 
@@ -143,4 +160,5 @@ def build_conductivity_uq_precompute(
         max_iters=max_iters,
         nominal_sigma=nominal_sigma,
         nominal_data=nominal_data,
+        affine_has_base=has_base,
     )

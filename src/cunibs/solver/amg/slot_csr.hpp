@@ -19,3 +19,31 @@ void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
                          const std::int16_t* cols, const double* src, double* dst,
                          cudaStream_t stream);
 
+// An operator affine in per-column coefficients, laid out for the affine SpMV (cg_kernels.hpp):
+// every row's entries regrouped into one segment per part that has a nonzero there, each in
+// column order and in slots.
+struct AffineSlots {
+    // Rows in the order the SpMV takes them: each window of kAffineWindow consecutive rows grouped
+    // by segment count, then longest first, so rows that share a warp walk near-equal lengths.
+    DeviceBuffer<int> order;
+    DeviceBuffer<int> seg_ptr;
+    DeviceBuffer<int> seg_start;
+    DeviceBuffer<std::uint8_t> seg_term;
+    DeviceBuffer<std::int16_t> cols;
+    DeviceBuffer<double> vals;
+    int n_terms = 0;
+    int n_segs = 0;
+    int n_slots = 0;
+};
+
+constexpr int kAffineWindow = 32;
+
+// Setup only. term_vals is (n_terms, nnz) over the entry CSR row_ptr, whose slot form is
+// slot_ptr/slot_cols. Synchronises the legacy stream it runs on.
+AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* slot_ptr,
+                               const std::int16_t* slot_cols, const double* term_vals,
+                               int n_terms, const char* origin);
+
+// aw_t[t * n_s + s] = the sum of part t's entries in row rows[s], in entry order.
+void launch_term_row_sums(int n_s, const int* rows, const int* row_ptr, const double* term_vals,
+                          int nnz, int n_terms, double* aw_t, cudaStream_t stream);

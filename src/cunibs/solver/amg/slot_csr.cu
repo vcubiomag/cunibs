@@ -3,7 +3,10 @@
 
 #include <cub/device/device_scan.cuh>
 
+#include <algorithm>
+#include <numeric>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -52,6 +55,86 @@ __global__ void slot_scatter_kernel(int n, const int* __restrict__ row_ptr,
     }
 }
 
+// Walks row's slots alongside its entries: a low-half slot belongs to the far column before it and
+// has no entry of its own. f(entry, slot, far) is called once per entry.
+template <typename F>
+__device__ __forceinline__ void for_each_entry(int row, const int* __restrict__ row_ptr,
+                                               const int* __restrict__ slot_ptr,
+                                               const std::int16_t* __restrict__ slot_cols, F&& f) {
+    int p = row_ptr[row];
+    for (int s = slot_ptr[row]; s < slot_ptr[row + 1]; ++s) {
+        const int c = slot_cols[s];
+        if (c > kSlotNearMax) continue;
+        f(p++, s, c < kSlotNearMin);
+    }
+}
+
+__global__ void affine_count_kernel(int n, int nnz, const int* __restrict__ row_ptr,
+                                    const int* __restrict__ slot_ptr,
+                                    const std::int16_t* __restrict__ slot_cols,
+                                    const double* __restrict__ term_vals, int n_terms,
+                                    int* __restrict__ segs, int* __restrict__ slots) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+    int n_seg = 0, n_slot = 0;
+    for (int t = 0; t < n_terms; ++t) {
+        const double* v = term_vals + static_cast<std::int64_t>(t) * nnz;
+        int cnt = 0;
+        for_each_entry(row, row_ptr, slot_ptr, slot_cols, [&](int p, int, bool far) {
+            if (v[p] != 0.0) cnt += far ? 2 : 1;
+        });
+        n_seg += cnt > 0;
+        n_slot += cnt;
+    }
+    segs[row] = n_seg;
+    slots[row] = n_slot;
+}
+
+__global__ void affine_fill_kernel(int n, int nnz, const int* __restrict__ row_ptr,
+                                   const int* __restrict__ slot_ptr,
+                                   const std::int16_t* __restrict__ slot_cols,
+                                   const double* __restrict__ term_vals, int n_terms,
+                                   const int* __restrict__ seg_ptr,
+                                   const int* __restrict__ slot_base, int* __restrict__ seg_start,
+                                   std::uint8_t* __restrict__ seg_term,
+                                   std::int16_t* __restrict__ cols, double* __restrict__ vals) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+    int g = seg_ptr[row];
+    int o = slot_base[row];
+    for (int t = 0; t < n_terms; ++t) {
+        const double* v = term_vals + static_cast<std::int64_t>(t) * nnz;
+        const int begin = o;
+        for_each_entry(row, row_ptr, slot_ptr, slot_cols, [&](int p, int s, bool far) {
+            if (v[p] == 0.0) return;
+            cols[o] = slot_cols[s];
+            vals[o++] = v[p];
+            if (far) {
+                cols[o] = slot_cols[s + 1];
+                vals[o++] = 0.0;
+            }
+        });
+        if (o > begin) {
+            seg_term[g] = static_cast<std::uint8_t>(t);
+            seg_start[g++] = begin;
+        }
+    }
+}
+
+__global__ void term_row_sums_kernel(int n_s, const int* __restrict__ rows,
+                                     const int* __restrict__ row_ptr,
+                                     const double* __restrict__ term_vals, int nnz, int n_terms,
+                                     double* __restrict__ aw_t) {
+    const std::int64_t t = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (t >= static_cast<std::int64_t>(n_s) * n_terms) return;
+    const int term = static_cast<int>(t / n_s);
+    const int i = static_cast<int>(t % n_s);
+    const double* v = term_vals + static_cast<std::int64_t>(term) * nnz;
+    double s = 0.0;
+    for (int p = row_ptr[rows[i]]; p < row_ptr[rows[i] + 1]; ++p) s += v[p];
+    aw_t[t] = s;
+}
+
 }  // namespace
 
 SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, const char* origin) {
@@ -93,3 +176,87 @@ void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
     }
 }
 
+namespace {
+
+// Exclusive scan of n per-row counts into an (n + 1) pointer; returns the total.
+int scan_counts(int n, const int* counts, int* ptr, const char* origin) {
+    std::size_t bytes = 0;
+    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts, ptr, n + 1), origin,
+               "scan size");
+    DeviceBuffer<unsigned char> temp = device_alloc<unsigned char>(bytes, origin, "scan");
+    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts, ptr, n + 1), origin,
+               "scan");
+    int total = 0;
+    check_cuda(cudaMemcpy(&total, ptr + n, sizeof(int), cudaMemcpyDeviceToHost), origin, "total");
+    return total;
+}
+
+}  // namespace
+
+AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* slot_ptr,
+                               const std::int16_t* slot_cols, const double* term_vals,
+                               int n_terms, const char* origin) {
+    if (n_terms < 1 || n_terms > 255) {
+        throw std::invalid_argument("affine operator: between 1 and 255 parts");
+    }
+    AffineSlots out;
+    out.n_terms = n_terms;
+    const std::size_t rows1 = static_cast<std::size_t>(n) + 1;
+    DeviceBuffer<int> segs = device_alloc<int>(rows1, origin, "affine segs");
+    DeviceBuffer<int> slots = device_alloc<int>(rows1, origin, "affine slots");
+    check_cuda(cudaMemsetAsync(segs.get() + n, 0, sizeof(int), nullptr), origin, "affine segs");
+    check_cuda(cudaMemsetAsync(slots.get() + n, 0, sizeof(int), nullptr), origin, "affine slots");
+    if (const unsigned blocks = grid_for(n)) {
+        affine_count_kernel<<<blocks, kBlock>>>(n, nnz, row_ptr, slot_ptr, slot_cols, term_vals,
+                                                n_terms, segs.get(), slots.get());
+    }
+    out.seg_ptr = device_alloc<int>(rows1, origin, "affine seg_ptr");
+    DeviceBuffer<int> slot_base = device_alloc<int>(rows1, origin, "affine slot base");
+    out.n_segs = scan_counts(n, segs.get(), out.seg_ptr.get(), origin);
+    out.n_slots = scan_counts(n, slots.get(), slot_base.get(), origin);
+    out.seg_start =
+        device_alloc<int>(static_cast<std::size_t>(out.n_segs) + 1, origin, "affine seg_start");
+    out.seg_term =
+        device_alloc<std::uint8_t>(static_cast<std::size_t>(out.n_segs), origin, "affine terms");
+    out.cols = device_alloc<std::int16_t>(static_cast<std::size_t>(out.n_slots), origin,
+                                          "affine cols");
+    out.vals = device_alloc<double>(static_cast<std::size_t>(out.n_slots), origin, "affine vals");
+    if (const unsigned blocks = grid_for(n)) {
+        affine_fill_kernel<<<blocks, kBlock>>>(n, nnz, row_ptr, slot_ptr, slot_cols, term_vals,
+                                               n_terms, out.seg_ptr.get(), slot_base.get(),
+                                               out.seg_start.get(), out.seg_term.get(),
+                                               out.cols.get(), out.vals.get());
+    }
+    // The last segment ends where the slots do.
+    check_cuda(cudaMemcpy(out.seg_start.get() + out.n_segs, &out.n_slots, sizeof(int),
+                          cudaMemcpyHostToDevice),
+               origin, "affine seg end");
+    std::vector<int> h_slots(n), h_segs(n);
+    check_cuda(cudaMemcpy(h_slots.data(), slots.get(), n * sizeof(int), cudaMemcpyDeviceToHost),
+               origin, "affine lengths");
+    check_cuda(cudaMemcpy(h_segs.data(), segs.get(), n * sizeof(int), cudaMemcpyDeviceToHost),
+               origin, "affine segments");
+    std::vector<int> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    for (int lo = 0; lo < n; lo += kAffineWindow) {
+        const int hi = std::min(n, lo + kAffineWindow);
+        std::stable_sort(order.begin() + lo, order.begin() + hi, [&](int a, int b) {
+            if (h_segs[a] != h_segs[b]) return h_segs[a] > h_segs[b];
+            return h_slots[a] > h_slots[b];
+        });
+    }
+    out.order = device_alloc<int>(static_cast<std::size_t>(n), origin, "affine order");
+    check_cuda(cudaMemcpy(out.order.get(), order.data(), n * sizeof(int), cudaMemcpyHostToDevice),
+               origin, "affine order");
+    check_cuda(cudaGetLastError(), origin, "affine fill");
+    check_cuda(cudaStreamSynchronize(nullptr), origin, "affine fill");
+    return out;
+}
+
+void launch_term_row_sums(int n_s, const int* rows, const int* row_ptr, const double* term_vals,
+                          int nnz, int n_terms, double* aw_t, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n_s) * n_terms)) {
+        term_row_sums_kernel<<<blocks, kBlock, 0, stream>>>(n_s, rows, row_ptr, term_vals, nnz,
+                                                            n_terms, aw_t);
+    }
+}

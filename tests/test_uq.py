@@ -429,7 +429,8 @@ def test_uq_sensitivity_basis_predicts_a_small_perturbation(cp, two_tissue_subje
         [
             csp.csr_matrix((data, pre.indices, pre.indptr), shape=(n_red, n_red)) @ x_nom
             for data in pre.tissue_data
-        ]
+        ],
+        axis=1,
     )
 
     w, einv = _sensitivity_basis(pre, b_tissue, ax_tissue, stream)
@@ -569,3 +570,68 @@ def test_uq_result_save_load(tmp_path, two_tissue_cube):
     np.testing.assert_array_equal(loaded.cov_magnE, r.cov_magnE)
     assert loaded.n_samples == r.n_samples
     assert loaded.perturbed_tags == r.perturbed_tags
+
+
+def test_affine_block_solves_each_draw_against_its_own_matrix(cp, two_tissue_subject):
+    """A column of the affine block solve is the draw's own system, and not its neighbours'.
+
+    Every column carries a different A(sigma) built from the per-tissue parts on the fly, so it
+    has to land where an ordinary solve of that column's assembled matrix does. And a column
+    solved alone must come back bit for bit as it did inside a block: the draws only share reads.
+    """
+    from cunibs.uq import build_conductivity_uq_precompute
+
+    ctx = two_tissue_subject.context
+    pre = build_conductivity_uq_precompute(ctx, (2, 3))
+    n_red = int(pre.idx.shape[0])
+    stream = cp.cuda.get_current_stream().ptr
+    rng = np.random.default_rng(3)
+    sigmas = cp.asarray(pre.nominal_sigma.get() * rng.lognormal(0.0, 0.3, size=(4, 2)))
+    b = cp.asarray(rng.standard_normal((n_red, 4)))
+
+    x = cp.empty_like(b)
+    _, rels, _ = pre.pcg.solve_affine_block(
+        pre.precond, b, x, pre.affine_coefficients(sigmas), 1e-10, pre.max_iters, stream
+    )
+    assert max(rels) <= 1e-10
+
+    for c in range(4):
+        pre.pcg.update_values(cp.ascontiguousarray(pre.combine(sigmas[c])), stream)
+        ref = cp.empty(n_red, dtype=cp.float64)
+        pre.pcg.solve_mixed(
+            pre.precond, cp.ascontiguousarray(b[:, c]), ref, 1e-12, pre.max_iters, stream
+        )
+        np.testing.assert_allclose(cp.asnumpy(x[:, c]), cp.asnumpy(ref), rtol=1e-7, atol=1e-12)
+
+        alone = cp.empty((n_red, 1), dtype=cp.float64)
+        pre.pcg.solve_affine_block(
+            pre.precond,
+            cp.ascontiguousarray(b[:, c : c + 1]),
+            alone,
+            pre.affine_coefficients(sigmas[c : c + 1]),
+            1e-10,
+            pre.max_iters,
+            stream,
+        )
+        np.testing.assert_array_equal(cp.asnumpy(alone[:, 0]), cp.asnumpy(x[:, c]))
+
+
+def test_block_moments_and_row_dot_match_their_serial_forms(cp):
+    from cunibs.solver import accumulate_moments, accumulate_moments_block, row_dot
+
+    rng = np.random.default_rng(4)
+    stream = cp.cuda.get_current_stream().ptr
+    magn = [cp.asarray(rng.random(1000).astype(np.float32)) for _ in range(5)]
+    s1, q1 = cp.zeros(1000), cp.zeros(1000)
+    for m in magn:
+        accumulate_moments(m, s1, q1, stream)
+    s2, q2 = cp.zeros(1000), cp.zeros(1000)
+    accumulate_moments_block(magn, s2, q2, stream)
+    np.testing.assert_array_equal(cp.asnumpy(s1), cp.asnumpy(s2))
+    np.testing.assert_array_equal(cp.asnumpy(q1), cp.asnumpy(q2))
+
+    a = rng.standard_normal((1000, 9))
+    s = rng.standard_normal(9)
+    out = cp.empty(1000)
+    row_dot(cp.asarray(a), cp.asarray(s), out, stream)
+    np.testing.assert_allclose(cp.asnumpy(out), a @ s, rtol=1e-13, atol=1e-13)

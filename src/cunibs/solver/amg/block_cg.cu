@@ -111,6 +111,47 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     WidthView<double, K>(y, n)(row, c) = part[0];
 }
 
+// y = A(sigma_c) x_c for an operator affine in per-column coefficients,
+// A(sigma) = sum_t sigma_t A_t on one pattern: the conductivity-UQ stiffness, a sum of per-tissue
+// parts. A row's entries are grouped into one segment per part that touches it, so each column
+// applies its own sigma once per segment and no column's matrix is ever materialised. The parts are read once for all K
+// columns, which is what lets independent draws share a block.
+//
+// One thread per (row, column), each walking its row in order, so a column's arithmetic does not
+// depend on K. Entries are slots (core/slot_csr.cuh) and sigma is laid out [column][term].
+//
+// A warp holds 32 / K rows, and the nested loops cost it, per segment, the longest of its rows'
+// segments, so rows are taken in `order`: each window of consecutive rows grouped by segment count,
+// then longest first. That leaves every row's arithmetic as it was. On a head mesh at K = 8 it took
+// active lanes from 68% to 83% and the kernel from 648 to 595 us; 128- and 512-row windows align
+// rows better and lose as much in gather locality. A single loop over the row's slots, closing
+// segments as it crosses them, evens trip counts further and measured slower (799 us): the
+// boundary test becomes predicated fp64 work on every slot of a kernel that is fp64-bound.
+template <int K>
+__global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
+    affine_spmv_kernel(int n, const int* __restrict__ order, const int* __restrict__ seg_ptr,
+                       const int* __restrict__ seg_start, const std::uint8_t* __restrict__ seg_term,
+                       const std::int16_t* __restrict__ cols, const double* __restrict__ vals,
+                       const double* __restrict__ sigma, int n_terms,
+                       const double* __restrict__ x, double* __restrict__ y) {
+    const std::int64_t tid = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int slot = static_cast<int>(tid / K);
+    if (slot >= n) return;
+    const int row = order[slot];
+    const int c = static_cast<int>(tid % K);
+    const WidthView<const double, K> xv(x, n);
+    const double* sig = sigma + c * n_terms;
+    double acc = 0.0;
+    for (int g = seg_ptr[row]; g < seg_ptr[row + 1]; ++g) {
+        double part = 0.0;
+        for (int j = seg_start[g]; j < seg_start[g + 1]; ++j) {
+            part += vals[j] * xv(slot_column(cols, j, row), c);
+        }
+        acc += sig[seg_term[g]] * part;
+    }
+    WidthView<double, K>(y, n)(row, c) = acc;
+}
+
 // Rows each thread of a reducing kernel carries. A warp's shuffle tree spends five fp64 adds per
 // lane and per column to combine 32 values, and fp64 runs at a sixty-fourth of fp32 on a GeForce
 // part, so the tree rather than the loads is what bounds these kernels: with the tree removed the
@@ -229,9 +270,9 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
 //     z = z~ + shift * 1,   shift = (sum(r) - Aw . z~) / E,   z~ = M^-1 r,
 //     r . z = r . z~ + shift * sum(r).
 // sum(r) rides on the residual-norm reduction and Aw . z~ is a handful of loads in the kernel that
-// folds r . z~. Aw and 1/E are held per column. It never moves the fixed point, only the
-// preconditioner. inv_e = 0 switches it off and leaves every shift exactly zero, which is what an
-// operator with no positive E gets.
+// folds r . z~. Aw and 1/E are held per column, because an affine operator gives every column its
+// own matrix. It never moves the fixed point, only the preconditioner. inv_e = 0 switches it off
+// and leaves every shift exactly zero, which is what an operator with no positive E gets.
 
 // Setup only: each row's sum and l1 norm, which decide the support.
 __global__ void bcg_row_sums_kernel(int n, const int* __restrict__ row_ptr,
@@ -260,6 +301,20 @@ __global__ void bcg_defl_rows_kernel(int n_s, const int* __restrict__ rows,
     for (int j = row_ptr[row]; j < row_ptr[row + 1]; ++j) s += vals[j];
 #pragma unroll
     for (int c = 0; c < kDeflCols; ++c) aw[t * kDeflCols + c] = s;
+}
+
+// Aw on the support for an affine operator: column c's is sum_t sigma[c, t] Aw_t.
+__global__ void bcg_defl_affine_kernel(int n_s, int n_terms, const double* __restrict__ aw_t,
+                                       const double* __restrict__ sigma, double* __restrict__ aw) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_s) return;
+    for (int c = 0; c < kDeflCols; ++c) {
+        double s = 0.0;
+        for (int term = 0; term < n_terms; ++term) {
+            s += sigma[c * n_terms + term] * aw_t[static_cast<std::int64_t>(term) * n_s + t];
+        }
+        aw[t * kDeflCols + c] = s;
+    }
 }
 
 // 1/E per column, E summed over the support in its own order.
@@ -587,6 +642,18 @@ void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const std::int16_
     });
 }
 
+void launch_affine_spmv_block(int n, int k, const AffineOperator& op, const double* sigma,
+                              const double* x, double* y, cudaStream_t stream) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
+            affine_spmv_kernel<K><<<blocks, kBlock, 0, stream>>>(
+                n, op.order, op.seg_ptr, op.seg_start, op.seg_term, op.cols, op.vals, sigma,
+                op.n_terms, x, y);
+        }
+    });
+}
+
 void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,
                     double* out, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
@@ -632,6 +699,14 @@ void launch_bcg_defl_from_values(int n_s, const int* rows, const int* row_ptr,
                                  cudaStream_t stream) {
     if (const unsigned blocks = grid_for(n_s)) {
         bcg_defl_rows_kernel<<<blocks, kBlock, 0, stream>>>(n_s, rows, row_ptr, vals, aw);
+    }
+    bcg_defl_energy_kernel<<<1, kDeflCols, 0, stream>>>(n_s, aw, inv_e);
+}
+
+void launch_bcg_defl_affine(int n_s, int n_terms, const double* aw_t, const double* sigma,
+                            double* aw, double* inv_e, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(n_s)) {
+        bcg_defl_affine_kernel<<<blocks, kBlock, 0, stream>>>(n_s, n_terms, aw_t, sigma, aw);
     }
     bcg_defl_energy_kernel<<<1, kDeflCols, 0, stream>>>(n_s, aw, inv_e);
 }

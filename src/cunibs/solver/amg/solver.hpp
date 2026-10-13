@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "amg/cg_kernels.hpp"
@@ -148,11 +149,26 @@ public:
                                      int k, double tolerance, int max_iters,
                                      cudaStream_t stream, const double* X0 = nullptr);
 
+    // An operator affine in per-column coefficients over this solver's pattern,
+    // A(sigma) = sum_t sigma_t A_t, given as n_terms value arrays in entry order (n_terms, nnz).
+    // Kept beside the values update_values sets, which the other solves go on using.
+    void set_affine_terms(int n_terms, const double* term_values);
+    int affine_terms() const { return affine_.n_terms; }
+    // A block solve in which column c's operator is A(sigma[c]), sigma host (k, n_terms): every
+    // column a different matrix, sharing each part's reads and the preconditioner.
+    PcgBlockResult solve_affine_block(NativeVCycle& preconditioner, const double* B, double* X,
+                                      int k, const double* sigma, double tolerance, int max_iters,
+                                      cudaStream_t stream, const double* X0 = nullptr);
+
 private:
     void ensure_block_buffers(int k);
     Deflation deflation() const;
-    // Sets the deflation state from values_.
+    // Sets the deflation state from values_, unless it already holds it.
     void deflation_from_values(cudaStream_t stream);
+    void apply_operator(int k, bool affine, const double* x, double* y, cudaStream_t stream);
+    PcgBlockResult solve_block(NativeVCycle& preconditioner, const double* B, double* X, int k,
+                               double tolerance, int max_iters, cudaStream_t stream,
+                               const double* X0, bool affine);
 
     int n_ = 0;
     int nnz_ = 0;
@@ -174,11 +190,13 @@ private:
     // Per-block partial sums for the fused deterministic reductions, two columns each.
     DeviceBuffer<double> partials_;
     // Deflation of the constant vector (block_cg.cu): the rows where A 1 is nonzero, chosen once
-    // from the pattern's values, then Aw on them per column and 1/E per column.
+    // from the pattern's values, then Aw on them per column and 1/E per column. It holds either
+    // values_' state or one affine block's; the flag says which.
     int defl_n_ = 0;
     DeviceBuffer<int> defl_rows_;
     DeviceBuffer<double> defl_aw_;
     DeviceBuffer<double> defl_inv_e_;
+    bool defl_affine_ = false;
     PinnedBuffer<double> h_norm_;
     // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
     // un-capturable legacy default stream; b/x are handed off via join_event_. The iteration body
@@ -201,4 +219,11 @@ private:
     DeviceBuffer<double> partials_blk_;
     PinnedBuffer<double> h_norms_blk_;  // pinned, k residual norms + k reference norms
     GraphCache block_graph_;
+    // The affine operator, its parts' Aw on the deflation rows (n_terms, defl_n_), and the
+    // per-column coefficients a block runs with, [column][term]. The graph is its own: the body
+    // reads different arrays, and a new set of parts replaces it.
+    AffineSlots affine_;
+    DeviceBuffer<double> affine_aw_t_;
+    DeviceBuffer<double> affine_sigma_;
+    std::unique_ptr<GraphCache> affine_graph_;
 };

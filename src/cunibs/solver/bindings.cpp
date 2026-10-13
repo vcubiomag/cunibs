@@ -200,7 +200,53 @@ NB_MODULE(_solver_ext, m) {
             "Lockstep k-RHS mixed-precision PCG over row-major (n, k) operands; returns "
             "(block iterations, per-column relative residuals, per-column iteration counts). A "
             "column freezes once its own residual meets tolerance, so it stops where it would "
-            "have solved alone. k in {1, 2, 4, 8}.");
+            "have solved alone. k in {1, 2, 4, 8}.")
+        .def(
+            "set_affine_terms",
+            [](PcgAmgSolver& self, f64_cuda_2d terms) {
+                if (static_cast<int>(terms.shape(1)) != self.nnz()) {
+                    throw std::invalid_argument("affine terms must be (n_terms, nnz)");
+                }
+                self.set_affine_terms(static_cast<int>(terms.shape(0)), terms.data());
+            },
+            nb::arg("terms").noconvert(),
+            "Set an operator affine in per-column coefficients, A(sigma) = sum_t sigma_t A_t, "
+            "from its parts' values in entry order (n_terms, nnz).")
+        .def(
+            "solve_affine_block",
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
+               nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> sigma,
+               double tolerance, int max_iters, uintptr_t stream,
+               std::optional<f64_cuda_2d> X0) {
+                const int k = static_cast<int>(B.shape(1));
+                const int n = self.n();
+                const bool shaped = static_cast<int>(B.shape(0)) == n &&
+                                    static_cast<int>(X.shape(0)) == n &&
+                                    static_cast<int>(X.shape(1)) == k &&
+                                    static_cast<int>(sigma.shape(0)) == k &&
+                                    static_cast<int>(sigma.shape(1)) == self.affine_terms() &&
+                                    (!X0.has_value() || (static_cast<int>(X0->shape(0)) == n &&
+                                                         static_cast<int>(X0->shape(1)) == k));
+                if (!shaped) {
+                    throw std::invalid_argument(
+                        "B, X and X0 must be (n, k) and sigma (k, n_terms)");
+                }
+                PcgBlockResult result = self.solve_affine_block(
+                    preconditioner, B.data(), X.data(), k, sigma.data(), tolerance, max_iters,
+                    reinterpret_cast<cudaStream_t>(stream),
+                    X0.has_value() ? X0->data() : nullptr);
+                nb::list rels;
+                for (double r : result.relative_residual) rels.append(r);
+                nb::list col_iters;
+                for (int i : result.column_iterations) col_iters.append(i);
+                return nb::make_tuple(result.iterations, rels, col_iters);
+            },
+            nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
+            nb::arg("sigma").noconvert(), nb::arg("tolerance"), nb::arg("max_iters"),
+            nb::arg("stream"), nb::arg("X0").noconvert() = nb::none(),
+            "The block solve with column c's operator A(sigma[c]) from set_affine_terms: every "
+            "column its own matrix, sharing the parts' reads and the preconditioner. sigma is a "
+            "host (k, n_terms) float64 array. Returns what solve_mixed_block does.");
 
     m.def(
         "p1_gradients",
@@ -874,6 +920,42 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("magn").noconvert(), nb::arg("sum_e").noconvert(), nb::arg("sumsq_e").noconvert(),
         nb::arg("stream"),
         "Fused streaming |E| moments: sum_e += magn; sumsq_e += magn^2 (in place).");
+
+    m.def(
+        "accumulate_moments_block",
+        [](std::vector<f32_cuda_1d> magn, f64_cuda sum_e, f64_cuda sumsq_e, uintptr_t stream) {
+            const int k = static_cast<int>(magn.size());
+            const int n = static_cast<int>(sum_e.shape(0));
+            if (k < 1 || k > kMaxStageBlock || sumsq_e.shape(0) != sum_e.shape(0)) {
+                throw std::invalid_argument("accumulate_moments_block: bad sizes");
+            }
+            const float* ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                if (static_cast<int>(magn[c].shape(0)) != n) {
+                    throw std::invalid_argument("accumulate_moments_block: bad sizes");
+                }
+                ptrs[c] = magn[c].data();
+            }
+            launch_accumulate_moments_block(ptrs, k, sum_e.data(), sumsq_e.data(), n,
+                                            reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("magn").noconvert(), nb::arg("sum_e").noconvert(), nb::arg("sumsq_e").noconvert(),
+        nb::arg("stream"),
+        "accumulate_moments for up to 8 draws at once, folded in the order given.");
+
+    m.def(
+        "row_dot",
+        [](f64_cuda_2d a, f64_cuda s, f64_cuda out, uintptr_t stream) {
+            const int n = static_cast<int>(a.shape(0));
+            const int p = static_cast<int>(a.shape(1));
+            if (static_cast<int>(s.shape(0)) != p || static_cast<int>(out.shape(0)) != n) {
+                throw std::invalid_argument("row_dot: a must be (n, p), s (p,) and out (n,)");
+            }
+            launch_row_dot(a.data(), s.data(), out.data(), n, p,
+                           reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("a").noconvert(), nb::arg("s").noconvert(), nb::arg("out").noconvert(),
+        nb::arg("stream"), "out = a @ s for a tall, narrow a, each row summed in term order.");
 
     m.def(
         "place_transforms",

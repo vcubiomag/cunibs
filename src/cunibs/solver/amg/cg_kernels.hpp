@@ -11,6 +11,21 @@ int bcg_partials_blocks(int n);
 void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const std::int16_t* cols,
                              const double* vals, const double* x, double* y,
                              cudaStream_t stream);
+// An operator affine in per-column coefficients, A(sigma) = sum_t sigma_t A_t, stored as per-row
+// segments, one per part touching the row: segments [seg_ptr[i], seg_ptr[i+1]) of row i, segment
+// g holding slots [seg_start[g], seg_start[g+1]) of part seg_term[g].
+struct AffineOperator {
+    int n_terms = 0;
+    const int* order = nullptr;  // the order rows are taken in; any permutation gives the same y
+    const int* seg_ptr = nullptr;
+    const int* seg_start = nullptr;
+    const std::uint8_t* seg_term = nullptr;
+    const std::int16_t* cols = nullptr;
+    const double* vals = nullptr;
+};
+// sigma is [column][term] for kMaxStageBlock columns.
+void launch_affine_spmv_block(int n, int k, const AffineOperator& op, const double* sigma,
+                              const double* x, double* y, cudaStream_t stream);
 void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,
                     double* out, cudaStream_t stream);
 void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
@@ -33,6 +48,10 @@ void launch_bcg_row_sums(int n, const int* row_ptr, const double* vals, double* 
 void launch_bcg_defl_from_values(int n_s, const int* rows, const int* row_ptr,
                                  const double* vals, double* aw, double* inv_e,
                                  cudaStream_t stream);
+// The same for an affine operator: column c's Aw is sum_t sigma[c, t] aw_t[t], sigma laid out
+// [column][term] for kMaxStageBlock columns.
+void launch_bcg_defl_affine(int n_s, int n_terms, const double* aw_t, const double* sigma,
+                            double* aw, double* inv_e, cudaStream_t stream);
 // x <- x + Q r and r <- r - A Q r for the starting pair; also writes rf and the new sum(r).
 void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, double* r, float* rf,
                               double* partials, double* rsum, cudaStream_t stream);

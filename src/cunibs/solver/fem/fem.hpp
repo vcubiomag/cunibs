@@ -179,3 +179,9 @@ void launch_adm_reach(const double* origin, const double* spacing, const int* sh
 // --- moments.cu: streaming UQ statistics over the |E| this directory produces ---------------
 void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
                                cudaStream_t stream);
+// k <= kMaxStageBlock draws' |E| folded in draw order, as k calls of the above would.
+void launch_accumulate_moments_block(const float* const* magn, int k, double* sum_e,
+                                     double* sumsq_e, int n, cudaStream_t stream);
+// out (n) = a (n, p) times s (p), each row summed in term order.
+void launch_row_dot(const double* a, const double* s, double* out, int n, int p,
+                    cudaStream_t stream);

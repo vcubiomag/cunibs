@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
+import numpy as np
 
 from cunibs import metrics
 from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
@@ -19,10 +20,11 @@ from cunibs.fem.solve import (
     _pad_block,
 )
 from cunibs.solver import (
-    accumulate_moments,
+    accumulate_moments_block,
     dadt_node_to_element,
-    reconstruct_e,
+    reconstruct_e_block,
     rhs_assemble,
+    row_dot,
 )
 from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductivities
 from cunibs.uq.conductivity.result import ConductivityUQResult
@@ -142,7 +144,7 @@ def _sensitivity_basis(
     """
     n_red = int(pre.idx.shape[0])
     rhs = cp.ascontiguousarray(
-        b_tissue[:, pre.idx].astype(cp.float64).T - ax_tissue.T  # (n_red, P)
+        b_tissue[:, pre.idx].astype(cp.float64).T - ax_tissue  # (n_red, P)
     )
     sens = _solve_columns(pre, rhs, _SENSITIVITY_TOL, stream)
 
@@ -184,19 +186,32 @@ class _InitialGuess:
         # than per draw; _sensitivity_basis needs the same products for its right-hand sides.
         a_base = csp.csr_matrix((pre.base_data, pre.indices, pre.indptr), shape=shape)
         self._ax_base = a_base @ x_nominal
-        self._ax_tissue = cp.stack(
-            [
-                csp.csr_matrix((data, pre.indices, pre.indptr), shape=shape) @ x_nominal
-                for data in pre.tissue_data
-            ]
+        # Held (n_red, P), so a draw's sum over tissues is a short reduction along each row.
+        self._ax_tissue = cp.ascontiguousarray(
+            cp.stack(
+                [
+                    csp.csr_matrix((data, pre.indices, pre.indptr), shape=shape) @ x_nominal
+                    for data in pre.tissue_data
+                ],
+                axis=1,
+            )
         )
         self._w, self._einv = _sensitivity_basis(pre, b_tissue, self._ax_tissue, stream)
         self._buf = cp.empty(n_red, dtype=cp.float64)
+        self._tmp = cp.empty(n_red, dtype=cp.float64)
 
     def for_draw(self, sigma: cp.ndarray, b_red: cp.ndarray) -> cp.ndarray:
         """The initial guess for one draw."""
-        r0 = b_red - (self._ax_base + sigma @ self._ax_tissue)
-        self._buf[:] = self._x_nominal + self._w @ (self._einv @ (self._w.T @ r0))
+        # The two products with one output per row go through row_dot: matmul sends this shape to
+        # a tensor-op GEMM that costs a millisecond each on a part without fp64 tensor throughput.
+        stream = cp.cuda.get_current_stream().ptr
+        row_dot(
+            self._ax_tissue, cp.ascontiguousarray(sigma, dtype=cp.float64), self._tmp, stream
+        )
+        r0 = b_red - (self._ax_base + self._tmp)
+        y = cp.ascontiguousarray(self._einv @ (self._w.T @ r0))
+        row_dot(self._w, y, self._tmp, stream)
+        self._buf[:] = self._x_nominal + self._tmp
         return self._buf
 
 
@@ -254,47 +269,44 @@ def run_conductivity_uq(
     n_tet = int(ctx.tet_nodes.shape[0])
     n_red = int(pre.idx.shape[0])
     stream = cp.cuda.get_current_stream().ptr
-    b_red = cp.empty(n_red, dtype=cp.float64)
-    x_red = cp.empty(n_red, dtype=cp.float64)
-    v = cp.zeros(ctx.n_nodes, dtype=cp.float64)
+    # Draws are solved MAX_BLOCK at a time as columns of one affine block solve: column c's matrix
+    # is A(sigma_c), applied from the per-tissue parts without ever being assembled, and every
+    # part's read is shared across the block. A short last block repeats its final draw, which
+    # costs a column and changes nothing, since columns are independent and the repeat is never
+    # read back.
+    width = MAX_BLOCK
+    b_blk = cp.empty((n_red, width), dtype=cp.float64)
+    x_blk = cp.empty((n_red, width), dtype=cp.float64)
+    x0_blk = cp.empty((n_red, width), dtype=cp.float64)
+    v_blk = cp.zeros((ctx.n_nodes, width), dtype=cp.float64)
     sum_e = cp.zeros(n_tet, dtype=cp.float64)
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
-    # Every buffer below is allocated once and rewritten in place per draw, like everything else
+    # Every buffer below is allocated once and rewritten in place per block, like everything else
     # in the loop, so the recovery call's arguments are loop-invariant too.
-    elements: list[cp.ndarray] | None = None
-    potential: cp.ndarray | None = None
-    dadt_nodal: list[cp.ndarray] | None = None
-    if recovery is None:
-        recover = None
-        e_buf = cp.empty((n_tet, 3), dtype=cp.float32)
-        magn = cp.empty(n_tet, dtype=cp.float32)
-        magn_stat = magn
-    else:
-        rec = RecoveredField.allocate(recovery, n_tet, 1)
-        # The operator and its buffers are consumed together, so they travel together.
-        recover = (recovery, rec)
-        # magn_stat is what every statistic below reads: binding it once is what keeps the
-        # moments and the per-draw scalars describing the same field.
-        magn_stat = rec.magnE[0]
-        if recovery.on_potential:
-            # Reads the nodal potential and the exact nodal dA/dt rather than the per-element
-            # field, so it allocates no raw buffer and skips the reconstruct on every one of the
-            # n_samples draws. v is rewritten in place each draw, so the column view holds.
-            e_buf = magn = None
-            potential = v.reshape(-1, 1)
-            dadt_nodal = [cp.ascontiguousarray(dadt_nodes)]
-        else:
-            e_buf = cp.empty((n_tet, 3), dtype=cp.float32)
-            magn = cp.empty(n_tet, dtype=cp.float32)
-            elements = [e_buf]
+    e_bufs: list[cp.ndarray] = []
+    magns: list[cp.ndarray] = []
+    dadt_elms = [dadt_elm] * width
+    rec = None
+    if recovery is None or not recovery.on_potential:
+        e_bufs = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(width)]
+        magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(width)]
+    if recovery is not None:
+        rec = RecoveredField.allocate(recovery, n_tet, width)
+    # magn_stat is what every statistic below reads: binding it once is what keeps the moments
+    # and the per-draw scalars describing the same field.
+    magn_stat = magns if rec is None else rec.magnE
+    # A potential-consuming operator reads the nodal potential and the exact nodal dA/dt rather
+    # than the per-element field, so the reconstruct is skipped on every draw.
+    dadt_nodal = [cp.ascontiguousarray(dadt_nodes)] * width
+    on_potential = recovery is not None and recovery.on_potential
 
     # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
     # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
     # initial residual, so a warm-started draw still reaches the same accuracy criterion.
     # pcg is cached on `pre` and reused across placements, so its values may hold a previous
-    # placement's last draw — reset the matrix to nominal before seeding (the preconditioner
-    # affects only iteration count, not the solution, so it needs no reset).
+    # placement's last fallback draw — reset the matrix to nominal before seeding (the
+    # preconditioner affects only iteration count, not the solution, so it needs no reset).
     x_nominal = cp.empty(n_red, dtype=cp.float64)
     pcg.update_values(cp.ascontiguousarray(pre.nominal_data), stream)
     b_nom = cp.ascontiguousarray(
@@ -321,44 +333,76 @@ def run_conductivity_uq(
     foc_s = cp.empty(config.n_samples, dtype=cp.float64)
     peakloc_s = cp.empty((config.n_samples, 3), dtype=cp.float64)
 
-    for k in range(config.n_samples):
-        sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
-        pcg.update_values(sample_data, stream)
-
-        b_red[:] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        x0 = guess.for_draw(sigmas[k], b_red)
-        _, rel = pcg.solve_mixed(
-            precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x0
+    # A block runs until its slowest column converges, so draws are blocked with those that will
+    # take about as long. How far a draw's sigma sits from the nominal point the warm start and
+    # the preconditioner were built at predicts that well enough to take the block's mean
+    # iteration count from 18.6 to 16.6 on a head mesh (the per-draw mean is 14.2). A draw's own
+    # result does not depend on the block it lands in, so the order changes no draw; the moments
+    # are summed in it.
+    log_dist = cp.asnumpy(
+        cp.sqrt((cp.log(sigmas / pre.nominal_sigma[None, :]) ** 2).sum(axis=1))
+    )
+    schedule = [int(k) for k in np.argsort(log_dist, kind="stable")]
+    for start in range(0, config.n_samples, width):
+        draws = schedule[start : start + width]
+        cols = draws + [draws[-1]] * (width - len(draws))
+        # Each column's right-hand side and initial guess are the arithmetic a lone draw gets,
+        # column by column, so neither depends on which block the draw landed in.
+        for c, k in enumerate(cols):
+            b_blk[:, c] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
+            x0_blk[:, c] = guess.for_draw(sigmas[k], b_blk[:, c])
+        _, rels, _ = pcg.solve_affine_block(
+            precond,
+            b_blk,
+            x_blk,
+            pre.affine_coefficients(sigmas[cp.asarray(cols)]),
+            pre.tolerance,
+            pre.max_iters,
+            stream,
+            x0_blk,
         )
-        if rel > pre.tolerance:
+        for c, k in enumerate(draws):
+            if rels[c] <= pre.tolerance:
+                continue
             # Rare extreme draw: the nominal-σ preconditioner missed tolerance, so build one
-            # matched to this sample, restart from the failed iterate, and discard it. pre.precond
-            # stays at nominal for the following draws.
+            # matched to this sample, restart from the failed iterate, and discard it.
+            # pre.precond stays at nominal for the following draws.
+            sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
+            pcg.update_values(sample_data, stream)
             draw_precond = pre.preconditioner_for(sample_data)
+            b_red = cp.ascontiguousarray(b_blk[:, c])
+            x_red = cp.ascontiguousarray(x_blk[:, c])
             retry_iters, rel = pcg.solve_mixed(
                 draw_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x_red
             )
             if rel > pre.tolerance:
                 raise SolverConvergenceError(int(retry_iters), float(rel), pre.tolerance)
+            x_blk[:, c] = x_red
 
-        v[pre.idx] = x_red
-        if e_buf is not None and magn is not None:
-            reconstruct_e(v, ctx.tet_nodes, ctx.g, dadt_elm, e_buf, magn, stream)
-        if recover is not None:
+        v_blk[pre.idx] = x_blk
+        if not on_potential:
+            reconstruct_e_block(v_blk, ctx.tet_nodes, ctx.g, dadt_elms, e_bufs, magns, stream)
+        if rec is not None:
             apply_recovery_into(
-                *recover, elements=elements, potential=potential, dadt_nodes=dadt_nodal
+                recovery,
+                rec,
+                elements=None if on_potential else e_bufs,
+                potential=v_blk,
+                dadt_nodes=dadt_nodal if on_potential else None,
             )
-        accumulate_moments(magn_stat, sum_e, sumsq_e, stream)
 
-        magn_gm = magn_stat[gm_idx]
-        peak_s[k] = magn_gm.max()
-        # Same percentile anchor as metrics.focality, so a per-draw focality and the summary's
-        # measure the same thing. Kept on device: reading the anchor would sync the loop.
-        anchor = metrics.weighted_quantiles(magn_gm, vols_gm, anchor_q)
-        foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
-        peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
-        for j, (idx, w) in enumerate(probes):
-            roi_s[k, j] = (magn_stat[idx].astype(cp.float64) * w).sum()
+        accumulate_moments_block(magn_stat[: len(draws)], sum_e, sumsq_e, stream)
+        for c, k in enumerate(draws):
+            magn_k = magn_stat[c]
+            magn_gm = magn_k[gm_idx]
+            peak_s[k] = magn_gm.max()
+            # Same percentile anchor as metrics.focality, so a per-draw focality and the
+            # summary's measure the same thing. Kept on device: reading the anchor would sync.
+            anchor = metrics.weighted_quantiles(magn_gm, vols_gm, anchor_q)
+            foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
+            peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
+            for j, (idx, w) in enumerate(probes):
+                roi_s[k, j] = (magn_k[idx].astype(cp.float64) * w).sum()
 
     n = config.n_samples
     mean = sum_e / n
