@@ -33,17 +33,22 @@ __global__ void accumulate_moments_block_kernel(ConstPtrPack magn, int k,
     sumsq_e[i] = q;
 }
 
-// out[i] = sum_t a[i, t] s[t], one thread per row, terms in order. The UQ initial guess forms two
-// of these per draw over a mesh-length, nine-column a; cuBLAS takes that shape to a tensor-op
-// GEMM at a millisecond, and a reduction along the short axis is slower still.
+// out[i, c] = sum_t a[i, t] s[c, t], one thread per (row, column), terms in order. The UQ
+// initial guess forms these over a mesh-length, narrow a; cuBLAS takes that shape to a tensor-op
+// GEMM at a millisecond, and a reduction along the short axis is slower still. A column's sum is
+// the same loop whatever k is, so a draw's guess does not depend on the block it was formed in.
+// Adjacent threads share a row, so its loads coalesce across the k columns.
 __global__ void row_dot_kernel(const double* __restrict__ a, const double* __restrict__ s,
-                               double* __restrict__ out, int n, int p) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const double* row = a + static_cast<std::int64_t>(i) * p;
+                               double* __restrict__ out, int n, int p, int k) {
+    const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= static_cast<std::int64_t>(n) * k) return;
+    const std::int64_t i = idx / k;
+    const int c = static_cast<int>(idx - i * k);
+    const double* row = a + i * p;
+    const double* sc = s + static_cast<std::int64_t>(c) * p;
     double acc = 0.0;
-    for (int t = 0; t < p; ++t) acc += row[t] * s[t];
-    out[i] = acc;
+    for (int t = 0; t < p; ++t) acc = fma(row[t], sc[t], acc);
+    out[idx] = acc;
 }
 
 }  // namespace
@@ -63,9 +68,9 @@ void launch_accumulate_moments_block(const float* const* magn, int k, double* su
     }
 }
 
-void launch_row_dot(const double* a, const double* s, double* out, int n, int p,
+void launch_row_dot(const double* a, const double* s, double* out, int n, int p, int k,
                     cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        row_dot_kernel<<<blocks, kBlock, 0, stream>>>(a, s, out, n, p);
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * k)) {
+        row_dot_kernel<<<blocks, kBlock, 0, stream>>>(a, s, out, n, p, k);
     }
 }

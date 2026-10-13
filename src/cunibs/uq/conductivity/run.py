@@ -6,7 +6,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import cupy as cp
-import cupyx.scipy.sparse as csp
 import numpy as np
 
 from cunibs import metrics
@@ -41,11 +40,20 @@ if TYPE_CHECKING:
 
 _NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
 
-# Tolerance for the sensitivity solves that span the projection basis. Deliberately far looser
+# Tolerance for the sensitivity solves that span the warm-start basis. Deliberately far looser
 # than the draw tolerance: the basis only has to point in the right directions for an initial
 # guess that CG then refines to `pre.tolerance` anyway, so its accuracy sets the rate and never
 # the answer.
 _SENSITIVITY_TOL = 1e-3
+
+# Second-order sensitivities kept in the warm-start basis: two block solves. On sub-004 the
+# strongest 16 of 45 take a block from 15.5 iterations (first order only) to 12.6; all 45 reach
+# 12.5 for three times the setup.
+_SECOND_ORDER_PAIRS = 16
+
+# Relative eigenvalue below which a basis direction counts as dependent on the others and is
+# dropped, in the nominal energy norm.
+_BASIS_RTOL = 1e-12
 
 
 def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
@@ -104,115 +112,155 @@ def _solve_columns(
     return out
 
 
-def _dominant_left_basis(a: cp.ndarray, rtol: float = 1e-8) -> cp.ndarray:
-    """Orthonormal basis for the dominant column space of a tall, skinny ``a``.
+def _cholesky_solve(e: np.ndarray, rhs: np.ndarray) -> np.ndarray:
+    """Solve ``e[d] y[d] = rhs[d]`` for every draw ``d``, ``e`` (N, m, m) SPD.
 
-    ``a = QR`` with ``Q`` orthonormal, so ``R`` carries ``a``'s singular values exactly and ``a``'s
-    left singular vectors are ``Q·U_R``; only the P-by-P ``R`` reaches an SVD. Taking the SVD of
-    ``a`` itself is the same factorisation, but cuSOLVER sizes ``gesvd``'s workspace off the *row*
-    count and reserves gigabytes at mesh-sized rows, where ``geqrf``'s workspace is row-independent.
-    Going through ``aᵀa`` would be cheaper still and is not backward stable: it squares the
-    condition number, and the sensitivities decay steeply enough across tissues to lose the tail.
+    Written as elementwise operations along the draw axis, with every sum accumulated in a fixed
+    order: a batched LAPACK or BLAS call may pick its summation order by size or alignment, and a
+    draw's guess must not depend on how many draws it was formed with.
     """
-    q, r = cp.linalg.qr(a, mode="reduced")
-    u, s, _ = cp.linalg.svd(r, full_matrices=False)
-    keep = int((s > rtol * float(s[0])).sum())
-    return cp.ascontiguousarray(q @ u[:, :keep])
+    n, m = rhs.shape
+    lo = np.zeros((n, m, m))
+    for j in range(m):
+        acc = e[:, j, j].copy()
+        for q in range(j):
+            acc = acc - lo[:, j, q] * lo[:, j, q]
+        lo[:, j, j] = np.sqrt(acc)
+        for i in range(j + 1, m):
+            acc = e[:, i, j].copy()
+            for q in range(j):
+                acc = acc - lo[:, i, q] * lo[:, j, q]
+            lo[:, i, j] = acc / lo[:, j, j]
+    z = np.zeros((n, m))
+    for i in range(m):
+        acc = rhs[:, i].copy()
+        for q in range(i):
+            acc = acc - lo[:, i, q] * z[:, q]
+        z[:, i] = acc / lo[:, i, i]
+    y = np.zeros((n, m))
+    for i in reversed(range(m)):
+        acc = z[:, i].copy()
+        for q in range(i + 1, m):
+            acc = acc - lo[:, q, i] * y[:, q]
+        y[:, i] = acc / lo[:, i, i]
+    return y
 
 
-def _sensitivity_basis(
-    pre: ConductivityUQPrecompute,
-    b_tissue: cp.ndarray,
-    ax_tissue: cp.ndarray,
-    stream: int,
-) -> tuple[cp.ndarray, cp.ndarray]:
-    """Orthonormal basis for the span of dx/dsigma at the ensemble centre, and its frozen E^-1.
+class _ReducedBasis:
+    """The x0 the sampling loop starts every draw from: a reduced-basis Galerkin solve.
 
-    Both the matrix and the RHS are linear in sigma, so differentiating ``A(s)x(s) = b(s)`` at
-    nominal sigma gives one system per perturbed tissue:
+    Both A(sigma) and b(sigma) are affine in sigma, so the solution x(sigma) is a smooth function of
+    P conductivities and lies close to a low-dimensional space. The basis is the ensemble-centre
+    solution, its first derivatives and the strongest second derivatives:
 
-        A_nom * dx/ds_t = b_t - A_t * x_nom.
+        A_nom dx/ds_t = b_t - A_t x_nom,
+        A_nom d2x/ds_s ds_t = -(A_s dx/ds_t + A_t dx/ds_s),
 
-    That is the subspace a draw's correction lives in, to first order, and it is P-dimensional
-    for P perturbed tissues. Both right-hand sides are already to hand: ``b_t`` is a row of the
-    per-tissue RHS decomposition, and ``A_t x_nom`` is the same product the per-draw residual
-    shortcut needs.
+    and a draw's guess is the Galerkin solution in that span with the draw's own operator,
+    ``x0 = V y``, ``(V^T A(sigma) V) y = V^T b(sigma)``, which is the A(sigma)-best point of the span.
+    Both reduced quantities are affine in sigma too, so ``V^T A_t V`` and ``V^T b_t`` are formed once
+    and a draw costs an m-by-m solve. The second derivatives kept are those with the largest
+    ``std(s_s) std(s_t) |rhs|``, weighted by how often the pair appears in the Taylor series.
 
-    ``_dominant_left_basis`` drops directions two tissues share, so the basis is P columns wide in
-    the normal case. A placement that couples to nothing leaves every sensitivity zero and the
-    basis empty; an empty basis contributes an empty correction, so there is nothing to guard.
-    """
-    n_red = int(pre.idx.shape[0])
-    rhs = cp.ascontiguousarray(
-        b_tissue[:, pre.idx].astype(cp.float64).T - ax_tissue  # (n_red, P)
-    )
-    sens = _solve_columns(pre, rhs, _SENSITIVITY_TOL, stream)
-
-    w = _dominant_left_basis(sens)
-    a_nom = csp.csr_matrix((pre.nominal_data, pre.indices, pre.indptr), shape=(n_red, n_red))
-    return w, cp.linalg.inv(w.T @ (a_nom @ w))
-
-
-class _InitialGuess:
-    """The x0 the sampling loop starts every draw from.
-
-    A draw starts at the solved ensemble-centre solution, corrected by the Galerkin projection of
-    its own residual onto the sensitivity subspace:
-
-        x0 = x_nominal + W·E⁻¹·Wᵀ·r0,   r0 = b(σ) − A(σ)·x_nominal,   E = Wᵀ·A_nominal·W.
-
-    The correction is A_nominal-optimal over ``span(W)`` for the residual it is handed. The drawn
-    system is A(σ), so that is optimal for the wrong operator, but the samples cluster at the
-    centre.
-
-    ``x_nominal`` and the basis are pure functions of the mesh, the placement and the nominal
-    conductivities, and the correction reads nothing else but the draw's own σ. Keep it that way.
-    x0 cannot move a draw outside ``pre.tolerance``, but it does decide where inside it the draw
-    lands, so anything reaching x0 from the ensemble — a size-dependent cost heuristic, a basis
-    accumulated over draws — makes a draw's last digits depend on the batch it was solved in.
+    Every per-placement quantity is a function of the mesh, the placement, the nominal
+    conductivities and the configured spreads, and a draw's guess reads nothing else but its own
+    sigma. Keep it that way. x0 cannot move a draw outside ``pre.tolerance``, but it does decide
+    where inside it the draw lands, so anything reaching x0 from the ensemble (a basis grown from
+    earlier draws, a size-dependent batched solve) makes a draw's last digits depend on the batch.
     """
 
     def __init__(
         self,
         pre: ConductivityUQPrecompute,
+        b_base: cp.ndarray,
         b_tissue: cp.ndarray,
         x_nominal: cp.ndarray,
+        spreads: np.ndarray,
         stream: int,
     ) -> None:
-        self._x_nominal = x_nominal
-        n_red = int(pre.idx.shape[0])
-        shape = (n_red, n_red)
-        # r0 is linear in σ, so A_base·x_nom and each A_t·x_nom are formed once here rather
-        # than per draw; _sensitivity_basis needs the same products for its right-hand sides.
-        a_base = csp.csr_matrix((pre.base_data, pre.indices, pre.indptr), shape=shape)
-        self._ax_base = a_base @ x_nominal
-        # Held (n_red, P), so a draw's sum over tissues is a short reduction along each row.
-        self._ax_tissue = cp.ascontiguousarray(
+        idx = pre.idx
+        p = len(pre.tissue_ops)
+        ax = cp.stack([op @ x_nominal for op in pre.tissue_ops], axis=1)  # (n_red, P)
+        rhs1 = cp.ascontiguousarray(b_tissue[:, idx].astype(cp.float64).T - ax)
+        sens = _solve_columns(pre, rhs1, _SENSITIVITY_TOL, stream)
+        a_sens = [op @ sens for op in pre.tissue_ops]
+
+        pairs = [(s, t) for s in range(p) for t in range(s, p)]
+        std = cp.asnumpy(pre.nominal_sigma) * spreads
+        score = np.array(
+            [
+                (1.0 if s != t else 0.5)
+                * std[s]
+                * std[t]
+                * float(cp.linalg.norm(a_sens[s][:, t] + a_sens[t][:, s]))
+                for s, t in pairs
+            ]
+        )
+        keep = np.sort(np.argsort(-score, kind="stable")[:_SECOND_ORDER_PAIRS])
+        rhs2 = cp.ascontiguousarray(
             cp.stack(
                 [
-                    csp.csr_matrix((data, pre.indices, pre.indptr), shape=shape) @ x_nominal
-                    for data in pre.tissue_data
+                    -(a_sens[pairs[j][0]][:, pairs[j][1]] + a_sens[pairs[j][1]][:, pairs[j][0]])
+                    for j in keep
                 ],
                 axis=1,
             )
         )
-        self._w, self._einv = _sensitivity_basis(pre, b_tissue, self._ax_tissue, stream)
-        self._buf = cp.empty(n_red, dtype=cp.float64)
-        self._tmp = cp.empty(n_red, dtype=cp.float64)
+        sens2 = _solve_columns(pre, rhs2, _SENSITIVITY_TOL, stream)
+        v = cp.ascontiguousarray(cp.concatenate([x_nominal[:, None], sens, sens2], axis=1))
+        del rhs1, rhs2
 
-    def for_draw(self, sigma: cp.ndarray, b_red: cp.ndarray) -> cp.ndarray:
-        """The initial guess for one draw."""
-        # The two products with one output per row go through row_dot: matmul sends this shape to
-        # a tensor-op GEMM that costs a millisecond each on a part without fp64 tensor throughput.
-        stream = cp.cuda.get_current_stream().ptr
-        row_dot(
-            self._ax_tissue, cp.ascontiguousarray(sigma, dtype=cp.float64), self._tmp, stream
-        )
-        r0 = b_red - (self._ax_base + self._tmp)
-        y = cp.ascontiguousarray(self._einv @ (self._w.T @ r0))
-        row_dot(self._w, y, self._tmp, stream)
-        self._buf[:] = self._x_nominal + self._tmp
-        return self._buf
+        # V^T A_t V per tissue. A_t x_nom and A_t dx/ds are already to hand from the right-hand
+        # sides; only the second-order columns need a product of their own.
+        e_tissue = []
+        for t, op in enumerate(pre.tissue_ops):
+            av = cp.concatenate([ax[:, t : t + 1], a_sens[t], op @ sens2], axis=1)
+            e_tissue.append(cp.asnumpy(v.T @ av))
+        e_terms = np.stack(e_tissue)
+        if pre.base_op is not None:
+            e_terms = np.concatenate([cp.asnumpy(v.T @ (pre.base_op @ v))[None], e_terms])
+        e_terms = 0.5 * (e_terms + e_terms.transpose(0, 2, 1))
+        b_cols = cp.concatenate([b_base[idx][:, None], b_tissue[:, idx].T], axis=1)
+        b_terms = cp.asnumpy(v.T @ b_cols.astype(cp.float64)).T  # (1 + P, m)
+
+        # An A_nom-orthonormal basis, once per placement: a draw's reduced matrix is then the
+        # identity plus the draw's departure from nominal, so a plain Cholesky solves it, and
+        # directions the others already span are dropped here rather than per draw.
+        nominal = np.concatenate([[1.0], cp.asnumpy(pre.nominal_sigma)])
+        coef_nom = nominal if pre.base_op is not None else nominal[1:]
+        # The columns differ in scale by orders of magnitude, so they are equilibrated first and
+        # the cutoff only sees dependence, not size.
+        g = np.tensordot(coef_nom, e_terms, axes=1)
+        d = 1.0 / np.sqrt(np.diag(g))
+        w, u = np.linalg.eigh(g * d[:, None] * d[None, :])
+        live = w > _BASIS_RTOL * w[-1]
+        tr = d[:, None] * u[:, live] / np.sqrt(w[live])
+        self._e_terms = np.einsum("ji,tjk,kl->til", tr, e_terms, tr)
+        self._b_terms = b_terms @ tr
+        self._v = cp.ascontiguousarray(v @ cp.asarray(tr))
+        self._has_base = pre.base_op is not None
+
+    @property
+    def width(self) -> int:
+        return int(self._v.shape[1])
+
+    def coefficients(self, sigmas: np.ndarray) -> np.ndarray:
+        """Each draw's reduced coordinates ``y`` (N, m), its own arithmetic whatever N is."""
+        n = sigmas.shape[0]
+        e = np.zeros((n, self.width, self.width))
+        rhs = np.zeros((n, self.width))
+        first = 1 if self._has_base else 0
+        if self._has_base:
+            e = e + self._e_terms[0][None]
+        rhs = rhs + self._b_terms[0][None]
+        for t in range(sigmas.shape[1]):
+            e = e + sigmas[:, t, None, None] * self._e_terms[first + t][None]
+            rhs = rhs + sigmas[:, t, None] * self._b_terms[1 + t][None]
+        return _cholesky_solve(e, rhs)
+
+    def guess_into(self, y: cp.ndarray, out: cp.ndarray, stream: int) -> None:
+        """``out[:, c] = V y[c]`` for the k rows of ``y``."""
+        row_dot(self._v, y, out, stream)
 
 
 def run_conductivity_uq(
@@ -314,7 +362,9 @@ def run_conductivity_uq(
     )
     pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
 
-    guess = _InitialGuess(pre, b_tissue, x_nominal, stream)
+    spreads = np.array([config.cov_for(t) for t in pre.perturbed_tags], dtype=np.float64)
+    basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream)
+    y_all = cp.asarray(basis.coefficients(cp.asnumpy(sigmas)))
 
     gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
     vols_gm = ctx.vols[gm_idx].astype(cp.float64)
@@ -335,13 +385,15 @@ def run_conductivity_uq(
 
     # A block runs until its slowest column converges, so draws are blocked with those that will
     # take about as long. How far a draw's sigma sits from the nominal point the warm start and
-    # the preconditioner were built at predicts that well enough to take the block's mean
-    # iteration count from 18.6 to 16.6 on a head mesh (the per-draw mean is 14.2). A draw's own
-    # result does not depend on the block it lands in, so the order changes no draw; the moments
-    # are summed in it.
-    log_dist = cp.asnumpy(
-        cp.sqrt((cp.log(sigmas / pre.nominal_sigma[None, :]) ** 2).sum(axis=1))
-    )
+    # the preconditioner were built at predicts that. With every tissue perturbed, A and b both
+    # scale with sigma, so x(c sigma) = x(sigma), and CG against a fixed preconditioner takes the
+    # same iterates for a scaled operator: only the ratios matter, and the common scale is
+    # projected out of the distance. A draw's own result does not depend on the block it lands
+    # in, so the order changes no draw; the moments are summed in it.
+    log_ratio = cp.log(sigmas / pre.nominal_sigma[None, :])
+    if pre.base_op is None:
+        log_ratio = log_ratio - log_ratio.mean(axis=1, keepdims=True)
+    log_dist = cp.asnumpy(cp.sqrt((log_ratio**2).sum(axis=1)))
     schedule = [int(k) for k in np.argsort(log_dist, kind="stable")]
     for start in range(0, config.n_samples, width):
         draws = schedule[start : start + width]
@@ -350,7 +402,7 @@ def run_conductivity_uq(
         # column by column, so neither depends on which block the draw landed in.
         for c, k in enumerate(cols):
             b_blk[:, c] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-            x0_blk[:, c] = guess.for_draw(sigmas[k], b_blk[:, c])
+        basis.guess_into(cp.ascontiguousarray(y_all[cp.asarray(cols)]), x0_blk, stream)
         _, rels, _ = pcg.solve_affine_block(
             precond,
             b_blk,

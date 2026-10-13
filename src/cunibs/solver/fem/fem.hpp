@@ -182,6 +182,6 @@ void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e
 // k <= kMaxStageBlock draws' |E| folded in draw order, as k calls of the above would.
 void launch_accumulate_moments_block(const float* const* magn, int k, double* sum_e,
                                      double* sumsq_e, int n, cudaStream_t stream);
-// out (n) = a (n, p) times s (p), each row summed in term order.
-void launch_row_dot(const double* a, const double* s, double* out, int n, int p,
+// out (n, k) = a (n, p) times s (k, p) transposed, each entry summed in term order.
+void launch_row_dot(const double* a, const double* s, double* out, int n, int p, int k,
                     cudaStream_t stream);

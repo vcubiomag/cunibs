@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cupy as cp
+import cupyx.scipy.sparse as csp
 import numpy as np
 import numpy.typing as npt
 
@@ -54,6 +55,10 @@ class ConductivityUQPrecompute:
         cp.ndarray
     )  # (nnz,) f64 — reduced values at nominal σ (frozen-preconditioner point)
     affine_has_base: bool  # whether pcg's affine parts lead with the fixed base
+    # The perturbed tissues' parts as their own CSR matrices with the pattern's zeros dropped, so a
+    # product with one part streams only that tissue's entries. The warm start forms many.
+    tissue_ops: list[csp.csr_matrix]
+    base_op: csp.csr_matrix | None  # the fixed part, or None when every tissue is perturbed
 
     def affine_coefficients(self, sigmas: cp.ndarray) -> npt.NDArray[np.float64]:
         """Host ``(k, n_terms)`` coefficients of the affine operator for draws ``sigmas``."""
@@ -147,6 +152,19 @@ def build_conductivity_uq_precompute(
     tolerance = DEFAULT_TOLERANCE
     max_iters = DEFAULT_MAX_ITERS
 
+    shape = (int(idx.shape[0]), int(idx.shape[0]))
+
+    rows = cp.repeat(cp.arange(shape[0], dtype=cp.int32), cp.diff(row_ptr).astype(cp.int64))
+
+    def compressed(data: cp.ndarray) -> csp.csr_matrix:
+        keep = data != 0.0
+        counts = cp.bincount(rows[keep], minlength=shape[0])
+        ptr = cp.concatenate([cp.zeros(1, dtype=cp.int32), cp.cumsum(counts).astype(cp.int32)])
+        return csp.csr_matrix((data[keep], col_idx[keep], ptr), shape=shape)
+
+    tissue_ops = [compressed(tissue_data[i]) for i in range(len(perturbed_tags))]
+    base_op = compressed(base_data) if has_base else None
+
     return ConductivityUQPrecompute(
         perturbed_tags=perturbed_tags,
         idx=idx,
@@ -161,4 +179,6 @@ def build_conductivity_uq_precompute(
         nominal_sigma=nominal_sigma,
         nominal_data=nominal_data,
         affine_has_base=has_base,
+        tissue_ops=tissue_ops,
+        base_op=base_op,
     )

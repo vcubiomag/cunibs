@@ -946,17 +946,21 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "row_dot",
-        [](f64_cuda_2d a, f64_cuda s, f64_cuda out, uintptr_t stream) {
+        [](f64_cuda_2d a, f64_cuda_2d s, f64_cuda_2d out, uintptr_t stream) {
             const int n = static_cast<int>(a.shape(0));
             const int p = static_cast<int>(a.shape(1));
-            if (static_cast<int>(s.shape(0)) != p || static_cast<int>(out.shape(0)) != n) {
-                throw std::invalid_argument("row_dot: a must be (n, p), s (p,) and out (n,)");
+            const int k = static_cast<int>(s.shape(0));
+            if (static_cast<int>(s.shape(1)) != p || static_cast<int>(out.shape(0)) != n ||
+                static_cast<int>(out.shape(1)) != k) {
+                throw std::invalid_argument("row_dot: a must be (n, p), s (k, p) and out (n, k)");
             }
-            launch_row_dot(a.data(), s.data(), out.data(), n, p,
+            launch_row_dot(a.data(), s.data(), out.data(), n, p, k,
                            reinterpret_cast<cudaStream_t>(stream));
         },
         nb::arg("a").noconvert(), nb::arg("s").noconvert(), nb::arg("out").noconvert(),
-        nb::arg("stream"), "out = a @ s for a tall, narrow a, each row summed in term order.");
+        nb::arg("stream"),
+        "out = a @ s.T for a tall, narrow a, each entry summed in term order. A column's result "
+        "does not depend on k.");
 
     m.def(
         "place_transforms",

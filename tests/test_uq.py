@@ -382,28 +382,24 @@ def test_uq_draws_do_not_depend_on_the_ensemble_size(two_tissue_subject, small_n
     np.testing.assert_array_equal(small.peak_samples, large.peak_samples[:small_n])
 
 
-def test_uq_sensitivity_basis_predicts_a_small_perturbation(cp, two_tissue_subject):
-    """The projection basis must actually be dx/dsigma at nominal sigma.
+def test_uq_reduced_basis_guess_tracks_the_solution(cp, two_tissue_subject):
+    """The warm start must be the Galerkin solve it claims, in the span it claims.
 
-    Nothing downstream would notice a sign slip or a mismatched tissue index: a wrong subspace
-    only makes the initial guess worse, and every draw still converges to the right answer, just
-    slower. This pins the derivation against the thing it claims to be — for a small step in one
-    tissue's conductivity, ``x(sigma_nom + d) ≈ x_nom + d · dx/dsigma_t``, with the error second
-    order in d.
+    Nothing downstream would notice a wrong basis or a mismatched tissue index: a bad guess only
+    costs iterations, and every draw still converges to the right answer. This pins the guess
+    against the solution itself. At nominal sigma the span holds x_nom, so the guess is x_nom. For
+    a step in one tissue the span holds the first and second derivatives, so what the guess misses
+    is third order in the step and far below the step's own effect.
     """
-    import cupyx.scipy.sparse as csp
-
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
     from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
-    from cunibs.uq.conductivity.run import _dadt_node_to_elm, _placement_rhs, _sensitivity_basis
+    from cunibs.uq.conductivity.run import _dadt_node_to_elm, _placement_rhs, _ReducedBasis
 
     ctx = two_tissue_subject.context
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
-    n_pert = len(pre.perturbed_tags)
     n_red = int(pre.idx.shape[0])
     stream = cp.cuda.get_current_stream().ptr
 
-    # The real per-tissue RHS decomposition, so both terms of b_t - A_t x_nom are exercised.
     placement = _placement()
     transform = compute_coil_transform(
         ctx, placement.center_mm, placement.handle_mm, placement.distance_mm
@@ -424,87 +420,46 @@ def test_uq_sensitivity_basis_predicts_a_small_perturbation(cp, two_tissue_subje
         pre.pcg.solve_mixed(pre.precond, b, x, 1e-11, pre.max_iters, stream)
         return x
 
+    def guess_at(basis, sigma):
+        y = basis.coefficients(cp.asnumpy(sigma)[None])
+        out = cp.empty((n_red, 1), dtype=cp.float64)
+        basis.guess_into(cp.asarray(y), out, stream)
+        return out[:, 0]
+
     x_nom = solve_at(pre.nominal_sigma)
-    ax_tissue = cp.stack(
-        [
-            csp.csr_matrix((data, pre.indices, pre.indptr), shape=(n_red, n_red)) @ x_nom
-            for data in pre.tissue_data
-        ],
-        axis=1,
+    basis = _ReducedBasis(pre, b_base, b_tissue, x_nom, np.array([0.15, 0.15]), stream)
+
+    rel = float(
+        cp.linalg.norm(guess_at(basis, pre.nominal_sigma) - x_nom) / cp.linalg.norm(x_nom)
     )
+    assert rel < 1e-6, f"the guess at nominal sigma is {rel:.2e} off x_nom"
 
-    w, einv = _sensitivity_basis(pre, b_tissue, ax_tissue, stream)
-    assert w.shape == (n_red, n_pert), "one basis direction per perturbed tissue"
-    assert einv.shape == (n_pert, n_pert)
-    # Orthonormal columns, so the frozen Galerkin operator is well conditioned by construction.
-    np.testing.assert_allclose(cp.asnumpy(w.T @ w), np.eye(n_pert), atol=1e-10)
-
-    # Step one tissue and check the move lands in the span the basis claims. A sign slip or a
-    # transposed tissue index leaves it pointing elsewhere and this fails outright.
-    for t in range(n_pert):
+    for t in range(len(pre.perturbed_tags)):
         sigma = pre.nominal_sigma.copy()
-        sigma[t] *= 1.01
-        delta = solve_at(sigma) - x_nom
-        moved = float(cp.linalg.norm(delta))
-        out_of_span = float(cp.linalg.norm(delta - w @ (w.T @ delta)))
+        sigma[t] *= 1.1
+        x = solve_at(sigma)
+        moved = float(cp.linalg.norm(x - x_nom))
+        missed = float(cp.linalg.norm(guess_at(basis, sigma) - x))
         assert moved > 0, f"tissue {pre.perturbed_tags[t]} had no effect on the solution"
-        assert out_of_span <= 0.02 * moved, (
-            f"tissue {pre.perturbed_tags[t]}: {out_of_span:.3e} of a {moved:.3e} move fell "
-            f"outside the sensitivity basis"
+        assert missed <= 1e-2 * moved, (
+            f"tissue {pre.perturbed_tags[t]}: the guess missed {missed:.3e} of a {moved:.3e} move"
         )
 
 
-def test_dominant_left_basis_matches_dense_svd(cp):
-    """The basis must span the same leading subspace a dense SVD of the tall matrix gives."""
-    from cunibs.uq.conductivity.run import _dominant_left_basis
+def test_reduced_solve_does_not_depend_on_the_batch():
+    """A draw's reduced coordinates must be bitwise the same whatever draws come with it."""
+    from cunibs.uq.conductivity.run import _cholesky_solve
 
-    m, n = 200_000, 9
-    # A steeply decaying spectrum, the regime a squared-condition-number route loses the tail in,
-    # plus two exact dependencies so the rank cutoff has something to cut.
-    a = cp.random.RandomState(0).standard_normal((m, n)) * cp.asarray(
-        [1.0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1.0, 1.0]
-    )
-    a[:, 7] = a[:, 2]
-    a[:, 8] = a[:, 0] + a[:, 1]
-    a = cp.ascontiguousarray(a)
+    rng = np.random.default_rng(3)
+    m, n = 12, 40
+    q = rng.standard_normal((n, m, m))
+    e = q @ q.transpose(0, 2, 1) + m * np.eye(m)
+    rhs = rng.standard_normal((n, m))
 
-    w = _dominant_left_basis(a)
-    assert w.shape == (m, 7), "two dependent columns must drop out"
-    assert w.flags.c_contiguous
-    np.testing.assert_allclose(cp.asnumpy(w.T @ w), np.eye(7), atol=1e-10)
-
-    # Every column of the input lies in the span, down to the 1e-6 one. A direction missing
-    # outright leaves its column's relative residual at ~1.
-    resid = a - w @ (w.T @ a)
-    rel = cp.linalg.norm(resid, axis=0) / cp.linalg.norm(a, axis=0)
-    assert float(cp.max(rel)) < 1e-8
-
-    # Two orthonormal bases of one subspace differ by a rotation, so compare the subspaces:
-    # each reference direction must lie in span(W).
-    u_ref = cp.asarray(np.linalg.svd(cp.asnumpy(a), full_matrices=False)[0][:, :7])
-    off = cp.linalg.norm(u_ref - w @ (w.T @ u_ref), axis=0)
-    assert float(cp.max(off)) < 1e-8
-
-
-def test_dominant_left_basis_workspace_stays_bounded(cp):
-    """The basis must not reserve a cuSOLVER workspace sized off the row count.
-
-    Pinned at a full head mesh's DOF count, not a toy one: the routines whose workspace scales
-    with rows only blow past this at that scale, and the card is already holding a subject.
-    """
-    from cunibs.uq.conductivity.run import _dominant_left_basis
-
-    n_rows = 881_455
-    pool = cp.get_default_memory_pool()
-    a = cp.random.RandomState(0).standard_normal((n_rows, 9))
-    pool.free_all_blocks()
-    before = pool.total_bytes()
-    w = _dominant_left_basis(a)
-    cp.cuda.Device().synchronize()
-    grew = pool.total_bytes() - before
-
-    assert w.shape == (n_rows, 9)
-    assert grew < 1 << 30, f"basis reserved {grew / 2**20:.0f} MiB of workspace"
+    full = _cholesky_solve(e, rhs)
+    np.testing.assert_allclose(full, np.linalg.solve(e, rhs[:, :, None])[:, :, 0], rtol=1e-10)
+    for lo, hi in [(0, 1), (5, 6), (7, 23), (39, 40)]:
+        np.testing.assert_array_equal(_cholesky_solve(e[lo:hi], rhs[lo:hi]), full[lo:hi])
 
 
 def test_uq_unreachable_tolerance_rebuilds_then_raises(fresh_subject, two_tissue_cube_mesh):
@@ -630,8 +585,13 @@ def test_block_moments_and_row_dot_match_their_serial_forms(cp):
     np.testing.assert_array_equal(cp.asnumpy(s1), cp.asnumpy(s2))
     np.testing.assert_array_equal(cp.asnumpy(q1), cp.asnumpy(q2))
 
-    a = rng.standard_normal((1000, 9))
-    s = rng.standard_normal(9)
-    out = cp.empty(1000)
-    row_dot(cp.asarray(a), cp.asarray(s), out, stream)
-    np.testing.assert_allclose(cp.asnumpy(out), a @ s, rtol=1e-13, atol=1e-13)
+    a = cp.asarray(rng.standard_normal((1000, 9)))
+    s = cp.asarray(rng.standard_normal((5, 9)))
+    out = cp.empty((1000, 5))
+    row_dot(a, s, out, stream)
+    np.testing.assert_allclose(cp.asnumpy(out), cp.asnumpy(a @ s.T), rtol=1e-13, atol=1e-13)
+    # Each column alone is bitwise the column formed beside the others.
+    for c in range(5):
+        alone = cp.empty((1000, 1))
+        row_dot(a, cp.ascontiguousarray(s[c : c + 1]), alone, stream)
+        np.testing.assert_array_equal(cp.asnumpy(alone[:, 0]), cp.asnumpy(out[:, c]))
