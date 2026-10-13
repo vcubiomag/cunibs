@@ -62,18 +62,22 @@ __device__ __forceinline__ void cross3(const double* u, const double* v, double*
     out[2] = u[0] * v[1] - u[1] * v[0];
 }
 
-// grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron. Accumulated in fp64
-// because callers subtract a comparable term from it and lose the leading digits.
+// grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron, taken as
+// Σ_{i≥1} (v_i − v_0) g[e,i,:] since P1 gradients sum to zero over the corners. The direct sum
+// carries v's common level through fp32 g that do not sum to zero to the last bit, which leaks
+// |v| |g| ε into a gradient that is small beside it. Accumulated in fp64 because callers subtract
+// a comparable term from it and lose the leading digits. g[e,0,:] is never read.
 __device__ __forceinline__ Vec3d tet_grad4(const double* __restrict__ v,
                                            Tet4View<const int> tet_nodes,
                                            TetGradView<const float> g, int e) {
+    const double v0 = v[tet_nodes(e, 0)];
     double gx = 0.0, gy = 0.0, gz = 0.0;
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const double vi = v[tet_nodes(e, i)];
-        gx += vi * static_cast<double>(g(e, i, 0));
-        gy += vi * static_cast<double>(g(e, i, 1));
-        gz += vi * static_cast<double>(g(e, i, 2));
+    for (int i = 1; i < 4; ++i) {
+        const double di = v[tet_nodes(e, i)] - v0;
+        gx += di * static_cast<double>(g(e, i, 0));
+        gy += di * static_cast<double>(g(e, i, 1));
+        gz += di * static_cast<double>(g(e, i, 2));
     }
     return {gx, gy, gz};
 }

@@ -62,6 +62,8 @@ void launch_stiffness_rows(const double* g, const double* scale, const int* tet_
                            double* data, int n_rows, cudaStream_t stream);
 
 // --- reconstruct.cu: E = -grad(v) - dA/dt --------------------------------------------------
+// g must be P1 basis gradients, whose four corners sum to zero: the kernels difference the
+// potential against corner 0 and never read g[e, 0].
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,
                         cudaStream_t stream);

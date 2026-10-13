@@ -37,11 +37,14 @@ def mesh_arrays():
         np.int32
     )
 
+    # P1 basis gradients sum to zero over an element's corners, and reconstruct relies on it.
+    g = rng.standard_normal((N_TET, 4, 3))
+    g -= g.mean(axis=1, keepdims=True)
     return {
         "tet_nodes": tet_nodes,
         "ptr": ptr,
         "idx": idx,
-        "g": rng.standard_normal((N_TET, 4, 3)).astype(np.float32),
+        "g": g.astype(np.float32),
         "neg_vc": (-rng.random(N_TET) - 0.1).astype(np.float32),
         "dadt_elm": rng.standard_normal((N_TET, 3)).astype(np.float32),
         "v": rng.standard_normal(N_NODES),
@@ -266,6 +269,16 @@ def test_reconstruct_e_block_matches_single(cp, dev, stream, k):
 # --- ADM reciprocity weights -------------------------------------------------------------
 
 
+def _p1_grad_reference(v, tet_nodes, g):
+    """Σᵢ v_i g_i taken as Σ_{i≥1} (v_i − v_0) g_i, which P1 gradients summing to zero allow.
+
+    The kernels use this form, and comparing against the direct sum would charge them the
+    |v| |g| ε that the fp32 g's rounding leaves in it.
+    """
+    vt = v[tet_nodes]
+    return np.einsum("ei,eik->ek", vt[:, 1:] - vt[:, :1], g[:, 1:].astype(np.float64))
+
+
 def test_element_weight_matches_numpy(cp, dev, mesh_arrays, stream):
     """w_e[e,k] = (−neg_vc[e]) · Σᵢ values[tet_nodes[e,i]]·g[e,i,k] — i.e. vol·σ·(Gλ)."""
     from cunibs.solver import element_weight
@@ -273,26 +286,39 @@ def test_element_weight_matches_numpy(cp, dev, mesh_arrays, stream):
     w_e = cp.empty((N_TET, 3), dtype=cp.float64)
     element_weight(dev["v"], dev["tet_nodes"], dev["g"], dev["neg_vc"], w_e, stream)
 
-    grad = np.einsum(
-        "ei,eik->ek", mesh_arrays["v"][mesh_arrays["tet_nodes"]], mesh_arrays["g"].astype(float)
-    )
+    grad = _p1_grad_reference(mesh_arrays["v"], mesh_arrays["tet_nodes"], mesh_arrays["g"])
     expected = -mesh_arrays["neg_vc"].astype(np.float64)[:, None] * grad
     np.testing.assert_allclose(cp.asnumpy(w_e), expected, rtol=1e-9)
 
 
-def test_element_weight_sign_is_positive_for_positive_conductivity(cp, dev, stream):
+def test_element_weight_sign_is_positive_for_positive_conductivity(
+    cp, dev, mesh_arrays, stream
+):
     """neg_vc is −vol·σ, so the kernel's leading −neg_vc must come out positive."""
     from cunibs.solver import element_weight
 
-    ones = cp.ones(N_NODES, dtype=cp.float64)
     w_e = cp.empty((N_TET, 3), dtype=cp.float64)
-    element_weight(ones, dev["tet_nodes"], dev["g"], dev["neg_vc"], w_e, stream)
-    # Σᵢ g[e,i,:] is the P1 partition-of-unity gradient, which is zero for a real element;
-    # here g is random, so just check the scaling factor is applied with the right sign.
-    grad = cp.asnumpy(dev["g"]).astype(np.float64).sum(axis=1)
+    element_weight(dev["v"], dev["tet_nodes"], dev["g"], dev["neg_vc"], w_e, stream)
+    grad = _p1_grad_reference(mesh_arrays["v"], mesh_arrays["tet_nodes"], mesh_arrays["g"])
     scale = -cp.asnumpy(dev["neg_vc"]).astype(np.float64)
     assert np.all(scale > 0)
     np.testing.assert_allclose(cp.asnumpy(w_e), scale[:, None] * grad, rtol=1e-9)
+
+
+def test_element_weight_of_a_constant_is_exactly_zero(cp, dev, stream):
+    """A constant potential has no gradient, and the differenced form returns exactly that."""
+    from cunibs.solver import element_weight
+
+    w_e = cp.empty((N_TET, 3), dtype=cp.float64)
+    element_weight(
+        cp.full(N_NODES, 3.25, dtype=cp.float64),
+        dev["tet_nodes"],
+        dev["g"],
+        dev["neg_vc"],
+        w_e,
+        stream,
+    )
+    assert not cp.any(w_e)
 
 
 def test_element_weight_is_linear_in_values(cp, dev, stream):
