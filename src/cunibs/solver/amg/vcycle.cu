@@ -40,7 +40,11 @@ Buffer<T> device_clone(const T* src, std::size_t count, const char* what) {
 // indexed by row, so halving the active lanes per warp halves the coalescing on all of them. At
 // the fine level the epilogue is about a fifth of the row's traffic and its loss outweighs the
 // matrix gain; by the coarsest it is ~1% and the matrix decides alone.
-constexpr int kTprChoices[] = {4, 8, 16, 32};
+//
+// Two lanes is the fine level's choice once its columns are 2-byte slots: measured on a head
+// mesh, level-0 widths 1 / 2 / 4 / 8 give 19.2 / 18.4 / 19.4 / 21.5 ms per placement at k = 1 and
+// 7.60 / 6.90 / 7.06 / 7.37 at k = 8.
+constexpr int kTprChoices[] = {2, 4, 8, 16, 32};
 
 // Strided steps of matrix work per thread needed before widening pays for what the epilogue loses.
 constexpr int kMinRowIters = 4;
@@ -91,6 +95,13 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
     warp_reduce_sum<TPR>(sum);
 }
 
+// Whether the operator kernels issue the row's own operands before the gather rather than after
+// the reduction. Single width only: there the row-local loads are a few words whose latency the
+// gather can hide, measured 2.8% off the k = 1 solve; at k = 8 they are 24 live floats per row
+// and the occupancy they cost is worth more, +1.4%. Where the loads land never moves a result.
+template <int K>
+constexpr bool kHoistEpilogue = (K == 1);
+
 // Threads per row for one level, from that level's shape alone: deterministic, and independent of
 // k, so the same operator always gets the same split and a solve reproduces across block widths.
 inline int choose_tpr(int n_rows, int nnz, int n_sm) {
@@ -123,19 +134,25 @@ template <int K, int TPR>
 __global__ void __launch_bounds__(kBlock)
     vc_residual_kernel(int n, const int* __restrict__ row_ptr,
                        const std::int16_t* __restrict__ cols, const __half* __restrict__ vals,
-                       const float* __restrict__ row_scale,
-                       const float* __restrict__ x, const float* __restrict__ b,
-                       float* __restrict__ r) {
+                       const float* __restrict__ row_scale, const float* __restrict__ x,
+                       const float* __restrict__ b, float* __restrict__ r) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
+    const bool owner = row < n && lane == 0;
+    cuda::std::array<float, K> rhs;
+    float s = 0.0f;
+    const auto load_operands = [&] {
+        load_row<K>(&WidthView<const float, K>(b, n)(row, 0), rhs);
+        s = row_scale[row];
+    };
+    if (kHoistEpilogue<K> && owner) load_operands();
     cuda::std::array<float, K> sum;
     row_spmv<K, TPR>(n, row_ptr, cols, vals, x, row, lane, sum);
-    if (row < n && lane == 0) {
-        const WidthView<const float, K> bv(b, n);
+    if (owner) {
+        if (!kHoistEpilogue<K>) load_operands();
         const WidthView<float, K> rv(r, n);
-        const float s = row_scale[row];
 #pragma unroll
-        for (int c = 0; c < K; ++c) rv(row, c) = bv(row, c) - s * sum[c];
+        for (int c = 0; c < K; ++c) rv(row, c) = rhs[c] - s * sum[c];
     }
 }
 
@@ -239,23 +256,32 @@ __global__ void __launch_bounds__(kBlock)
                          float c_prev, float alpha, float* x_out) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
-    cuda::std::array<float, K> sum;
-    row_spmv<K, TPR>(n, row_ptr, cols, vals, x_cur, row, lane, sum);
-    if (row < n && lane == 0) {
+    const bool owner = row < n && lane == 0;
+    // x_prev is read before this row's x_out is written, wherever the load lands, which is all
+    // its aliasing needs.
+    cuda::std::array<float, K> cur;
+    cuda::std::array<float, K> prev;
+    cuda::std::array<float, K> rhs;
+    float d = 0.0f;
+    float s = 0.0f;
+    const auto load_operands = [&] {
         const WidthView<const float, K> curv(x_cur, n);
         const WidthView<const float, K> prevv(x_prev, n);
         const WidthView<const float, K> bv(b, n);
-        const float d = alpha * dinv[row];
-        const float s = row_scale[row];
-        cuda::std::array<float, K> cur;
-        cuda::std::array<float, K> prev;
-        cuda::std::array<float, K> rhs;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             cur[c] = curv(row, c);
             prev[c] = prevv(row, c);
             rhs[c] = bv(row, c);
         }
+        d = alpha * dinv[row];
+        s = row_scale[row];
+    };
+    if (kHoistEpilogue<K> && owner) load_operands();
+    cuda::std::array<float, K> sum;
+    row_spmv<K, TPR>(n, row_ptr, cols, vals, x_cur, row, lane, sum);
+    if (owner) {
+        if (!kHoistEpilogue<K>) load_operands();
         // Plain, not __restrict__: x_out is allowed to alias x_prev, and from the second step
         // of a sweep it always does.
         const WidthView<float, K> outv(x_out, n);
@@ -263,6 +289,65 @@ __global__ void __launch_bounds__(kBlock)
         for (int c = 0; c < K; ++c) {
             outv(row, c) = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
         }
+    }
+}
+
+// The first two steps of a sweep from a zero initial guess in one pass. The first step is the
+// Jacobi point x1 = alpha0 D^-1 b and needs no SpMV, so the second step's gather forms each
+// neighbour's x1 on the fly from b and dinv instead of reading a materialised x1. The expression
+// is vc_jacobi_zero_kernel's, so the result is the same bit for bit; what goes is that kernel's
+// launch, its write of x1 and the step's re-read of it. x1_out, when not null, still receives x1,
+// for a degree high enough that a later step needs it as x_prev.
+template <int K, int TPR>
+__global__ void __launch_bounds__(kBlock)
+    vc_cheby_first_kernel(int n, const int* __restrict__ row_ptr,
+                          const std::int16_t* __restrict__ cols,
+                          const __half* __restrict__ vals, const float* __restrict__ row_scale,
+                          const float* __restrict__ dinv, const float* __restrict__ b,
+                          float alpha0, float c_cur, float c_prev, float alpha,
+                          float* __restrict__ x1_out, float* __restrict__ x_out) {
+    const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
+    const int lane = static_cast<int>(threadIdx.x) % TPR;
+    const bool owner = row < n && lane == 0;
+    const WidthView<const float, K> bv(b, n);
+    cuda::std::array<float, K> rhs;
+    float dr = 0.0f;
+    float s = 0.0f;
+    const auto load_operands = [&] {
+        load_row<K>(&bv(row, 0), rhs);
+        dr = dinv[row];
+        s = row_scale[row];
+    };
+    if (kHoistEpilogue<K> && owner) load_operands();
+    cuda::std::array<float, K> sum;
+#pragma unroll
+    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    if (row < n) {
+        const int row_e = row_ptr[row + 1];
+        for (int j = row_ptr[row] + lane; j < row_e; j += TPR) {
+            const float v = __half2float(vals[j]);
+            const int col = slot_column(cols, j, row);
+            const float w = alpha0 * dinv[col];
+            cuda::std::array<float, K> bj;
+            load_row<K>(&bv(col, 0), bj);
+#pragma unroll
+            for (int c = 0; c < K; ++c) sum[c] += v * (w * bj[c]);
+        }
+    }
+    warp_reduce_sum<TPR>(sum);
+    if (owner) {
+        if (!kHoistEpilogue<K>) load_operands();
+        const float w = alpha0 * dr;
+        const float d = alpha * dr;
+        cuda::std::array<float, K> x1;
+#pragma unroll
+        for (int c = 0; c < K; ++c) x1[c] = w * rhs[c];
+        const WidthView<float, K> outv(x_out, n);
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+            outv(row, c) = c_cur * x1[c] + c_prev * x1[c] + d * (rhs[c] - s * sum[c]);
+        }
+        if (x1_out != nullptr) store_row<K>(&WidthView<float, K>(x1_out, n)(row, 0), x1);
     }
 }
 
@@ -322,7 +407,7 @@ void launch_jacobi_zero(int n, const float* dinv, const float* b, float alpha, f
 // a disagreement between the two and not something a caller can provoke.
 template <typename F>
 void dispatch_tpr(int tpr, F&& f) {
-    dispatch_k<4, 8, 16, 32>(tpr, "V-cycle threads-per-row must be one of {4, 8, 16, 32}",
+    dispatch_k<2, 4, 8, 16, 32>(tpr, "V-cycle threads-per-row must be one of {2, 4, 8, 16, 32}",
                              std::forward<F>(f));
 }
 
@@ -370,6 +455,21 @@ void launch_cheby_step(int n, int tpr, const int* row_ptr, const std::int16_t* c
             vc_cheby_step_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
                 n, row_ptr, cols, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
                 alpha, x_out);
+        }
+    });
+}
+
+template <int K>
+void launch_cheby_first(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
+                        const __half* values, const float* row_scale, const float* dinv,
+                        const float* b, float alpha0, float c_cur, float c_prev, float alpha,
+                        float* x1_out, float* x_out, cudaStream_t stream) {
+    dispatch_tpr(tpr, [&](auto tc) {
+        constexpr int TPR = decltype(tc)::value;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
+            vc_cheby_first_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
+                n, row_ptr, cols, values, row_scale, dinv, b, alpha0, c_cur, c_prev, alpha,
+                x1_out, x_out);
         }
     });
 }
@@ -576,9 +676,9 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
     // alternate between `first` and `other`. From the second step on the output is the buffer
     // that held x_{i-1}, which is legal because x_prev is read only at the row being written.
     //
-    // x0 == nullptr is a zero initial guess. That drops the first step's SpMV altogether and
-    // zeroes the first recurrence step's x_prev coefficient, so `other` is never read before
-    // it is written and no zeroed buffer is needed to multiply by.
+    // x0 == nullptr is a zero initial guess. That drops the first step's SpMV altogether, and
+    // from degree 2 up the first two steps run as one kernel that never reads `other`, so no
+    // zeroed buffer is needed to multiply by.
     //
     // final_out, when set, takes the last step in place of the alternating buffers. Only level
     // 0 on the up-sweep uses it, to write the caller's x directly.
@@ -588,28 +688,33 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
             if (s + 1 == degree_ && final_out) return final_out;
             return (s % 2) ? other : first;
         };
-        if (x0 == nullptr) {
+        int first_step = 1;
+        float* cur = target(0);
+        float* prev = other;
+        if (x0 == nullptr && degree_ > 1) {
+            // Steps 0 and 1 fused; x1 is only materialised when step 2 will read it as x_prev.
+            // Step 1's c_prev is 0 because there is no x_{-1}, and the kernel multiplies it by
+            // x1 rather than by any buffer, so no unwritten memory reaches it.
+            launch_cheby_first<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
+                                  lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi,
+                                  cheby_.alpha0, cheby_.c_cur[0], 0.0f, cheby_.alpha[0],
+                                  degree_ > 2 ? target(0) : nullptr, target(1), stream);
+            prev = target(0);
+            cur = target(1);
+            first_step = 2;
+        } else if (x0 == nullptr) {
             launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, cheby_.alpha0, target(0), stream);
         } else {
             launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
                                  lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, x0,
                                  x0, 1.0f, 0.0f, cheby_.alpha0, target(0), stream);
         }
-        float* cur = target(0);
-        // From a zero initial guess the first recurrence step has no x_{-1}, and its c_prev is
-        // 0 to match. That zero does NOT make the pointer irrelevant: `other` has not been
-        // written yet this cycle, and 0 * NaN is NaN, so pointing at it poisons the result with
-        // whatever the allocator last left there. Recycled fp64 buffers are the bad case, since
-        // reading a double's high word as a float is usually a NaN pattern. Point at `cur`
-        // instead: it is finite, it was just written, and its coefficient is zero.
-        float* prev = (x0 == nullptr) ? cur : other;
-        for (int s = 1; s < degree_; ++s) {
+        for (int s = first_step; s < degree_; ++s) {
             float* out = target(s);
-            const float c_prev = (s == 1 && x0 == nullptr) ? 0.0f : cheby_.c_prev[s - 1];
             launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
                                  lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, cur,
-                                 prev, cheby_.c_cur[s - 1], c_prev, cheby_.alpha[s - 1], out,
-                                 stream);
+                                 prev, cheby_.c_cur[s - 1], cheby_.c_prev[s - 1],
+                                 cheby_.alpha[s - 1], out, stream);
             prev = cur;
             cur = out;
         }
