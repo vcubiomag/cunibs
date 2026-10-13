@@ -10,6 +10,11 @@
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
                  int out_stride, int n_dip, int n_nodes, float didt, float mu0_4pi,
                  cudaStream_t stream);
+// n_sets moment sets (1 or 3) over the same sources and targets in one pass: mp is
+// (n_sets, n_dip, 6) and out (n_nodes, n_sets, 3).
+void launch_dadt_multi(const float* s, const float* mp, const float* sn, const float* r,
+                       float* out, int n_sets, int n_dip, int n_nodes, float didt, float mu0_4pi,
+                       cudaStream_t stream);
 
 // --- dadt_element.cu -----------------------------------------------------------------------
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,

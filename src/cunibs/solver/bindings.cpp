@@ -26,6 +26,36 @@ using f32_cuda_1d = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cu
 using f32_cuda_2d = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
 using f32_cuda_3d = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
 using i32_cuda_2d = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+using u8_cuda_1d = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
+using u8_cuda_2d = nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+
+namespace {
+
+// A grid's origin and spacing (metres) and shape, as the ADM kernels take them.
+struct GridArgs {
+    double origin[3];
+    double spacing[3];
+    int shape[3];
+};
+
+GridArgs grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
+                   const std::vector<int>& shape) {
+    if (origin.size() != 3 || spacing.size() != 3 || shape.size() != 3) {
+        throw std::invalid_argument("grid origin, spacing and shape must each have 3 entries");
+    }
+    GridArgs g;
+    for (int i = 0; i < 3; ++i) {
+        if (shape[i] < 2 || !(spacing[i] > 0.0)) {
+            throw std::invalid_argument("grid needs at least 2 samples and a positive spacing");
+        }
+        g.origin[i] = origin[i];
+        g.spacing[i] = spacing[i];
+        g.shape[i] = shape[i];
+    }
+    return g;
+}
+
+}  // namespace
 
 NB_MODULE(_solver_ext, m) {
     // Compiled-in limits, exported so the Python layer never restates them.
@@ -738,6 +768,101 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("w_e").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("node_w").noconvert(), nb::arg("stream"),
         "Node-centric 3-vector corner gather with 1/4 weight; into caller-allocated node_w.");
+
+    m.def(
+        "dadt_nbody_multi",
+        [](f32_cuda_2d s, f32_cuda_3d mp, f32_cuda_1d sn, f32_cuda_2d r, f32_cuda_3d out,
+           float didt, float mu0_4pi, uintptr_t stream) {
+            const int n_sets = static_cast<int>(mp.shape(0));
+            const int n_dip = static_cast<int>(s.shape(0));
+            const int n_nodes = static_cast<int>(r.shape(0));
+            if (static_cast<int>(mp.shape(1)) != n_dip || mp.shape(2) != 6 ||
+                static_cast<int>(out.shape(0)) != n_nodes ||
+                static_cast<int>(out.shape(1)) != n_sets || out.shape(2) != 3) {
+                throw std::invalid_argument("dadt_nbody_multi: shape mismatch");
+            }
+            launch_dadt_multi(s.data(), mp.data(), sn.data(), r.data(), out.data(), n_sets,
+                              n_dip, n_nodes, didt, mu0_4pi,
+                              reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
+        nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
+        nb::arg("stream"),
+        "The dA/dt N-body for 1 or 3 moment sets over shared positions: mp is (n_sets, n_dip, 6) "
+        "and out (n_targets, n_sets, 3).");
+
+    m.def(
+        "adm_evaluate",
+        [](f64_cuda_3d frames, f32_cuda_2d coil_pos, f32_cuda_2d coil_mom, f32_cuda_1d q,
+           u8_cuda_1d cell_ok, std::vector<double> origin, std::vector<double> spacing,
+           std::vector<int> shape, int n_dir, double didt, f64_cuda_2d out, i32_cuda fault,
+           uintptr_t stream) {
+            const GridArgs g = grid_args(origin, spacing, shape);
+            const int n_frames = static_cast<int>(frames.shape(0));
+            const int n_dip = static_cast<int>(coil_pos.shape(0));
+            const std::int64_t n_pts = static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2];
+            const std::int64_t n_cells =
+                static_cast<std::int64_t>(shape[0] - 1) * (shape[1] - 1) * (shape[2] - 1);
+            if (frames.shape(1) != 4 || frames.shape(2) != 4 || coil_pos.shape(1) != 3 ||
+                coil_mom.shape(0) != coil_pos.shape(0) || coil_mom.shape(1) != 3 ||
+                static_cast<std::int64_t>(q.shape(0)) != n_pts * n_dir * 3 ||
+                static_cast<std::int64_t>(cell_ok.shape(0)) != n_cells ||
+                static_cast<int>(out.shape(0)) != n_frames ||
+                static_cast<int>(out.shape(1)) != n_dir || fault.shape(0) != 2) {
+                throw std::invalid_argument("adm_evaluate: shape mismatch");
+            }
+            launch_adm_evaluate(frames.data(), n_frames, coil_pos.data(), coil_mom.data(), n_dip,
+                                q.data(), cell_ok.data(), g.origin, g.spacing, g.shape, n_dir,
+                                didt, out.data(), fault.data(),
+                                reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(),
+        nb::arg("coil_mom").noconvert(), nb::arg("q").noconvert(), nb::arg("cell_ok").noconvert(),
+        nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("n_dir"),
+        nb::arg("didt"), nb::arg("out").noconvert(), nb::arg("fault").noconvert(),
+        nb::arg("stream"),
+        "Target E-vectors (n_frames, n_dir) of coil frames against a sampled reciprocity field. "
+        "fault (2 ints, zeroed by the caller) receives a fault kind and the first candidate.");
+
+    m.def(
+        "adm_mark",
+        [](f64_cuda_3d frames, f32_cuda_2d coil_pos, std::vector<double> origin,
+           std::vector<double> spacing, std::vector<int> shape, u8_cuda_1d need,
+           uintptr_t stream) {
+            const GridArgs g = grid_args(origin, spacing, shape);
+            if (static_cast<std::int64_t>(need.shape(0)) !=
+                static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2]) {
+                throw std::invalid_argument("adm_mark: need must have one byte per grid point");
+            }
+            launch_adm_mark(frames.data(), static_cast<int>(frames.shape(0)), coil_pos.data(),
+                            static_cast<int>(coil_pos.shape(0)), g.origin, g.spacing, g.shape,
+                            need.data(), reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(), nb::arg("origin"),
+        nb::arg("spacing"), nb::arg("shape"), nb::arg("need").noconvert(), nb::arg("stream"),
+        "Sets need to 1 at every grid point a frame's dipoles interpolate from.");
+
+    m.def(
+        "adm_reach",
+        [](std::vector<double> origin, std::vector<double> spacing, std::vector<int> shape,
+           f64_cuda_2d origins, f64_cuda_2d axes, u8_cuda_2d profile, double h0, double cell,
+           u8_cuda_1d mask, uintptr_t stream) {
+            const GridArgs g = grid_args(origin, spacing, shape);
+            if (origins.shape(1) != 3 || axes.shape(1) != 3 ||
+                origins.shape(0) != axes.shape(0) ||
+                static_cast<std::int64_t>(mask.shape(0)) !=
+                    static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2]) {
+                throw std::invalid_argument("adm_reach: shape mismatch");
+            }
+            launch_adm_reach(g.origin, g.spacing, g.shape, origins.data(), axes.data(),
+                             static_cast<int>(origins.shape(0)), profile.data(),
+                             static_cast<int>(profile.shape(0)), static_cast<int>(profile.shape(1)),
+                             h0, cell, mask.data(), reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("origins").noconvert(),
+        nb::arg("axes").noconvert(), nb::arg("profile").noconvert(), nb::arg("h0"),
+        nb::arg("cell"), nb::arg("mask").noconvert(), nb::arg("stream"),
+        "Marks the grid points a coil's swept (rho, h) profile reaches about any centre's axis.");
 
     m.def(
         "accumulate_moments",

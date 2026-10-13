@@ -7,6 +7,21 @@ from dataclasses import dataclass
 import cupy as cp
 
 
+@dataclass(frozen=True)
+class SweptCoverage:
+    """Where a coil can sit over a set of centres at any in-plane rotation.
+
+    An in-plane rotation carries each dipole round a circle of fixed ``(rho, h)`` about the coil
+    axis, so the region one centre's coil reaches is the solid of revolution of its dipoles'
+    ``(rho, h)`` profile, and the coverage is the union over centres. ``margin_m`` dilates it.
+    """
+
+    origins_m: cp.ndarray  # (C, 3) coil origin per centre
+    axes: cp.ndarray  # (C, 3) unit coil axis per centre
+    profile_m: cp.ndarray  # (N, 2) each dipole's (rho, h) about the coil's own axis
+    margin_m: float
+
+
 @dataclass
 class Grid:
     """Axis-aligned regular grid in metres.
@@ -19,6 +34,8 @@ class Grid:
     origin_m: cp.ndarray  # (3,) float64
     spacing_m: cp.ndarray  # (3,) float64
     shape: tuple[int, int, int]
+    # When set, sampling covers only the points this region can reach rather than the whole box.
+    coverage: SweptCoverage | None = None
 
     @property
     def n_points(self) -> int:
@@ -48,7 +65,7 @@ class Grid:
         return cp.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
 
     def world_to_index(self, points_m: cp.ndarray) -> cp.ndarray:
-        """Fractional index coordinates ``(3, N)`` for ``map_coordinates`` (order matches axes)."""
+        """Fractional index coordinates ``(3, N)``, one row per axis in order."""
         idx = (points_m - self.origin_m[None, :]) / self.spacing_m[None, :]
         return cp.ascontiguousarray(idx.T)
 

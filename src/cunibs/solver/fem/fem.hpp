@@ -154,6 +154,28 @@ void launch_node_gather(const double* corner, const int* ptr, const int* idx, do
 void launch_node_scatter3(const double* w_e, const int* ptr, const int* idx, double* node_w,
                           int n_nodes, cudaStream_t stream);
 
+// Candidate evaluation against a sampled reciprocity field. The grid is origin/spacing (metres)
+// and shape (3 ints, host arrays); q is (nx, ny, nz, n_dir, 3) and cell_ok one byte per cell, set
+// when all eight of its corners were sampled. frames are (n_frames, 4, 4) coil-to-head affines
+// with the translation in mm; coil_pos/coil_mom are the coil-frame dipoles in metres. out is
+// (n_frames, n_dir). fault is two device ints the caller zeroes: a kind (1 off the grid, 2 an
+// unsampled cell) and the first candidate that hit it.
+void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_pos,
+                         const float* coil_mom, int n_dip, const float* q,
+                         const unsigned char* cell_ok, const double* origin,
+                         const double* spacing, const int* shape, int n_dir, double didt,
+                         double* out, int* fault, cudaStream_t stream);
+// Sets need[p] = 1 for every grid point some dipole's interpolation reads.
+void launch_adm_mark(const double* frames, int n_frames, const float* coil_pos, int n_dip,
+                     const double* origin, const double* spacing, const int* shape,
+                     unsigned char* need, cudaStream_t stream);
+// mask[p] = 1 where a grid point falls in the coil's swept (rho, h) profile about any centre's
+// axis. profile is (n_rho, n_h) over rho = ir * cell, h = h0 + ih * cell.
+void launch_adm_reach(const double* origin, const double* spacing, const int* shape,
+                      const double* origins, const double* axes, int n_centers,
+                      const unsigned char* profile, int n_rho, int n_h, double h0, double cell,
+                      unsigned char* mask, cudaStream_t stream);
+
 // --- moments.cu: streaming UQ statistics over the |E| this directory produces ---------------
 void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
                                cudaStream_t stream);

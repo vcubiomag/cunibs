@@ -530,3 +530,50 @@ def test_adjoint_solver_is_cached_on_the_context(
     assert ensure_adjoint_solver(ctx, tolerance=1e-7) is not first
     assert len(ctx.adjoint) == 2
     ctx.adjoint.clear()
+
+
+@pytest.mark.realmesh
+def test_masked_sampling_matches_the_full_box_and_fills_off_coverage_frames(
+    cp, patch_subject, d70_coil, patch_target, patch_top_mm
+):
+    """Sampling only the reachable region must not change any value a frame reads.
+
+    The coverage decides which points are sampled up front. A frame tilted off it lands in cells
+    the coverage skipped; those are sampled on demand, and the result has to equal the one from a
+    grid sampled everywhere, bit for bit, since every point is the same N-body either way.
+    """
+    import dataclasses
+
+    from cunibs.adm import Target, build_reciprocity
+    from cunibs.adm.evaluate import evaluate_frames
+    from cunibs.adm.optimize import _frames, _project
+    from cunibs.adm.reciprocity import sample_qfield, solve_adjoint
+    from cunibs.adm.target import resolve_target
+
+    ctx = patch_subject.context
+    target = Target(patch_target, region="gray_matter")
+    centers = patch_top_mm[None]
+    masked = build_reciprocity(ctx, d70_coil, target, centers, spacing_mm=4.0)
+    assert masked.grid.coverage is not None
+    assert int(masked.sampled.sum()) < masked.grid.n_points
+
+    adj = solve_adjoint(ctx, resolve_target(ctx, target))
+    full = sample_qfield(adj, dataclasses.replace(masked.grid, coverage=None))
+
+    proj, normal, u, v = _project(ctx, cp.asarray(centers), 4.0)
+    frames = _frames(proj, normal, u, v, cp.linspace(0.0, 6.0, 5), 4.0)
+    tilt = np.deg2rad(12.0)
+    rot = cp.asarray(
+        [[1, 0, 0], [0, np.cos(tilt), -np.sin(tilt)], [0, np.sin(tilt), np.cos(tilt)]]
+    )
+    tilted = frames.copy()
+    tilted[:, :3, :3] = frames[:, :3, :3] @ rot
+    before = int(masked.sampled.sum())
+    for f in (frames, tilted):
+        np.testing.assert_array_equal(
+            cp.asnumpy(evaluate_frames(masked, d70_coil, f, DIDT)),
+            cp.asnumpy(evaluate_frames(full, d70_coil, f, DIDT)),
+        )
+    assert int(masked.sampled.sum()) > before, (
+        "the tilted frames needed points the coverage skipped"
+    )

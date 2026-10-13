@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 import cupy as cp
 
-from cunibs.adm.grid import Grid, build_grid
+from cunibs.adm.grid import Grid, SweptCoverage, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.fem.solve import (
@@ -25,7 +25,13 @@ from cunibs.fem.solve import (
     _pad_block,
     _solve_grounded_block_mat,
 )
-from cunibs.solver import dadt_nbody, element_weight, node_gather, node_scatter3
+from cunibs.solver import (
+    adm_reach,
+    dadt_nbody_multi,
+    element_weight,
+    node_gather,
+    node_scatter3,
+)
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -193,20 +199,127 @@ class ReciprocityField:
     ``q`` holds, per adjoint direction, the reciprocity field
     ``Q_d(g) = (μ0/4π) Σ_n W_{d,n} × (g - r_n) / |g - r_n|³`` so that the target E-field component
     of any placement is ``E_d = didt · Σ_j m_j · Q_d(s_j)`` (``s_j``, ``m_j`` = placed coil dipoles).
+    It is laid out ``(nx, ny, nz, D, 3)`` so that one grid point's every direction is one read.
+
+    Only the points a coil can reach are sampled when the grid carries a coverage; ``sampled``
+    marks them, and ``cell_ok`` marks the cells whose eight corners all are, which is the only
+    place interpolation is allowed to read. A frame that lands elsewhere has its points sampled on
+    demand from the kept sources, so the coverage decides what is paid up front and never what a
+    frame may ask for.
     """
 
     ctx: SolverContext
     target: ResolvedTarget
     grid: Grid
-    q: cp.ndarray  # (D, nx, ny, nz, 3) float32
+    q: cp.ndarray  # (nx, ny, nz, D, 3) float32
     magnitude: bool
+    sampled: cp.ndarray  # (nx * ny * nz,) uint8
+    cell_ok: cp.ndarray  # ((nx-1) * (ny-1) * (nz-1),) uint8
+    # The N-body sources, centred on the grid, for sampling further points on demand.
+    src: cp.ndarray  # (n_nodes, 3) float32
+    src_sq: cp.ndarray  # (n_nodes,) float32
+    moments: cp.ndarray  # (D, n_nodes, 6) float32: W_d and W_d x s
+
+    @property
+    def n_directions(self) -> int:
+        return int(self.q.shape[3])
+
+    def sample_points(self, points: cp.ndarray) -> None:
+        """Sample the field at the flat grid indices ``points`` and mark them sampled."""
+        if points.size == 0:
+            return
+        grid = self.grid
+        flat = grid_points_m(grid, points) - grid.center_m[None, :]
+        r = cp.ascontiguousarray(flat.astype(cp.float32))
+        out = cp.empty((int(points.size), self.n_directions, 3), dtype=cp.float32)
+        dadt_nbody_multi(
+            self.src,
+            self.moments,
+            self.src_sq,
+            r,
+            out,
+            1.0,
+            MU0_OVER_4PI,
+            cp.cuda.get_current_stream().ptr,
+        )
+        self.q.reshape(-1, self.n_directions, 3)[points] = out
+        self.sampled[points] = 1
+        self.cell_ok = _cells_ok(self.sampled, grid.shape)
+
+
+def grid_points_m(grid: Grid, points: cp.ndarray) -> cp.ndarray:
+    """Coordinates ``(K, 3)`` of the flat C-order grid indices ``points``."""
+    _, ny, nz = grid.shape
+    ix = points // (ny * nz)
+    iy = (points // nz) % ny
+    iz = points % nz
+    idx = cp.stack([ix, iy, iz], axis=1).astype(cp.float64)
+    return grid.origin_m[None, :] + grid.spacing_m[None, :] * idx
+
+
+def _cells_ok(sampled: cp.ndarray, shape: tuple[int, int, int]) -> cp.ndarray:
+    """One byte per cell: whether all eight of its corners are sampled."""
+    s = sampled.reshape(shape).astype(cp.bool_)
+    ok = s[:-1, :-1, :-1].copy()
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                ok &= s[dx : dx + shape[0] - 1, dy : dy + shape[1] - 1, dz : dz + shape[2] - 1]
+    return cp.ascontiguousarray(ok.astype(cp.uint8).ravel())
+
+
+def _reachable(grid: Grid, coverage: SweptCoverage) -> cp.ndarray:
+    """One byte per grid point: whether the coverage's swept region reaches it.
+
+    The coil's ``(rho, h)`` profile is rasterised once at a quarter of the grid spacing, each cell
+    marked when its centre lies within the margin of some dipole plus the raster's own half
+    diagonal, so the raster never misses a point the margin covers. Every grid point then looks
+    its cylindrical coordinates up against each centre's axis.
+    """
+    cell = float(cp.min(grid.spacing_m)) / 4.0
+    margin = coverage.margin_m
+    prof = coverage.profile_m
+    rho_hi = float(prof[:, 0].max()) + margin + cell
+    h_lo = float(prof[:, 1].min()) - margin - cell
+    h_hi = float(prof[:, 1].max()) + margin + cell
+    n_rho = int(cp.ceil(rho_hi / cell)) + 1
+    n_h = int(cp.ceil((h_hi - h_lo) / cell)) + 1
+    rc = (cp.arange(n_rho, dtype=cp.float64) + 0.5) * cell
+    hc = h_lo + (cp.arange(n_h, dtype=cp.float64) + 0.5) * cell
+    reach_sq = (margin + cell * 0.5 * 2.0**0.5) ** 2
+    profile = cp.zeros((n_rho, n_h), dtype=cp.uint8)
+    # Rows at a time keeps the (rows * n_h * N) distance block to a few hundred MB.
+    rows = max(1, (1 << 24) // max(1, n_h * int(prof.shape[0])))
+    for lo in range(0, n_rho, rows):
+        r = rc[lo : lo + rows, None, None]
+        d2 = (r - prof[None, None, :, 0]) ** 2 + (
+            hc[None, :, None] - prof[None, None, :, 1]
+        ) ** 2
+        profile[lo : lo + rows] = (d2.min(axis=2) <= reach_sq).astype(cp.uint8)
+
+    mask = cp.empty(grid.n_points, dtype=cp.uint8)
+    adm_reach(
+        [float(x) for x in cp.asnumpy(grid.origin_m)],
+        [float(x) for x in cp.asnumpy(grid.spacing_m)],
+        list(grid.shape),
+        cp.ascontiguousarray(coverage.origins_m, dtype=cp.float64),
+        cp.ascontiguousarray(coverage.axes, dtype=cp.float64),
+        cp.ascontiguousarray(profile),
+        h_lo,
+        cell,
+        mask,
+        cp.cuda.get_current_stream().ptr,
+    )
+    return mask
 
 
 def sample_qfield(adjoint: AdjointField, grid: Grid) -> ReciprocityField:
     """Evaluate the reciprocity Q-field on ``grid`` via the node-sourced dA/dt N-body kernel.
 
     ``Q_d = dadt_nbody(sources=mesh nodes, moments=W_{d,n}, targets=grid, didt=1)`` uses the same
-    kernel and formula as the forward coil field, with the roles of coil and mesh swapped.
+    kernel and formula as the forward coil field, with the roles of coil and mesh swapped, and all
+    directions in one pass over the sources. With a coverage on the grid only the reachable points
+    are sampled; without one, all of them.
     """
     ctx = adjoint.ctx
     center = grid.center_m
@@ -214,24 +327,28 @@ def sample_qfield(adjoint: AdjointField, grid: Grid) -> ReciprocityField:
         ((cp.asarray(ctx.nodes_mm) * 1e-3) - center[None, :]).astype(cp.float32)
     )
     sn = cp.ascontiguousarray((s * s).sum(1))
-    r = cp.ascontiguousarray((grid.points_m() - center[None, :]).astype(cp.float32))
-
     n_dir = int(adjoint.node_weights.shape[0])
-    q = cp.empty((n_dir, *grid.shape, 3), dtype=cp.float32)
-    out = cp.empty((grid.n_points, 3), dtype=cp.float32)
-    stream = cp.cuda.get_current_stream().ptr
-    for d in range(n_dir):
-        w = adjoint.node_weights[d].astype(cp.float32)  # (n_nodes, 3)
-        mp = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, s)], axis=1))
-        dadt_nbody(s, mp, sn, r, out, 1.0, MU0_OVER_4PI, stream)
-        q[d] = out.reshape((*grid.shape, 3))
-    return ReciprocityField(
+    w = adjoint.node_weights.astype(cp.float32)  # (D, n_nodes, 3)
+    moments = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, s[None])], axis=2))
+
+    field = ReciprocityField(
         ctx=ctx,
         target=adjoint.target,
         grid=grid,
-        q=q,
+        q=cp.zeros((*grid.shape, n_dir, 3), dtype=cp.float32),
         magnitude=adjoint.target.magnitude,
+        sampled=cp.zeros(grid.n_points, dtype=cp.uint8),
+        cell_ok=cp.zeros(0, dtype=cp.uint8),
+        src=s,
+        src_sq=sn,
+        moments=moments,
     )
+    if grid.coverage is None:
+        points = cp.arange(grid.n_points, dtype=cp.int64)
+    else:
+        points = cp.flatnonzero(_reachable(grid, grid.coverage))
+    field.sample_points(points)
+    return field
 
 
 def _coverage_grid(
@@ -248,8 +365,18 @@ def _coverage_grid(
     base = compute_coil_transforms(ctx, centers, None, cp.full(centers.shape[0], distance_mm))
     origins_m = base[:, :3, 3] * 1e-3
     # A dipole stays within max|position| of the coil origin at any rotation; dilate by that + margin.
-    reach_mm = float(cp.linalg.norm(cp.asarray(coil.positions_m), axis=1).max()) * 1e3
-    return build_grid(origins_m, spacing_mm=spacing_mm, margin_mm=reach_mm + margin_mm)
+    pos = cp.asarray(coil.positions_m, dtype=cp.float64)
+    reach_mm = float(cp.linalg.norm(pos, axis=1).max()) * 1e3
+    grid = build_grid(origins_m, spacing_mm=spacing_mm, margin_mm=reach_mm + margin_mm)
+    grid.coverage = SweptCoverage(
+        origins_m=cp.ascontiguousarray(origins_m),
+        axes=cp.ascontiguousarray(base[:, :3, 2]),
+        profile_m=cp.ascontiguousarray(
+            cp.stack([cp.linalg.norm(pos[:, :2], axis=1), pos[:, 2]], axis=1)
+        ),
+        margin_m=margin_mm * 1e-3,
+    )
+    return grid
 
 
 def build_reciprocity(

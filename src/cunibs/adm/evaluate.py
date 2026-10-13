@@ -5,13 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
-from cupyx.scipy.ndimage import map_coordinates
 
 from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.place import place_coil_dipoles_batch
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.simulation import Placement
-from cunibs.solver import dadt_nbody
+from cunibs.solver import adm_evaluate, adm_mark, dadt_nbody
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,14 +20,19 @@ if TYPE_CHECKING:
     from cunibs.fem.solve import SolverContext
 
 
+def _placement_frames(ctx: SolverContext, placements: Sequence[Placement]) -> cp.ndarray:
+    """Coil-to-head affines ``(P,4,4)`` for ``placements``, translation in mm."""
+    centers = cp.asarray([pl.center_mm for pl in placements], dtype=cp.float64)
+    handles = cp.asarray([pl.handle_mm for pl in placements], dtype=cp.float64)
+    dists = cp.asarray([pl.distance_mm for pl in placements], dtype=cp.float64)
+    return compute_coil_transforms(ctx, centers, handles, dists)
+
+
 def _placed_dipoles(
     ctx: SolverContext, coil: Coil, placements: Sequence[Placement]
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Stack placed dipole positions ``(P,N,3)`` (m) and moments ``(P,N,3)`` for all placements."""
-    centers = cp.asarray([pl.center_mm for pl in placements], dtype=cp.float64)
-    handles = cp.asarray([pl.handle_mm for pl in placements], dtype=cp.float64)
-    dists = cp.asarray([pl.distance_mm for pl in placements], dtype=cp.float64)
-    transforms = compute_coil_transforms(ctx, centers, handles, dists)
+    transforms = _placement_frames(ctx, placements)
     return place_coil_dipoles_batch(transforms, coil.positions_m, coil.moments)
 
 
@@ -49,11 +53,8 @@ def _reduce(dipole_q: cp.ndarray, moments: cp.ndarray, didt: float) -> cp.ndarra
     return didt * cp.einsum("dpnk,pnk->pd", dipole_q, moments)
 
 
-# Cap the number of (placement × dipole) samples interpolated at once so large sweeps do not
-# allocate a multi-gigabyte (D, P·N, 3) buffer; placements are processed in chunks under this bound.
-_INTERP_CHUNK_SAMPLES = 1 << 23
-
-# Slack on the fractional index bounds. At a 3 mm spacing this is 3 nm (noise).
+# Slack on the fractional index bounds. At a 3 mm spacing this is 3 nm (noise). The kernel applies
+# the same slack.
 _INDEX_TOL = 1e-6
 
 
@@ -66,7 +67,7 @@ def _require_in_grid(
     grid edge and yield a wrong field rather than an error.
     """
     # >= / <= rather than a negated < / >: a non-finite coordinate compares false either way, so
-    # it fails closed instead of reaching map_coordinates.
+    # it fails closed instead of reaching the interpolation.
     ok = (coords >= -_INDEX_TOL) & (coords <= grid.max_index[:, None] + _INDEX_TOL)
     if bool(ok.all()):
         return
@@ -88,27 +89,68 @@ def _require_in_grid(
     )
 
 
-def _interp_reduce(
-    recip: ReciprocityField, s: cp.ndarray, m: cp.ndarray, didt: float
+def _raise_off_grid(recip: ReciprocityField, coil: Coil, frames: cp.ndarray, cand: int) -> None:
+    """Raise the off-grid error for candidate ``cand``, with its own dipoles' coordinates."""
+    s, _ = place_coil_dipoles_batch(frames[cand : cand + 1], coil.positions_m, coil.moments)
+    n_dip = int(s.shape[1])
+    coords = recip.grid.world_to_index(s.reshape(-1, 3))
+    _require_in_grid(recip.grid, coords, cand, n_dip, int(frames.shape[0]))
+    raise AssertionError(
+        "the evaluator reported a dipole off the grid that the host check passed"
+    )
+
+
+def _evaluate_native(
+    recip: ReciprocityField, coil: Coil, frames: cp.ndarray, didt: float
 ) -> cp.ndarray:
-    """Target E-vector ``(P,D)`` from placed dipole positions ``s`` and moments ``m`` (both P,N,3)."""
-    p, n, _ = s.shape
-    n_dir = int(recip.q.shape[0])
-    out = cp.empty((p, n_dir), dtype=cp.float64)
-    chunk = max(1, _INTERP_CHUNK_SAMPLES // n)
-    for lo in range(0, p, chunk):
-        hi = min(lo + chunk, p)
-        pc = hi - lo
-        coords = recip.grid.world_to_index(s[lo:hi].reshape(-1, 3))  # (3, pc*N)
-        _require_in_grid(recip.grid, coords, lo, n, p)
-        dipole_q = cp.empty((n_dir, pc * n, 3), dtype=cp.float64)
-        for d in range(n_dir):
-            for k in range(3):
-                dipole_q[d, :, k] = map_coordinates(
-                    recip.q[d, ..., k], coords, order=1, mode="nearest"
-                )
-        out[lo:hi] = _reduce(dipole_q.reshape(n_dir, pc, n, 3), m[lo:hi], didt)
-    return out
+    """Target E-vectors ``(P, D)`` for ``frames``, sampling any cell a frame needs that is not yet.
+
+    One warp per candidate transforms the coil, interpolates every direction at each dipole and
+    reduces the dot products, all on chip. A dipole in a cell the coverage did not sample is
+    reported rather than read; its frame's points are then sampled and the call re-run, so a frame
+    outside the coverage costs its own sampling once and is never answered from zeros.
+    """
+    grid = recip.grid
+    frames = cp.ascontiguousarray(frames, dtype=cp.float64).reshape(-1, 4, 4)
+    pos = cp.ascontiguousarray(cp.asarray(coil.positions_m, dtype=cp.float32))
+    mom = cp.ascontiguousarray(cp.asarray(coil.moments, dtype=cp.float32))
+    origin = [float(x) for x in cp.asnumpy(grid.origin_m)]
+    spacing = [float(x) for x in cp.asnumpy(grid.spacing_m)]
+    shape = list(grid.shape)
+    stream = cp.cuda.get_current_stream().ptr
+    n_dir = recip.n_directions
+    out = cp.empty((int(frames.shape[0]), n_dir), dtype=cp.float64)
+    fault = cp.zeros(2, dtype=cp.int32)
+    q = recip.q.reshape(-1)
+    for attempt in range(2):
+        fault[:] = 0
+        adm_evaluate(
+            frames,
+            pos,
+            mom,
+            q,
+            recip.cell_ok,
+            origin,
+            spacing,
+            shape,
+            n_dir,
+            float(didt),
+            out,
+            fault,
+            stream,
+        )
+        kind, cand = (int(x) for x in cp.asnumpy(fault))
+        if kind == 0:
+            return out
+        if kind == 1:
+            _raise_off_grid(recip, coil, frames, cand)
+        if attempt == 0:
+            need = cp.zeros(grid.n_points, dtype=cp.uint8)
+            adm_mark(frames, pos, origin, spacing, shape, need, stream)
+            recip.sample_points(cp.flatnonzero(need & (recip.sampled ^ 1)))
+    raise AssertionError(
+        "cells were still unsampled after sampling every point the frames need"
+    )
 
 
 def evaluate(
@@ -126,8 +168,7 @@ def evaluate(
     """
     single = isinstance(placements, Placement)
     pls = [placements] if single else list(placements)
-    s, m = _placed_dipoles(recip.ctx, coil, pls)  # (P,N,3)
-    e = _interp_reduce(recip, s, m, didt)
+    e = _evaluate_native(recip, coil, _placement_frames(recip.ctx, pls), didt)
     return e[0] if single else e
 
 
@@ -144,12 +185,7 @@ def evaluate_frames(
     scalp projection, so a caller comparing against another code can adopt that code's frames
     exactly instead of reproducing its projection rule.
     """
-    s, m = place_coil_dipoles_batch(
-        cp.ascontiguousarray(cp.asarray(transforms, dtype=cp.float64).reshape(-1, 4, 4)),
-        coil.positions_m,
-        coil.moments,
-    )
-    return _interp_reduce(recip, s, m, didt)
+    return _evaluate_native(recip, coil, cp.asarray(transforms, dtype=cp.float64), didt)
 
 
 def evaluate_exact(
