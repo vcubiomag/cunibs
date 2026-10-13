@@ -160,15 +160,14 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                 s);
         launch_bcg_dot(n_, k, P, AP, partials, d_pap, s);
         launch_bcg_alpha(k, d_rz, d_pap, d_converged, d_alpha, d_neg_alpha, s);
-        launch_bcg_update_xr_norm(n_, k, d_alpha, d_neg_alpha, P, AP, X_int, R, RF, partials,
-                                  d_norm, s);
+        launch_bcg_update_r_norm(n_, k, d_neg_alpha, AP, R, RF, partials, d_norm, s);
         launch_bcg_mark_converged(k, d_norm, d_ref_sq, tolerance, d_converged, s);
         check_cuda(cudaMemcpyAsync(h_norm, d_norm, static_cast<size_t>(k) * sizeof(double),
                                    cudaMemcpyDeviceToHost, s),
                    "block:copy(norms)");
         preconditioner.apply_block(n_, k, RF, ZF, s);
         launch_bcg_cast_dot_beta(n_, k, ZF, R, d_converged, partials, d_rz, d_beta, s);
-        launch_bcg_update_p(n_, k, d_beta, ZF, P, s);
+        launch_bcg_update_p(n_, k, d_alpha, d_beta, ZF, P, X_int, s);
     };
 
     const GraphCache::Key key{&preconditioner, preconditioner.generation(), k};
@@ -291,16 +290,16 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
                                 s);
         launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
         launch_bcg_alpha(1, d_rz, d_pap, nullptr, d_alpha, d_neg_alpha, s);
-        // x += α p; r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)
-        launch_bcg_update_xr_norm(n_, 1, d_alpha, d_neg_alpha, p, ap, x_int, r, rf, partials,
-                                  d_norm, s);
+        // r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt)
+        launch_bcg_update_r_norm(n_, 1, d_neg_alpha, ap, r, rf, partials, d_norm, s);
         check_cuda(
             cudaMemcpyAsync(h_norm_.get(), d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
             "copy(norm)");
         preconditioner.apply(n_, rf, zf, s);
         // rz' = r·(double)zf; beta = rz'/rz; rz <- rz' (no fp64 z vector)
         launch_bcg_cast_dot_beta(n_, 1, zf, r, nullptr, partials, d_rz, d_beta, s);
-        launch_bcg_update_p(n_, 1, d_beta, zf, p, s);  // p = β p + (double)zf
+        // x += α p; p = β p + (double)zf
+        launch_bcg_update_p(n_, 1, d_alpha, d_beta, zf, p, x_int, s);
     };
 
     // The body references only solver-owned buffers plus the preconditioner's hierarchy, so a graph

@@ -22,17 +22,17 @@ void launch_bcg_alpha(int k, const double* rz, const double* pap, const double* 
                       double* alpha, double* neg_alpha, cudaStream_t stream);
 void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_sq,
                                double tolerance, double* converged, cudaStream_t stream);
-void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* neg_alpha,
-                               const double* p, const double* ap, double* x, double* r,
-                               float* rf, double* partials, double* norms,
-                               cudaStream_t stream);
+// r -= alpha Ap and rf = (float)r, with |r|^2 per column into norms.
+void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const double* ap, double* r,
+                              float* rf, double* partials, double* norms, cudaStream_t stream);
 void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r,
                               const double* converged, double* partials, double* rz, double* beta,
                               cudaStream_t stream);
 void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
                               double* partials, double* rz, cudaStream_t stream);
-void launch_bcg_update_p(int n, int k, const double* beta, const float* zf, double* p,
-                         cudaStream_t stream);
+// x += alpha p, then p = beta p + zf, in one pass over p.
+void launch_bcg_update_p(int n, int k, const double* alpha, const double* beta, const float* zf,
+                         double* p, double* x, cudaStream_t stream);
 void launch_bcg_d2f(std::int64_t n_total, const double* in, float* out, cudaStream_t stream);
 void launch_bcg_f2d(std::int64_t n_total, const float* in, double* out, cudaStream_t stream);
 void launch_bcg_residual(std::int64_t n_total, const double* b, const double* ap, double* r,

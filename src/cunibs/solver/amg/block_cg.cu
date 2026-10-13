@@ -13,10 +13,14 @@
 
 namespace {
 
-// Threads cooperating on one row in the strided SpMV. The reduced stiffness has ~14 nnz/row
-// (P1 tets), so eight threads cover a row in a couple of strided steps. vcycle.cu tunes its
-// fp32 counterpart separately.
-constexpr int kTpr = 8;
+// Threads cooperating on one row in the strided SpMV, which also fixes the association every width
+// must reproduce: the column-lane kernel carries this many partial sums per (row, column) and pays
+// kTpr - 1 fp64 adds to combine them. At k = 8 that kernel is fp64-pipe bound (90% active on a
+// 1:64 part), so the combine is real cost. Measured on a head mesh, k = 1 / k = 8 SpMV in us:
+// 8 lanes 175 / 475, 4 lanes 166 / 414, 2 lanes 164 / 379, 1 lane 186 / 377. One lane loses the
+// k = 1 gather's coalescing; two keep it and drop most of the combine. vcycle.cu tunes its fp32
+// counterpart separately.
+constexpr int kTpr = 2;
 
 // Blocks-per-SM floor for both fp64 SpMV kernels, which is what bounds the register budget ptxas
 // will spend. Both are bandwidth-bound and want the residency for latency hiding; without the
@@ -98,7 +102,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     }
 
     // The same pairing warp_reduce_sum performs above, in registers rather than across lanes,
-    // so both kernels land on ((p0+p4)+(p2+p6)) + ((p1+p5)+(p3+p7)).
+    // so both kernels land on the same association (p0 + p1 at kTpr = 2).
 #pragma unroll
     for (int off = kTpr / 2; off > 0; off >>= 1) {
 #pragma unroll
@@ -238,42 +242,52 @@ __global__ void bcg_alpha_kernel(int k, const double* __restrict__ rz,
     }
 }
 
+// r -= alpha Ap, with rf and |r|^2 from the same pass. x is not touched here: its x += alpha p
+// rides on bcg_update_p_kernel, which reads p anyway, so p is read once per iteration rather
+// than twice.
 template <int K>
-__global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
-                                     const double* __restrict__ neg_alpha,
-                                     const double* __restrict__ p, const double* __restrict__ ap,
-                                     double* __restrict__ x, double* __restrict__ r,
-                                     float* __restrict__ rf, double* __restrict__ partials,
-                                     int n_blocks) {
-    const WidthView<const double, K> prows(p, n);
+__global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
+                                    const double* __restrict__ ap, double* __restrict__ r,
+                                    float* __restrict__ rf, double* __restrict__ partials,
+                                    int n_blocks) {
     const WidthView<const double, K> aprows(ap, n);
-    const WidthView<double, K> xrows(x, n);
     const WidthView<double, K> rrows(r, n);
     const WidthView<float, K> rfrows(rf, n);
     cuda::std::array<double, K> rloc;
 #pragma unroll
     for (int c = 0; c < K; ++c) rloc[c] = 0.0;
     const int stride = gridDim.x * blockDim.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    // Rows go in batches whose loads are all issued before any is consumed. A plain loop with an
+    // early exit leaves each row's loads behind the previous row's stores, and with only two
+    // streams per row that is latency-bound at 40% of DRAM. The fold into rloc keeps row order.
+    constexpr int kBatch = 4;
+    static_assert(kRowsPerThread % kBatch == 0, "batches must tile the rows a thread carries");
 #pragma unroll
-    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
-        if (i >= n) break;
-        cuda::std::array<double, K> pv, apv, xv, rv;
-        load_row<K>(&prows(i, 0), pv);
-        load_row<K>(&aprows(i, 0), apv);
-        load_row<K>(&xrows(i, 0), xv);
-        load_row<K>(&rrows(i, 0), rv);
-        cuda::std::array<float, K> rfv;
+    for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
+        cuda::std::array<double, K> apv[kBatch], rv[kBatch];
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            xv[c] += __ldg(alpha + c) * pv[c];
-            rv[c] += __ldg(neg_alpha + c) * apv[c];
-            rfv[c] = static_cast<float>(rv[c]);
-            rloc[c] += rv[c] * rv[c];
+        for (int t = 0; t < kBatch; ++t) {
+            const int i = i0 + (t0 + t) * stride;
+            if (i < n) {
+                load_row<K>(&aprows(i, 0), apv[t]);
+                load_row<K>(&rrows(i, 0), rv[t]);
+            }
         }
-        store_row<K>(&xrows(i, 0), xv);
-        store_row<K>(&rrows(i, 0), rv);
-        store_row<K>(&rfrows(i, 0), rfv);
+#pragma unroll
+        for (int t = 0; t < kBatch; ++t) {
+            const int i = i0 + (t0 + t) * stride;
+            if (i >= n) break;
+            cuda::std::array<float, K> rfv;
+#pragma unroll
+            for (int c = 0; c < K; ++c) {
+                rv[t][c] += __ldg(neg_alpha + c) * apv[t][c];
+                rfv[c] = static_cast<float>(rv[t][c]);
+                rloc[c] += rv[t][c] * rv[t][c];
+            }
+            store_row<K>(&rrows(i, 0), rv[t]);
+            store_row<K>(&rfrows(i, 0), rfv);
+        }
     }
     bcg_block_reduce_cols<K>(rloc, partials, n_blocks);
 }
@@ -282,20 +296,35 @@ __global__ void bcg_update_xr_kernel(int n, const double* __restrict__ alpha,
 // fly, which is exact.
 template <int K>
 __global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
-                                    const double* __restrict__ r,
-                                    double* __restrict__ partials, int n_blocks) {
+                                    const double* __restrict__ r, double* __restrict__ partials,
+                                    int n_blocks) {
     const WidthView<const double, K> rv(r, n);
     const WidthView<const float, K> zfv(zf, n);
     cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
     const int stride = gridDim.x * blockDim.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    // Batched like bcg_update_r_kernel, for the same reason; the fold keeps row order.
+    constexpr int kBatch = 4;
 #pragma unroll
-    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
-        if (i >= n) break;
+    for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
+        cuda::std::array<double, K> rb[kBatch];
+        cuda::std::array<float, K> zb[kBatch];
 #pragma unroll
-        for (int c = 0; c < K; ++c) local[c] += rv(i, c) * static_cast<double>(zfv(i, c));
+        for (int t = 0; t < kBatch; ++t) {
+            const int i = i0 + (t0 + t) * stride;
+            if (i < n) {
+                load_row<K>(&rv(i, 0), rb[t]);
+                load_row<K>(&zfv(i, 0), zb[t]);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < kBatch; ++t) {
+            if (i0 + (t0 + t) * stride >= n) break;
+#pragma unroll
+            for (int c = 0; c < K; ++c) local[c] += rb[t][c] * static_cast<double>(zb[t][c]);
+        }
     }
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
 }
@@ -313,17 +342,28 @@ __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int 
     }
 }
 
+// x += alpha p, then p = beta p + zf. alpha is still this iteration's and p still the one the
+// SpMV read, so x takes exactly the update it would have taken beside r.
 template <int K>
-__global__ void bcg_update_p_kernel(int n, const double* __restrict__ beta,
-                                    const float* __restrict__ zf, double* __restrict__ p) {
+__global__ void bcg_update_p_kernel(int n, const double* __restrict__ alpha,
+                                    const double* __restrict__ beta,
+                                    const float* __restrict__ zf, double* __restrict__ p,
+                                    double* __restrict__ x) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const WidthView<double, K> pv(p, n);
+        const WidthView<double, K> prows(p, n);
+        const WidthView<double, K> xrows(x, n);
         const WidthView<const float, K> zfv(zf, n);
+        cuda::std::array<double, K> pv, xv;
+        load_row<K>(&prows(i, 0), pv);
+        load_row<K>(&xrows(i, 0), xv);
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            pv(i, c) = __ldg(beta + c) * pv(i, c) + static_cast<double>(zfv(i, c));
+            xv[c] += __ldg(alpha + c) * pv[c];
+            pv[c] = __ldg(beta + c) * pv[c] + static_cast<double>(zfv(i, c));
         }
+        store_row<K>(&xrows(i, 0), xv);
+        store_row<K>(&prows(i, 0), pv);
     }
 }
 
@@ -402,15 +442,13 @@ void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_s
     bcg_mark_converged_kernel<<<1, k, 0, stream>>>(k, norm_sq, ref_sq, tolerance, converged);
 }
 
-void launch_bcg_update_xr_norm(int n, int k, const double* alpha, const double* neg_alpha,
-                               const double* p, const double* ap, double* x, double* r,
-                               float* rf, double* partials, double* norms,
-                               cudaStream_t stream) {
+void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const double* ap, double* r,
+                              float* rf, double* partials, double* norms, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        bcg_update_xr_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, alpha, neg_alpha, p, ap, x,
-                                                                 r, rf, partials, n_blocks);
+        bcg_update_r_kernel<K>
+            <<<n_blocks, kBlock, 0, stream>>>(n, neg_alpha, ap, r, rf, partials, n_blocks);
     });
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, norms);
 }
@@ -436,12 +474,12 @@ void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r,
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rz);
 }
 
-void launch_bcg_update_p(int n, int k, const double* beta, const float* zf, double* p,
-                         cudaStream_t stream) {
+void launch_bcg_update_p(int n, int k, const double* alpha, const double* beta, const float* zf,
+                         double* p, double* x, cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         if (const unsigned blocks = grid_for(n)) {
-            bcg_update_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, beta, zf, p);
+            bcg_update_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, alpha, beta, zf, p, x);
         }
     });
 }
