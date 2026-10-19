@@ -141,9 +141,9 @@ for result in subject.iter_simulate(coil, placements, didt=1.0e6):
     print(result.peak_magnE())
 ```
 
-The iterator computes results only as they are requested. It releases each
-result as the loop advances unless you retain it. Use `list(...)` when all
-results are needed in memory.
+The iterator computes results as they are requested, at most one block ahead.
+It releases each result as the loop advances unless you retain it. Use
+`list(...)` when all results are needed in memory.
 
 `block_k` controls how many placements are processed together (default `8`).
 Reduce it to lower peak memory use, or increase it when GPU memory permits. It

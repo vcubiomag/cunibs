@@ -18,6 +18,7 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
+from cunibs._transfer import AsyncCopier, Fence
 from cunibs.fem import (
     MAX_BLOCK,
     PlacementResult,
@@ -270,6 +271,7 @@ class Subject:
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
         self._scratch: cp.cuda.MemoryPool | None = None
+        self._copier: AsyncCopier | None = None
         # Guards every lazy field above: under the free-threaded build two threads sharing a
         # subject would otherwise each build a solver context, and free() could clear one out
         # from under a reader mid-sweep. Reentrant because _region_slice and
@@ -299,6 +301,9 @@ class Subject:
             if self._scratch is not None:
                 self._scratch.free_all_blocks()
                 self._scratch = None
+            if self._copier is not None:
+                self._copier.drain()
+                self._copier = None
         cp.get_default_memory_pool().free_all_blocks()
 
     def __enter__(self) -> Self:
@@ -306,6 +311,13 @@ class Subject:
 
     def __exit__(self, *exc: object) -> None:
         self.free()
+
+    def _async_copier(self) -> AsyncCopier:
+        """The pinned ring a multi-chunk call copies retained arrays through, kept until free()."""
+        with self._lock:
+            if self._copier is None:
+                self._copier = AsyncCopier()
+            return self._copier
 
     def _scratch_pool(self) -> cp.cuda.MemoryPool:
         """The pool a call's chunk-scoped temporaries come from, kept until :meth:`free`.
@@ -485,13 +497,26 @@ class Subject:
         op: RecoveryOperator | None,
         rois: Sequence[_RoiProbe] = (),
         provenance: dict[str, Any] | None = None,
+        copier: AsyncCopier | None = None,
     ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
         Runs inside the scratch pool, so nothing it returns may be device-backed.
         ``RegionSlice.summarize`` satisfies that: it returns Python floats and host arrays even
         when every input is on the device.
+
+        With a ``copier`` the retained arrays are queued behind the chunk's GPU work rather than
+        copied now, and are complete only once ``copier.fence()`` passes.
         """
+        if copier is None:
+            to_host = cp.asnumpy
+        else:
+            produced = cp.cuda.Event(disable_timing=True)
+            produced.record()
+
+            def to_host(a: cp.ndarray) -> npt.NDArray[Any]:
+                return copier.copy(a, produced)
+
         # nodal_field resolves its region against tet_tags, so a nodal result needs the host
         # metric inputs even without magnitude.
         host = self._host_metric_inputs if (retain.magnitude or retain.nodal) else None
@@ -505,9 +530,9 @@ class Subject:
             FieldResult(
                 summary=summary,
                 roi_means=_roi_means(out["magnE"], rois),
-                magnE=cp.asnumpy(out["magnE"]) if retain.magnitude else None,
-                E=cp.asnumpy(out["E"]) if retain.vectors else None,
-                v=cp.asnumpy(out["v"]) if retain.potential else None,
+                magnE=to_host(out["magnE"]) if retain.magnitude else None,
+                E=to_host(out["E"]) if retain.vectors else None,
+                v=to_host(out["v"]) if retain.potential else None,
                 transform=np.asarray(out["transform"]),
                 placement=site,
                 coil_name=coil.name,
@@ -520,7 +545,7 @@ class Subject:
                 relative_residual=float(out["relative_residual"]),
                 provenance=provenance,
                 n_nodes=n_nodes,
-                E_slots=cp.asnumpy(out["E_slots"]) if retain.nodal else None,
+                E_slots=to_host(out["E_slots"]) if retain.nodal else None,
                 slot_node=slot_node,
                 slot_tag=slot_tag,
                 tet_nodes=tet_nodes,
@@ -588,25 +613,55 @@ class Subject:
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
         temp_pool = self._scratch_pool()
-        for start in range(0, len(sites), chunk_k):
-            chunk = sites[start : start + chunk_k]
-            site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
-            with cp.cuda.using_allocator(temp_pool.malloc):
-                outs = solve_placements_block(
-                    ctx,
-                    dip_pos_m,
-                    dip_moment,
-                    site_args,
-                    didt,
-                    recovery=op,
-                    nodal=retain.nodal,
-                    tissues=tissues,
-                )
-                batch = self._reduce_chunk(
-                    chunk, outs, coil, didt, retain, region, recovery, op, rois, provenance
-                )
-                del outs
-            yield from batch
+        # With arrays to keep and more than one chunk, a chunk's copies to the host run while the
+        # next chunk computes, so its results are yielded one chunk late. The pending chunk's
+        # device outputs are held until its copies land.
+        keeps = retain.magnitude or retain.vectors or retain.potential or retain.nodal
+        copier = self._async_copier() if keeps and len(sites) > chunk_k else None
+        pending: tuple[list[FieldResult], Fence] | None = None
+        try:
+            for start in range(0, len(sites), chunk_k):
+                chunk = sites[start : start + chunk_k]
+                site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
+                with cp.cuda.using_allocator(temp_pool.malloc):
+                    outs = solve_placements_block(
+                        ctx,
+                        dip_pos_m,
+                        dip_moment,
+                        site_args,
+                        didt,
+                        recovery=op,
+                        nodal=retain.nodal,
+                        tissues=tissues,
+                    )
+                    batch = self._reduce_chunk(
+                        chunk,
+                        outs,
+                        coil,
+                        didt,
+                        retain,
+                        region,
+                        recovery,
+                        op,
+                        rois,
+                        provenance,
+                        copier,
+                    )
+                    del outs
+                if copier is None:
+                    yield from batch
+                    continue
+                if pending is not None:
+                    copier.settle(pending[1])
+                    yield from pending[0]
+                pending = (batch, copier.fence())
+            if pending is not None:
+                copier.settle(pending[1])
+                yield from pending[0]
+        finally:
+            # An abandoned sweep still has copies writing into its arrays.
+            if copier is not None:
+                copier.drain()
 
     def prepare_sweep(self, coil: Coil, size: int = 128) -> None:
         """Seed every later solve on this subject from a basis of ``size`` scalp placements.

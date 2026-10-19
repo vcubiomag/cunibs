@@ -4,6 +4,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <cstring>
 #include <new>
 #include <stdexcept>
 
@@ -53,6 +54,21 @@ GridArgs grid_args(const std::vector<double>& origin, const std::vector<double>&
         g.shape[i] = shape[i];
     }
     return g;
+}
+
+// A host-to-host copy run in stream order by the CUDA driver's own callback thread, which is what
+// lets a pinned staging buffer drain into a pageable array while the calling thread goes on to
+// queue GPU work. It never touches Python, so it needs no interpreter lock.
+struct HostCopy {
+    const void* src;
+    void* dst;
+    std::size_t bytes;
+};
+
+void CUDART_CB run_host_copy(void* arg) {
+    auto* copy = static_cast<HostCopy*>(arg);
+    std::memcpy(copy->dst, copy->src, copy->bytes);
+    delete copy;
 }
 
 }  // namespace
@@ -976,6 +992,21 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("axes").noconvert(), nb::arg("profile").noconvert(), nb::arg("h0"),
         nb::arg("cell"), nb::arg("mask").noconvert(), nb::arg("stream"),
         "Marks the grid points a coil's swept (rho, h) profile reaches about any centre's axis.");
+
+    m.def(
+        "host_copy_async",
+        [](uintptr_t src, uintptr_t dst, std::size_t bytes, uintptr_t stream) {
+            auto* copy = new HostCopy{reinterpret_cast<const void*>(src),
+                                      reinterpret_cast<void*>(dst), bytes};
+            const cudaError_t err = cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
+                                                       run_host_copy, copy);
+            if (err != cudaSuccess) delete copy;
+            check_cuda(err, "host_copy_async", "launch host func");
+        },
+        nb::call_guard<nb::gil_scoped_release>(), nb::arg("src"), nb::arg("dst"),
+        nb::arg("bytes"), nb::arg("stream"),
+        "Copy bytes from src to dst (host pointers) once the stream reaches this point. The "
+        "caller keeps both buffers alive until then.");
 
     m.attr("SUMMARY_LAYOUT") = nb::make_tuple(kSummaryPeak, kSummaryPeakLocation,
                                               kSummaryCenterOfGravity, kSummaryMean, kSummaryStd,

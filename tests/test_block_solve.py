@@ -460,3 +460,25 @@ def test_a_block_solve_honours_its_own_tolerance(cp, fresh_subject, patch_mesh):
         )
         assert iters == ref_iters
         np.testing.assert_array_equal(cp.asnumpy(got), cp.asnumpy(ref))
+
+
+@pytest.mark.realmesh
+def test_retained_arrays_copied_behind_the_next_chunk_match_a_direct_copy(
+    patch_subject, d70_coil, patch_sites
+):
+    """A multi-chunk sweep copies its arrays while the next chunk computes; nothing may differ."""
+    from cunibs import Placement
+
+    placements = [Placement(c, h, d) for c, h, d in patch_sites] * 2 + [
+        Placement(*patch_sites[0])
+    ]
+    flags = {"magnitude": True, "vectors": True, "potential": True, "nodal": True}
+    swept = list(patch_subject.iter_simulate(d70_coil, placements, 1e6, **flags))
+    assert len(swept) == len(placements)
+    for i, (placement, result) in enumerate(zip(placements, swept, strict=True)):
+        alone = patch_subject.simulate(d70_coil, placement, 1e6, **flags)
+        assert result.placement is placement
+        for name in ("magnE", "E", "v", "E_slots"):
+            np.testing.assert_array_equal(
+                getattr(result, name), getattr(alone, name), err_msg=f"{name}, placement {i}"
+            )

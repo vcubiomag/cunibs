@@ -78,7 +78,7 @@ def test_retained_results_are_independent_of_the_stream(cube_subject, synthetic_
     kept = first.magnE.copy()
     rest = list(stream)
     assert len(rest) == 3
-    # Exhausting the generator (and freeing its pool) must not disturb the held result.
+    # Exhausting the generator must not disturb the held result.
     np.testing.assert_array_equal(first.magnE, kept)
     assert first.peak_magnE() > 0
 
@@ -91,7 +91,7 @@ def test_iter_simulate_survives_early_break(cube_subject, synthetic_coil):
         if i == 1:
             break
     stream.close()
-    # The subject stays usable once the abandoned generator has released its scratch pool.
+    # The subject stays usable after an abandoned sweep, whose copies were still in flight.
     assert cube_subject.simulate(synthetic_coil, sites[0]).peak_magnE() > 0
 
 
