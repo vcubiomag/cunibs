@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal, TypedDict
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import cupy as cp
 import numpy as np
 import numpy.typing as npt
 
 from cunibs.mesh import VOLUME_KEY_TO_LABEL, TissueLabel
+from cunibs.solver import (
+    MAX_STAGE_BLOCK,
+    SUMMARY_LAYOUT,
+    region_summary,
+    region_summary_work_size,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 type ArrayT = cp.ndarray | np.ndarray
 type Region = TissueLabel | Literal["all"]
@@ -205,6 +214,11 @@ class RegionSlice:
     vols: ArrayT
     barycenters_mm: ArrayT
     volume_m3: float
+    # For a device slice: the index as int32 and the volumes and barycentres as float64, the
+    # layout the native summary reads.
+    native: tuple[cp.ndarray, cp.ndarray, cp.ndarray] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def summarize(
         self,
@@ -218,7 +232,11 @@ class RegionSlice:
         ``peak_magnE`` is the true maximum; the focality volumes are measured against
         :data:`FOCALITY_ANCHOR_PERCENTILE` of |E| instead (see :func:`focality`).
         """
-        xp = cp.get_array_module(magnE)
+        if self.native is not None:
+            (summary,) = self.summarize_block(
+                [magnE], focality_fracs=focality_fracs, percentiles=percentiles
+            )
+            return summary
         m = magnE[self.index]
         w = self.vols
         dist = _distribution(m, w, percentiles)
@@ -233,7 +251,7 @@ class RegionSlice:
         return {
             "region": self.region,
             "peak_magnE": float(m.max()),
-            "peak_location_mm": cp.asnumpy(self.barycenters_mm[xp.argmax(m)]),
+            "peak_location_mm": np.asarray(self.barycenters_mm[np.argmax(m)]),
             "center_of_gravity_mm": _center_of_gravity_mm(m, w, self.barycenters_mm),
             "region_volume_m3": self.volume_m3,
             "focality_m3": {
@@ -241,6 +259,79 @@ class RegionSlice:
             },
             "distribution": dist,
         }
+
+    def summarize_block(
+        self,
+        fields: Sequence[cp.ndarray],
+        *,
+        focality_fracs: tuple[float, ...] = _SUMMARY_FOCALITY_FRACS,
+        percentiles: tuple[float, ...] = _SUMMARY_PERCENTILES,
+    ) -> list[FieldMetrics]:
+        """:meth:`summarize` for several device fields at once, in one copy to the host.
+
+        Each field's metrics are the same whatever else is summarised with it.
+        """
+        qs, anchor = _probe_quantiles(percentiles)
+        out = cp.asnumpy(self.summary_table(fields, qs, anchor, focality_fracs))
+        q0 = SUMMARY_LAYOUT[5]
+        return [
+            {
+                "region": self.region,
+                "peak_magnE": float(row[SUMMARY_LAYOUT[0]]),
+                "peak_location_mm": row[SUMMARY_LAYOUT[1] : SUMMARY_LAYOUT[1] + 3].copy(),
+                "center_of_gravity_mm": row[SUMMARY_LAYOUT[2] : SUMMARY_LAYOUT[2] + 3].copy(),
+                "region_volume_m3": self.volume_m3,
+                "focality_m3": {
+                    f"{frac:g}": float(row[q0 + len(qs) + f])
+                    for f, frac in enumerate(focality_fracs)
+                },
+                "distribution": {
+                    "mean": float(row[SUMMARY_LAYOUT[3]]),
+                    "std": float(row[SUMMARY_LAYOUT[4]]),
+                    **{f"p{p:g}": float(row[q0 + i]) for i, p in enumerate(percentiles)},
+                },
+            }
+            for row in out
+        ]
+
+    def summary_table(
+        self,
+        fields: Sequence[cp.ndarray],
+        qs: Sequence[float],
+        anchor: int,
+        focality_fracs: Sequence[float],
+    ) -> cp.ndarray:
+        """The native summary of ``fields`` as a device ``(len(fields), n_out)`` table.
+
+        Columns follow ``cunibs.solver.SUMMARY_LAYOUT``: quantiles ``qs`` (in [0, 1]) start at its
+        last offset, then the volumes at or above each fraction of quantile ``qs[anchor]``.
+        Nothing is copied to the host, so a caller can keep the table on the device.
+        """
+        if self.native is None:
+            raise ValueError("summary_table needs a slice built from device arrays")
+        index, w, bary = self.native
+        stream = cp.cuda.get_current_stream().ptr
+        rows = []
+        for start in range(0, len(fields), MAX_STAGE_BLOCK):
+            chunk = [cp.ascontiguousarray(f) for f in fields[start : start + MAX_STAGE_BLOCK]]
+            f64 = chunk[0].dtype == cp.float64
+            out = cp.empty((len(chunk), SUMMARY_LAYOUT[5] + len(qs) + len(focality_fracs)))
+            work = cp.empty(
+                region_summary_work_size(int(index.shape[0]), len(chunk), f64), dtype=cp.uint8
+            )
+            region_summary(
+                chunk, index, w, bary, list(qs), anchor, list(focality_fracs), work, out, stream
+            )
+            rows.append(out)
+        return rows[0] if len(rows) == 1 else cp.concatenate(rows)
+
+
+def _probe_quantiles(percentiles: tuple[float, ...]) -> tuple[list[float], int]:
+    """The quantiles a summary probes, and which one anchors focality."""
+    qs = [p / 100.0 for p in percentiles]
+    if FOCALITY_ANCHOR_PERCENTILE in percentiles:
+        return qs, percentiles.index(FOCALITY_ANCHOR_PERCENTILE)
+    return [*qs, FOCALITY_ANCHOR_PERCENTILE / 100.0], len(qs)
 
 
 def region_slice(
@@ -250,12 +341,21 @@ def region_slice(
     xp = cp.get_array_module(vols)
     index = xp.where(region_mask(tet_tags, region))[0]
     v = vols[index]
+    bary = barycenters_mm[index]
+    native = None
+    if xp is cp:
+        native = (
+            cp.ascontiguousarray(index, dtype=cp.int32),
+            cp.ascontiguousarray(v, dtype=cp.float64),
+            cp.ascontiguousarray(bary, dtype=cp.float64),
+        )
     return RegionSlice(
         region=region,
         index=index,
         vols=v,
-        barycenters_mm=barycenters_mm[index],
+        barycenters_mm=bary,
         volume_m3=float(v.sum()),
+        native=native,
     )
 
 

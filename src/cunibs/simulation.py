@@ -475,9 +475,10 @@ class Subject:
         # (node, tissue) slot carries its own tag.
         tet_nodes = self._host_tet_nodes if retain.nodal and slot_tag is None else None
         n_nodes = int(self.context.n_nodes) if retain.nodal else None
+        summaries = region.summarize_block([out["magnE"] for out in outs])
         return [
             FieldResult(
-                summary=region.summarize(out["magnE"]),
+                summary=summary,
                 roi_means=_roi_means(out["magnE"], rois),
                 magnE=cp.asnumpy(out["magnE"]) if retain.magnitude else None,
                 E=cp.asnumpy(out["E"]) if retain.vectors else None,
@@ -499,7 +500,7 @@ class Subject:
                 slot_tag=slot_tag,
                 tet_nodes=tet_nodes,
             )
-            for site, out in zip(chunk, outs, strict=False)
+            for site, out, summary in zip(chunk, outs, summaries, strict=True)
         ]
 
     @property

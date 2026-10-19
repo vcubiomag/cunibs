@@ -258,3 +258,54 @@ def test_tail_percentiles_use_the_exact_probability_for_float32_fields():
     assert exact != rounded, "the tail must be steep enough to tell the two apart"
     assert metrics.distribution(magn, vols, mask)["p99.9"] == exact
     assert metrics.percentile_magnitude(magn, vols, mask, 99.9) == exact
+
+
+def _same_summary(a, b):
+    for key, value in a.items():
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(value, b[key], err_msg=key)
+        else:
+            assert value == b[key], key
+
+
+@pytest.mark.gpu
+def test_a_block_summary_is_each_field_summarised_alone(cp):
+    """Batching is a throughput choice: no field's numbers may depend on its batch mates."""
+    rng = np.random.default_rng(8)
+    n = 60_000
+    vols = cp.asarray(rng.random(n) + 0.1, dtype=cp.float32)
+    bary = cp.asarray(rng.standard_normal((n, 3)))
+    tags = cp.asarray(rng.choice(np.array([2, 3], np.int32), n))
+    # Rounded so that ties, which decide where weight lands in the scan, are common.
+    fields = [cp.round(cp.asarray(rng.pareto(2.0, n), dtype=cp.float32), 2) for _ in range(10)]
+    region = metrics.region_slice(vols, bary, tags, "gray_matter")
+
+    block = region.summarize_block(fields)
+    for field, batched in zip(fields, block, strict=True):
+        _same_summary(batched, region.summarize(field))
+    for again in (region.summarize_block(fields), region.summarize_block(fields[::-1])[::-1]):
+        for a, b in zip(block, again, strict=True):
+            _same_summary(a, b)
+
+
+@pytest.mark.gpu
+def test_a_float32_device_summary_matches_the_host_path(cp):
+    rng = np.random.default_rng(9)
+    n = 20_000
+    magn = (rng.pareto(2.0, n) + 0.01).astype(np.float32)
+    vols = (rng.random(n) + 0.1).astype(np.float32)
+    bary = rng.standard_normal((n, 3))
+    tags = rng.choice(np.array([2, 3], np.int32), n)
+    host = metrics.compute_metrics(magn, vols, bary, tags)
+    dev = metrics.compute_metrics(
+        cp.asarray(magn), cp.asarray(vols), cp.asarray(bary), cp.asarray(tags)
+    )
+    assert dev["peak_magnE"] == host["peak_magnE"]
+    np.testing.assert_array_equal(dev["peak_location_mm"], host["peak_location_mm"])
+    np.testing.assert_allclose(
+        dev["center_of_gravity_mm"], host["center_of_gravity_mm"], rtol=1e-6
+    )
+    for key, value in host["distribution"].items():
+        assert dev["distribution"][key] == pytest.approx(value, rel=1e-6), key
+    for key, value in host["focality_m3"].items():
+        assert dev["focality_m3"][key] == pytest.approx(value, rel=1e-6), key

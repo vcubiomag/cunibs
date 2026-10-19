@@ -968,6 +968,56 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("cell"), nb::arg("mask").noconvert(), nb::arg("stream"),
         "Marks the grid points a coil's swept (rho, h) profile reaches about any centre's axis.");
 
+    m.attr("SUMMARY_LAYOUT") = nb::make_tuple(kSummaryPeak, kSummaryPeakLocation,
+                                              kSummaryCenterOfGravity, kSummaryMean, kSummaryStd,
+                                              kSummaryQuantiles);
+    m.attr("MAX_SUMMARY_QUANTILES") = kMaxSummaryQuantiles;
+    m.def(
+        "region_summary_work_size",
+        [](int n, int k, bool f64) { return region_summary_work_size(n, k, f64); },
+        nb::call_guard<nb::gil_scoped_release>(), nb::arg("n"), nb::arg("k"), nb::arg("f64"),
+        "Bytes of workspace region_summary needs.");
+    m.def(
+        "region_summary",
+        [](std::vector<nb::ndarray<nb::ndim<1>, nb::c_contig, nb::device::cuda>> fields,
+           i32_cuda index, f64_cuda w, f64_cuda_2d bary, std::vector<double> qs, int anchor,
+           std::vector<double> fracs, u8_cuda_1d work, f64_cuda_2d out, uintptr_t stream) {
+            const int k = static_cast<int>(fields.size());
+            const int n = static_cast<int>(index.shape(0));
+            if (k < 1 || k > kMaxStageBlock) {
+                throw std::invalid_argument("region_summary: between 1 and 8 fields");
+            }
+            const bool f64 = fields[0].dtype() == nb::dtype<double>();
+            const void* ptrs[kMaxStageBlock];
+            for (int c = 0; c < k; ++c) {
+                const bool ok = fields[c].dtype() == (f64 ? nb::dtype<double>()
+                                                          : nb::dtype<float>()) &&
+                                fields[c].shape(0) == fields[0].shape(0);
+                if (!ok) {
+                    throw std::invalid_argument(
+                        "region_summary: fields must share one length and be float32 or float64");
+                }
+                ptrs[c] = fields[c].data();
+            }
+            const int n_q = static_cast<int>(qs.size());
+            const int n_f = static_cast<int>(fracs.size());
+            if (static_cast<int>(w.shape(0)) != n || static_cast<int>(bary.shape(0)) != n ||
+                bary.shape(1) != 3 || static_cast<int>(out.shape(0)) != k ||
+                static_cast<int>(out.shape(1)) != kSummaryQuantiles + n_q + n_f) {
+                throw std::invalid_argument("region_summary: shape mismatch");
+            }
+            launch_region_summary(ptrs, f64, k, n, index.data(), w.data(), bary.data(),
+                                  qs.data(), n_q, anchor, fracs.data(), n_f, work.data(),
+                                  work.shape(0), out.data(),
+                                  reinterpret_cast<cudaStream_t>(stream));
+        },
+        nb::call_guard<nb::gil_scoped_release>(), nb::arg("fields"),
+        nb::arg("index").noconvert(), nb::arg("w").noconvert(), nb::arg("bary").noconvert(),
+        nb::arg("qs"), nb::arg("anchor"), nb::arg("fracs"), nb::arg("work").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("stream"),
+        "Volume-weighted metrics of up to 8 fields over one region; see fem/fem.hpp for the "
+        "layout of out.");
+
     m.def(
         "accumulate_moments",
         [](f32_cuda_1d magn, f64_cuda sum_e, f64_cuda sumsq_e, uintptr_t stream) {

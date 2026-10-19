@@ -85,6 +85,7 @@ nanobind_add_module(_solver_ext LTO FREE_THREADED
   src/cunibs/solver/fem/skin.cu
   src/cunibs/solver/fem/adm.cu
   src/cunibs/solver/fem/moments.cu
+  src/cunibs/solver/fem/summary.cu
   src/cunibs/solver/fem/seed.cu
   src/cunibs/solver/coil/dadt.cu
   src/cunibs/solver/coil/dadt_element.cu

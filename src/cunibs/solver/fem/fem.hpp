@@ -176,6 +176,25 @@ void launch_adm_reach(const double* origin, const double* spacing, const int* sh
                       const unsigned char* profile, int n_rho, int n_h, double h0, double cell,
                       unsigned char* mask, cudaStream_t stream);
 
+// --- summary.cu: volume-weighted region metrics of |E| ---------------------------------------
+// out is (k, n_out) float64 with n_out = kSummaryQuantiles + n_q + n_f: the peak, its element's
+// barycentre, the centre of gravity, mean and std, then the n_q quantiles qs and the volume at or
+// above fracs[f] times quantile qs[anchor]. fields are k (n_tet,) arrays, float64 when f64 and
+// float32 otherwise, read at index (n,); w and bary are the region's volumes (n,) and barycentres
+// (n, 3). work holds region_summary_work_size(n, k, f64) bytes.
+inline constexpr int kSummaryPeak = 0;
+inline constexpr int kSummaryPeakLocation = 1;
+inline constexpr int kSummaryCenterOfGravity = 4;
+inline constexpr int kSummaryMean = 7;
+inline constexpr int kSummaryStd = 8;
+inline constexpr int kSummaryQuantiles = 9;
+inline constexpr int kMaxSummaryQuantiles = 16;
+std::size_t region_summary_work_size(int n, int k, bool f64);
+void launch_region_summary(const void* const* fields, bool f64, int k, int n, const int* index,
+                           const double* w, const double* bary, const double* qs, int n_q,
+                           int anchor, const double* fracs, int n_f, void* work,
+                           std::size_t work_bytes, double* out, cudaStream_t stream);
+
 // --- moments.cu: streaming UQ statistics over the |E| this directory produces ---------------
 void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
                                cudaStream_t stream);

@@ -9,7 +9,7 @@ import cupy as cp
 import numpy as np
 
 from cunibs import metrics
-from cunibs.fem.assembly import GM_TAG, conductivity_per_tet
+from cunibs.fem.assembly import conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.fem.recovery import RecoveredField, RecoveryOperator, apply_recovery_into
 from cunibs.fem.solve import (
@@ -19,6 +19,7 @@ from cunibs.fem.solve import (
     _pad_block,
 )
 from cunibs.solver import (
+    SUMMARY_LAYOUT,
     accumulate_moments_block,
     dadt_node_to_element,
     reconstruct_e_block,
@@ -374,10 +375,9 @@ def run_conductivity_uq(
     basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream)
     y_all = cp.asarray(basis.coefficients(cp.asnumpy(sigmas)))
 
-    gm_idx = cp.where(ctx.tet_tags == GM_TAG)[0]
-    vols_gm = ctx.vols[gm_idx].astype(cp.float64)
-    bary_gm = ctx.tet_barycenters_mm[gm_idx]
-    anchor_q = cp.asarray([metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0], dtype=cp.float64)
+    gm = metrics.region_slice(ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, "gray_matter")
+    anchor_q = [metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0]
+    peak_col, loc_col, q0 = SUMMARY_LAYOUT[0], SUMMARY_LAYOUT[1], SUMMARY_LAYOUT[5]
     roi_names = list(record_rois)
     probes = [
         (
@@ -452,15 +452,15 @@ def run_conductivity_uq(
             )
 
         accumulate_moments_block(magn_stat[: len(draws)], sum_e, sumsq_e, stream)
+        # The summary's own kernel, so a per-draw peak and focality are the summary's
+        # definitions. The table stays on the device.
+        table = gm.summary_table(magn_stat[: len(draws)], anchor_q, 0, [focality_frac])
+        drawn = cp.asarray(draws)
+        peak_s[drawn] = table[:, peak_col]
+        peakloc_s[drawn] = table[:, loc_col : loc_col + 3]
+        foc_s[drawn] = table[:, q0 + 1]
         for c, k in enumerate(draws):
             magn_k = magn_stat[c]
-            magn_gm = magn_k[gm_idx]
-            peak_s[k] = magn_gm.max()
-            # Same percentile anchor as metrics.focality, so a per-draw focality and the
-            # summary's measure the same thing. Kept on device: reading the anchor would sync.
-            anchor = metrics.weighted_quantiles(magn_gm, vols_gm, anchor_q)
-            foc_s[k] = vols_gm[magn_gm >= focality_frac * anchor[0]].sum()
-            peakloc_s[k] = bary_gm[cp.argmax(magn_gm)]
             for j, (idx, w) in enumerate(probes):
                 roi_s[k, j] = (magn_k[idx].astype(cp.float64) * w).sum()
 
