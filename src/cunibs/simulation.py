@@ -370,16 +370,13 @@ class Subject:
     ) -> ConductivityUQPrecompute:
         """Build (and cache) the per-tissue stiffness components for a UQ configuration.
 
-        Cached by the set of perturbed tissues so repeated UQ runs on the same subject reuse the
-        components and the nominal-σ AMG hierarchy.
+        Cached by the set of perturbed tissues (see :meth:`ConductivityUQConfig.tags_for`) so
+        repeated UQ runs on the same subject reuse the components and the nominal-σ AMG hierarchy.
         """
         from cunibs.uq import build_conductivity_uq_precompute
 
         ctx = self.context
-        if config.perturbed_tags is not None:
-            tags = tuple(sorted(int(t) for t in config.perturbed_tags))
-        else:
-            tags = tuple(int(t) for t in cp.asnumpy(cp.unique(ctx.tet_tags)))
+        tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
         with self._lock:
             if tags not in self._conductivity_uq_pre:
                 self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
@@ -725,7 +722,14 @@ class Subject:
             for site in sites:
                 with cp.cuda.using_allocator(temp_pool.malloc):
                     result = run_conductivity_uq(
-                        ctx, pre, coil, site, config, didt, record_rois, recovery=op
+                        ctx,
+                        pre,
+                        coil,
+                        site,
+                        config,
+                        didt=didt,
+                        record_rois=record_rois,
+                        recovery=op,
                     )
                     # Summarised on the device before anything is copied back.
                     host = self._host_metric_inputs if moments else None

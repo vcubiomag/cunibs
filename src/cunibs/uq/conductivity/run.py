@@ -269,10 +269,10 @@ def run_conductivity_uq(
     coil: Coil,
     placement: Placement,
     config: ConductivityUQConfig,
+    *,
     didt: float = 1e6,
     record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     focality_frac: float = 0.5,
-    *,
     recovery: RecoveryOperator | None = None,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
@@ -297,6 +297,14 @@ def run_conductivity_uq(
     :func:`~cunibs.fem.ensure_recovery`, or ``None`` for the raw per-tetrahedron field.
     """
     _check_operator(ctx, recovery, False, "run_conductivity_uq")
+    wanted = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
+    if wanted != tuple(sorted(pre.perturbed_tags)):
+        raise ValueError(
+            f"config perturbs tissues {wanted} but the precompute was built for "
+            f"{tuple(pre.perturbed_tags)}. Build it with "
+            "build_conductivity_uq_precompute(ctx, config.tags_for(...)), or use "
+            "Subject.simulate_conductivity_uq, which matches them for you."
+        )
     sigmas = sample_conductivities(config, pre.perturbed_tags)  # (N, P) f64
     sig_f32 = sigmas.astype(cp.float32)
 

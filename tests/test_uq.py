@@ -137,6 +137,28 @@ def test_uq_perturbed_tags_subset(two_tissue_subject):
     assert r.sigma_samples.shape == (32, 1)
 
 
+def test_uq_tissue_cov_alone_perturbs_only_the_named_tissues(two_tissue_subject):
+    from cunibs import ConductivityUQConfig
+
+    r = two_tissue_subject.simulate_conductivity_uq(
+        _coil(),
+        _placement(),
+        config=ConductivityUQConfig(n_samples=4, tissue_cov={"csf": 0.3}, seed=0),
+    )
+    assert r.perturbed_tags == (3,)
+
+
+def test_run_conductivity_uq_rejects_a_precompute_for_other_tissues(two_tissue_subject):
+    from cunibs import ConductivityUQConfig
+    from cunibs.uq import build_conductivity_uq_precompute, run_conductivity_uq
+
+    ctx = two_tissue_subject.context
+    pre = build_conductivity_uq_precompute(ctx, (3,))
+    config = ConductivityUQConfig(n_samples=4, tissue_cov={2: 0.1, 3: 0.3})
+    with pytest.raises(ValueError, match="precompute was built for"):
+        run_conductivity_uq(ctx, pre, _coil(), _placement(), config)
+
+
 def test_uq_degenerate_matches_forward(cp, cube_mesh):
     """Zero conductivity variance → mean field equals the deterministic solve, std is zero."""
     from cunibs import ConductivityUQConfig, Subject

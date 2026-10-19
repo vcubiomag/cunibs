@@ -315,6 +315,10 @@ print(uq_result.peak_mean_magnE())
 print(uq_result.max_local_cov())
 ```
 
+Only the tissues in `tissue_cov` are perturbed, named by tag or by label
+(`{"gray_matter": 0.15}`). Without `tissue_cov`, every tissue in the mesh is perturbed at the
+`DEFAULT_TISSUE_COV` values. `perturbed_tags` adds tissues at their default CoV.
+
 The result includes summary metrics for the per-tetrahedron mean field. Pass
 `moments=True` to retain `mean_magnE`, `std_magnE`, and `cov_magnE` arrays.
 Use `iter_simulate_conductivity_uq` to stream placements.
