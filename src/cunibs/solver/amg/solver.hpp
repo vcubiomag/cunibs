@@ -34,6 +34,8 @@ public:
         const NativeVCycle* precond = nullptr;
         int generation = 0;
         int k = 0;
+        // The solver's block buffers the body reads, which ensure_block_buffers replaces.
+        int buffers = 0;
         bool operator==(const Key&) const = default;
     };
 
@@ -206,7 +208,9 @@ private:
     CudaEvent join_event_;
     GraphCache graph_;
     // Block-solve state: (n, k) row-major work buffers, lazily sized to the largest k seen.
+    // block_buffers_ counts their allocations and keys both block graphs.
     int block_k_ = 0;
+    int block_buffers_ = 0;
     DeviceBuffer<double> r_blk_;
     DeviceBuffer<double> p_blk_;
     DeviceBuffer<double> ap_blk_;

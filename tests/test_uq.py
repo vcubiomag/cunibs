@@ -571,6 +571,41 @@ def test_affine_block_solves_each_draw_against_its_own_matrix(cp, two_tissue_sub
         np.testing.assert_array_equal(cp.asnumpy(alone[:, 0]), cp.asnumpy(x[:, c]))
 
 
+@pytest.mark.parametrize("k", [1, 2])
+def test_a_block_solve_after_a_wider_one_reads_the_current_buffers(cp, two_tissue_subject, k):
+    """A wider solve reallocates the block buffers that a narrower solve's captured graph reads."""
+    from cunibs.uq import build_conductivity_uq_precompute
+
+    ctx = two_tissue_subject.context
+    stream = cp.cuda.get_current_stream().ptr
+    rng = np.random.default_rng(5)
+
+    def solve_narrow(pre):
+        b = cp.asarray(np.random.default_rng(6).standard_normal((int(pre.idx.shape[0]), k)))
+        x = cp.empty_like(b)
+        pre.pcg.solve_mixed_block(pre.precond, b, x, 1e-10, pre.max_iters, stream)
+        return cp.asnumpy(x)
+
+    pre = build_conductivity_uq_precompute(ctx, (2, 3))
+    n_red = int(pre.idx.shape[0])
+    solve_narrow(pre)
+    sigmas = cp.asarray(pre.nominal_sigma.get() * rng.lognormal(0.0, 0.3, size=(8, 2)))
+    wide = cp.asarray(rng.standard_normal((n_red, 8)))
+    pre.pcg.solve_affine_block(
+        pre.precond,
+        wide,
+        cp.empty_like(wide),
+        pre.affine_coefficients(sigmas),
+        1e-10,
+        pre.max_iters,
+        stream,
+    )
+    after = solve_narrow(pre)
+    np.testing.assert_array_equal(
+        after, solve_narrow(build_conductivity_uq_precompute(ctx, (2, 3)))
+    )
+
+
 def test_block_moments_and_row_dot_match_their_serial_forms(cp):
     from cunibs.solver import accumulate_moments, accumulate_moments_block, row_dot
 

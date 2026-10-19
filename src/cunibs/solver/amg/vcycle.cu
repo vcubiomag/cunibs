@@ -630,6 +630,8 @@ void NativeVCycle::finalize() {
 // graph capture (allocation inside a capture fails).
 void NativeVCycle::ensure_block_buffers(int k) {
     if (block_k_ >= k) return;
+    // A captured graph holds the buffers freed below, so it must not replay against this cycle.
+    generation_ = ++g_vcycle_generation;
     block_k_ = 0;
     for (std::size_t i = 0; i < levels_.size(); ++i) {
         Level& lvl = levels_[i];

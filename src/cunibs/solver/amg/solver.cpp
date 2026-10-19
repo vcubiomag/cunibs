@@ -159,6 +159,7 @@ void PcgAmgSolver::ensure_block_buffers(int k) {
         alloc<double>(static_cast<size_t>(2) * k * bcg_partials_blocks(n_), "partials_blk");
     h_norms_blk_ = pinned_alloc<double>(static_cast<size_t>(2) * k, "solver", "norms_blk");
     block_k_ = k;
+    ++block_buffers_;
 }
 
 PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, const double* B,
@@ -285,7 +286,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
         launch_bcg_update_p(n_, k, d_alpha, d_beta, d_shift, ZF, P, X_int, s);
     };
 
-    const GraphCache::Key key{&preconditioner, preconditioner.generation(), k};
+    const GraphCache::Key key{&preconditioner, preconditioner.generation(), k, block_buffers_};
     std::vector<double> rel(k, 0.0);
     // max_iters doubles as the default for a column that never reaches tolerance and as the
     // value a column crossing on the last iteration would be given.
