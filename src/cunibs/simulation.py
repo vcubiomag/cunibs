@@ -331,19 +331,19 @@ class Subject:
 
     def roi(
         self,
-        point_mm: npt.ArrayLike,
+        position_mm: npt.ArrayLike,
         radius_mm: float = 0.0,
         region: metrics.Region = "gray_matter",
     ) -> ResolvedTarget:
-        """Volume-weighted ROI of ``region`` elements around ``point_mm`` (nearest one if radius 0).
+        """Volume-weighted ROI of ``region`` elements around ``position_mm`` (nearest if radius 0).
 
-        Returns a :class:`~cunibs.adm.target.ResolvedTarget` usable as a ``record_rois`` probe or an
-        ``adm`` target.
+        Returns a :class:`~cunibs.adm.target.ResolvedTarget` usable as a ``record_rois`` probe or as
+        the target of :func:`cunibs.adm.build_reciprocity` and :func:`cunibs.adm.optimize`.
         """
         from cunibs.adm.target import Target, resolve_target
 
         return resolve_target(
-            self.context, Target(point_mm, region=region, radius_mm=radius_mm)
+            self.context, Target(position_mm, region=region, radius_mm=radius_mm)
         )
 
     def depth_probes(

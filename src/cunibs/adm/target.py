@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,10 @@ from cunibs.metrics import Region, region_mask
 
 if TYPE_CHECKING:
     from cunibs.fem.solve import SolverContext
+
+# Offset past which resolve_target warns that the point lies outside its region. A scalp
+# coordinate lands 10-20 mm from gray matter.
+FAR_FROM_REGION_MM = 5.0
 
 
 def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
@@ -30,6 +35,9 @@ class Target:
     ``None`` requests the direction-free magnitude (three adjoint solves). ``region`` restricts the
     target to a tissue type. ``radius_mm`` averages the functional over all region elements whose
     barycentre lies within the ball; ``0`` selects the single nearest element.
+
+    The functional is linear in the field: the volume-weighted ROI mean of the raw per-element
+    ``E``, then its component along ``direction``, or its norm for a magnitude target.
     """
 
     position_mm: npt.NDArray[np.float64]
@@ -67,10 +75,21 @@ class ResolvedTarget:
     directions: cp.ndarray  # (D, 3) float64 orthonormal adjoint directions
     magnitude: bool  # True when directions are the canonical basis for |E|
     barycenter_mm: cp.ndarray  # (3,) float64 ROI centroid
+    # How far the requested position lies outside the region, in mm, measured to the nearest
+    # element's bounding sphere.
+    offset_mm: float = 0.0
 
 
-def resolve_target(ctx: SolverContext, target: Target) -> ResolvedTarget:
-    """Map a :class:`Target` to ROI elements, weights, and adjoint directions."""
+def resolve_target(ctx: SolverContext, target: Target | ResolvedTarget) -> ResolvedTarget:
+    """Map a :class:`Target` to ROI elements, weights, and adjoint directions.
+
+    A :class:`ResolvedTarget` is returned as it is, so anything that takes a target takes either.
+    When no region element lies within ``radius_mm`` the ROI falls back to the nearest one, and
+    ``offset_mm`` on the result says how far away that was. Past :data:`FAR_FROM_REGION_MM` it
+    also warns, because the point was then most likely given in the wrong frame or region.
+    """
+    if isinstance(target, ResolvedTarget):
+        return target
     barys = ctx.tet_barycenters_mm
     mask = region_mask(ctx.tet_tags, target.region)
     region_ids = cp.where(mask)[0].astype(cp.int32)
@@ -88,6 +107,18 @@ def resolve_target(ctx: SolverContext, target: Target) -> ResolvedTarget:
         if not bool(within.any()):
             within = d2 == d2.min()
         sel = region_ids[within]
+    corners = ctx.nodes_mm[ctx.tet_nodes[region_ids]]
+    reach = cp.sqrt(((corners - region_barys[:, None, :]) ** 2).sum(-1).max(axis=1))
+    offset_mm = float(cp.maximum(cp.sqrt(d2) - reach, 0.0).min())
+    del corners
+    if offset_mm > FAR_FROM_REGION_MM:
+        warnings.warn(
+            f"The target at {np.array2string(target.position_mm, precision=1)} mm lies "
+            f"{offset_mm:.1f} mm outside {target.region}, so the ROI is the nearest "
+            f"{target.region} instead. Check that the point is in mesh coordinates and that the "
+            "region is the tissue it lies in.",
+            stacklevel=2,
+        )
 
     vols = ctx.vols[sel].astype(cp.float64)
     weights = vols / vols.sum()
@@ -106,4 +137,5 @@ def resolve_target(ctx: SolverContext, target: Target) -> ResolvedTarget:
         directions=cp.ascontiguousarray(directions),
         magnitude=magnitude,
         barycenter_mm=centroid,
+        offset_mm=offset_mm,
     )

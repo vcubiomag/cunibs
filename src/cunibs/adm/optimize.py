@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
-    from cunibs.adm.target import Target
+    from cunibs.adm.target import ResolvedTarget, Target
     from cunibs.coil import Coil
     from cunibs.fem.solve import SolverContext
 
@@ -34,7 +34,7 @@ class OptimizeResult:
     best_handle_mm: npt.NDArray[np.float64]  # a point along the optimum handle direction
     best_angle_rad: float
     best_E: npt.NDArray[np.float64]  # target E-vector components (per adjoint direction)
-    best_objective: float  # |E| (magnitude target) or signed E·ê (directional)
+    best_objective: float  # |mean E| over the ROI (magnitude target) or signed mean E·ê
     centers_mm: cp.ndarray  # (C,3) scalp contact point per candidate
     center_objective: cp.ndarray  # (C,) optimum objective per candidate
     center_handle_mm: cp.ndarray  # (C,3) optimum handle point per candidate
@@ -133,7 +133,7 @@ def _project(
 def optimize(
     ctx: SolverContext,
     coil: Coil,
-    target: Target,
+    target: Target | ResolvedTarget,
     centers_mm: npt.ArrayLike,
     *,
     n_samples: int = 9,

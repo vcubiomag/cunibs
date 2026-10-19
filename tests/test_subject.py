@@ -237,6 +237,13 @@ def test_load_mesh_is_deterministic(patch_mesh_path):
     np.testing.assert_array_equal(first.skin_tris, second.skin_tris)
 
 
+def _cortex_under(subject, placement) -> np.ndarray:
+    """The gray-matter barycentre nearest the placement's centre."""
+    mesh = subject.mesh
+    gm = np.asarray(mesh.tet_barycenters_mm)[np.asarray(mesh.tet_tags) == 2]
+    return gm[np.argmin(np.linalg.norm(gm - placement.center_mm, axis=1))]
+
+
 @pytest.mark.realmesh
 def test_record_rois_matches_a_host_reduction_of_the_retained_field(
     cp, patch_subject, d70_coil, patch_placement
@@ -246,11 +253,10 @@ def test_record_rois_matches_a_host_reduction_of_the_retained_field(
     Recording ROIs on the forward path avoids keeping a per-tetrahedron array to extract a few
     numbers from; it does not approximate the reduction, so the two must agree exactly.
     """
+    cortex = _cortex_under(patch_subject, patch_placement)
     rois = {
-        "near": patch_subject.roi(
-            patch_placement.center_mm, radius_mm=5.0, region="gray_matter"
-        ),
-        "point": patch_subject.roi(patch_placement.center_mm, region="gray_matter"),
+        "near": patch_subject.roi(cortex, radius_mm=5.0, region="gray_matter"),
+        "point": patch_subject.roi(cortex, region="gray_matter"),
     }
     result = patch_subject.simulate(d70_coil, patch_placement, magnitude=True, record_rois=rois)
 
@@ -271,7 +277,9 @@ def test_record_rois_matches_a_host_reduction_of_the_retained_field(
 def test_roi_means_round_trip_through_hdf5(patch_subject, d70_coil, patch_placement, tmp_path):
     from cunibs import FieldResult
 
-    rois = {"m1": patch_subject.roi(patch_placement.center_mm, radius_mm=5.0)}
+    rois = {
+        "m1": patch_subject.roi(_cortex_under(patch_subject, patch_placement), radius_mm=5.0)
+    }
     result = patch_subject.simulate(d70_coil, patch_placement, record_rois=rois)
     path = tmp_path / "roi.h5"
     result.save(path)

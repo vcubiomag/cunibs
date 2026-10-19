@@ -382,7 +382,7 @@ def _coverage_grid(
 def build_reciprocity(
     ctx: SolverContext,
     coil: Coil,
-    target: Target,
+    target: Target | ResolvedTarget,
     coverage_centers_mm: npt.ArrayLike,
     *,
     distance_mm: float = 4.0,

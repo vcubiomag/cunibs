@@ -209,17 +209,51 @@ def test_resolve_target_tiny_radius_falls_back_to_nearest(cp, cube_subject, cube
     from cunibs.adm.target import Target, resolve_target
 
     point = np.array([1e4, 3e3, -7e3])
-    rt = resolve_target(cube_subject.context, Target(point, radius_mm=1e-6))
+    with pytest.warns(UserWarning, match="outside gray_matter"):
+        rt = resolve_target(cube_subject.context, Target(point, radius_mm=1e-6))
     expected = int(np.argmin(np.linalg.norm(cube_mesh.tet_barycenters_mm - point, axis=1)))
     assert cp.asnumpy(rt.elem_idx).tolist() == [expected]
     assert float(rt.weights.sum()) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_resolve_target_reports_how_far_outside_the_region_it_landed(cube_subject):
+    """Inside the cube the offset is zero although every barycentre is tens of mm away."""
+    import warnings
+
+    from cunibs.adm.target import Target, resolve_target
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        inside = resolve_target(cube_subject.context, Target([50, 50, 50]))
+    assert inside.offset_mm == 0.0
+    with pytest.warns(UserWarning, match="outside gray_matter"):
+        outside = resolve_target(cube_subject.context, Target([50, 50, 400]))
+    assert outside.offset_mm > 200.0
+
+
+def test_a_resolved_target_is_accepted_wherever_a_target_is(cp, cube_subject, coil):
+    from cunibs.adm import build_reciprocity, evaluate
+    from cunibs.adm.target import Target
+    from cunibs.simulation import Placement
+
+    center = np.array([[50.0, 50.0, 100.0]])
+    pl = Placement([50, 50, 100], [50, 150, 100], 4.0)
+    by_target = build_reciprocity(cube_subject.context, coil, Target([50, 50, 60]), center)
+    by_roi = build_reciprocity(
+        cube_subject.context, coil, cube_subject.roi([50, 50, 60]), center
+    )
+    np.testing.assert_array_equal(
+        cp.asnumpy(evaluate(by_roi, coil, pl, DIDT)),
+        cp.asnumpy(evaluate(by_target, coil, pl, DIDT)),
+    )
 
 
 def test_resolve_target_equidistant_fallback_keeps_all_ties(cp, cube_subject):
     """On the diagonal every tetrahedron ties, and the fallback keeps them all, volume-weighted."""
     from cunibs.adm.target import Target, resolve_target
 
-    rt = resolve_target(cube_subject.context, Target([1e4, 1e4, 1e4], radius_mm=1e-6))
+    with pytest.warns(UserWarning, match="outside gray_matter"):
+        rt = resolve_target(cube_subject.context, Target([1e4, 1e4, 1e4], radius_mm=1e-6))
     assert cp.asnumpy(rt.elem_idx).size == 6
     assert float(rt.weights.sum()) == pytest.approx(1.0, abs=1e-12)
 
