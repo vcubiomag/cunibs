@@ -287,7 +287,7 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
     and only the returned arrays are materialized. Every field of the result owns its
     data: nothing may alias the mapping, which is released when this frame returns.
     """
-    with Path.open(mesh_file, "rb") as f:
+    with mesh_file.open("rb") as f:
         cursor = _MshCursor(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ), mesh_file)
         _read_format(cursor)
         num_nodes, nodes_xyz = _read_nodes(cursor)
@@ -378,11 +378,11 @@ class HeadMesh:
     @property
     def n_nodes(self) -> int:
         # Off the source array, so asking a device-backed mesh its size does not fetch it.
-        return int(self._nodes_mm.shape[0])
+        return self._nodes_mm.shape[0]
 
     @property
     def n_tets(self) -> int:
-        return int(self._tet_nodes.shape[0])
+        return self._tet_nodes.shape[0]
 
     @cached_property
     def surf_tags(self) -> npt.NDArray[np.int32]:
@@ -447,14 +447,7 @@ class HeadMesh:
 
 def load_mesh(mesh_file: str | Path) -> HeadMesh:
     """Load a binary Gmsh 2.2 tetrahedral head mesh."""
-    arrays = parse_msh_binary(Path(mesh_file))
-    return HeadMesh(
-        nodes_mm=np.ascontiguousarray(arrays.nodes_mm, dtype=np.float64),
-        tet_nodes=np.ascontiguousarray(arrays.tet_nodes, dtype=np.int32),
-        tet_tags=np.ascontiguousarray(arrays.tet_tags, dtype=np.int32),
-        surf_tris=np.ascontiguousarray(arrays.surf_tris, dtype=np.int32),
-        surf_tags=np.ascontiguousarray(arrays.surf_tags, dtype=np.int32),
-    )
+    return HeadMesh(*parse_msh_binary(Path(mesh_file)))
 
 
 # Tissues a head model has to have for a TMS field to mean anything. Deliberately not the whole
@@ -495,7 +488,6 @@ class MeshReport:
     n_tets: int = 0
     n_skin_tris: int = 0
     tag_counts: dict[int, int] = dataclass_field(default_factory=dict)
-    tags_present: tuple[int, ...] = ()
     missing_tags: tuple[int, ...] = ()
     bbox_mm: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
     n_nonpositive_volume: int = 0
@@ -565,17 +557,17 @@ def validate_mesh(mesh_file: str | Path) -> MeshReport:
             "skull is what shapes the field"
         )
 
-    skin = arrays.surf_tris[arrays.surf_tags == SKIN_SURFACE_TAG]
-    if skin.shape[0] == 0:
+    n_skin_tris = int(np.count_nonzero(arrays.surf_tags == SKIN_SURFACE_TAG))
+    if n_skin_tris == 0:
         warnings.append(
             f"no surface triangles carry the scalp tag {SKIN_SURFACE_TAG}; the mesh loads but a "
             "coil placement has nothing to project onto"
         )
 
     lo, hi = nodes_mm.min(axis=0), nodes_mm.max(axis=0)
-    if float((hi - lo).max()) < _MIN_PLAUSIBLE_EXTENT_MM:
+    if (extent := float((hi - lo).max())) < _MIN_PLAUSIBLE_EXTENT_MM:
         warnings.append(
-            f"the mesh spans {float((hi - lo).max()):.3g} in its longest axis; coordinates are "
+            f"the mesh spans {extent:.3g} in its longest axis; coordinates are "
             "read as millimetres, so a head given in metres would look like this"
         )
 
@@ -584,11 +576,10 @@ def validate_mesh(mesh_file: str | Path) -> MeshReport:
         ok=not errors,
         errors=tuple(errors),
         warnings=tuple(warnings),
-        n_nodes=int(nodes_mm.shape[0]),
-        n_tets=int(tet_nodes.shape[0]),
-        n_skin_tris=int(skin.shape[0]),
+        n_nodes=nodes_mm.shape[0],
+        n_tets=tet_nodes.shape[0],
+        n_skin_tris=n_skin_tris,
         tag_counts=tag_counts,
-        tags_present=tuple(sorted(tag_counts)),
         missing_tags=missing,
         bbox_mm=(tuple(lo.tolist()), tuple(hi.tolist())),
         n_nonpositive_volume=n_bad,

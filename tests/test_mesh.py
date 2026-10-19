@@ -476,7 +476,7 @@ def test_validate_mesh_accepts_a_sound_mesh(tmp_path):
     )
     assert report.ok and not report.errors and not report.warnings
     assert report.n_tets == len(tets) and report.n_skin_tris == len(tets)
-    assert report.tags_present == (1, 2, 3, 5, 7, 8, 9)
+    assert tuple(report.tag_counts) == (1, 2, 3, 5, 7, 8, 9)
     # A unit tetrahedron is far from regular but nowhere near degenerate.
     assert 0.0 < report.min_flatness < 1.0
 

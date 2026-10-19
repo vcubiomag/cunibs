@@ -83,7 +83,7 @@ from cunibs import validate_mesh
 report = validate_mesh("subject.msh")
 if not report.ok:
     print(report.errors)
-print(report.n_tets, report.tags_present, report.min_flatness)
+print(report.n_tets, report.tag_counts, report.min_flatness)
 ```
 
 `min_flatness` is a scale-free element quality, 1 for a regular tetrahedron and tending to 0 as one
