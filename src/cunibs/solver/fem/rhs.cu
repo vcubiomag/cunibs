@@ -4,9 +4,6 @@
 // Assign one thread per node to avoid atomic updates and fix the sum order.
 //   b[node] = Σ_{(e,i): tet_nodes[e,i]=node}  neg_vc[e] · dot(dadt_elm[e], g[e,i])
 // ``neg_vc[e] = -vols[e] * cond[e]``.
-//
-// Two forms. The fused one does the whole thing in the node gather, which reads g uncoalesced
-// once per incident node; the staged one pays a corner pass first so that both halves coalesce.
 
 namespace {
 
@@ -16,8 +13,8 @@ __global__ void rhs_kernel(const float* __restrict__ dadt_elm, const float* __re
     const int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= n_nodes) return;
 
-    const Vec3View<const float> dadt(dadt_elm, kUnsizedRows);
-    const Vec3View<const float> gv(g, kUnsizedRows);
+    const auto dadt = unsized<Vec3View<const float>>(dadt_elm);
+    const auto gv = unsized<Vec3View<const float>>(g);
 
     const int begin = ptr[node];
     const int end = ptr[node + 1];
@@ -31,86 +28,13 @@ __global__ void rhs_kernel(const float* __restrict__ dadt_elm, const float* __re
     b[node] = acc;
 }
 
-// One thread per corner c: q[c] = neg_vc[c>>2] · dadt_elm[c>>2] · g[c]. Kept separate from the
-// node-centric gather so both reads coalesce (corners c=4e..4e+3 share e → broadcast; g[c] is
-// corner-contiguous).
-__global__ void rhs_corner_kernel(const float* __restrict__ dadt_elm, const float* __restrict__ g,
-                                  const float* __restrict__ neg_vc, float* __restrict__ q,
-                                  int n_corner) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= n_corner) return;
-    const Vec3View<const float> dadt(dadt_elm, kUnsizedRows);
-    const Vec3View<const float> gv(g, n_corner);
-    const int e = c >> 2;
-    const float w = neg_vc[e];
-    q[c] = dadt(e, 0) * (gv(c, 0) * w) + dadt(e, 1) * (gv(c, 1) * w) +
-           dadt(e, 2) * (gv(c, 2) * w);
-}
-
-// Segmented reduction b[node] = Σ_{p∈[ptr[node],ptr[node+1])} q[idx[p]]. The per-node
-// accumulation order is fixed by ptr/idx, so b is bit-reproducible run to run.
-__global__ void rhs_gather_kernel(const float* __restrict__ q, const int* __restrict__ ptr,
-                                  const int* __restrict__ idx, float* __restrict__ b, int n_nodes) {
-    const int node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= n_nodes) return;
-    const int begin = ptr[node];
-    const int end = ptr[node + 1];
-    float acc = 0.f;
-    for (int p = begin; p < end; ++p) acc += q[idx[p]];
-    b[node] = acc;
-}
-
-// Block corner pass: g and neg_vc are loaded once for all k placements; q_block is row-major
-// (n_corner, k).
-__global__ void rhs_corner_block_kernel(ConstPtrPack dadt_elm, const float* __restrict__ g,
-                                        const float* __restrict__ neg_vc,
-                                        float* __restrict__ q_block, int n_corner, int k) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= n_corner) return;
-    const Vec3View<const float> gv(g, n_corner);
-    const Mat2View<float> q(q_block, n_corner, k);
-    const int e = c >> 2;
-    const float w = neg_vc[e];
-    const float w0 = gv(c, 0) * w;
-    const float w1 = gv(c, 1) * w;
-    const float w2 = gv(c, 2) * w;
-    for (int i = 0; i < k; ++i) {
-        const Vec3View<const float> dadt(dadt_elm[i], kUnsizedRows);
-        q(c, i) = dadt(e, 0) * w0 + dadt(e, 1) * w1 + dadt(e, 2) * w2;
-    }
-}
-
-// Block gather: node2corner ptr/idx read once. Per-node accumulation order per column matches the
-// single-RHS kernel, so each column is bit-identical to its serial counterpart. Writes b_block
-// row-major (n_nodes, k) — the solver layout.
-__global__ void rhs_gather_block_kernel(const float* __restrict__ q_block,
-                                        const int* __restrict__ ptr,
-                                        const int* __restrict__ idx,
-                                        float* __restrict__ b_block, int n_nodes, int k) {
-    const int node = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node >= n_nodes) return;
-    const Mat2View<const float> q(q_block, kUnsizedRows, k);
-    const Mat2View<float> b(b_block, n_nodes, k);
-
-    const int begin = ptr[node];
-    const int end = ptr[node + 1];
-    cuda::std::array<float, kMaxStageBlock> acc;
-    for (int i = 0; i < k; ++i) acc[i] = 0.f;
-    for (int p = begin; p < end; ++p) {
-        const int corner = idx[p];
-        for (int i = 0; i < k; ++i) acc[i] += q(corner, i);
-    }
-    for (int i = 0; i < k; ++i) b(node, i) = acc[i];
-}
-
 // The forward path's RHS as one assembled operator on the nodal field. dA/dt reaches an element
 // as the mean of its four nodes, and every step after that is linear, so
 //     b_i = Σ_j B_ij · a_j,   B_ij = Σ_{e ∋ i, j} (neg_vc_e / 4) g[e, i_loc]  (a 3-vector)
 // with a the nodal dA/dt. B has the stiffness pattern and depends only on the mesh and the
 // conductivities, so it is built once per context. A placement then costs one pass over B and a
-// gather of a cache-resident nodal field, where the staged pair writes and re-gathers a value per
-// corner per placement: 14x less time at k = 8, and contracting B in fp64 at setup also halves the
-// rounding against an fp64 evaluation.
+// gather of a cache-resident nodal field. B is contracted in fp64 at setup, so each entry is
+// rounded once.
 //
 // A nonzero is packed as (Bx, By, Bz, column bits) so that it is one 16-byte load.
 
@@ -125,8 +49,8 @@ __global__ void rhs_operator_fill_kernel(const double* __restrict__ g,
                                          int n_rows) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows) return;
-    const Vec3View<const double, std::int64_t> gv(g, kUnsizedRows);
-    const Tet4View<const int, std::int64_t> tn(tet_nodes, kUnsizedRows);
+    const auto gv = unsized<Vec3View<const double, std::int64_t>>(g);
+    const auto tn = unsized<Tet4View<const int, std::int64_t>>(tet_nodes);
     const int begin = ptr[row];
     const int end = ptr[row + 1];
     for (int p = indptr[row]; p < indptr[row + 1]; ++p) {
@@ -176,9 +100,12 @@ __global__ void __launch_bounds__(kBlock)
             const float4 v = op[p];
             cuda::std::array<float, 3 * K> t;
             load_row<3 * K>(a + static_cast<std::int64_t>(__float_as_int(v.w)) * (3 * K), t);
+            // Spelled out so that every K contracts the same way.
 #pragma unroll
             for (int c = 0; c < K; ++c) {
-                acc[c] += v.x * t[3 * c] + v.y * t[3 * c + 1] + v.z * t[3 * c + 2];
+                const float bt = __fmaf_rn(
+                    v.z, t[3 * c + 2], __fmaf_rn(v.x, t[3 * c], __fmul_rn(v.y, t[3 * c + 1])));
+                acc[c] = __fadd_rn(acc[c], bt);
             }
         }
     }
@@ -196,44 +123,6 @@ void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, cons
     if (const unsigned blocks = grid_for(n_nodes)) {
         rhs_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, g, neg_vc, ptr, idx, b, n_nodes);
     }
-}
-
-void launch_rhs_staged(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
-                       const int* idx, float* b, int n_nodes, int n_tet, cudaStream_t stream) {
-    const int n_corner = 4 * n_tet;
-    float* q = nullptr;
-    // Safe here because the RHS build runs outside the solver's CUDA-graph capture; cudaMallocAsync
-    // would be illegal inside a captured region.
-    check_cuda(cudaMallocAsync(&q, static_cast<size_t>(n_corner) * sizeof(float), stream), "rhs",
-               "mallocAsync(q)");
-    if (const unsigned blocks = grid_for(n_corner)) {
-        rhs_corner_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, g, neg_vc, q, n_corner);
-    }
-    if (const unsigned blocks = grid_for(n_nodes)) {
-        rhs_gather_kernel<<<blocks, kBlock, 0, stream>>>(q, ptr, idx, b, n_nodes);
-    }
-    check_cuda(cudaFreeAsync(q, stream), "rhs", "freeAsync(q)");
-}
-
-void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const float* neg_vc,
-                             const int* ptr, const int* idx, float* b_block, int n_nodes,
-                             int n_tet, int k, cudaStream_t stream) {
-    const ConstPtrPack in = const_ptr_pack(dadt_elm, k);
-    const int n_corner = 4 * n_tet;
-    float* q_block = nullptr;
-    // Outside any CUDA-graph capture (same constraint as launch_rhs_staged).
-    check_cuda(cudaMallocAsync(&q_block, static_cast<size_t>(n_corner) * k * sizeof(float),
-                               stream),
-               "rhs", "mallocAsync(q_block)");
-    if (const unsigned blocks = grid_for(n_corner)) {
-        rhs_corner_block_kernel<<<blocks, kBlock, 0, stream>>>(in, g, neg_vc, q_block, n_corner,
-                                                               k);
-    }
-    if (const unsigned blocks = grid_for(n_nodes)) {
-        rhs_gather_block_kernel<<<blocks, kBlock, 0, stream>>>(q_block, ptr, idx, b_block,
-                                                               n_nodes, k);
-    }
-    check_cuda(cudaFreeAsync(q_block, stream), "rhs", "freeAsync(q_block)");
 }
 
 void launch_rhs_operator_fill(const double* g, const double* scale, const int* tet_nodes,

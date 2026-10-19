@@ -5,18 +5,8 @@
 
 namespace {
 
-__global__ void accumulate_moments_kernel(const float* __restrict__ magn,
-                                          double* __restrict__ sum_e,
-                                          double* __restrict__ sumsq_e, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const double m = static_cast<double>(magn[i]);
-    sum_e[i] += m;
-    sumsq_e[i] += m * m;
-}
-
-// A block of draws in draw order: per element, the same additions in the same order as one call
-// per draw, with the fp64 sums read and written once for the block rather than once per draw.
+// A block of draws folded in draw order, so per element the additions are the same whatever
+// block width the draws were split into. The fp64 sums are read and written once per block.
 __global__ void accumulate_moments_block_kernel(ConstPtrPack magn, int k,
                                                 double* __restrict__ sum_e,
                                                 double* __restrict__ sumsq_e, int n) {
@@ -33,11 +23,10 @@ __global__ void accumulate_moments_block_kernel(ConstPtrPack magn, int k,
     sumsq_e[i] = q;
 }
 
-// out[i, c] = sum_t a[i, t] s[c, t], one thread per (row, column), terms in order. The UQ
-// initial guess forms these over a mesh-length, narrow a; cuBLAS takes that shape to a tensor-op
-// GEMM at a millisecond, and a reduction along the short axis is slower still. A column's sum is
-// the same loop whatever k is, so a draw's guess does not depend on the block it was formed in.
-// Adjacent threads share a row, so its loads coalesce across the k columns.
+// out[i, c] = sum_t a[i, t] s[c, t] for a mesh-length, narrow a, one thread per (row, column),
+// terms in order. A column's sum is the same loop whatever k is, so a draw's guess does not depend
+// on the block it was formed in. Adjacent threads share a row, so its loads coalesce across the k
+// columns.
 __global__ void row_dot_kernel(const double* __restrict__ a, const double* __restrict__ s,
                                double* __restrict__ out, int n, int p, int k) {
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -53,16 +42,9 @@ __global__ void row_dot_kernel(const double* __restrict__ a, const double* __res
 
 }  // namespace
 
-void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
-                               cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        accumulate_moments_kernel<<<blocks, kBlock, 0, stream>>>(magn, sum_e, sumsq_e, n);
-    }
-}
-
 void launch_accumulate_moments_block(const float* const* magn, int k, double* sum_e,
                                      double* sumsq_e, int n, cudaStream_t stream) {
-    const ConstPtrPack in = const_ptr_pack(magn, k);
+    const ConstPtrPack in = ptr_pack(magn, k);
     if (const unsigned blocks = grid_for(n)) {
         accumulate_moments_block_kernel<<<blocks, kBlock, 0, stream>>>(in, k, sum_e, sumsq_e, n);
     }

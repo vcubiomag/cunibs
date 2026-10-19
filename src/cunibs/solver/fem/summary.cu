@@ -8,6 +8,7 @@
 #include "fem/fem.hpp"
 
 #include <cub/device/device_radix_sort.cuh>
+#include <cuda/cmath>
 #include <math_constants.h>
 
 #include <cmath>
@@ -35,9 +36,14 @@ struct Peak {
 };
 
 // Larger value wins and ties go to the lower index, so the result is the first maximum in region
-// order however the partial results are combined.
+// order however the partial results are combined. NaN beats every number, as in np.max, so a field
+// carrying one reports it rather than the largest finite value.
 __device__ __forceinline__ Peak better(Peak a, Peak b) {
-    return (b.value > a.value || (b.value == a.value && b.index < a.index)) ? b : a;
+    const bool a_nan = isnan(a.value);
+    const bool b_nan = isnan(b.value);
+    if (a_nan != b_nan) return b_nan ? b : a;
+    const bool b_wins = a_nan || b.value == a.value ? b.index < a.index : b.value > a.value;
+    return b_wins ? b : a;
 }
 
 __device__ __forceinline__ Peak shfl_down(Peak p, int off) {
@@ -106,13 +112,8 @@ __device__ double block_total(const double* __restrict__ part, int n_blocks) {
     __shared__ double sdata[kBlock];
     double v = 0.0;
     for (int b = threadIdx.x; b < n_blocks; b += kBlock) v += part[b];
-    sdata[threadIdx.x] = v;
-    __syncthreads();
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    const double total = sdata[0];
+    const double total = block_tree_sum(v, sdata);
+    // Callers sum again into the same array.
     __syncthreads();
     return total;
 }
@@ -192,13 +193,29 @@ __global__ void summary_gather_kernel(const T* __restrict__ m, const int* __rest
     if (i < n) keys[i] = m[index[i]];
 }
 
+// Hillis-Steele inclusive scan of one value per thread across the block, whose data flow does not
+// depend on scheduling. Every thread of the block must reach it.
+__device__ double block_inclusive_scan(double v) {
+    __shared__ double buf[2][kBlock];
+    int cur = 0;
+    buf[cur][threadIdx.x] = v;
+    __syncthreads();
+    for (int off = 1; off < kBlock; off <<= 1) {
+        const double t = buf[cur][threadIdx.x] +
+                         (threadIdx.x >= off ? buf[cur][threadIdx.x - off] : 0.0);
+        buf[cur ^ 1][threadIdx.x] = t;
+        cur ^= 1;
+        __syncthreads();
+    }
+    return buf[cur][threadIdx.x];
+}
+
 // Inclusive scan of one tile in a fixed order: kPerThread consecutive entries per thread in
-// sequence, then a Hillis-Steele scan of the thread totals, whose data flow does not depend on
-// scheduling. within[i] is the scan inside the tile; tile_total[t] the tile's sum.
+// sequence, then a block scan of the thread totals. within[i] is the scan inside the tile;
+// tile_total[t] the tile's sum.
 __global__ void __launch_bounds__(kBlock)
     summary_tile_scan_kernel(const double* __restrict__ w, int n, double* __restrict__ within,
                              double* __restrict__ tile_total) {
-    __shared__ double buf[2][kBlock];
     const std::int64_t base =
         static_cast<std::int64_t>(blockIdx.x) * kTile + static_cast<std::int64_t>(threadIdx.x) *
                                                             kPerThread;
@@ -210,47 +227,27 @@ __global__ void __launch_bounds__(kBlock)
         run += (i < n) ? w[i] : 0.0;
         local[j] = run;
     }
-    int cur = 0;
-    buf[cur][threadIdx.x] = run;
-    __syncthreads();
-    for (int off = 1; off < kBlock; off <<= 1) {
-        const double v = buf[cur][threadIdx.x] +
-                         (threadIdx.x >= off ? buf[cur][threadIdx.x - off] : 0.0);
-        buf[cur ^ 1][threadIdx.x] = v;
-        cur ^= 1;
-        __syncthreads();
-    }
-    const double offset = buf[cur][threadIdx.x] - run;
+    const double inclusive = block_inclusive_scan(run);
+    const double offset = inclusive - run;
 #pragma unroll
     for (int j = 0; j < kPerThread; ++j) {
         const std::int64_t i = base + j;
         if (i < n) within[i] = offset + local[j];
     }
-    if (threadIdx.x == kBlock - 1) tile_total[blockIdx.x] = buf[cur][threadIdx.x];
+    if (threadIdx.x == kBlock - 1) tile_total[blockIdx.x] = inclusive;
 }
 
-// Exclusive scan of the tile totals in one block: a fixed chunk per thread, then the same
-// Hillis-Steele pass over the chunk sums.
+// Exclusive scan of the tile totals in one block: a fixed chunk per thread, then the same block
+// scan over the chunk sums.
 __global__ void __launch_bounds__(kBlock)
     summary_tile_offsets_kernel(const double* __restrict__ tile_total, int n_tiles,
                                 double* __restrict__ tile_offset) {
-    __shared__ double buf[2][kBlock];
-    const int chunk = (n_tiles + kBlock - 1) / kBlock;
+    const int chunk = cuda::ceil_div(n_tiles, kBlock);
     const int lo = threadIdx.x * chunk;
     const int hi = min(n_tiles, lo + chunk);
     double run = 0.0;
     for (int t = lo; t < hi; ++t) run += tile_total[t];
-    int cur = 0;
-    buf[cur][threadIdx.x] = run;
-    __syncthreads();
-    for (int off = 1; off < kBlock; off <<= 1) {
-        const double v = buf[cur][threadIdx.x] +
-                         (threadIdx.x >= off ? buf[cur][threadIdx.x - off] : 0.0);
-        buf[cur ^ 1][threadIdx.x] = v;
-        cur ^= 1;
-        __syncthreads();
-    }
-    double acc = buf[cur][threadIdx.x] - run;
+    double acc = block_inclusive_scan(run) - run;
     for (int t = lo; t < hi; ++t) {
         tile_offset[t] = acc;
         acc += tile_total[t];
@@ -332,7 +329,7 @@ __global__ void summary_quantiles_kernel(const T* __restrict__ keys, const doubl
     }
 }
 
-std::size_t aligned(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+std::size_t aligned(std::size_t bytes) { return cuda::round_up(bytes, std::size_t{256}); }
 
 template <typename T>
 std::size_t sort_bytes(int n) {

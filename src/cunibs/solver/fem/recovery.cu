@@ -104,14 +104,12 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
 
 // --- patch fitting --------------------------------------------------------------------------
 
-// Cholesky-solve A X = [e_r : r in rhs_rows] for an N x N SPD A held in registers. Returns false
-// on a non-positive pivot, which is how a coplanar or under-filled patch reports itself. Only the
-// SPR modes use this, at N = 4, where the factor is 16 doubles and stays in registers. The
-// harmonic rungs go up to N = 16, whose factor does not, and factor per warp instead; see
-// fit_gradient_weights.
+// Cholesky-solve A z = e_0 for an N x N SPD A held in registers. Returns false on a non-positive
+// pivot, which is how a coplanar or under-filled patch reports itself. Only the SPR modes use
+// this, at N = 4, where the factor is 16 doubles and stays in registers. The harmonic rungs go up
+// to N = 16, whose factor does not, and factor per warp instead; see fit_gradient_weights.
 template <int N>
-__device__ bool solve_spd_columns(const double a[N][N], const int* rhs_rows, int n_rhs,
-                                  double out[][N]) {
+__device__ bool solve_spd_e0(const double a[N][N], double out[N]) {
     double l[N][N];
 #pragma unroll
     for (int i = 0; i < N; ++i) {
@@ -131,18 +129,16 @@ __device__ bool solve_spd_columns(const double a[N][N], const int* rhs_rows, int
             l[i][j] = s / l[j][j];
         }
     }
-    for (int c = 0; c < n_rhs; ++c) {
-        double y[N];
-        for (int i = 0; i < N; ++i) {
-            double s = (i == rhs_rows[c]) ? 1.0 : 0.0;
-            for (int k = 0; k < i; ++k) s -= l[i][k] * y[k];
-            y[i] = s / l[i][i];
-        }
-        for (int i = N - 1; i >= 0; --i) {
-            double s = y[i];
-            for (int k = i + 1; k < N; ++k) s -= l[k][i] * out[c][k];
-            out[c][i] = s / l[i][i];
-        }
+    double y[N];
+    for (int i = 0; i < N; ++i) {
+        double s = (i == 0) ? 1.0 : 0.0;
+        for (int k = 0; k < i; ++k) s -= l[i][k] * y[k];
+        y[i] = s / l[i][i];
+    }
+    for (int i = N - 1; i >= 0; --i) {
+        double s = y[i];
+        for (int k = i + 1; k < N; ++k) s -= l[k][i] * out[k];
+        out[i] = s / l[i][i];
     }
     return true;
 }
@@ -199,12 +195,12 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     const int count = end - begin;
     if (count <= 0) return;
 
-    const Vec3View<const double> nodes(nodes_mm, kUnsizedRows);
-    const Tet4View<const int> tn(tet_nodes, kUnsizedRows);
+    const auto nodes = unsized<Vec3View<const double>>(nodes_mm);
+    const auto tn = unsized<Tet4View<const int>>(tet_nodes);
     const double xn[3] = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
 
     bool fit = (count >= 4) && !(is_boundary && is_boundary[node]);
-    double z[1][4] = {{1.0, 0.0, 0.0, 0.0}};
+    double z[4] = {1.0, 0.0, 0.0, 0.0};
     double h = 1.0;
 
     if (fit) {
@@ -230,8 +226,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
                 for (int j = 0; j < 4; ++j) a[i][j] += q[i] * q[j];
             }
         }
-        constexpr int kConstantRow = 0;
-        fit = solve_spd_columns<4>(a, &kConstantRow, 1, z);
+        fit = solve_spd_e0<4>(a, z);
     }
 
     // The weights sum to one, so sum|w| -- the patch's Lebesgue constant -- is how much the fit
@@ -244,7 +239,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         for (int p = begin; p < end; ++p) {
             double b[3];
             tet_barycentre(nodes, tn, idx[p] >> 2, b);
-            lebesgue += fabs(spr_corner_weight(z[0], b, xn, h));
+            lebesgue += fabs(spr_corner_weight(z, b, xn, h));
         }
         fit = lebesgue <= kMaxLebesgue;
     }
@@ -271,7 +266,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     for (int p = begin; p < end; ++p) {
         double b[3];
         tet_barycentre(nodes, tn, idx[p] >> 2, b);
-        w[p] = static_cast<float>(spr_corner_weight(z[0], b, xn, h));
+        w[p] = static_cast<float>(spr_corner_weight(z, b, xn, h));
     }
 }
 
@@ -403,11 +398,8 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
         row[e] = 0;
         col[e] = 0;
         if (k < kEntries) {
-            // Invert k = i(i+1)/2 + j. The square root lands on the right row or one either side
-            // of it, so the two walks below are a fixup rather than a search.
-            int i = static_cast<int>((sqrt(8.0 * k + 1.0) - 1.0) * 0.5);
-            while ((i * (i + 1)) / 2 > k) --i;
-            while (((i + 1) * (i + 2)) / 2 <= k) ++i;
+            // Invert k = i(i+1)/2 + j.
+            const int i = (cuda::isqrt(8 * k + 1) - 1) / 2;
             row[e] = i;
             col[e] = k - (i * (i + 1)) / 2;
             ++mine;
@@ -442,6 +434,7 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
     // factor may overwrite it. Lane i owns row i. a[0][0] is the patch size, so it sets the pivot
     // scale, and it has to be read before the first column overwrites it.
     const double floor_pivot = 1e-12 * s.a[0];
+    __syncwarp();
     for (int j = 0; j < N; ++j) {
         if (lane == j) {
             double d = s.a[j * N + j];
@@ -531,9 +524,9 @@ __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
 
     const int begin = pptr[s], end = pptr[s + 1];
     const int node = slot_node[s];
-    const Vec3View<const double> nodes(nodes_mm, kUnsizedRows);
+    const auto nodes = unsized<Vec3View<const double>>(nodes_mm);
     // One 3-vector per patch entry, so its rows are entries of pptr/pidx, not slots.
-    const Vec3View<float> wv(w, kUnsizedRows);
+    const auto wv = unsized<Vec3View<float>>(w);
     const Vec3 xn = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
     const double h = patch_radius(nodes, pidx, begin, end, xn, lane);
 
@@ -584,12 +577,11 @@ __global__ void split_potential_kernel(const double* __restrict__ v_block, int s
 //
 // A patch's gradient weights reproduce constants, so differencing against the slot's own node
 // changes nothing in exact arithmetic and removes the potential's common level, which the fp32
-// weights' rounding otherwise leaks into the gradient at |v| |W| eps (the same leak reconstruct.cu
-// had). The difference comes from the float pairs: hi_m − hi_0 is exact whenever the two are
-// within a factor of two (Sterbenz) and otherwise the difference is as large as the values, so
-// either way it carries a float's relative precision. The sum over the patch is compensated, so
-// its error does not grow with the patch. Done in fp64 instead, this kernel was fp64-bound at
-// 93% on a 1:64 part.
+// weights' rounding otherwise leaks into the gradient at |v| |W| eps. The difference comes from
+// the float pairs: hi_m − hi_0 is exact whenever the two are within a factor of two (Sterbenz)
+// and otherwise the difference is as large as the values, so either way it carries a float's
+// relative precision. The sum over the patch is compensated, so its error does not grow with the
+// patch, and nothing here needs the 1:64 fp64 pipe.
 //
 // Every operation is an explicit round-to-nearest intrinsic. nvcc may otherwise fuse a multiply
 // into the add after it in one instantiation and not another, which made the result depend on K.
@@ -603,17 +595,17 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
     if (t >= n) return;
     const int s = active ? active[t] : t;
 
-    const Vec3View<const float> wv(w, kUnsizedRows);
-    const WidthView<const float, K> hi(v_hi, kUnsizedRows);
-    const WidthView<const float, K> lo(v_lo, kUnsizedRows);
+    const auto wv = unsized<Vec3View<const float>>(w);
+    const auto hi = unsized<WidthView<const float, K>>(v_hi);
+    const auto lo = unsized<WidthView<const float, K>>(v_lo);
     const int node = slot_node[s];
 
-    float h0[K], l0[K];
+    cuda::std::array<float, K> h0, l0;
+    load_row<K>(&hi(node, 0), h0);
+    load_row<K>(&lo(node, 0), l0);
     float acc[K][3], comp[K][3];
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        h0[c] = hi(node, c);
-        l0[c] = lo(node, c);
         acc[c][0] = acc[c][1] = acc[c][2] = 0.f;
         comp[c][0] = comp[c][1] = comp[c][2] = 0.f;
     }
@@ -622,9 +614,12 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
     for (int p = begin; p < end; ++p) {
         const float wx = wv(p, 0), wy = wv(p, 1), wz = wv(p, 2);
         const int m = pidx[p];
+        cuda::std::array<float, K> hm, lm;
+        load_row<K>(&hi(m, 0), hm);
+        load_row<K>(&lo(m, 0), lm);
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const float d = __fadd_rn(__fsub_rn(hi(m, c), h0[c]), __fsub_rn(lo(m, c), l0[c]));
+            const float d = __fadd_rn(__fsub_rn(hm[c], h0[c]), __fsub_rn(lm[c], l0[c]));
             const float wd[3] = {__fmul_rn(wx, d), __fmul_rn(wy, d), __fmul_rn(wz, d)};
 #pragma unroll
             for (int i = 0; i < 3; ++i) {
@@ -639,7 +634,7 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
 
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        const Vec3View<const float> da(dadt_nodes[c], kUnsizedRows);
+        const auto da = unsized<Vec3View<const float>>(dadt_nodes[c]);
         const Vec3View<float> dst(e_slots[c], n_slots);
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
@@ -673,10 +668,10 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
         const int e = idx[p] >> 2;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            const Vec3View<const float> src(e_in[c], kUnsizedRows);
-            acc[c][0] += wp * src(e, 0);
-            acc[c][1] += wp * src(e, 1);
-            acc[c][2] += wp * src(e, 2);
+            const auto src = unsized<Vec3View<const float>>(e_in[c]);
+            acc[c][0] = __fmaf_rn(wp, src(e, 0), acc[c][0]);
+            acc[c][1] = __fmaf_rn(wp, src(e, 1), acc[c][1]);
+            acc[c][2] = __fmaf_rn(wp, src(e, 2), acc[c][2]);
         }
     }
 #pragma unroll
@@ -719,7 +714,7 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
 
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        const Vec3View<const float> src(e_slots[c], kUnsizedRows);
+        const auto src = unsized<Vec3View<const float>>(e_slots[c]);
         const Vec3View<float> dst(e_out[c], n_tet);
         float m[3];
 #pragma unroll
@@ -771,17 +766,15 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
                      int n_slots, const int* active, int n, int k, int stride, int n_nodes,
                      cudaStream_t stream) {
-    const ConstPtrPack da = const_ptr_pack(dadt_nodes, k);
+    const ConstPtrPack da = ptr_pack(dadt_nodes, k);
     const PtrPack out = ptr_pack(e_slots, k);
     const unsigned blocks = grid_for(n);
     if (!blocks) return;
     const std::size_t count = static_cast<std::size_t>(n_nodes) * k;
-    float* split = nullptr;
-    // Outside any graph capture, like the RHS staging buffers.
-    check_cuda(cudaMallocAsync(&split, 2 * count * sizeof(float), stream), "hpr_grad",
-               "mallocAsync(split)");
-    float* const v_hi = split;
-    float* const v_lo = split + count;
+    const ScratchBuffer<float> split =
+        scratch_alloc<float>(2 * count, stream, "hpr_grad", "split potential");
+    float* const v_hi = split.get();
+    float* const v_lo = v_hi + count;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "hpr_grad: unsupported block width", [&](auto kk) {
         constexpr int K = decltype(kk)::value;
         if (const unsigned sb = grid_for(static_cast<std::int64_t>(count))) {
@@ -791,12 +784,11 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
         hpr_grad_kernel<K><<<blocks, kBlock, 0, stream>>>(v_hi, v_lo, w, pptr, pidx, slot_node,
                                                           da, out, n_slots, active, n);
     });
-    check_cuda(cudaFreeAsync(split, stream), "hpr_grad", "freeAsync(split)");
 }
 
 void launch_recover_nodes(const float* const* e_in, const float* w, const int* ptr, const int* idx,
                           float* const* e_slots, int n_slots, int k, cudaStream_t stream) {
-    const ConstPtrPack in = const_ptr_pack(e_in, k);
+    const ConstPtrPack in = ptr_pack(e_in, k);
     const PtrPack out = ptr_pack(e_slots, k);
     const unsigned blocks = grid_for(n_slots);
     if (!blocks) return;
@@ -812,7 +804,7 @@ void launch_recover_nodes(const float* const* e_in, const float* w, const int* p
 void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,
                              float* const* e_out, float* const* magn_out, int n_tet,
                              const int* active, int n, int k, cudaStream_t stream) {
-    const ConstPtrPack in = const_ptr_pack(e_slots, k);
+    const ConstPtrPack in = ptr_pack(e_slots, k);
     const PtrPack eo = ptr_pack(e_out, k);
     const PtrPack mo = ptr_pack(magn_out, k);
     const unsigned blocks = grid_for(n);

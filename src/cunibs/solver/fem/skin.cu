@@ -45,7 +45,7 @@ __global__ void face_normals_kernel(const double* __restrict__ nodes_mm,
                                     int n_tri) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tri) return;
-    const Vec3View<const double> nodes(nodes_mm, kUnsizedRows);
+    const auto nodes = unsized<Vec3View<const double>>(nodes_mm);
     const Vec3 a = load_vec3(nodes, tris(t, 0));
     const Vec3 b = load_vec3(nodes, tris(t, 1));
     const Vec3 c = load_vec3(nodes, tris(t, 2));
@@ -58,7 +58,7 @@ __global__ void face_normals_kernel(const double* __restrict__ nodes_mm,
     }
     Vec3 normal;
     cross3(u.data(), v.data(), normal.data());
-    store_vec3(Vec3View<double>(out, kUnsizedRows), t, normal);
+    store_vec3(unsized<Vec3View<double>>(out), t, normal);
 }
 
 // One thread per node, summing the per-face vector of every triangle corner in the node's segment.
@@ -69,7 +69,7 @@ __global__ void spread_to_nodes_kernel(const double* __restrict__ face, const in
                                        int n_nodes) {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
     if (n >= n_nodes) return;
-    const Vec3View<const double> src(face, kUnsizedRows);
+    const auto src = unsized<Vec3View<const double>>(face);
 
     Vec3 acc{};
     const int end = ptr[n + 1];
@@ -78,7 +78,7 @@ __global__ void spread_to_nodes_kernel(const double* __restrict__ face, const in
 #pragma unroll
         for (int i = 0; i < 3; ++i) acc[i] += src(t, i);
     }
-    store_vec3(Vec3View<double>(out, kUnsizedRows), n, acc);
+    store_vec3(unsized<Vec3View<double>>(out), n, acc);
 }
 
 // One thread per triangle, gathering its three node vectors back. The sum is normalised rather
@@ -89,7 +89,7 @@ __global__ void gather_to_faces_kernel(const double* __restrict__ node_vec,
                                        int n_tri) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tri) return;
-    const Vec3View<const double> src(node_vec, kUnsizedRows);
+    const auto src = unsized<Vec3View<const double>>(node_vec);
 
     Vec3 acc;
 #pragma unroll
@@ -97,13 +97,13 @@ __global__ void gather_to_faces_kernel(const double* __restrict__ node_vec,
         acc[i] = src(tris(t, 0), i) + src(tris(t, 1), i) + src(tris(t, 2), i);
     }
     normalise(acc);
-    store_vec3(Vec3View<double>(out, kUnsizedRows), t, acc);
+    store_vec3(unsized<Vec3View<double>>(out), t, acc);
 }
 
 __global__ void normalise_rows_kernel(double* __restrict__ v, int n) {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= n) return;
-    const Vec3View<double> rows(v, kUnsizedRows);
+    const auto rows = unsized<Vec3View<double>>(v);
     Vec3 a = load_vec3(rows, r);
     normalise(a);
     store_vec3(rows, r, a);
@@ -119,10 +119,10 @@ void launch_skin_normals(const double* nodes_mm, const int* tris_ptr, const int*
                          const int* node_idx, double* out_tri_normals, int n_tri, int n_nodes,
                          cudaStream_t stream) {
     if (n_tri <= 0) return;
-    DeviceBuffer<double> face =
-        device_alloc<double>(static_cast<std::size_t>(n_tri) * 3, "skin", "face normals");
-    DeviceBuffer<double> node =
-        device_alloc<double>(static_cast<std::size_t>(n_nodes) * 3, "skin", "node normals");
+    const ScratchBuffer<double> face =
+        scratch_alloc<double>(static_cast<std::size_t>(n_tri) * 3, stream, "skin", "face normals");
+    const ScratchBuffer<double> node = scratch_alloc<double>(static_cast<std::size_t>(n_nodes) * 3,
+                                                             stream, "skin", "node normals");
 
     const Tri3View<const int> tris(tris_ptr, n_tri);
     const unsigned tri_blocks = grid_for(n_tri);
@@ -142,6 +142,4 @@ void launch_skin_normals(const double* nodes_mm, const int* tris_ptr, const int*
     gather_to_faces_kernel<<<tri_blocks, kBlock, 0, stream>>>(node.get(), tris, out_tri_normals,
                                                               n_tri);
     check_cuda(cudaGetLastError(), "skin normals launch");
-    // The scratch dies with this frame, so the stream must be done with it first.
-    check_cuda(cudaStreamSynchronize(stream), "sync(skin normals)");
 }

@@ -6,6 +6,26 @@
 
 namespace {
 
+// grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron, taken as
+// Σ_{i≥1} (v_i − v_0) g[e,i,:] since P1 gradients sum to zero over the corners. The direct sum
+// carries v's common level through fp32 g that do not sum to zero to the last bit, which leaks
+// |v| |g| ε into a gradient that is small beside it. Accumulated in fp64 because callers subtract
+// a comparable term from it and lose the leading digits. g[e,0,:] is never read.
+__device__ __forceinline__ Vec3 tet_grad4(const double* __restrict__ v,
+                                          Tet4View<const int> tet_nodes,
+                                          TetGradView<const float> g, int e) {
+    const double v0 = v[tet_nodes(e, 0)];
+    double gx = 0.0, gy = 0.0, gz = 0.0;
+#pragma unroll
+    for (int i = 1; i < 4; ++i) {
+        const double di = v[tet_nodes(e, i)] - v0;
+        gx += di * static_cast<double>(g(e, i, 0));
+        gy += di * static_cast<double>(g(e, i, 1));
+        gz += di * static_cast<double>(g(e, i, 2));
+    }
+    return {gx, gy, gz};
+}
+
 //   w_e[e,k] = (−neg_vc[e]) · Σ_i values[tet_nodes[e,i]] · g[e,i,k]   (= vol_e·σ_e·(G_e λ))
 // Accumulate in float64: the weight feeds a difference against the direct ROI term.
 __global__ void element_weight_kernel(const double* __restrict__ values,
@@ -16,13 +36,11 @@ __global__ void element_weight_kernel(const double* __restrict__ values,
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    const Vec3d grad = tet_grad4(values, Tet4View<const int>(tet_nodes, n_tet),
-                                 TetGradView<const float>(g, n_tet), e);
+    const Vec3 grad = tet_grad4(values, Tet4View<const int>(tet_nodes, n_tet),
+                                TetGradView<const float>(g, n_tet), e);
     const Vec3View<double> w(w_e, n_tet);
     const double s = -static_cast<double>(neg_vc[e]);
-    w(e, 0) = s * grad.x;
-    w(e, 1) = s * grad.y;
-    w(e, 2) = s * grad.z;
+    for (int k = 0; k < 3; ++k) w(e, k) = s * grad[k];
 }
 
 //   out[n] = Σ_{c ∋ n} corner[c]   (node2corner stores corner ids c = 4e + i)
@@ -42,13 +60,13 @@ __global__ void node_gather_kernel(const double* __restrict__ corner, const int*
 }
 
 //   node_w[n,k] = ¼ Σ_{c ∋ n} w_e[c>>2, k]
-__global__ void node_scatter3_kernel(const double* __restrict__ w_e, const int* __restrict__ ptr,
+__global__ void node_gather3_kernel(const double* __restrict__ w_e, const int* __restrict__ ptr,
                                      const int* __restrict__ idx, double* __restrict__ node_w,
                                      int n_nodes) {
     const int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= n_nodes) return;
 
-    const Vec3View<const double> w(w_e, kUnsizedRows);
+    const auto w = unsized<Vec3View<const double>>(w_e);
     const Vec3View<double> out(node_w, n_nodes);
 
     const int begin = ptr[node];
@@ -100,7 +118,9 @@ __device__ __forceinline__ CandidateMap candidate_map(const double* __restrict__
 // Slack on the fractional index bounds, the same 1e-6 of a cell the host-side check allowed.
 constexpr float kIndexTol = 1e-6f;
 
-enum AdmFault : int { kAdmOk = 0, kAdmOffGrid = 1, kAdmUnsampled = 2 };
+// Slots of the fault array: the lowest candidate with a dipole off the grid, and the lowest with
+// one in an unsampled cell.
+enum AdmFault : int { kAdmOffGrid = 0, kAdmUnsampled = 1 };
 
 // The lowest corner of a dipole's cell, or false when the dipole is off the grid. A coordinate on
 // the last sample belongs to the last cell, so every in-grid point has a full cell around it.
@@ -118,9 +138,9 @@ __device__ __forceinline__ bool locate(const CandidateMap& c, const GridGeom& g,
     return true;
 }
 
-__device__ __forceinline__ void report_fault(int* fault, int kind, int candidate) {
-    // The first fault to land wins; the host reconstructs the message for that candidate.
-    if (atomicCAS(&fault[0], kAdmOk, kind) == kAdmOk) fault[1] = candidate;
+// A minimum, so the candidate reported does not depend on which warp got there first.
+__device__ __forceinline__ void report_fault(int* fault, AdmFault kind, int candidate) {
+    atomicMin(&fault[kind], candidate);
 }
 
 // E_{p,d} = didt * sum_j m_{p,j} . Q_d(s_{p,j}), one warp per candidate. Q is trilinearly
@@ -265,10 +285,10 @@ void launch_node_gather(const double* corner, const int* ptr, const int* idx, do
     }
 }
 
-void launch_node_scatter3(const double* w_e, const int* ptr, const int* idx, double* node_w,
+void launch_node_gather3(const double* w_e, const int* ptr, const int* idx, double* node_w,
                           int n_nodes, cudaStream_t stream) {
     if (const unsigned blocks = grid_for(n_nodes)) {
-        node_scatter3_kernel<<<blocks, kBlock, 0, stream>>>(w_e, ptr, idx, node_w, n_nodes);
+        node_gather3_kernel<<<blocks, kBlock, 0, stream>>>(w_e, ptr, idx, node_w, n_nodes);
     }
 }
 

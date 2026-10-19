@@ -11,18 +11,10 @@ void launch_p1_gradients(const double* nodes_mm, const int* tet_nodes, double* g
                          int n_tet, cudaStream_t stream);
 
 // --- rhs.cu: FEM right-hand-side assembly --------------------------------------------------
-// launch_rhs fuses the corner dot product into the node gather; the staged pair pays a corner
-// pass first so that both halves coalesce.
+// The per-element RHS gathered at each node; the UQ draws use it, since their conductivities
+// change per draw.
 void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
                 const int* idx, float* b, int n_nodes, cudaStream_t stream);
-
-void launch_rhs_staged(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
-                       const int* idx, float* b, int n_nodes, int n_tet, cudaStream_t stream);
-
-// b_block is row-major (n_nodes, k) float32 — the layout the block solver consumes.
-void launch_rhs_staged_block(const float* const* dadt_elm, const float* g, const float* neg_vc,
-                             const int* ptr, const int* idx, float* b_block, int n_nodes,
-                             int n_tet, int k, cudaStream_t stream);
 
 // The forward path's RHS as an assembled operator on the nodal dA/dt (see rhs.cu). op is
 // (nnz, 4) float32 over the stiffness pattern indptr/indices, one packed (Bx, By, Bz, column)
@@ -44,11 +36,12 @@ void launch_tet_lowest_node(const int* inverse, const int* tet_nodes, int* lowes
 // until it has been sorted. `count` fills out_ptr with the exclusive scan of the row lengths and
 // returns nnz, which is the length the caller then allocates out_idx at; `fill` writes the rows
 // out_ptr describes. A segment's candidates stay in shared memory unless it is far wider than a
-// head mesh's, which is the only case that materialises them. Both halves synchronise the stream.
+// head mesh's, which is the only case that materialises them. `count` synchronises the stream to
+// return nnz; `fill` is stream-ordered.
 
-// Distinct nodes of the tetrahedra in each segment of a corner CSR (c = 4e + i). ptr/idx is
-// rhs.cu's node2corner map for the stiffness pattern, or a per-(node, tissue) corner CSR for the
-// recovery slots.
+// Distinct nodes of the tetrahedra in each segment of a corner CSR (c = 4e + i), every corner of
+// a segment being one of the same node's. ptr/idx is rhs.cu's node2corner map for the stiffness
+// pattern, or a per-(node, tissue) corner CSR for the recovery slots.
 int count_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx, int* out_ptr,
                             int n_seg, cudaStream_t stream);
 void fill_incident_node_csr(const int* tet_nodes, const int* ptr, const int* idx,
@@ -64,7 +57,7 @@ void fill_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, 
 
 // --- stiffness.cu: conductivity stiffness values over a prebuilt CSR pattern ----------------
 // indptr/indices must have sorted column indices per row and cover every (i, j) the tets touch;
-// a contribution whose column is missing lands in a neighbouring slot rather than faulting.
+// nothing checks it, and a missing column corrupts a neighbouring entry.
 // data is overwritten. scale[e] = vols[e] * cond[e]. ptr/idx are rhs.cu's node2corner map.
 void launch_stiffness_rows(const double* g, const double* scale, const int* tet_nodes,
                            const int* ptr, const int* idx, const int* indptr, const int* indices,
@@ -155,15 +148,15 @@ void launch_element_weight(const double* values, const int* tet_nodes, const flo
 void launch_node_gather(const double* corner, const int* ptr, const int* idx, double* out,
                         int n_nodes, cudaStream_t stream);
 
-void launch_node_scatter3(const double* w_e, const int* ptr, const int* idx, double* node_w,
+void launch_node_gather3(const double* w_e, const int* ptr, const int* idx, double* node_w,
                           int n_nodes, cudaStream_t stream);
 
 // Candidate evaluation against a sampled reciprocity field. The grid is origin/spacing (metres)
 // and shape (3 ints, host arrays); q is (nx, ny, nz, n_dir, 3) and cell_ok one byte per cell, set
 // when all eight of its corners were sampled. frames are (n_frames, 4, 4) coil-to-head affines
 // with the translation in mm; coil_pos/coil_mom are the coil-frame dipoles in metres. out is
-// (n_frames, n_dir). fault is two device ints the caller zeroes: a kind (1 off the grid, 2 an
-// unsampled cell) and the first candidate that hit it.
+// (n_frames, n_dir). fault is two device ints the caller sets to n_frames: they receive the lowest
+// candidate with a dipole off the grid, and the lowest with one in an unsampled cell.
 void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_pos,
                          const float* coil_mom, int n_dip, const float* q,
                          const unsigned char* cell_ok, const double* origin,
@@ -200,9 +193,7 @@ void launch_region_summary(const void* const* fields, bool f64, int k, int n, co
                            std::size_t work_bytes, double* out, cudaStream_t stream);
 
 // --- moments.cu: streaming UQ statistics over the |E| this directory produces ---------------
-void launch_accumulate_moments(const float* magn, double* sum_e, double* sumsq_e, int n,
-                               cudaStream_t stream);
-// k <= kMaxStageBlock draws' |E| folded in draw order, as k calls of the above would.
+// sum_e += magn[c] and sumsq_e += magn[c]^2 for k <= kMaxStageBlock draws, folded in draw order.
 void launch_accumulate_moments_block(const float* const* magn, int k, double* sum_e,
                                      double* sumsq_e, int n, cudaStream_t stream);
 // out (n, k) = a (n, p) times s (k, p) transposed, each entry summed in term order.

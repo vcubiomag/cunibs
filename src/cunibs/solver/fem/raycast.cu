@@ -3,6 +3,7 @@
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda/cmath>
+#include <cuda/functional>
 
 #include <limits>
 
@@ -17,13 +18,7 @@ constexpr double kParallelEps = 1e-12;
 
 constexpr double kMiss = std::numeric_limits<double>::infinity();
 
-// (n_tri, 3, 3): the three corner coordinates of each triangle.
-using VertsView =
-    cuda::std::mdspan<const double, cuda::std::extents<int, cuda::std::dynamic_extent, 3, 3>>;
-
-struct MinOp {
-    __device__ __forceinline__ double operator()(double x, double y) const { return fmin(x, y); }
-};
+using VertsView = TriVertView<const double>;
 
 // Distance along `dir` to triangle j, or kMiss where the ray misses it or hits it nearer than
 // min_t. `dir` need not be normalised; the distance comes back in its units.
@@ -68,8 +63,8 @@ __global__ void ray_scan_kernel(const double* __restrict__ origins,
     const int lo = blockIdx.y * per;
     const int hi = min(lo + per, n_tri);
 
-    const Vec3View<const double> org(origins, kUnsizedRows);
-    const Vec3View<const double> dir(directions, kUnsizedRows);
+    const auto org = unsized<Vec3View<const double>>(origins);
+    const auto dir = unsized<Vec3View<const double>>(directions);
     const double o[3] = {org(r, 0), org(r, 1), org(r, 2)};
     const double d[3] = {dir(r, 0), dir(r, 1), dir(r, 2)};
 
@@ -78,7 +73,7 @@ __global__ void ray_scan_kernel(const double* __restrict__ origins,
         best = fmin(best, intersect(o, d, verts, j, min_t));
     }
 
-    const double won = BlockReduce(temp).Reduce(best, MinOp());
+    const double won = BlockReduce(temp).Reduce(best, cuda::minimum<>{});
     if (threadIdx.x == 0) chunk_t[static_cast<size_t>(r) * n_chunks + blockIdx.y] = won;
 }
 
@@ -103,16 +98,14 @@ void launch_ray_first_hit(const double* origins, const double* directions, const
 
     const int n_chunks = scan_chunks(n_rays, n_tri);
 
-    double* chunk_t = nullptr;
-    check_cuda(
-        cudaMallocAsync(&chunk_t, static_cast<size_t>(n_rays) * n_chunks * sizeof(double), stream),
-        "raycast", "mallocAsync(chunk_t)");
+    const ScratchBuffer<double> chunk_t = scratch_alloc<double>(
+        static_cast<std::size_t>(n_rays) * n_chunks, stream, "raycast", "chunk hits");
 
     // Rays go on x, the only grid axis not capped at 65535 blocks.
     ray_scan_kernel<<<dim3(n_rays, n_chunks), kBlock, 0, stream>>>(
-        origins, directions, VertsView(verts, n_tri), chunk_t, n_tri, n_chunks, min_t);
-    ray_select_kernel<<<grid_for(n_rays), kBlock, 0, stream>>>(chunk_t, out_t, n_rays, n_chunks);
+        origins, directions, VertsView(verts, n_tri), chunk_t.get(), n_tri, n_chunks, min_t);
+    ray_select_kernel<<<grid_for(n_rays), kBlock, 0, stream>>>(chunk_t.get(), out_t, n_rays,
+                                                               n_chunks);
 
     check_cuda(cudaGetLastError(), "raycast", "first hit launch");
-    check_cuda(cudaFreeAsync(chunk_t, stream), "raycast", "freeAsync(chunk_t)");
 }

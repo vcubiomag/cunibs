@@ -26,7 +26,7 @@ __global__ void p1_gradients_kernel(const double* __restrict__ nodes_mm,
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
 
-    const Vec3View<const double, std::int64_t> nodes(nodes_mm, kUnsizedRows);
+    const auto nodes = unsized<Vec3View<const double, std::int64_t>>(nodes_mm);
     const Tet4View<const int> tn(tet_nodes, n_tet);
     const TetGradView<double, std::int64_t> gv(g, n_tet);
 
