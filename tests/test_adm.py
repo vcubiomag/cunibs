@@ -155,7 +155,7 @@ def test_fourier_matches_brute_angle_sweep(cp, cube_mesh, coil):
     angles = np.linspace(0, 2 * np.pi, 720, endpoint=False)
     pls = [Placement(proj, proj + np.cos(a) * y0 + np.sin(a) * x0, DIST) for a in angles]
     e = evaluate(recip, coil, pls, DIDT)
-    brute_max = float(cp.linalg.norm(e, axis=1).max())
+    brute_max = float(np.linalg.norm(e, axis=1).max())
 
     assert result.best_objective == pytest.approx(brute_max, rel=5e-3)
 
@@ -279,6 +279,54 @@ def test_target_magnitude_mode_uses_identity_basis(cp, cube_subject):
     rt = resolve_target(cube_subject.context, Target([50, 50, 50]))
     assert rt.magnitude
     np.testing.assert_allclose(cp.asnumpy(rt.directions), np.eye(3))
+
+
+def test_optimize_placement_defaults_to_what_the_field_was_built_for(cube_subject, coil):
+    from cunibs.adm import build_reciprocity, optimize_placement
+    from cunibs.adm.target import Target
+
+    centers = np.array([[50.0, 50.0, 100.0], [45.0, 52.0, 100.0]])
+    recip = build_reciprocity(
+        cube_subject, coil, Target([50, 50, 60]), centers, distance_mm=6.0
+    )
+    implicit = optimize_placement(recip, coil)
+    explicit = optimize_placement(recip, coil, centers, distance_mm=6.0)
+    assert implicit.best_placement.distance_mm == 6.0
+    np.testing.assert_array_equal(implicit.center_objective, explicit.center_objective)
+
+
+def test_optimize_rejects_bad_sampling_before_building_the_field(
+    cube_subject, coil, monkeypatch
+):
+    import sys
+
+    from cunibs import adm
+    from cunibs.adm.target import Target
+
+    opt = sys.modules["cunibs.adm.optimize"]
+
+    def unreachable(*_args, **_kwargs):
+        raise AssertionError("built the reciprocity field for an invalid search")
+
+    monkeypatch.setattr(opt, "build_reciprocity", unreachable)
+    center = np.array([[50.0, 50.0, 100.0]])
+    with pytest.raises(ValueError, match="odd"):
+        adm.optimize(cube_subject, coil, Target([50, 50, 60]), center, n_samples=8)
+    with pytest.raises(ValueError, match="resolution"):
+        adm.optimize(cube_subject, coil, Target([50, 50, 60]), center, resolution=4)
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"distance_mm": -1.0}, {"spacing_mm": 0.0}, {"margin_mm": float("nan")}]
+)
+def test_build_reciprocity_rejects_bad_geometry(cube_subject, coil, kwargs):
+    from cunibs.adm import build_reciprocity
+    from cunibs.adm.target import Target
+
+    with pytest.raises(ValueError, match="must be"):
+        build_reciprocity(
+            cube_subject, coil, Target([50, 50, 60]), np.array([[50.0, 50.0, 100.0]]), **kwargs
+        )
 
 
 def test_optimize_placement_rejects_even_n_samples(cube_subject, coil):
@@ -405,7 +453,7 @@ def test_evaluate_is_linear_in_didt(cp, cube_reciprocity, coil):
     np.testing.assert_allclose(two, 2.0 * one, rtol=1e-9)
 
 
-def test_optimize_result_fields_consistent(cp, cube_subject, coil):
+def test_optimize_result_fields_consistent(cube_subject, coil):
     from cunibs import adm
     from cunibs.adm.target import Target
 
@@ -415,10 +463,17 @@ def test_optimize_result_fields_consistent(cp, cube_subject, coil):
     )
     result = adm.optimize(ctx, coil, Target([50, 50, 60]), centers)
 
-    objectives = cp.asnumpy(cp.asarray(result.center_objective))
+    objectives = result.center_objective
+    assert isinstance(objectives, np.ndarray)
+    assert isinstance(result.centers_mm, np.ndarray)
     assert objectives.shape == (len(centers),)
     assert result.best_objective == pytest.approx(float(objectives.max()), rel=1e-9)
-    assert np.linalg.norm(result.best_handle_mm - result.best_center_mm) > 0
+    assert np.linalg.norm(result.best_handle_mm - result.best_center_mm) == pytest.approx(50.0)
+
+    best = result.best_placement
+    np.testing.assert_array_equal(best.center_mm, result.best_center_mm)
+    np.testing.assert_array_equal(best.handle_mm, result.best_handle_mm)
+    assert best.distance_mm == 4.0
 
 
 # --- The real-mesh ladder ----------------------------------------------------------------
@@ -501,7 +556,7 @@ def test_grid_interpolation_error_converges(
 
 @pytest.mark.realmesh
 def test_optimize_matches_brute_force_on_patch(
-    cp, patch_subject, d70_coil, patch_target, patch_top_mm
+    patch_subject, d70_coil, patch_target, patch_top_mm
 ):
     """The closed-form rotation optimum against a 360-angle brute-force sweep on real scalp."""
     from cunibs.adm import build_reciprocity, evaluate
@@ -524,7 +579,7 @@ def test_optimize_matches_brute_force_on_patch(
     sweep = [
         Placement(proj, proj + 50 * (np.cos(a) * y0 + np.sin(a) * x0), 4.0) for a in angles
     ]
-    brute = cp.asnumpy(cp.linalg.norm(evaluate(recip, d70_coil, sweep, DIDT), axis=1))
+    brute = np.linalg.norm(evaluate(recip, d70_coil, sweep, DIDT), axis=1)
 
     assert result.best_objective == pytest.approx(float(brute.max()), rel=5e-3)
     best_angle = angles[int(brute.argmax())]
@@ -540,7 +595,8 @@ def test_adjoint_solver_is_cached_on_the_context(
     build_adjoint_solver reassembles the stiffness in float64 and builds its own tight-tolerance
     AMG hierarchy. Neither depends on the target, so a sweep has to share one setup.
     """
-    from cunibs.adm import Target, build_reciprocity, ensure_adjoint_solver
+    from cunibs.adm import Target, build_reciprocity
+    from cunibs.adm.reciprocity import ensure_adjoint_solver
 
     ctx = patch_subject.context
     ctx.adjoint.clear()

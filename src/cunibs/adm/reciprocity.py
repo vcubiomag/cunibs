@@ -11,10 +11,12 @@ with ``W_n = ¼ Σ_{e∋n} w_e``, evaluable as a node-sourced N-body with no ext
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import numpy as np
 
 from cunibs.adm.grid import Grid, SweptCoverage, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
@@ -221,6 +223,10 @@ class ReciprocityField:
     src: cp.ndarray  # (n_nodes, 3) float32
     src_sq: cp.ndarray  # (n_nodes,) float32
     moments: cp.ndarray  # (D, n_nodes, 6) float32: W_d and W_d x s
+    # The coil's offset from the scalp and the candidate centres the coverage was built for, or
+    # None for a field not built by build_reciprocity. optimize_placement defaults to both.
+    distance_mm: float | None = None
+    centers_mm: npt.NDArray[np.float64] | None = None
 
     @property
     def n_directions(self) -> int:
@@ -385,22 +391,29 @@ def build_reciprocity(
     subject: Subject | SolverContext,
     coil: Coil,
     target: Target | ResolvedTarget,
-    coverage_centers_mm: npt.ArrayLike,
+    centers_mm: npt.ArrayLike,
     *,
     distance_mm: float = 4.0,
     spacing_mm: float = 3.0,
     margin_mm: float = 8.0,
-    adjoint_solver: GroundedSolver | None = None,
+    tolerance: float = ADJOINT_TOLERANCE,
 ) -> ReciprocityField:
     """Build the reciprocity field: adjoint solves plus a Q-field grid covering the candidates.
 
-    ``coverage_centers_mm`` are the scalp positions the coil may occupy; the grid is sized to contain
-    every coil dipole over those positions at any rotation.
+    ``centers_mm`` are the scalp positions the coil may occupy, at ``distance_mm`` from the scalp;
+    the grid is sized to contain every coil dipole over those positions at any rotation, and the
+    field remembers both so :func:`~cunibs.adm.optimize_placement` can default to them.
+    ``tolerance`` is the adjoint solves' relative residual; the solver for it is cached on the
+    subject and shared by every target.
     """
+    if not (math.isfinite(distance_mm) and distance_mm >= 0.0):
+        raise ValueError(f"distance_mm must be non-negative and finite, got {distance_mm!r}.")
     ctx = context_of(subject)
     resolved = resolve_target(ctx, target)
-    if adjoint_solver is None:
-        adjoint_solver = ensure_adjoint_solver(ctx)
-    adjoint = solve_adjoint(ctx, resolved, adjoint_solver)
-    grid = _coverage_grid(ctx, coil, coverage_centers_mm, distance_mm, spacing_mm, margin_mm)
-    return sample_qfield(adjoint, grid)
+    adjoint = solve_adjoint(ctx, resolved, ensure_adjoint_solver(ctx, tolerance))
+    centers = np.ascontiguousarray(cp.asnumpy(centers_mm), dtype=np.float64).reshape(-1, 3)
+    grid = _coverage_grid(ctx, coil, centers, distance_mm, spacing_mm, margin_mm)
+    field = sample_qfield(adjoint, grid)
+    field.distance_mm = float(distance_mm)
+    field.centers_mm = centers
+    return field

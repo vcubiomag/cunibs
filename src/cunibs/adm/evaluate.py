@@ -15,6 +15,9 @@ from cunibs.solver import adm_evaluate, adm_mark, dadt_nbody
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import numpy as np
+    import numpy.typing as npt
+
     from cunibs.adm.reciprocity import AdjointField, ReciprocityField
     from cunibs.coil import Coil
     from cunibs.fem.solve import SolverContext
@@ -84,7 +87,7 @@ def _require_in_grid(
         f"A coil dipole falls outside the reciprocity grid: sample {sample} of {n_total} on "
         f"axis {axis} ({'xyz'[axis]}), dipole at {pos_mm:.3f} mm against a grid spanning "
         f"[{origin_mm:.3f}, {upper_mm:.3f}] mm ({outside_mm:.3f} mm outside). Rebuild the "
-        "reciprocity field so the grid covers it: widen coverage_centers_mm or margin_mm, or "
+        "reciprocity field so the grid covers it: widen centers_mm or margin_mm, or "
         "evaluate at the distance_mm the grid was built with."
     )
 
@@ -158,26 +161,27 @@ def evaluate(
     coil: Coil,
     placements: Placement | Sequence[Placement],
     didt: float = 1e6,
-) -> cp.ndarray:
+) -> npt.NDArray[np.float64]:
     """Target E-vector (component per adjoint direction) for each placement via grid interpolation.
 
-    Returns ``(P, D)``: for magnitude targets ``D=3`` (orthonormal basis, ``|E| = ‖row‖``); for a
-    directional target ``D=1``. No FEM solve, only trilinear sampling of the cached Q-field.
+    Returns ``(P, D)``, or ``(D,)`` for a single placement: for magnitude targets ``D=3``
+    (orthonormal basis, ``|E| = ‖row‖``); for a directional target ``D=1``. No FEM solve, only
+    trilinear sampling of the cached Q-field.
 
     ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
     """
     single = isinstance(placements, Placement)
     pls = [placements] if single else list(placements)
-    e = _evaluate_native(recip, coil, _placement_frames(recip.ctx, pls), didt)
+    e = cp.asnumpy(_evaluate_native(recip, coil, _placement_frames(recip.ctx, pls), didt))
     return e[0] if single else e
 
 
 def evaluate_frames(
     recip: ReciprocityField,
     coil: Coil,
-    transforms: cp.ndarray,
+    transforms: npt.ArrayLike,
     didt: float = 1e6,
-) -> cp.ndarray:
+) -> npt.NDArray[np.float64]:
     """Target E-vector ``(P,D)`` for coil-to-head affines given directly, one per placement.
 
     ``transforms`` is ``(P,4,4)`` with the rotation in ``[:3,:3]`` and a translation in **mm** in
@@ -185,7 +189,9 @@ def evaluate_frames(
     scalp projection, so a caller comparing against another code can adopt that code's frames
     exactly instead of reproducing its projection rule.
     """
-    return _evaluate_native(recip, coil, cp.asarray(transforms, dtype=cp.float64), didt)
+    return cp.asnumpy(
+        _evaluate_native(recip, coil, cp.asarray(transforms, dtype=cp.float64), didt)
+    )
 
 
 def evaluate_exact(

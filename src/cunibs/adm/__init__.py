@@ -6,13 +6,8 @@ dipole sum.
 """
 
 from cunibs.adm.evaluate import evaluate, evaluate_frames
-from cunibs.adm.optimize import OptimizeResult, optimize
-from cunibs.adm.reciprocity import (
-    ReciprocityField,
-    build_adjoint_solver,
-    build_reciprocity,
-    ensure_adjoint_solver,
-)
+from cunibs.adm.optimize import OptimizeResult, optimize, optimize_placement
+from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 
 __all__ = [
@@ -20,11 +15,10 @@ __all__ = [
     "ReciprocityField",
     "ResolvedTarget",
     "Target",
-    "build_adjoint_solver",
     "build_reciprocity",
-    "ensure_adjoint_solver",
     "evaluate",
     "evaluate_frames",
     "optimize",
+    "optimize_placement",
     "resolve_target",
 ]

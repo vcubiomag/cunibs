@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import cupy as cp
@@ -72,6 +73,10 @@ class Grid:
 
 def build_grid(dipole_positions_m: cp.ndarray, spacing_mm: float, margin_mm: float) -> Grid:
     """Build a grid covering ``dipole_positions_m`` (metres) dilated by ``margin_mm``."""
+    if not (math.isfinite(spacing_mm) and spacing_mm > 0.0):
+        raise ValueError(f"spacing_mm must be positive and finite, got {spacing_mm!r}.")
+    if not (math.isfinite(margin_mm) and margin_mm >= 0.0):
+        raise ValueError(f"margin_mm must be non-negative and finite, got {margin_mm!r}.")
     spacing_m = spacing_mm * 1e-3
     margin_m = margin_mm * 1e-3
     lo = dipole_positions_m.min(0) - margin_m

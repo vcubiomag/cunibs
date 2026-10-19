@@ -12,14 +12,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import numpy as np
 
-from cunibs.adm.evaluate import evaluate_frames
+from cunibs.adm.evaluate import _evaluate_native
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.fem.placement import compute_coil_transforms
 from cunibs.fem.solve import context_of
+from cunibs.simulation import Placement
 
 if TYPE_CHECKING:
-    import numpy as np
     import numpy.typing as npt
 
     from cunibs.adm.target import ResolvedTarget, Target
@@ -28,18 +29,30 @@ if TYPE_CHECKING:
     from cunibs.simulation import Subject
 
 
+# Distance from the centre to each reported handle point, along the handle direction.
+_HANDLE_MM = 50.0
+
+
 @dataclass
 class OptimizeResult:
-    """Best placement plus the full per-position objective map."""
+    """Best placement plus the full per-candidate objective map, all as host arrays.
 
+    ``best_placement`` is the optimum ready for a forward solve: ``Subject.simulate(coil,
+    result.best_placement)``. ``best_angle_rad`` is the handle's angle in the tangent plane,
+    measured from ``u = n x e / |n x e|`` towards ``v = n x u``, where ``n`` is the outward scalp
+    normal and ``e`` the world axis least aligned with it. That reference changes from centre to
+    centre, so compare handles, not angles, across candidates.
+    """
+
+    best_placement: Placement
     best_center_mm: npt.NDArray[np.float64]  # scalp contact point of the optimum
-    best_handle_mm: npt.NDArray[np.float64]  # a point along the optimum handle direction
+    best_handle_mm: npt.NDArray[np.float64]  # a point 50 mm out along the optimum handle
     best_angle_rad: float
     best_E: npt.NDArray[np.float64]  # target E-vector components (per adjoint direction)
     best_objective: float  # |mean E| over the ROI (magnitude target) or signed mean E·ê
-    centers_mm: cp.ndarray  # (C,3) scalp contact point per candidate
-    center_objective: cp.ndarray  # (C,) optimum objective per candidate
-    center_handle_mm: cp.ndarray  # (C,3) optimum handle point per candidate
+    centers_mm: npt.NDArray[np.float64]  # (C,3) scalp contact point per candidate
+    center_objective: npt.NDArray[np.float64]  # (C,) optimum objective per candidate
+    center_handle_mm: npt.NDArray[np.float64]  # (C,3) optimum handle point per candidate
 
 
 def _inplane_basis(normal: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
@@ -100,7 +113,7 @@ def _sample_objective(
     c = proj.shape[0]
     a = angles.shape[0]
     frames = _frames(proj, normal, u, v, angles, distance_mm)
-    return evaluate_frames(recip, coil, frames, didt).reshape(c, a, -1)
+    return _evaluate_native(recip, coil, frames, didt).reshape(c, a, -1)
 
 
 def _parabolic_refine(
@@ -139,16 +152,21 @@ def optimize(
     centers_mm: npt.ArrayLike,
     *,
     n_samples: int = 9,
+    resolution: int = 512,
     distance_mm: float = 4.0,
     didt: float = 1e6,
     spacing_mm: float = 3.0,
+    margin_mm: float = 8.0,
 ) -> OptimizeResult:
     """Build the reciprocity field for ``target`` and search ``centers_mm`` × rotations for the best
     coil placement, with no per-placement FEM solve.
 
     ``didt`` is the coil current's rate of change in A/s. It scales ``best_E`` linearly and
-    leaves the chosen placement unchanged.
+    leaves the chosen placement unchanged. To search several candidate sets against one target,
+    build the field once with :func:`~cunibs.adm.build_reciprocity` and call
+    :func:`optimize_placement` on it.
     """
+    _check_angle_sampling(n_samples, resolution)
     recip = build_reciprocity(
         context_of(subject),
         coil,
@@ -156,25 +174,36 @@ def optimize(
         centers_mm,
         distance_mm=distance_mm,
         spacing_mm=spacing_mm,
+        margin_mm=margin_mm,
     )
     return optimize_placement(
-        recip, coil, centers_mm, n_samples=n_samples, distance_mm=distance_mm, didt=didt
+        recip, coil, n_samples=n_samples, resolution=resolution, didt=didt
     )
+
+
+def _check_angle_sampling(n_samples: int, resolution: int) -> None:
+    if n_samples < 1 or n_samples % 2 == 0:
+        raise ValueError("n_samples must be odd for symmetric Fourier interpolation.")
+    if resolution < n_samples:
+        raise ValueError(
+            f"resolution must be at least n_samples ({n_samples}), got {resolution}."
+        )
 
 
 def optimize_placement(
     recip: ReciprocityField,
     coil: Coil,
-    centers_mm: npt.ArrayLike,
+    centers_mm: npt.ArrayLike | None = None,
     *,
     n_samples: int = 9,
     resolution: int = 512,
-    distance_mm: float = 4.0,
+    distance_mm: float | None = None,
     didt: float = 1e6,
 ) -> OptimizeResult:
     """Find the coil position and in-plane angle maximizing the target objective.
 
-    ``centers_mm`` is a set of candidate scalp targets ``(C,3)`` (each is projected onto the scalp).
+    ``centers_mm`` is a set of candidate scalp targets ``(C,3)`` (each is projected onto the scalp),
+    and ``distance_mm`` the coil's offset from it. Both default to what ``recip`` was built for.
     The rotation is optimized in closed form: ``E_d(θ)`` is sampled at ``n_samples`` (odd) angles,
     Fourier-interpolated to ``resolution`` points, and ``|E(θ)|²`` is maximized on that fine grid.
 
@@ -184,8 +213,16 @@ def optimize_placement(
     The angle sweep is flattened over (position, angle), so a grid-bounds error from it names
     a sample index that decodes as ``position = index // n_samples``.
     """
-    if n_samples % 2 == 0:
-        raise ValueError("n_samples must be odd for symmetric Fourier interpolation.")
+    _check_angle_sampling(n_samples, resolution)
+    if centers_mm is None:
+        centers_mm = recip.centers_mm
+    if distance_mm is None:
+        distance_mm = recip.distance_mm
+    if centers_mm is None or distance_mm is None:
+        raise ValueError(
+            "this reciprocity field does not record the centres and distance it was built for; "
+            "pass centers_mm and distance_mm."
+        )
 
     ctx = recip.ctx
     centers = cp.ascontiguousarray(cp.asarray(centers_mm, dtype=cp.float64).reshape(-1, 3))
@@ -211,17 +248,21 @@ def optimize_placement(
 
     # Exact final evaluation at each position's own optimum angle (one field eval per position).
     e = _eval_per_position(recip, coil, proj, normal, u, v, theta, distance_mm, didt)  # (C,D)
-    obj = _objective(e, recip.magnitude)  # (C,)
-    handle = proj + cp.cos(theta)[:, None] * u + cp.sin(theta)[:, None] * v
+    obj = cp.asnumpy(_objective(e, recip.magnitude))  # (C,)
+    handle = cp.asnumpy(
+        proj + _HANDLE_MM * (cp.cos(theta)[:, None] * u + cp.sin(theta)[:, None] * v)
+    )
+    proj_h = cp.asnumpy(proj)
 
-    gi = int(cp.argmax(obj))
+    gi = int(np.argmax(obj))
     return OptimizeResult(
-        best_center_mm=cp.asnumpy(proj[gi]),
-        best_handle_mm=cp.asnumpy(handle[gi]),
+        best_placement=Placement(proj_h[gi], handle[gi], distance_mm),
+        best_center_mm=proj_h[gi],
+        best_handle_mm=handle[gi],
         best_angle_rad=float(theta[gi]),
         best_E=cp.asnumpy(e[gi]),
         best_objective=float(obj[gi]),
-        centers_mm=proj,
+        centers_mm=proj_h,
         center_objective=obj,
         center_handle_mm=handle,
     )
@@ -249,4 +290,4 @@ def _eval_per_position(
     m[:, :3, 2] = z
     m[:, :3, 3] = t
     m[:, 3, 3] = 1.0
-    return evaluate_frames(recip, coil, m, didt)
+    return _evaluate_native(recip, coil, m, didt)

@@ -366,8 +366,7 @@ centers = head.scalp_grid(subject, [-50.0, -10.0, 80.0], radius_mm=20.0, spacing
 result = adm.optimize(subject, coil, target, centers)
 
 result.best_objective
-result.best_center_mm
-result.best_angle_rad
+result.best_placement
 ```
 
 Omit `Target.direction` to maximize `|E|`; provide a direction to maximize its
