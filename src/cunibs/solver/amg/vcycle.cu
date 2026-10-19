@@ -42,9 +42,8 @@ Buffer<T> device_clone(const T* src, std::size_t count, cudaStream_t stream, con
 // the fine level the epilogue is about a fifth of the row's traffic and its loss outweighs the
 // matrix gain; by the coarsest it is ~1% and the matrix decides alone.
 //
-// Two lanes is the fine level's choice once its columns are 2-byte slots: measured on a head
-// mesh, level-0 widths 1 / 2 / 4 / 8 give 19.2 / 18.4 / 19.4 / 21.5 ms per placement at k = 1 and
-// 7.60 / 6.90 / 7.06 / 7.37 at k = 8.
+// Two lanes is the narrowest choice: with 2-byte column slots, a single lane leaves the fine
+// level's gather too few bytes per request.
 constexpr int kTprChoices[] = {2, 4, 8, 16, 32};
 
 // Strided steps of matrix work per thread needed before widening pays for what the epilogue loses.
@@ -90,10 +89,10 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
     warp_reduce_sum<TPR>(sum);
 }
 
-// Whether the operator kernels issue the row's own operands before the gather rather than after
-// the reduction. Single width only: there the row-local loads are a few words whose latency the
-// gather can hide, measured 2.8% off the k = 1 solve; at k = 8 they are 24 live floats per row
-// and the occupancy they cost is worth more, +1.4%. Where the loads land never moves a result.
+// Whether the operator kernels issue the row's own operands before the gather instead of after the
+// reduction. Single width only: there the row-local loads are a few words whose latency the gather
+// can hide, while at k = 8 they are 24 live floats per row and cost more occupancy than they save.
+// Where the loads land never moves a result.
 template <int K>
 constexpr bool kHoistEpilogue = (K == 1);
 
@@ -231,12 +230,11 @@ __global__ void __launch_bounds__(kBlock)
 // a sweep on it always does: that is what lets any degree run on the level's two existing
 // buffers with no third one.
 //
-// x_prev and x_out therefore must NOT be __restrict__, however tempting it looks next to the
-// pointers that are: restrict on x_out would promise the compiler it aliases nothing, which is
-// exactly the promise this call pattern breaks, and it would be free to hoist the K stores
-// above the x_prev loads. The row's values are staged into registers first so the read/write
-// order is explicit rather than resting on alias analysis at all. x_cur keeps its restrict: it
-// is the gather's hot pointer, and x_out is never the buffer it reads.
+// x_prev and x_out therefore must not be __restrict__: restrict on x_out would promise the
+// compiler it aliases nothing, which is exactly the promise this call pattern breaks, and it would
+// be free to hoist the K stores above the x_prev loads. The row's values are staged into registers
+// first so the read/write order is explicit in the code. x_cur keeps its restrict: it is the
+// gather's hot pointer, and x_out is never the buffer it reads.
 //
 // A zero c_prev does not excuse passing a pointer at unwritten memory, because 0 * NaN is NaN.
 // See the caller.
@@ -286,10 +284,9 @@ __global__ void __launch_bounds__(kBlock)
 
 // The first two steps of a sweep from a zero initial guess in one pass. The first step is the
 // Jacobi point x1 = alpha0 D^-1 b and needs no SpMV, so the second step's gather forms each
-// neighbour's x1 on the fly from b and dinv instead of reading a materialised x1. The expression
-// is vc_jacobi_zero_kernel's, so the result is the same bit for bit; what goes is that kernel's
-// launch, its write of x1 and the step's re-read of it. x1_out, when not null, still receives x1,
-// for a degree high enough that a later step needs it as x_prev.
+// neighbour's x1 on the fly from b and dinv, and x1 is never written and read back. The expression
+// is vc_jacobi_zero_kernel's, so the result is the same bit for bit. x1_out, when not null, still
+// receives x1, for a degree high enough that a later step needs it as x_prev.
 template <int K, int TPR>
 __global__ void __launch_bounds__(kBlock)
     vc_cheby_first_kernel(int n, const int* __restrict__ row_ptr,

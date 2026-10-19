@@ -197,7 +197,7 @@ private:
     // evict theirs.
     GraphCache single_graph_;
     // Block-solve state: (n, k) row-major work buffers, lazily sized to the largest k seen.
-    // block_buffers_ counts their allocations and keys both block graphs.
+    // block_buffers_ counts their allocations and is part of every graph's key.
     int block_k_ = 0;
     int block_buffers_ = 0;
     DeviceBuffer<double> r_blk_;

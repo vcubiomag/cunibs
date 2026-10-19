@@ -18,11 +18,9 @@ namespace {
 
 // Threads cooperating on one row in the strided SpMV, which also fixes the association every width
 // must reproduce: the column-lane kernel carries this many partial sums per (row, column) and pays
-// kTpr - 1 fp64 adds to combine them. At k = 8 that kernel is fp64-pipe bound (90% active on a
-// 1:64 part), so the combine is real cost. Measured on a head mesh, k = 1 / k = 8 SpMV in us:
-// 8 lanes 175 / 475, 4 lanes 166 / 414, 2 lanes 164 / 379, 1 lane 186 / 377. One lane loses the
-// k = 1 gather's coalescing; two keep it and drop most of the combine. vcycle.cu tunes its fp32
-// counterpart separately.
+// kTpr - 1 fp64 adds to combine them. At k = 8 that kernel is bound by the 1:64 fp64 pipe, so the
+// combine is real cost. Two lanes keep the k = 1 gather coalesced, which one lane does not, and
+// spend a single add on the combine.
 constexpr int kTpr = 2;
 
 // Blocks-per-SM floor for both fp64 SpMV kernels, which is what bounds the register budget ptxas
@@ -117,19 +115,17 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 // y = A(sigma_c) x_c for an operator affine in per-column coefficients,
 // A(sigma) = sum_t sigma_t A_t on one pattern: the conductivity-UQ stiffness, a sum of per-tissue
 // parts. A row's entries are grouped into one segment per part that touches it, so each column
-// applies its own sigma once per segment and no column's matrix is ever materialised. The parts are read once for all K
-// columns, which is what lets independent draws share a block.
+// applies its own sigma once per segment and no column's matrix is ever materialised. The parts
+// are read once for all K columns, which is what lets independent draws share a block.
 //
 // One thread per (row, column), each walking its row in order, so a column's arithmetic does not
 // depend on K. Entries are slots (core/slot_csr.cuh) and sigma is laid out [column][term].
 //
 // A warp holds 32 / K rows, and the nested loops cost it, per segment, the longest of its rows'
 // segments, so rows are taken in `order`: each window of consecutive rows grouped by segment count,
-// then longest first. That leaves every row's arithmetic as it was. On a head mesh at K = 8 it took
-// active lanes from 68% to 83% and the kernel from 648 to 595 us; 128- and 512-row windows align
-// rows better and lose as much in gather locality. A single loop over the row's slots, closing
-// segments as it crosses them, evens trip counts further and measured slower (799 us): the
-// boundary test becomes predicated fp64 work on every slot of a kernel that is fp64-bound.
+// then longest first. That leaves every row's arithmetic as it was, and keeps rows near their
+// spatial neighbours for the gather. The segment loop stays nested: closing segments inside one
+// loop over the slots would put predicated fp64 work on every slot of a kernel that is fp64-bound.
 template <int K>
 __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     affine_spmv_kernel(int n, const int* __restrict__ order, const int* __restrict__ seg_ptr,
@@ -157,12 +153,10 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 
 // Rows each thread of a reducing kernel carries. A warp's shuffle tree spends five fp64 adds per
 // lane and per column to combine 32 values, and fp64 runs at a sixty-fourth of fp32 on a GeForce
-// part, so the tree rather than the loads is what bounds these kernels: with the tree removed the
-// r.z dot runs in 86 us against 150. Folding rows into a thread's accumulator first replaces
-// eight trees with seven sequential adds and one tree. The rows a thread takes are a grid stride
-// apart, so every access stays as coalesced as it was at one row per thread.
-//
-// Past eight the return is under a percent and the grid stops covering the SMs.
+// part, so the tree, not the loads, is what bounds these kernels. Folding rows into a thread's
+// accumulator first replaces eight trees with seven sequential adds and one tree. The rows a
+// thread takes are a grid stride apart, so every access stays as coalesced as it was at one row per
+// thread. Past eight the grid stops covering the SMs.
 constexpr int kRowsPerThread = 8;
 
 // Columns the deflation state is held for, one per possible block column.
@@ -406,16 +400,15 @@ __device__ __forceinline__ double bcg_support_dot(int n_s, const int* __restrict
     return block_tree_sum(local, sdot);
 }
 
-// A column freezes at the iteration its own residual first meets tolerance, rather than at the
-// one the block's worst column reaches it. Both alpha and beta go to zero, which leaves x, r and
-// rz untouched and pins p at the preconditioned residual, so the column contributes nothing
-// further and its answer is the one it would have had solved on its own.
+// A column freezes at the iteration its own residual first meets tolerance, whatever the block's
+// other columns do. Both alpha and beta go to zero, which leaves x, r and rz untouched and pins p
+// at the preconditioned residual, so the column contributes nothing further and its answer is the
+// one it would have had solved on its own.
 //
-// Freezing on the device rather than by skipping launches on the host is what keeps the CG body
-// replayable as a captured graph: the kernels are the same every iteration and only the mask's
-// contents change. A null mask means no column is frozen, which the single-RHS solve passes.
+// Freezing on the device keeps the CG body replayable as a captured graph: the kernels are the
+// same every iteration and only the mask's contents change.
 __device__ __forceinline__ bool frozen(const double* __restrict__ converged, int c) {
-    return converged != nullptr && converged[c] != 0.0;
+    return converged[c] != 0.0;
 }
 
 __global__ void bcg_mark_converged_kernel(int k, const double* __restrict__ norm_sq,
@@ -424,11 +417,10 @@ __global__ void bcg_mark_converged_kernel(int k, const double* __restrict__ norm
                                           double* __restrict__ converged) {
     const int c = threadIdx.x;
     if (c < k) {
-        // Deliberately the same expression the host stopping test uses, rather than the cheaper
-        // comparison of squares. fp64 sqrt and divide are both correctly rounded, so the two
-        // sides agree bit for bit on the same inputs. If they could disagree by an ulp at the
-        // boundary, a column the device had frozen but the host still called unconverged would
-        // stop improving and run the block to max_iters.
+        // The same expression the host stopping test uses. fp64 sqrt and divide are both
+        // correctly rounded, so the two sides agree bit for bit on the same inputs. If they could
+        // disagree by an ulp at the boundary, a column the device had frozen but the host still
+        // called unconverged would stop improving and run the block to max_iters.
         converged[c] = (sqrt(norm_sq[c]) / sqrt(ref_sq[c]) <= *tolerance) ? 1.0 : 0.0;
     }
 }
@@ -439,8 +431,8 @@ __global__ void bcg_alpha_kernel(int k, const double* __restrict__ rz,
                                  double* __restrict__ neg_alpha) {
     const int c = threadIdx.x;
     if (c < k) {
-        // Branch rather than multiply by the mask: a column frozen at an exactly zero residual
-        // has rz = pap = 0, and 0/0 * 0 would poison x with a NaN instead of leaving it alone.
+        // A branch, because a column frozen at an exactly zero residual has rz = pap = 0, and a
+        // quotient masked by multiplication would be 0/0 * 0, a NaN in x.
         const double a = frozen(converged, c) ? 0.0 : rz[c] / pap[c];
         alpha[c] = a;
         neg_alpha[c] = -a;
@@ -449,7 +441,7 @@ __global__ void bcg_alpha_kernel(int k, const double* __restrict__ rz,
 
 // r -= alpha Ap, with rf, |r|^2 and sum(r) from the same pass. x is not touched here: its
 // x += alpha p rides on bcg_update_p_kernel, which reads p anyway, so p is read once per
-// iteration rather than twice.
+// iteration.
 template <int K>
 __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
                                     const double* __restrict__ ap, double* __restrict__ r,

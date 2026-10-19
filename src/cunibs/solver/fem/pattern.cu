@@ -10,20 +10,19 @@
 #include <cstdint>
 
 // Segment-wise CSR construction: for every segment, the sorted distinct values of a candidate list
-// it generates for itself. Two operators are built this way -- the stiffness sparsity pattern and
-// the recovery patches -- and they differ only in how the candidates are gathered, which is all a
+// it generates for itself. Two operators are built this way, the stiffness sparsity pattern and
+// the recovery patches, and they differ only in how the candidates are gathered, which is all a
 // gather policy below says. Each builder runs twice, once to size its rows and once to fill them,
 // since nothing knows how many distinct values a segment has until it has sorted it.
 //
 // A segment is one node's incident corners or one patch's neighbour rings. Segments are split by
-// width into two classes rather than padded to one global width, so that a single pathological
-// node -- a fan from a centre node, which is how an analytic sphere is built -- cannot set the sort
-// width for the whole mesh. Each class gets the primitive suited to its regime, and those are
-// opposite ones. Millions of segments of a few hundred candidates get a warp each and sort in
-// shared memory, where cub::DeviceSegmentedSort measured 12x slower. A handful of segments of tens
-// of thousands materialise their candidates and go through that segmented sort, where a warp on a
-// bitonic network over global memory is three orders of magnitude slower, one segment being one
-// warp for the whole device. Neither class caps how wide a segment may be.
+// width into two classes, so that a single pathological node (a fan from a centre node, which is
+// how an analytic sphere is built) cannot set the sort width for the whole mesh. Each class gets
+// the primitive suited to its regime, and those are opposite ones. Millions of segments of a few
+// hundred candidates get a warp each and sort in shared memory, which a device-wide segmented sort
+// cannot match at that segment count. A handful of segments of tens of thousands materialise their
+// candidates and go through cub::DeviceSegmentedSort, which a warp per segment over global memory
+// cannot match at that width. Neither class caps how wide a segment may be.
 //
 // Sorting a multiset has one answer and duplicates are dropped by keeping the first of each equal
 // run, so no segment's output depends on how the work was scheduled or on which class handled it.
@@ -69,8 +68,6 @@ __device__ __forceinline__ int warp_keep_first_of_each_run(const int* b, int n, 
     return kept;
 }
 
-// --- gather policies --------------------------------------------------------------------------
-//
 // A policy answers `size`, how many candidates a segment has, and `load`, which writes exactly
 // that many into the buffer it is given and returns the count. The two must agree: the buffer is
 // reserved from `size`, and nothing bounds `load` again.
@@ -164,12 +161,9 @@ struct PatchGather {
     }
 };
 
-// --- the plan ---------------------------------------------------------------------------------
-
 // The shared class's width, and how many segments fall outside it. Max and add are both
 // order-independent, so the atomics cost nothing in reproducibility. Values across a warp are
-// near-identical, which is the case the hardware's atomic coalescing handles well; a block
-// reduction ahead of it measured slower than the writes it saved.
+// near-identical, which is the case the hardware's atomic coalescing handles well.
 //
 // kFastPad is a power of two, so `bit_ceil(n) > kFastPad` is just `n > kFastPad`. Both passes
 // classify from the same `size`, so both reach the same split from the same input.
@@ -243,8 +237,6 @@ SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
     plan.n_cand = scan_counts(plan.n_wide, sizes.get(), plan.wide_off.get(), stream, "pattern");
     return plan;
 }
-
-// --- the shared class -------------------------------------------------------------------------
 
 // One segment, by one warp, into the buffer `b` the caller chose. Everything that decides the
 // row is here; the two launch classes differ only in where `b` points and how they enumerate
@@ -321,8 +313,6 @@ void launch_fast(Gather g, const int* out_ptr, int* out_idx, int* counts, int n_
     check_cuda(cudaGetLastError(), "segment unique launch");
 }
 
-// --- the wide class ---------------------------------------------------------------------------
-//
 // Segments too wide for shared memory: their candidates are materialised in global memory, sorted
 // by CUB as one segmented problem, and compacted a warp per segment.
 

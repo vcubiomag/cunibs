@@ -176,8 +176,6 @@ PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, co
                            defl_inv_e_.get(), stream);
     check_cuda(cudaGetLastError(), "affine deflation");
     defl_affine_ = true;
-    // The copy reads a host vector that dies with this call, so it has to land before returning.
-    check_cuda(cudaStreamSynchronize(stream), "sync(sigma)");
     return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kAffine);
 }
 
@@ -192,8 +190,6 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     const bool single = path == Path::kSingle;
     ensure_block_buffers(k);
     if (!affine) deflation_from_values(stream);
-    // The solve runs on an internal capture-capable stream because the caller's is usually the
-    // un-capturable legacy default stream.
     cudaStream_t s = solve_stream_.get();
     check_cuda(cudaEventRecord(join_event_.get(), stream), "block:record_in");
     check_cuda(cudaStreamWaitEvent(s, join_event_.get(), 0), "block:wait_in");

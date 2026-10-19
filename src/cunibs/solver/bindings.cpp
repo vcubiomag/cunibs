@@ -722,7 +722,7 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("e_in").noconvert(), nb::arg("w").noconvert(), nb::arg("ptr").noconvert(),
         nb::arg("idx").noconvert(), nb::arg("e_slots").noconvert(), nb::arg("stream"),
         "Patch gather E*[s] = sum_c w[c] E[c>>2] for <=8 placements; the operator is read once "
-        "for the whole block and each column matches its serial counterpart bitwise.");
+        "for the whole block and a column's result does not depend on k.");
 
     m.def(
         "recover_elements",

@@ -54,9 +54,9 @@ void launch_bcg_defl_affine(int n_s, int n_terms, const double* aw_t, const doub
 // x <- x + Q r and r <- r - A Q r for the starting pair; also writes rf and the new sum(r).
 void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, double* r, float* rf,
                               double* partials, double* rsum, cudaStream_t stream);
-// converged is a k-wide 0/1 device mask the caller starts all-zero and mark_converged rewrites
-// each iteration; a null pointer means no column is frozen. A frozen column gets
-// alpha = beta = 0, which leaves its x and r exactly where they were.
+// converged is a k-wide 0/1 device mask the caller initialises and mark_converged rewrites each
+// iteration. A frozen column gets alpha = beta = 0, which leaves its x and r exactly where they
+// were.
 void launch_bcg_alpha(int k, const double* rz, const double* pap, const double* converged,
                       double* alpha, double* neg_alpha, cudaStream_t stream);
 void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_sq,

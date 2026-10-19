@@ -33,7 +33,7 @@ constexpr int kMaxStageBlock = 8;
 
 // Compiled widths of the k-RHS CG and V-cycle kernels, increasing. The dispatch_k call sites
 // in block_cg.cu and vcycle.cu enumerate the same set as template arguments; this is what the
-// bindings export, so the Python layer derives its BLOCK_SIZES rather than restating it.
+// bindings export, so the Python layer derives its BLOCK_SIZES from it.
 inline constexpr int kBlockWidths[] = {1, 2, 4, 8};
 
 inline bool is_block_width(int k) {
@@ -44,7 +44,7 @@ static_assert(kBlockWidths[std::size(kBlockWidths) - 1] <= kMaxStageBlock,
               "a solve width wider than a staging chunk could never be fed");
 
 // An allocation the device could not satisfy. Kept distinct so Python sees a MemoryError, which a
-// caller can recover from by asking for less, rather than a generic failure.
+// caller can recover from by asking for less.
 class CudaOutOfMemory : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;

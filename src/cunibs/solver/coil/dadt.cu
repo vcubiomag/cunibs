@@ -21,25 +21,24 @@ namespace {
 constexpr int kDadtBlock = 128;
 // One dipole per thread of the block, so a tile loads in one pass.
 constexpr int kDipTile = kDadtBlock;
-// Nodes each thread carries, not a node count: the register tiling that lets one dipole
-// tile load amortize over K nodes. Measured with a 128-thread block on a head mesh: 2 / 4 / 6 / 8
-// / 12 nodes gave 831 (at 256 threads) / 836 / 853 / 807 / 880 us; 8 at 256 threads was 821.
+// Nodes each thread carries, the register tiling that lets one dipole tile load amortise over
+// K nodes.
 constexpr int kNodesPerThread = 8;
 // The same for three moment sets, which carry three times the accumulators per node.
 constexpr int kNodesPerThreadMulti = 4;
 
 // D moment sets share every source and target position, and so every weight w_j: the coil's single
 // set for dA/dt, or the reciprocity field's one set per adjoint direction. The weight is the
-// rsqrt and two multiplies of an interaction; sharing it across D sets is what makes the
-// three-direction Q-field one pass rather than three. Set d of node n lands at out[n * out_stride
-// + 3 d + c], and each set's arithmetic is exactly the D = 1 kernel's.
+// rsqrt and two multiplies of an interaction, so sharing it makes the three-direction Q-field a
+// single pass. Set d of node n lands at out[n * out_stride + 3 d + c], and each set's arithmetic is
+// exactly the D = 1 kernel's.
 template <int D, int K>
 __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict__ mp,
                             const float* __restrict__ sn, const float* __restrict__ r,
                             float* __restrict__ out, int out_stride, int n_dip, int n_nodes,
                             float didt, float mu0_4pi) {
-    // A dipole is three vector reads from the tile, not ten scalar ones: shared-memory issue was
-    // most of what the FMA pipe waited on.
+    // A dipole is three vector reads from the tile, which keeps shared-memory issue from stalling
+    // the FMA pipe.
     __shared__ float4 s_pos[kDipTile];     // (s, |s|^2)
     __shared__ float4 s_mlo[D][kDipTile];  // m, (m x s).x
     __shared__ float2 s_mhi[D][kDipTile];  // (m x s).y, (m x s).z

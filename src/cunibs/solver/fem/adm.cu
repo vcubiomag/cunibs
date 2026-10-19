@@ -115,7 +115,8 @@ __device__ __forceinline__ CandidateMap candidate_map(const double* __restrict__
     return c;
 }
 
-// Slack on the fractional index bounds, the same 1e-6 of a cell the host-side check allowed.
+// Slack on the fractional index bounds, 1e-6 of a cell, the same as evaluate.py's _INDEX_TOL so the
+// host's off-grid message agrees with the kernel's verdict.
 constexpr float kIndexTol = 1e-6f;
 
 // Slots of the fault array: the lowest candidate with a dipole off the grid, and the lowest with

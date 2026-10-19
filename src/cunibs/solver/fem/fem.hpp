@@ -2,15 +2,12 @@
 #include "core/common.hpp"
 
 // Launchers for the mesh-side stages: the P1 operator, the assembled system, and the
-// post-processing that turns a solved potential back into a field. The AMG solver's own
-// launchers live in amg/, the coil-side ones in coil/.
+// post-processing that turns a solved potential back into a field.
 
-// --- gradient.cu: P1 basis-function gradients and element volumes --------------------------
 // nodes_mm is (n_nodes, 3) in millimetres; g is (n_tet, 4, 3) in 1/m and vols is (n_tet,) in m^3.
 void launch_p1_gradients(const double* nodes_mm, const int* tet_nodes, double* g, double* vols,
                          int n_tet, cudaStream_t stream);
 
-// --- rhs.cu: FEM right-hand-side assembly --------------------------------------------------
 // The per-element RHS gathered at each node; the UQ draws use it, since their conductivities
 // change per draw.
 void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
@@ -25,13 +22,11 @@ void launch_rhs_operator_fill(const double* g, const double* scale, const int* t
 void launch_rhs_operator(const int* indptr, const float* op, const float* a, float* b,
                          int n_nodes, int k, cudaStream_t stream);
 
-// --- reorder.cu: keys for the Morton layout -------------------------------------------------
 // inverse maps a mesh node to its position in the node permutation; lowest[e] is the smallest such
 // position over tetrahedron e's four nodes, which is the key its own permutation sorts by.
 void launch_tet_lowest_node(const int* inverse, const int* tet_nodes, int* lowest, int n_tet,
                             cudaStream_t stream);
 
-// --- pattern.cu: segment-wise CSR construction ----------------------------------------------
 // Each builder comes in two halves, because how many distinct values a segment holds is not known
 // until it has been sorted. `count` fills out_ptr with the exclusive scan of the row lengths and
 // returns nnz, which is the length the caller then allocates out_idx at; `fill` writes the rows
@@ -55,7 +50,6 @@ int count_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, 
 void fill_patch_csr(const int* r1_ptr, const int* r1_idx, const int* neighbour, int min_nodes,
                     const int* out_ptr, int* out_idx, int n_slots, cudaStream_t stream);
 
-// --- stiffness.cu: conductivity stiffness values over a prebuilt CSR pattern ----------------
 // indptr/indices must have sorted column indices per row and cover every (i, j) the tets touch;
 // nothing checks it, and a missing column corrupts a neighbouring entry.
 // data is overwritten. scale[e] = vols[e] * cond[e]. ptr/idx are rhs.cu's node2corner map.
@@ -63,7 +57,6 @@ void launch_stiffness_rows(const double* g, const double* scale, const int* tet_
                            const int* ptr, const int* idx, const int* indptr, const int* indices,
                            double* data, int n_rows, cudaStream_t stream);
 
-// --- reconstruct.cu: E = -grad(v) - dA/dt --------------------------------------------------
 // g must be P1 basis gradients, whose four corners sum to zero: the kernels difference the
 // potential against corner 0 and never read g[e, 0].
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
@@ -75,7 +68,6 @@ void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const
                               const float* const* dadt_elm, float* const* e_out,
                               float* const* magn_out, int n_tet, int k, cudaStream_t stream);
 
-// --- recovery.cu: patch-recovery post-processing --------------------------------------------
 // A "slot" is what a patch is fitted around: a node in the global mode, a (node, tissue) pair in
 // the tissue-restricted ones. The SPR entry points take a corner CSR over slots, in the same
 // c = 4e + i encoding rhs.cu uses; the harmonic ones take a CSR of patch nodes. Either way the
@@ -119,7 +111,7 @@ void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx
                         cudaStream_t stream);
 
 // v_block is row-major (n_nodes, stride) float64; column c of each slot uses dadt_nodes[c].
-// stride is the block width the potential was solved at, which is k except on the serial path.
+// stride is the width of v_block, which exceeds k when the block was padded.
 // Only the slots active[0, n) are written, or all n_slots when active is null.
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
@@ -132,7 +124,6 @@ void launch_recover_elements(const float* const* e_slots, const int* slot_of_cor
                              float* const* e_out, float* const* magn_out, int n_tet,
                              const int* active, int n, int k, cudaStream_t stream);
 
-// --- raycast.cu: first hit of a ray against a tissue surface --------------------------------
 // verts is (n_tri, 3, 3), the three corner coordinates of each triangle; out_t is one distance
 // per ray, in the units origins and verts carry, and is +inf where the ray misses. Hits nearer
 // than min_t are skipped, so a ray leaving one surface does not hit the one it started on.
@@ -140,7 +131,6 @@ void launch_ray_first_hit(const double* origins, const double* directions, const
                           double* out_t, int n_rays, int n_tri, double min_t,
                           cudaStream_t stream);
 
-// --- adm.cu: ADM reciprocity weights -------------------------------------------------------
 void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
                            const float* neg_vc, double* w_e, int n_tet, cudaStream_t stream);
 
@@ -173,7 +163,6 @@ void launch_adm_reach(const double* origin, const double* spacing, const int* sh
                       const unsigned char* profile, int n_rho, int n_h, double h0, double cell,
                       unsigned char* mask, cudaStream_t stream);
 
-// --- summary.cu: volume-weighted region metrics of |E| ---------------------------------------
 // out is (k, n_out) float64 with n_out = kSummaryQuantiles + n_q + n_f: the peak, its element's
 // barycentre, the centre of gravity, mean and std, then the n_q quantiles qs and the volume at or
 // above fracs[f] times quantile qs[anchor]. fields are k (n_tet,) arrays, float64 when f64 and
@@ -192,7 +181,6 @@ void launch_region_summary(const void* const* fields, bool f64, int k, int n, co
                            int anchor, const double* fracs, int n_f, void* work,
                            std::size_t work_bytes, double* out, cudaStream_t stream);
 
-// --- moments.cu: streaming UQ statistics over the |E| this directory produces ---------------
 // sum_e += magn[c] and sumsq_e += magn[c]^2 for k <= kMaxStageBlock draws, folded in draw order.
 void launch_accumulate_moments_block(const float* const* magn, int k, double* sum_e,
                                      double* sumsq_e, int n, cudaStream_t stream);

@@ -6,8 +6,7 @@
 // Column encoding for the CSRs the solve streams every iteration: the fp64 CG operator and every
 // V-cycle level. A node's neighbours sit close to it in the spatially ordered numbering, so a
 // column is stored as a 15-bit signed offset from its row, which covers 96% of a head mesh's
-// nonzeros and makes the column stream half the bytes of an int32 index. At k = 1 the column
-// index was half of each SpMV's DRAM traffic.
+// nonzeros and makes the column stream half the bytes of an int32 index.
 //
 // The rest are the jumps a space-filling curve makes across its own cell boundaries. Such a
 // column takes two consecutive slots, high half then low half, 14 bits each, and the second slot

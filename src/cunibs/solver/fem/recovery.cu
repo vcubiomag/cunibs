@@ -48,8 +48,6 @@ constexpr int kFitWarps = 2;
 constexpr int kFitBlock = kWarp * kFitWarps;
 constexpr int kFitChunk = kWarp;
 
-// --- outer-boundary detection ---------------------------------------------------------------
-
 // One thread per face. The four faces of a tet are its four 3-subsets of local corners; which
 // subset maps to which face does not matter, only that every tet enumerates the same four.
 //
@@ -101,8 +99,6 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
     is_boundary[p] = 1;
     is_boundary[q] = 1;
 }
-
-// --- patch fitting --------------------------------------------------------------------------
 
 // Cholesky-solve A z = e_0 for an N x N SPD A held in registers. Returns false on a non-positive
 // pivot, which is how a coplanar or under-filled patch reports itself. Only the SPR modes use
@@ -229,7 +225,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         fit = solve_spd_e0<4>(a, z);
     }
 
-    // The weights sum to one, so sum|w| -- the patch's Lebesgue constant -- is how much the fit
+    // The weights sum to one, so sum|w|, the patch's Lebesgue constant, is how much the fit
     // can amplify its inputs. A healthy patch sits near 1. A pivot test alone does not catch a
     // patch that is merely very flat: it passes, and then returns weights of order thousands.
     // Every patch reaching here is a full ball in its own volume, the half-balls having gone to
@@ -269,8 +265,6 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         w[p] = static_cast<float>(spr_corner_weight(z, b, xn, h));
     }
 }
-
-// --- harmonic-constrained potential recovery --------------------------------------------------
 
 // The 9 harmonic quadratics in the node-centred, radius-scaled frame. Dropping the tenth basis
 // function is the whole method: a general quadratic has three independent second derivatives,
@@ -473,9 +467,8 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
     }
     __syncwarp();
 
-    // sum accumulates h * sum_m |w[m,c]|, since w is acc / h. Kept in the same walk that writes
-    // w rather than in a pass of its own: the guard needs every entry anyway, and the alternative
-    // is a second evaluation of the basis over the whole patch.
+    // sum accumulates h * sum_m |w[m,c]|, since w is acc / h, in the walk that writes w, so the
+    // guard costs no second evaluation of the basis over the patch.
     Vec3 sum{};
     for (int p = begin + lane; p < end; p += kWarp) {
         const int m = pidx[p];
@@ -643,14 +636,12 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
     }
 }
 
-// --- apply ------------------------------------------------------------------------------------
-
 // One thread per slot, K placements at a time. The shared reads (w, ptr, idx) are paid once for
 // the whole block. K is a template parameter so the accumulators stay in registers; a runtime k
 // would put them in local memory.
 //
 // The walk order over ptr/idx does not depend on K, so column c comes back bit-identical at every
-// block width, and the K=1 instantiation is what the serial launcher calls.
+// block width, K = 1 included.
 template <int K>
 __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict__ w,
                                      const int* __restrict__ ptr, const int* __restrict__ idx,
@@ -695,9 +686,9 @@ __device__ __forceinline__ float two_sum(float a, float b, float& e) {
 // the four corner slots. slot_of_corner is the identity on tet_nodes for the node-slot modes and
 // the (node, tissue) map for the tissue-restricted ones.
 //
-// The four-term sum is formed exactly as a float plus its error terms and rounded once, which is
-// what an fp64 accumulation followed by an fp32 store gives, without the fp64 that made this
-// kernel fp64-bound at 87% on a 1:64 part. |E| is the norm of the stored components.
+// The four-term sum is compensated: each pairwise sum keeps its rounding error as a separate term,
+// and the errors are added back at the end, which comes close to an fp64 accumulation followed by
+// an fp32 store without using the 1:64 fp64 pipe. |E| is the norm of the stored components.
 template <int K>
 __global__ void recover_elements_kernel(ConstPtrPack e_slots,
                                         const int* __restrict__ slot_of_corner, PtrPack e_out,

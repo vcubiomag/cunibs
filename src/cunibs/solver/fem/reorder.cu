@@ -8,16 +8,16 @@
 
 namespace {
 
-// One thread per tetrahedron. Renumbering the connectivity to read the key off it would write a
-// copy of the whole array to reduce it away immediately; the permutation gathered from here is a
-// few megabytes and stays in L2 across the sweep.
+// One thread per tetrahedron, reading the key through the permutation so the connectivity is
+// never renumbered just to be reduced; the permutation gathered from here is a few megabytes and
+// stays in L2 across the sweep.
 __global__ void tet_lowest_node_kernel(const int* __restrict__ inverse,
                                        Tet4View<const int> tet_nodes, int* __restrict__ lowest,
                                        int n_tet) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
-    // A 16-byte load of the row rather than four 4-byte ones: the view is over one contiguous
-    // 4 * n_tet block, so a tet's four ids never straddle the boundary.
+    // One 16-byte load of the row: the view is over one contiguous 4 * n_tet block, so a tet's
+    // four ids never straddle the boundary.
     const int4 t = *reinterpret_cast<const int4*>(&tet_nodes(e, 0));
     lowest[e] = cuda::std::min(cuda::std::min(inverse[t.x], inverse[t.y]),
                                cuda::std::min(inverse[t.z], inverse[t.w]));

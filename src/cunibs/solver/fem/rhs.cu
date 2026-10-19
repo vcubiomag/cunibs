@@ -59,8 +59,8 @@ __global__ void rhs_operator_fill_kernel(const double* __restrict__ g,
         for (int q = begin; q < end; ++q) {
             const int corner = idx[q];
             const int e = corner >> 2;
-            // Multiplicity rather than membership, so the operator is the exact linear map even
-            // for an element that names a node twice.
+            // Counted with multiplicity, so the operator is the exact linear map even for an
+            // element that names a node twice.
             const int mult = (tn(e, 0) == col) + (tn(e, 1) == col) + (tn(e, 2) == col) +
                              (tn(e, 3) == col);
             if (mult == 0) continue;
@@ -74,17 +74,16 @@ __global__ void rhs_operator_fill_kernel(const double* __restrict__ g,
     }
 }
 
-// Lanes per row in the apply. Four lanes read a 64-byte stretch of a ~14-nonzero row per step;
-// measured against 1, 2 and 8 it is fastest at k = 1 and tied with 8 at k = 8. It must not depend
-// on k: it fixes each column's sum order, which is what keeps a placement's b the same at every
-// block width.
+// Lanes per row in the apply. Four lanes read a 64-byte stretch of a ~14-nonzero row per step. It
+// must not depend on k: it fixes each column's sum order, which is what keeps a placement's b the
+// same at every block width.
 constexpr int kRhsOpTpr = 4;
 
 static_assert(kWarp % kRhsOpTpr == 0 && kBlock % kRhsOpTpr == 0,
               "the apply's lanes per row must divide the warp and the block");
 
 // a is the nodal field interleaved (n_nodes, K, 3), so a neighbour's K placements are one
-// contiguous gather rather than K scattered ones.
+// contiguous gather.
 template <int K>
 __global__ void __launch_bounds__(kBlock)
     rhs_operator_kernel(int n, const int* __restrict__ indptr, const float4* __restrict__ op,

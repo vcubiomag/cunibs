@@ -37,7 +37,7 @@ struct Peak {
 
 // Larger value wins and ties go to the lower index, so the result is the first maximum in region
 // order however the partial results are combined. NaN beats every number, as in np.max, so a field
-// carrying one reports it rather than the largest finite value.
+// carrying one reports the NaN.
 __device__ __forceinline__ Peak better(Peak a, Peak b) {
     const bool a_nan = isnan(a.value);
     const bool b_nan = isnan(b.value);

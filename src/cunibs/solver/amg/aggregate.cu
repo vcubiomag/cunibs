@@ -11,8 +11,8 @@
 
 namespace {
 
-// AMGx defaults (core.cu). Fixed rather than exposed: nothing in the pipeline varies them,
-// and round 1 must not apply kMaxUnassignedFraction at all (see select_size4).
+// AMGx defaults (core.cu). Fixed, since nothing in the pipeline varies them, and round 1 must
+// not apply kMaxUnassignedFraction at all (see select_size4).
 constexpr int kMaxMatchingIterations = 15;
 constexpr float kMaxUnassignedFraction = 0.05f;
 
@@ -33,9 +33,8 @@ __device__ __forceinline__ unsigned int agg_hash(unsigned int a, unsigned int se
 // (0, -1). Every row scan below is that same fold, so the tie-break (highest column index wins)
 // lives in one place.
 //
-// One thread per row rather than a warp fraction as in vcycle.cu: consecutive CSR rows are
-// contiguous, so a warp already walks a contiguous span and these kernels run near peak
-// bandwidth. Splitting a row across lanes would pay in shuffles for coalescing it already has.
+// One thread per row: consecutive CSR rows are contiguous, so a warp already walks a contiguous
+// span and these kernels run near peak bandwidth without the shuffles a split row would need.
 struct Best {
     float w;
     int col;
@@ -57,7 +56,7 @@ __device__ __forceinline__ void best_take(Best& acc, float w, int col) {
     }
 }
 
-// One atomic per block instead of one per row, folded into the kernel that produces the
+// One atomic per block, folded into the kernel that produces the
 // flag so the convergence check costs no extra pass over the row arrays. Integer addition
 // is associative, so the order the blocks arrive in does not affect the count. Every thread
 // of the block must reach this. The counter guards nothing and the host reads it only after the
@@ -107,8 +106,8 @@ __global__ __launch_bounds__(kBlock) void agg_diag_kernel(int n, const int* __re
 // (common_selector.h), which breaks ties between equal-weight edges.
 //
 // The entries the matching skips, the diagonal and the columns past the row count, are set to -1
-// here rather than by a separate fill pass over all nnz: the rows of a valid CSR cover every j in
-// [0, nnz) exactly once, so `w` ends up fully written either way.
+// here, which leaves `w` fully written: the rows of a valid CSR cover every j in [0, nnz) exactly
+// once.
 __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
     int n, const int* __restrict__ row_ptr, const int* __restrict__ col_idx,
     const float* __restrict__ values, const float* __restrict__ diag, float* __restrict__ w) {

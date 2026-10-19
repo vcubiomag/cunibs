@@ -105,8 +105,7 @@ __device__ __forceinline__ void warp_reduce_sum(cuda::std::array<T, K>& sum) {
     }
 }
 
-// Move the K contiguous values of one row of a (n, K) row-major operand as vector accesses
-// rather than K scalar ones.
+// Move the K contiguous values of one row of a (n, K) row-major operand as vector accesses.
 //
 // This is what keeps a wide block off the L1 request limit: scalar accesses ask for K separate
 // slices per thread, so a warp generates up to 32 distinct wavefronts for data occupying a
