@@ -1,12 +1,16 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <stdexcept>
+#include <tuple>
 
 #include "amg/aggregate.hpp"
 #include "amg/l1.hpp"
@@ -17,38 +21,80 @@
 
 namespace nb = nanobind;
 
-// Contiguity is required because these arrays are passed to CUDA as raw pointers.
-using f64_cuda = nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
-using f64_cuda_2d = nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
-using f64_cuda_3d = nb::ndarray<double, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
-using i32_cuda = nb::ndarray<int32_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
+// Device arrays reach CUDA as raw pointers, so every one must be C-contiguous. A fixed trailing
+// extent is part of the type, so nanobind rejects a wrong shape before the call is made.
+template <typename T, nb::ssize_t... Shape>
+using Dev = nb::ndarray<T, nb::shape<Shape...>, nb::c_contig, nb::device::cuda>;
 
-using f32_cuda_1d = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
-using f32_cuda_2d = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
-using f32_cuda_3d = nb::ndarray<float, nb::ndim<3>, nb::c_contig, nb::device::cuda>;
-using i32_cuda_2d = nb::ndarray<int32_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
-using u8_cuda_1d = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cuda>;
-using u8_cuda_2d = nb::ndarray<uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cuda>;
+using f64_1d = Dev<double, -1>;
+using f64_2d = Dev<double, -1, -1>;
+using f32_1d = Dev<float, -1>;
+using f32_2d = Dev<float, -1, -1>;
+using i32_1d = Dev<int32_t, -1>;
+using u8_1d = Dev<uint8_t, -1>;
+using u8_2d = Dev<uint8_t, -1, -1>;
+// Per-row 3-vectors: node coordinates, fields, triangle corners.
+using Rows3d = Dev<double, -1, 3>;
+using Rows3f = Dev<float, -1, 3>;
+using Tets = Dev<int32_t, -1, 4>;
+using Tris = Dev<int32_t, -1, 3>;
+using TetGradd = Dev<double, -1, 4, 3>;
+using TetGradf = Dev<float, -1, 4, 3>;
+using TriVerts = Dev<double, -1, 3, 3>;
+using Frames = Dev<double, -1, 4, 4>;
+// An interleaved (n_nodes, k, 3) nodal block.
+using Interleaved = Dev<float, -1, -1, 3>;
 
 namespace {
+
+cudaStream_t as_stream(uintptr_t stream) { return reinterpret_cast<cudaStream_t>(stream); }
+
+void require(bool ok, const char* what) {
+    if (!ok) throw std::invalid_argument(what);
+}
+
+template <typename T>
+auto data_or_null(const std::optional<T>& a) -> decltype(a->data()) {
+    return a ? a->data() : nullptr;
+}
+
+int block_width(std::size_t k, const char* what) {
+    require(k >= 1 && k <= static_cast<std::size_t>(kMaxStageBlock), what);
+    return static_cast<int>(k);
+}
+
+// The per-placement pointers of a list of k arrays, each `rows` long.
+template <typename Ptr, typename Array>
+std::array<Ptr, kMaxStageBlock> pack(const std::vector<Array>& arrays, int k, std::size_t rows,
+                                     const char* what) {
+    require(arrays.size() == static_cast<std::size_t>(k), what);
+    std::array<Ptr, kMaxStageBlock> out{};
+    for (int c = 0; c < k; ++c) {
+        require(arrays[c].shape(0) == rows, what);
+        out[c] = arrays[c].data();
+    }
+    return out;
+}
 
 // A grid's origin and spacing (metres) and shape, as the ADM kernels take them.
 struct GridArgs {
     double origin[3];
     double spacing[3];
     int shape[3];
+
+    std::int64_t points() const {
+        return static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2];
+    }
 };
 
 GridArgs grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
                    const std::vector<int>& shape) {
-    if (origin.size() != 3 || spacing.size() != 3 || shape.size() != 3) {
-        throw std::invalid_argument("grid origin, spacing and shape must each have 3 entries");
-    }
+    require(origin.size() == 3 && spacing.size() == 3 && shape.size() == 3,
+            "grid origin, spacing and shape must each have 3 entries");
     GridArgs g;
     for (int i = 0; i < 3; ++i) {
-        if (shape[i] < 2 || !(spacing[i] > 0.0)) {
-            throw std::invalid_argument("grid needs at least 2 samples and a positive spacing");
-        }
+        require(shape[i] >= 2 && spacing[i] > 0.0,
+                "grid needs at least 2 samples and a positive spacing");
         g.origin[i] = origin[i];
         g.spacing[i] = spacing[i];
         g.shape[i] = shape[i];
@@ -66,9 +112,14 @@ struct HostCopy {
 };
 
 void CUDART_CB run_host_copy(void* arg) {
-    auto* copy = static_cast<HostCopy*>(arg);
+    const std::unique_ptr<HostCopy> copy(static_cast<HostCopy*>(arg));
     std::memcpy(copy->dst, copy->src, copy->bytes);
-    delete copy;
+}
+
+using BlockResult = std::tuple<int, std::vector<double>, std::vector<int>>;
+
+BlockResult as_tuple(PcgBlockResult r) {
+    return {r.iterations, std::move(r.relative_residual), std::move(r.column_iterations)};
 }
 
 }  // namespace
@@ -90,23 +141,20 @@ NB_MODULE(_solver_ext, m) {
              "smoother's spectral upper bound. Must precede the first add_level.")
         .def(
             "add_level",
-            [](NativeVCycle& self, i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values,
-               f32_cuda_1d dinv, i32_cuda p_row_ptr, i32_cuda p_col_idx, f32_cuda_1d p_values,
-               i32_cuda r_row_ptr, i32_cuda r_col_idx, f32_cuda_1d r_values, uintptr_t stream) {
-                int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
-                int nnz = static_cast<int>(values.shape(0));
-                int n_coarse = static_cast<int>(r_row_ptr.shape(0)) - 1;
-                int p_nnz = static_cast<int>(p_values.shape(0));
-                if (static_cast<int>(r_values.shape(0)) != p_nnz) {
-                    throw std::invalid_argument("R must be the transpose of P");
-                }
-                if (static_cast<int>(p_row_ptr.shape(0)) - 1 != n_rows) {
-                    throw std::invalid_argument("P must have one row per fine row");
-                }
-                self.add_level(n_rows, nnz, n_coarse, p_nnz, row_ptr.data(), col_idx.data(),
-                               values.data(), dinv.data(), p_row_ptr.data(), p_col_idx.data(),
-                               p_values.data(), r_row_ptr.data(), r_col_idx.data(),
-                               r_values.data(), reinterpret_cast<cudaStream_t>(stream));
+            [](NativeVCycle& self, const i32_1d& row_ptr, const i32_1d& col_idx,
+               const f32_1d& values, const f32_1d& dinv, const i32_1d& p_row_ptr,
+               const i32_1d& p_col_idx, const f32_1d& p_values, const i32_1d& r_row_ptr,
+               const i32_1d& r_col_idx, const f32_1d& r_values, uintptr_t stream) {
+                const int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
+                require(r_values.shape(0) == p_values.shape(0), "R must be the transpose of P");
+                require(p_row_ptr.shape(0) == row_ptr.shape(0),
+                        "P must have one row per fine row");
+                self.add_level(n_rows, static_cast<int>(values.shape(0)),
+                               static_cast<int>(r_row_ptr.shape(0)) - 1,
+                               static_cast<int>(p_values.shape(0)), row_ptr.data(),
+                               col_idx.data(), values.data(), dinv.data(), p_row_ptr.data(),
+                               p_col_idx.data(), p_values.data(), r_row_ptr.data(),
+                               r_col_idx.data(), r_values.data(), as_stream(stream));
             },
             nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
@@ -114,20 +162,17 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("p_row_ptr").noconvert(), nb::arg("p_col_idx").noconvert(),
             nb::arg("p_values").noconvert(), nb::arg("r_row_ptr").noconvert(),
             nb::arg("r_col_idx").noconvert(), nb::arg("r_values").noconvert(),
-            nb::arg("stream") = 0,
+            nb::arg("stream"),
             "Append one non-coarsest level (fp32 CSR, 1/guard(d), prolongator CSR and its "
             "transpose); device arrays are copied into solver-owned buffers.")
         .def(
             "set_coarse",
-            [](NativeVCycle& self, f32_cuda_2d ainv, uintptr_t stream) {
-                if (ainv.shape(0) != ainv.shape(1)) {
-                    throw std::invalid_argument("coarse inverse must be square");
-                }
-                self.set_coarse(static_cast<int>(ainv.shape(0)), ainv.data(),
-                                reinterpret_cast<cudaStream_t>(stream));
+            [](NativeVCycle& self, const f32_2d& ainv, uintptr_t stream) {
+                require(ainv.shape(0) == ainv.shape(1), "coarse inverse must be square");
+                self.set_coarse(static_cast<int>(ainv.shape(0)), ainv.data(), as_stream(stream));
             },
             nb::call_guard<nb::gil_scoped_release>(),
-            nb::arg("ainv").noconvert(), nb::arg("stream") = 0,
+            nb::arg("ainv").noconvert(), nb::arg("stream"),
             "Set the dense (row-major) inverse of the coarsest matrix.")
         .def("finalize", &NativeVCycle::finalize,
              "Validate level chain consistency; required before apply.")
@@ -136,99 +181,74 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "select_size4",
-        [](i32_cuda row_ptr, i32_cuda col_idx, f32_cuda_1d values, i32_cuda aggregates,
-           uintptr_t stream) {
-            int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
-            int nnz = static_cast<int>(values.shape(0));
-            if (static_cast<int>(aggregates.shape(0)) != n_rows) {
-                throw std::invalid_argument("aggregates must have one entry per row");
-            }
-            if (col_idx.shape(0) != values.shape(0)) {
-                throw std::invalid_argument("col_idx and values must have one entry per nonzero");
-            }
-            return select_size4(n_rows, nnz, row_ptr.data(), col_idx.data(), values.data(),
-                                aggregates.data(), reinterpret_cast<cudaStream_t>(stream));
+        [](const i32_1d& row_ptr, const i32_1d& col_idx, const f32_1d& values,
+           const i32_1d& aggregates, uintptr_t stream) {
+            const int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
+            require(static_cast<int>(aggregates.shape(0)) == n_rows,
+                    "aggregates must have one entry per row");
+            require(col_idx.shape(0) == values.shape(0),
+                    "col_idx and values must have one entry per nonzero");
+            return select_size4(n_rows, static_cast<int>(values.shape(0)), row_ptr.data(),
+                                col_idx.data(), values.data(), aggregates.data(),
+                                as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
-        nb::arg("values").noconvert(), nb::arg("aggregates").noconvert(),
-        nb::arg("stream") = 0,
+        nb::arg("values").noconvert(), nb::arg("aggregates").noconvert(), nb::arg("stream"),
         "Unsmoothed pairwise aggregation (AMGx SIZE_4). Fills `aggregates` with a surjective "
         "row -> aggregate map and returns the aggregate count. Synchronises the stream.");
 
     nb::class_<PcgAmgSolver>(m, "PcgAmgSolver")
         .def(
             "__init__",
-            [](PcgAmgSolver* self, i32_cuda row_ptr, i32_cuda col_idx, f64_cuda values,
-               uintptr_t stream) {
-                int n = static_cast<int>(row_ptr.shape(0)) - 1;
-                int nnz = static_cast<int>(values.shape(0));
-                new (self) PcgAmgSolver(n, nnz, row_ptr.data(), col_idx.data(), values.data(),
-                                        reinterpret_cast<cudaStream_t>(stream));
+            [](PcgAmgSolver* self, const i32_1d& row_ptr, const i32_1d& col_idx,
+               const f64_1d& values, uintptr_t stream) {
+                new (self) PcgAmgSolver(static_cast<int>(row_ptr.shape(0)) - 1,
+                                        static_cast<int>(values.shape(0)), row_ptr.data(),
+                                        col_idx.data(), values.data(), as_stream(stream));
             },
             nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
-            nb::arg("values").noconvert(), nb::arg("stream") = 0)
+            nb::arg("values").noconvert(), nb::arg("stream"))
         .def(
             "update_values",
-            [](PcgAmgSolver& self, f64_cuda values, uintptr_t stream) {
-                if (static_cast<int>(values.shape(0)) != self.nnz()) {
-                    throw std::invalid_argument("values must have one entry per nonzero");
-                }
-                self.update_values(values.data(), reinterpret_cast<cudaStream_t>(stream));
+            [](PcgAmgSolver& self, const f64_1d& values, uintptr_t stream) {
+                require(static_cast<int>(values.shape(0)) == self.nnz(),
+                        "values must have one entry per nonzero");
+                self.update_values(values.data(), as_stream(stream));
             },
             nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("values").noconvert(), nb::arg("stream"))
         .def(
             "solve_mixed",
-            [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda b, f64_cuda x,
-               double tolerance, int max_iters, uintptr_t stream, std::optional<f64_cuda> x0) {
-                const int n = self.n();
-                if (static_cast<int>(b.shape(0)) != n || static_cast<int>(x.shape(0)) != n ||
-                    (x0.has_value() && static_cast<int>(x0->shape(0)) != n)) {
-                    throw std::invalid_argument("b, x and x0 must have one entry per row");
-                }
-                PcgResult result;
-                {
-                    nb::gil_scoped_release release;
-                    result = self.solve_mixed(preconditioner, b.data(), x.data(), tolerance,
-                                              max_iters, reinterpret_cast<cudaStream_t>(stream),
-                                              x0.has_value() ? x0->data() : nullptr);
-                }
-                return nb::make_tuple(result.iterations, result.relative_residual);
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_1d& b, const f64_1d& x,
+               double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_1d>& x0) {
+                const std::size_t n = self.n();
+                require(b.shape(0) == n && x.shape(0) == n && (!x0 || x0->shape(0) == n),
+                        "b, x and x0 must have one entry per row");
+                const PcgResult r =
+                    self.solve_mixed(preconditioner, b.data(), x.data(), tolerance, max_iters,
+                                     as_stream(stream), data_or_null(x0));
+                return std::make_tuple(r.iterations, r.relative_residual);
             },
+            nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("preconditioner"), nb::arg("b").noconvert(), nb::arg("x").noconvert(),
             nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
             nb::arg("x0").noconvert() = nb::none())
         .def(
             "solve_mixed_block",
-            [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
-               double tolerance, int max_iters, uintptr_t stream,
-               std::optional<f64_cuda_2d> X0) {
-                const int k = static_cast<int>(B.shape(1));
-                const int n = self.n();
-                const bool shaped = static_cast<int>(B.shape(0)) == n &&
-                                    static_cast<int>(X.shape(0)) == n &&
-                                    static_cast<int>(X.shape(1)) == k &&
-                                    (!X0.has_value() || (static_cast<int>(X0->shape(0)) == n &&
-                                                         static_cast<int>(X0->shape(1)) == k));
-                if (!shaped) {
-                    throw std::invalid_argument("B, X and X0 must all be (n, k)");
-                }
-                PcgBlockResult result;
-                {
-                    nb::gil_scoped_release release;
-                    result = self.solve_mixed_block(preconditioner, B.data(), X.data(), k,
-                                                    tolerance, max_iters,
-                                                    reinterpret_cast<cudaStream_t>(stream),
-                                                    X0.has_value() ? X0->data() : nullptr);
-                }
-                nb::list rels;
-                for (double r : result.relative_residual) rels.append(r);
-                nb::list col_iters;
-                for (int i : result.column_iterations) col_iters.append(i);
-                return nb::make_tuple(result.iterations, rels, col_iters);
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_2d& B, const f64_2d& X,
+               double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_2d>& X0) {
+                const std::size_t n = self.n();
+                const std::size_t k = B.shape(1);
+                require(B.shape(0) == n && X.shape(0) == n && X.shape(1) == k &&
+                            (!X0 || (X0->shape(0) == n && X0->shape(1) == k)),
+                        "B, X and X0 must all be (n, k)");
+                return as_tuple(self.solve_mixed_block(preconditioner, B.data(), X.data(),
+                                                       static_cast<int>(k), tolerance, max_iters,
+                                                       as_stream(stream), data_or_null(X0)));
             },
+            nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
             nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
             nb::arg("X0").noconvert() = nb::none(),
@@ -238,50 +258,33 @@ NB_MODULE(_solver_ext, m) {
             "have solved alone. k in {1, 2, 4, 8}.")
         .def(
             "set_affine_terms",
-            [](PcgAmgSolver& self, f64_cuda_2d terms, uintptr_t stream) {
-                if (static_cast<int>(terms.shape(1)) != self.nnz()) {
-                    throw std::invalid_argument("affine terms must be (n_terms, nnz)");
-                }
+            [](PcgAmgSolver& self, const f64_2d& terms, uintptr_t stream) {
+                require(static_cast<int>(terms.shape(1)) == self.nnz(),
+                        "affine terms must be (n_terms, nnz)");
                 self.set_affine_terms(static_cast<int>(terms.shape(0)), terms.data(),
-                                      reinterpret_cast<cudaStream_t>(stream));
+                                      as_stream(stream));
             },
             nb::call_guard<nb::gil_scoped_release>(),
-            nb::arg("terms").noconvert(), nb::arg("stream") = 0,
+            nb::arg("terms").noconvert(), nb::arg("stream"),
             "Set an operator affine in per-column coefficients, A(sigma) = sum_t sigma_t A_t, "
             "from its parts' values in entry order (n_terms, nnz).")
         .def(
             "solve_affine_block",
-            [](PcgAmgSolver& self, NativeVCycle& preconditioner, f64_cuda_2d B, f64_cuda_2d X,
-               nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu> sigma,
-               double tolerance, int max_iters, uintptr_t stream,
-               std::optional<f64_cuda_2d> X0) {
-                const int k = static_cast<int>(B.shape(1));
-                const int n = self.n();
-                const bool shaped = static_cast<int>(B.shape(0)) == n &&
-                                    static_cast<int>(X.shape(0)) == n &&
-                                    static_cast<int>(X.shape(1)) == k &&
-                                    static_cast<int>(sigma.shape(0)) == k &&
-                                    static_cast<int>(sigma.shape(1)) == self.affine_terms() &&
-                                    (!X0.has_value() || (static_cast<int>(X0->shape(0)) == n &&
-                                                         static_cast<int>(X0->shape(1)) == k));
-                if (!shaped) {
-                    throw std::invalid_argument(
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_2d& B, const f64_2d& X,
+               const nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>& sigma,
+               double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_2d>& X0) {
+                const std::size_t n = self.n();
+                const std::size_t k = B.shape(1);
+                require(B.shape(0) == n && X.shape(0) == n && X.shape(1) == k &&
+                            sigma.shape(0) == k &&
+                            static_cast<int>(sigma.shape(1)) == self.affine_terms() &&
+                            (!X0 || (X0->shape(0) == n && X0->shape(1) == k)),
                         "B, X and X0 must be (n, k) and sigma (k, n_terms)");
-                }
-                PcgBlockResult result;
-                {
-                    nb::gil_scoped_release release;
-                    result = self.solve_affine_block(preconditioner, B.data(), X.data(), k,
-                                                     sigma.data(), tolerance, max_iters,
-                                                     reinterpret_cast<cudaStream_t>(stream),
-                                                     X0.has_value() ? X0->data() : nullptr);
-                }
-                nb::list rels;
-                for (double r : result.relative_residual) rels.append(r);
-                nb::list col_iters;
-                for (int i : result.column_iterations) col_iters.append(i);
-                return nb::make_tuple(result.iterations, rels, col_iters);
+                return as_tuple(self.solve_affine_block(
+                    preconditioner, B.data(), X.data(), static_cast<int>(k), sigma.data(),
+                    tolerance, max_iters, as_stream(stream), data_or_null(X0)));
             },
+            nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
             nb::arg("sigma").noconvert(), nb::arg("tolerance"), nb::arg("max_iters"),
             nb::arg("stream"), nb::arg("X0").noconvert() = nb::none(),
@@ -291,17 +294,13 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "p1_gradients",
-        [](f64_cuda_2d nodes_mm, i32_cuda_2d tet_nodes, f64_cuda_3d g, f64_cuda vols,
+        [](const Rows3d& nodes_mm, const Tets& tet_nodes, const TetGradd& g, const f64_1d& vols,
            uintptr_t stream) {
-            const int n_tet = static_cast<int>(tet_nodes.shape(0));
-            if (static_cast<int>(g.shape(0)) != n_tet || g.shape(1) != 4 || g.shape(2) != 3) {
-                throw std::invalid_argument("p1_gradients: g must be (n_tet, 4, 3)");
-            }
-            if (static_cast<int>(vols.shape(0)) != n_tet) {
-                throw std::invalid_argument("p1_gradients: vols must have one entry per tet");
-            }
-            launch_p1_gradients(nodes_mm.data(), tet_nodes.data(), g.data(), vols.data(), n_tet,
-                                reinterpret_cast<cudaStream_t>(stream));
+            const std::size_t n_tet = tet_nodes.shape(0);
+            require(g.shape(0) == n_tet && vols.shape(0) == n_tet,
+                    "p1_gradients: g and vols must have one entry per tet");
+            launch_p1_gradients(nodes_mm.data(), tet_nodes.data(), g.data(), vols.data(),
+                                static_cast<int>(n_tet), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -311,45 +310,42 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "dadt_nbody",
-        [](f32_cuda_2d s, f32_cuda_2d mp, f32_cuda_1d sn, f32_cuda_2d r, f32_cuda_2d out,
-           float didt, float mu0_4pi, uintptr_t stream, int column) {
-            int n_dip = static_cast<int>(s.shape(0));
-            int n_nodes = static_cast<int>(r.shape(0));
+        [](const Rows3f& s, const Dev<float, -1, -1, 6>& mp, const f32_1d& sn, const Rows3f& r,
+           const f32_2d& out, float didt, float mu0_4pi, uintptr_t stream, int column) {
+            const std::size_t n_sets = mp.shape(0);
+            const std::size_t n_dip = s.shape(0);
+            const std::size_t n_nodes = r.shape(0);
             const int stride = static_cast<int>(out.shape(1));
-            if (static_cast<int>(out.shape(0)) != n_nodes || stride % 3 != 0 || column < 0 ||
-                3 * column >= stride) {
-                throw std::invalid_argument(
-                    "dadt_nbody: out must be (n_nodes, 3k) with column < k");
-            }
+            require(mp.shape(1) == n_dip && sn.shape(0) == n_dip,
+                    "dadt_nbody: s, mp and sn must have one entry per dipole");
+            require(out.shape(0) == n_nodes && stride % 3 == 0 && column >= 0 &&
+                        3 * (column + static_cast<int>(n_sets)) <= stride,
+                    "dadt_nbody: out must be (n_nodes, 3k) with room for n_sets sets at column");
             launch_dadt(s.data(), mp.data(), sn.data(), r.data(), out.data() + 3 * column, stride,
-                        n_dip, n_nodes, didt, mu0_4pi, reinterpret_cast<cudaStream_t>(stream));
+                        static_cast<int>(n_sets), static_cast<int>(n_dip),
+                        static_cast<int>(n_nodes), didt, mu0_4pi, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
         nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
         nb::arg("stream"), nb::arg("column") = 0,
-        "Fused dA/dt at nodes from placed magnetic dipoles; writes into caller-allocated out. out "
-        "is (n_nodes, 3k), an interleaved (n_nodes, k, 3) block, and this fills placement column.");
+        "Fused dA/dt at nodes from placed magnetic dipoles, for 1 or 3 moment sets over shared "
+        "positions: mp is (n_sets, n_dip, 6). out is (n_nodes, 3k), an interleaved (n_nodes, k, 3) "
+        "block, and the sets fill columns column .. column + n_sets - 1.");
 
     m.def(
         "dadt_node_to_element_block",
-        [](f32_cuda_3d dadt_nodes, i32_cuda_2d tet_nodes, std::vector<f32_cuda_2d> out,
+        [](const Interleaved& dadt_nodes, const Tets& tet_nodes, const std::vector<Rows3f>& out,
            uintptr_t stream) {
-            const int k = static_cast<int>(out.size());
-            if (k < 1 || k > kMaxStageBlock || static_cast<int>(dadt_nodes.shape(1)) != k ||
-                dadt_nodes.shape(2) != 3) {
-                throw std::invalid_argument("dadt_node_to_element_block: bad block shape");
-            }
-            const int n_tet = static_cast<int>(tet_nodes.shape(0));
-            float* out_ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                if (static_cast<int>(out[c].shape(0)) != n_tet || out[c].shape(1) != 3) {
-                    throw std::invalid_argument("dadt_node_to_element_block: bad output shape");
-                }
-                out_ptrs[c] = out[c].data();
-            }
-            launch_dadt_element_average_block(dadt_nodes.data(), tet_nodes.data(), out_ptrs,
-                                              n_tet, k, reinterpret_cast<cudaStream_t>(stream));
+            const int k = block_width(out.size(), "dadt_node_to_element_block: bad block size");
+            require(static_cast<int>(dadt_nodes.shape(1)) == k,
+                    "dadt_node_to_element_block: dadt_nodes must be (n_nodes, k, 3)");
+            const std::size_t n_tet = tet_nodes.shape(0);
+            const auto out_ptrs =
+                pack<float*>(out, k, n_tet, "dadt_node_to_element_block: bad output shape");
+            launch_dadt_element_average_block(dadt_nodes.data(), tet_nodes.data(),
+                                              out_ptrs.data(), static_cast<int>(n_tet), k,
+                                              as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("dadt_nodes").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -359,16 +355,14 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "rhs_operator_fill",
-        [](f64_cuda_3d g, f64_cuda scale, i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx,
-           i32_cuda indptr, i32_cuda indices, f32_cuda_2d op, uintptr_t stream) {
-            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
-            if (op.shape(0) != indices.shape(0) || op.shape(1) != 4 ||
-                static_cast<int>(ptr.shape(0)) != n_rows + 1) {
-                throw std::invalid_argument("rhs_operator_fill: shape mismatch");
-            }
+        [](const TetGradd& g, const f64_1d& scale, const Tets& tet_nodes, const i32_1d& ptr,
+           const i32_1d& idx, const i32_1d& indptr, const i32_1d& indices,
+           const Dev<float, -1, 4>& op, uintptr_t stream) {
+            require(op.shape(0) == indices.shape(0) && ptr.shape(0) == indptr.shape(0),
+                    "rhs_operator_fill: shape mismatch");
             launch_rhs_operator_fill(g.data(), scale.data(), tet_nodes.data(), ptr.data(),
-                                     idx.data(), indptr.data(), indices.data(), op.data(), n_rows,
-                                     reinterpret_cast<cudaStream_t>(stream));
+                                     idx.data(), indptr.data(), indices.data(), op.data(),
+                                     static_cast<int>(indptr.shape(0)) - 1, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("g").noconvert(), nb::arg("scale").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -379,16 +373,15 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "rhs_operator_apply",
-        [](i32_cuda indptr, f32_cuda_2d op, f32_cuda_3d a, f32_cuda_2d b, uintptr_t stream) {
-            const int n_nodes = static_cast<int>(indptr.shape(0)) - 1;
-            const int k = static_cast<int>(a.shape(1));
-            if (k < 1 || k > kMaxStageBlock || static_cast<int>(a.shape(0)) != n_nodes ||
-                a.shape(2) != 3 || static_cast<int>(b.shape(0)) != n_nodes ||
-                static_cast<int>(b.shape(1)) != k || op.shape(1) != 4) {
-                throw std::invalid_argument("rhs_operator_apply: shape mismatch");
-            }
-            launch_rhs_operator(indptr.data(), op.data(), a.data(), b.data(), n_nodes, k,
-                                reinterpret_cast<cudaStream_t>(stream));
+        [](const i32_1d& indptr, const Dev<float, -1, 4>& op, const Interleaved& a, const f32_2d& b,
+           uintptr_t stream) {
+            const std::size_t n_nodes = indptr.shape(0) - 1;
+            const int k = block_width(a.shape(1), "rhs_operator_apply: bad block size");
+            require(a.shape(0) == n_nodes && b.shape(0) == n_nodes &&
+                        static_cast<int>(b.shape(1)) == k,
+                    "rhs_operator_apply: shape mismatch");
+            launch_rhs_operator(indptr.data(), op.data(), a.data(), b.data(),
+                                static_cast<int>(n_nodes), k, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("indptr").noconvert(), nb::arg("op").noconvert(), nb::arg("a").noconvert(),
@@ -398,10 +391,11 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "dadt_node_to_element",
-        [](f32_cuda_2d dadt_nodes, i32_cuda_2d tet_nodes, f32_cuda_2d out, uintptr_t stream) {
-            int n_tet = static_cast<int>(tet_nodes.shape(0));
-            launch_dadt_element_average(dadt_nodes.data(), tet_nodes.data(), out.data(), n_tet,
-                                        reinterpret_cast<cudaStream_t>(stream));
+        [](const Rows3f& dadt_nodes, const Tets& tet_nodes, const Rows3f& out, uintptr_t stream) {
+            require(out.shape(0) == tet_nodes.shape(0),
+                    "dadt_node_to_element: out must have one row per tet");
+            launch_dadt_element_average(dadt_nodes.data(), tet_nodes.data(), out.data(),
+                                        static_cast<int>(tet_nodes.shape(0)), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("dadt_nodes").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -410,11 +404,11 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "rhs_assemble",
-        [](f32_cuda_2d dadt_elm, f32_cuda_3d g, f32_cuda_1d neg_vc, i32_cuda ptr, i32_cuda idx,
-           f32_cuda_1d b, uintptr_t stream) {
-            int n_nodes = static_cast<int>(b.shape(0));
+        [](const Rows3f& dadt_elm, const TetGradf& g, const f32_1d& neg_vc, const i32_1d& ptr,
+           const i32_1d& idx, const f32_1d& b, uintptr_t stream) {
+            require(ptr.shape(0) == b.shape(0) + 1, "rhs_assemble: ptr must be n_nodes + 1");
             launch_rhs(dadt_elm.data(), g.data(), neg_vc.data(), ptr.data(), idx.data(), b.data(),
-                       n_nodes, reinterpret_cast<cudaStream_t>(stream));
+                       static_cast<int>(b.shape(0)), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
@@ -423,30 +417,12 @@ NB_MODULE(_solver_ext, m) {
         "Deterministic node-centric RHS assembly; writes into caller-allocated b.");
 
     m.def(
-        "rhs_assemble_staged",
-        [](f32_cuda_2d dadt_elm, f32_cuda_3d g, f32_cuda_1d neg_vc, i32_cuda ptr, i32_cuda idx,
-           f32_cuda_1d b, uintptr_t stream) {
-            int n_nodes = static_cast<int>(b.shape(0));
-            int n_tet = static_cast<int>(dadt_elm.shape(0));
-            launch_rhs_staged(dadt_elm.data(), g.data(), neg_vc.data(), ptr.data(), idx.data(),
-                              b.data(), n_nodes, n_tet, reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
-        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("b").noconvert(),
-        nb::arg("stream"),
-        "Deterministic node-centric RHS assembly, corner pass then gather.");
-
-    m.def(
         "tet_lowest_node",
-        [](i32_cuda inverse, i32_cuda_2d tet_nodes, i32_cuda lowest, uintptr_t stream) {
-            const int n_tet = static_cast<int>(tet_nodes.shape(0));
-            if (tet_nodes.shape(1) != 4 || static_cast<int>(lowest.shape(0)) != n_tet) {
-                throw std::invalid_argument(
-                    "tet_lowest_node: tet_nodes must be (n_tet, 4) and lowest (n_tet,)");
-            }
-            launch_tet_lowest_node(inverse.data(), tet_nodes.data(), lowest.data(), n_tet,
-                                   reinterpret_cast<cudaStream_t>(stream));
+        [](const i32_1d& inverse, const Tets& tet_nodes, const i32_1d& lowest, uintptr_t stream) {
+            require(lowest.shape(0) == tet_nodes.shape(0),
+                    "tet_lowest_node: lowest must have one entry per tet");
+            launch_tet_lowest_node(inverse.data(), tet_nodes.data(), lowest.data(),
+                                   static_cast<int>(tet_nodes.shape(0)), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("inverse").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -455,16 +431,14 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "count_incident_node_csr",
-        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda out_ptr,
+        [](const Tets& tet_nodes, const i32_1d& ptr, const i32_1d& idx, const i32_1d& out_ptr,
            uintptr_t stream) {
-            if (ptr.shape(0) != out_ptr.shape(0)) {
-                throw std::invalid_argument(
+            require(ptr.shape(0) == out_ptr.shape(0),
                     "count_incident_node_csr: ptr and out_ptr must both be n_seg + 1");
-            }
             return count_incident_node_csr(tet_nodes.data(), ptr.data(), idx.data(),
                                            out_ptr.data(),
                                            static_cast<int>(out_ptr.shape(0)) - 1,
-                                           reinterpret_cast<cudaStream_t>(stream));
+                                           as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
@@ -475,15 +449,13 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "fill_incident_node_csr",
-        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda out_ptr, i32_cuda out_idx,
-           uintptr_t stream) {
-            if (ptr.shape(0) != out_ptr.shape(0)) {
-                throw std::invalid_argument(
+        [](const Tets& tet_nodes, const i32_1d& ptr, const i32_1d& idx, const i32_1d& out_ptr,
+           const i32_1d& out_idx, uintptr_t stream) {
+            require(ptr.shape(0) == out_ptr.shape(0),
                     "fill_incident_node_csr: ptr and out_ptr must both be n_seg + 1");
-            }
             fill_incident_node_csr(tet_nodes.data(), ptr.data(), idx.data(), out_ptr.data(),
                                    out_idx.data(), static_cast<int>(out_ptr.shape(0)) - 1,
-                                   reinterpret_cast<cudaStream_t>(stream));
+                                   as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
@@ -492,19 +464,15 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "count_patch_csr",
-        [](i32_cuda r1_ptr, i32_cuda r1_idx, i32_cuda neighbour, int min_nodes, i32_cuda out_ptr,
-           uintptr_t stream) {
-            if (neighbour.shape(0) != r1_idx.shape(0)) {
-                throw std::invalid_argument(
+        [](const i32_1d& r1_ptr, const i32_1d& r1_idx, const i32_1d& neighbour, int min_nodes,
+           const i32_1d& out_ptr, uintptr_t stream) {
+            require(neighbour.shape(0) == r1_idx.shape(0),
                     "count_patch_csr: neighbour must have one entry per first-ring node");
-            }
-            if (out_ptr.shape(0) != r1_ptr.shape(0)) {
-                throw std::invalid_argument(
+            require(out_ptr.shape(0) == r1_ptr.shape(0),
                     "count_patch_csr: r1_ptr and out_ptr must both be n_slots + 1");
-            }
             return count_patch_csr(r1_ptr.data(), r1_idx.data(), neighbour.data(), min_nodes,
                                    out_ptr.data(), static_cast<int>(r1_ptr.shape(0)) - 1,
-                                   reinterpret_cast<cudaStream_t>(stream));
+                                   as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
@@ -515,20 +483,15 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "fill_patch_csr",
-        [](i32_cuda r1_ptr, i32_cuda r1_idx, i32_cuda neighbour, int min_nodes, i32_cuda out_ptr,
-           i32_cuda out_idx, uintptr_t stream) {
-            if (neighbour.shape(0) != r1_idx.shape(0)) {
-                throw std::invalid_argument(
+        [](const i32_1d& r1_ptr, const i32_1d& r1_idx, const i32_1d& neighbour, int min_nodes,
+           const i32_1d& out_ptr, const i32_1d& out_idx, uintptr_t stream) {
+            require(neighbour.shape(0) == r1_idx.shape(0),
                     "fill_patch_csr: neighbour must have one entry per first-ring node");
-            }
-            if (out_ptr.shape(0) != r1_ptr.shape(0)) {
-                throw std::invalid_argument(
+            require(out_ptr.shape(0) == r1_ptr.shape(0),
                     "fill_patch_csr: r1_ptr and out_ptr must both be n_slots + 1");
-            }
             fill_patch_csr(r1_ptr.data(), r1_idx.data(), neighbour.data(), min_nodes,
                            out_ptr.data(), out_idx.data(),
-                           static_cast<int>(r1_ptr.shape(0)) - 1,
-                           reinterpret_cast<cudaStream_t>(stream));
+                           static_cast<int>(r1_ptr.shape(0)) - 1, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
@@ -538,12 +501,14 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "assemble_stiffness_values",
-        [](f64_cuda_3d g, f64_cuda scale, i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx,
-           i32_cuda indptr, i32_cuda indices, f64_cuda data, uintptr_t stream) {
-            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
+        [](const TetGradd& g, const f64_1d& scale, const Tets& tet_nodes, const i32_1d& ptr,
+           const i32_1d& idx, const i32_1d& indptr, const i32_1d& indices, const f64_1d& data,
+           uintptr_t stream) {
+            require(data.shape(0) == indices.shape(0) && ptr.shape(0) == indptr.shape(0),
+                    "assemble_stiffness_values: shape mismatch");
             launch_stiffness_rows(g.data(), scale.data(), tet_nodes.data(), ptr.data(), idx.data(),
-                                  indptr.data(), indices.data(), data.data(), n_rows,
-                                  reinterpret_cast<cudaStream_t>(stream));
+                                  indptr.data(), indices.data(), data.data(),
+                                  static_cast<int>(indptr.shape(0)) - 1, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("g").noconvert(), nb::arg("scale").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -553,17 +518,14 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "l1_dinv",
-        [](i32_cuda indptr, i32_cuda indices, f32_cuda_1d data, f32_cuda_1d dinv,
+        [](const i32_1d& indptr, const i32_1d& indices, const f32_1d& data, const f32_1d& dinv,
            uintptr_t stream) {
-            const int n_rows = static_cast<int>(indptr.shape(0)) - 1;
-            if (static_cast<int>(dinv.shape(0)) != n_rows) {
-                throw std::invalid_argument("dinv must have one entry per row");
-            }
-            if (indices.shape(0) != data.shape(0)) {
-                throw std::invalid_argument("indices and data must have one entry per nonzero");
-            }
-            launch_l1_dinv(indptr.data(), indices.data(), data.data(), dinv.data(), n_rows,
-                           reinterpret_cast<cudaStream_t>(stream));
+            const std::size_t n_rows = indptr.shape(0) - 1;
+            require(dinv.shape(0) == n_rows, "dinv must have one entry per row");
+            require(indices.shape(0) == data.shape(0),
+                    "indices and data must have one entry per nonzero");
+            launch_l1_dinv(indptr.data(), indices.data(), data.data(), dinv.data(),
+                           static_cast<int>(n_rows), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("indptr").noconvert(), nb::arg("indices").noconvert(), nb::arg("data").noconvert(),
@@ -571,52 +533,21 @@ NB_MODULE(_solver_ext, m) {
         "l1-Jacobi smoother scaling 1 / (sign(a_ii) * sum_j |a_ij|), one thread per row.");
 
     m.def(
-        "rhs_assemble_staged_block",
-        [](std::vector<f32_cuda_2d> dadt_elm, f32_cuda_3d g, f32_cuda_1d neg_vc, i32_cuda ptr,
-           i32_cuda idx, f32_cuda_2d b_block, uintptr_t stream) {
-            const int k = static_cast<int>(dadt_elm.size());
-            if (k < 1 || k > kMaxStageBlock ||
-                static_cast<int>(b_block.shape(1)) != k) {
-                throw std::invalid_argument("rhs_assemble_staged_block: bad list sizes");
-            }
-            const float* in_ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) in_ptrs[c] = dadt_elm[c].data();
-            int n_nodes = static_cast<int>(b_block.shape(0));
-            int n_tet = static_cast<int>(dadt_elm[0].shape(0));
-            launch_rhs_staged_block(in_ptrs, g.data(), neg_vc.data(), ptr.data(), idx.data(),
-                                    b_block.data(), n_nodes, n_tet, k,
-                                    reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
-        nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("b_block").noconvert(),
-        nb::arg("stream"),
-        "Block RHS assembly for <=8 placements: the gradients and node2corner are read once for "
-        "the whole block; writes row-major (n_nodes, k) float32.");
-
-    m.def(
         "reconstruct_e_block",
-        [](f64_cuda_2d v_block, i32_cuda_2d tet_nodes, f32_cuda_3d g,
-           std::vector<f32_cuda_2d> dadt_elm, std::vector<f32_cuda_2d> e_out,
-           std::vector<f32_cuda_1d> magn_out, uintptr_t stream) {
-            const int k = static_cast<int>(dadt_elm.size());
-            if (k < 1 || k > kMaxStageBlock || e_out.size() != dadt_elm.size() ||
-                magn_out.size() != dadt_elm.size() ||
-                static_cast<int>(v_block.shape(1)) != k) {
-                throw std::invalid_argument("reconstruct_e_block: bad list sizes");
-            }
-            const float* de_ptrs[kMaxStageBlock];
-            float* e_ptrs[kMaxStageBlock];
-            float* m_ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                de_ptrs[c] = dadt_elm[c].data();
-                e_ptrs[c] = e_out[c].data();
-                m_ptrs[c] = magn_out[c].data();
-            }
-            int n_tet = static_cast<int>(tet_nodes.shape(0));
-            launch_reconstruct_block(v_block.data(), tet_nodes.data(), g.data(), de_ptrs,
-                                     e_ptrs, m_ptrs, n_tet, k,
-                                     reinterpret_cast<cudaStream_t>(stream));
+        [](const f64_2d& v_block, const Tets& tet_nodes, const TetGradf& g,
+           const std::vector<Rows3f>& dadt_elm, const std::vector<Rows3f>& e_out,
+           const std::vector<f32_1d>& magn_out, uintptr_t stream) {
+            const int k = block_width(dadt_elm.size(), "reconstruct_e_block: bad list sizes");
+            require(static_cast<int>(v_block.shape(1)) == k,
+                    "reconstruct_e_block: v_block must be (n_nodes, k)");
+            const std::size_t n_tet = tet_nodes.shape(0);
+            const char* bad = "reconstruct_e_block: every list must hold k (n_tet, ...) arrays";
+            const auto de = pack<const float*>(dadt_elm, k, n_tet, bad);
+            const auto eo = pack<float*>(e_out, k, n_tet, bad);
+            const auto mo = pack<float*>(magn_out, k, n_tet, bad);
+            launch_reconstruct_block(v_block.data(), tet_nodes.data(), g.data(), de.data(),
+                                     eo.data(), mo.data(), static_cast<int>(n_tet), k,
+                                     as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("v_block").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
@@ -627,11 +558,14 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "reconstruct_e",
-        [](f64_cuda v, i32_cuda_2d tet_nodes, f32_cuda_3d g, f32_cuda_2d dadt_elm,
-           f32_cuda_2d e_out, f32_cuda_1d magn_out, uintptr_t stream) {
-            int n_tet = static_cast<int>(tet_nodes.shape(0));
+        [](const f64_1d& v, const Tets& tet_nodes, const TetGradf& g, const Rows3f& dadt_elm,
+           const Rows3f& e_out, const f32_1d& magn_out, uintptr_t stream) {
+            const std::size_t n_tet = tet_nodes.shape(0);
+            require(dadt_elm.shape(0) == n_tet && e_out.shape(0) == n_tet &&
+                        magn_out.shape(0) == n_tet,
+                    "reconstruct_e: dadt_elm, e_out and magn_out must have one row per tet");
             launch_reconstruct(v.data(), tet_nodes.data(), g.data(), dadt_elm.data(), e_out.data(),
-                               magn_out.data(), n_tet, reinterpret_cast<cudaStream_t>(stream));
+                               magn_out.data(), static_cast<int>(n_tet), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("v").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
@@ -641,20 +575,16 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "mark_outer_boundary",
-        [](i32_cuda_2d tet_nodes, i32_cuda ptr, i32_cuda idx, i32_cuda is_boundary,
+        [](const Tets& tet_nodes, const i32_1d& ptr, const i32_1d& idx, const i32_1d& is_boundary,
            uintptr_t stream) {
-            const int n_tet = static_cast<int>(tet_nodes.shape(0));
-            if (idx.shape(0) != static_cast<size_t>(n_tet) * 4) {
-                throw std::invalid_argument(
+            const std::size_t n_tet = tet_nodes.shape(0);
+            require(idx.shape(0) == n_tet * 4,
                     "mark_outer_boundary: idx must hold one entry per tet corner");
-            }
-            if (ptr.shape(0) != is_boundary.shape(0) + 1) {
-                throw std::invalid_argument(
+            require(ptr.shape(0) == is_boundary.shape(0) + 1,
                     "mark_outer_boundary: ptr must hold n_nodes + 1 entries");
-            }
             launch_mark_outer_boundary(tet_nodes.data(), ptr.data(), idx.data(),
-                                       is_boundary.data(), n_tet,
-                                       reinterpret_cast<cudaStream_t>(stream));
+                                       is_boundary.data(), static_cast<int>(n_tet),
+                                       as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
@@ -664,21 +594,18 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "spr_weights",
-        [](f64_cuda_2d nodes_mm, i32_cuda_2d tet_nodes, f32_cuda_1d vols, i32_cuda ptr,
-           i32_cuda idx, std::optional<i32_cuda> slot_node, std::optional<i32_cuda> is_boundary,
-           f32_cuda_1d w, std::optional<i32_cuda> n_fallback, uintptr_t stream) {
-            const int n_slots = static_cast<int>(ptr.shape(0)) - 1;
-            if (w.shape(0) != idx.shape(0)) {
-                throw std::invalid_argument("spr_weights: w must have one entry per corner");
-            }
-            if (slot_node && static_cast<int>(slot_node->shape(0)) != n_slots) {
-                throw std::invalid_argument("spr_weights: slot_node must have one entry per slot");
-            }
+        [](const Rows3d& nodes_mm, const Tets& tet_nodes, const f32_1d& vols, const i32_1d& ptr,
+           const i32_1d& idx, const std::optional<i32_1d>& slot_node,
+           const std::optional<i32_1d>& is_boundary, const f32_1d& w,
+           const std::optional<i32_1d>& n_fallback, uintptr_t stream) {
+            const std::size_t n_slots = ptr.shape(0) - 1;
+            require(w.shape(0) == idx.shape(0), "spr_weights: w must have one entry per corner");
+            require(!slot_node || slot_node->shape(0) == n_slots,
+                    "spr_weights: slot_node must have one entry per slot");
             launch_spr_weights(nodes_mm.data(), tet_nodes.data(), vols.data(), ptr.data(),
-                               idx.data(), slot_node ? slot_node->data() : nullptr,
-                               is_boundary ? is_boundary->data() : nullptr, w.data(),
-                               n_fallback ? n_fallback->data() : nullptr, n_slots,
-                               reinterpret_cast<cudaStream_t>(stream));
+                               idx.data(), data_or_null(slot_node), data_or_null(is_boundary),
+                               w.data(), data_or_null(n_fallback), static_cast<int>(n_slots),
+                               as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
@@ -690,20 +617,15 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "skin_normals",
-        [](f64_cuda_2d nodes_mm, i32_cuda_2d tris, i32_cuda node_ptr, i32_cuda node_idx,
-           f64_cuda_2d out, uintptr_t stream) {
-            const int n_tri = static_cast<int>(tris.shape(0));
-            const int n_nodes = static_cast<int>(node_ptr.shape(0)) - 1;
-            if (tris.shape(1) != 3 || out.shape(1) != 3 ||
-                static_cast<int>(out.shape(0)) != n_tri) {
-                throw std::invalid_argument("skin_normals: tris and out must be (n_tri, 3)");
-            }
-            if (static_cast<int>(node_idx.shape(0)) != 3 * n_tri) {
-                throw std::invalid_argument("skin_normals: node_idx must hold every corner");
-            }
+        [](const Rows3d& nodes_mm, const Tris& tris, const i32_1d& node_ptr, const i32_1d& node_idx,
+           const Rows3d& out, uintptr_t stream) {
+            const std::size_t n_tri = tris.shape(0);
+            require(out.shape(0) == n_tri, "skin_normals: tris and out must be (n_tri, 3)");
+            require(node_idx.shape(0) == 3 * n_tri,
+                    "skin_normals: node_idx must hold every corner");
             launch_skin_normals(nodes_mm.data(), tris.data(), node_ptr.data(), node_idx.data(),
-                                out.data(), n_tri, n_nodes,
-                                reinterpret_cast<cudaStream_t>(stream));
+                                out.data(), static_cast<int>(n_tri),
+                                static_cast<int>(node_ptr.shape(0)) - 1, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tris").noconvert(),
@@ -714,23 +636,15 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "ray_first_hit",
-        [](f64_cuda_2d origins, f64_cuda_2d directions, f64_cuda_3d verts, f64_cuda out_t,
-           double min_t, uintptr_t stream) {
-            const int n_rays = static_cast<int>(origins.shape(0));
-            if (origins.shape(1) != 3 || directions.shape(0) != origins.shape(0) ||
-                directions.shape(1) != 3) {
-                throw std::invalid_argument(
+        [](const Rows3d& origins, const Rows3d& directions, const TriVerts& verts,
+           const f64_1d& out_t, double min_t, uintptr_t stream) {
+            const std::size_t n_rays = origins.shape(0);
+            require(directions.shape(0) == n_rays,
                     "ray_first_hit: origins and directions must both be (n_rays, 3)");
-            }
-            if (verts.shape(1) != 3 || verts.shape(2) != 3) {
-                throw std::invalid_argument("ray_first_hit: verts must be (n_tri, 3, 3)");
-            }
-            if (static_cast<int>(out_t.shape(0)) != n_rays) {
-                throw std::invalid_argument("ray_first_hit: out_t must have one entry per ray");
-            }
+            require(out_t.shape(0) == n_rays, "ray_first_hit: out_t must have one entry per ray");
             launch_ray_first_hit(origins.data(), directions.data(), verts.data(), out_t.data(),
-                                 n_rays, static_cast<int>(verts.shape(0)), min_t,
-                                 reinterpret_cast<cudaStream_t>(stream));
+                                 static_cast<int>(n_rays), static_cast<int>(verts.shape(0)),
+                                 min_t, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("origins").noconvert(), nb::arg("directions").noconvert(),
@@ -742,21 +656,17 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "hpr_weights",
-        [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node, f32_cuda_2d w,
-           i32_cuda status, uintptr_t stream, std::optional<i32_cuda> active) {
-            const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
-            if (w.shape(0) != pidx.shape(0) || w.shape(1) != 3) {
-                throw std::invalid_argument("hpr_weights: w must be (nnz, 3)");
-            }
-            if (static_cast<int>(slot_node.shape(0)) != n_slots ||
-                static_cast<int>(status.shape(0)) != n_slots) {
-                throw std::invalid_argument("hpr_weights: slot_node/status must be per slot");
-            }
+        [](const Rows3d& nodes_mm, const i32_1d& pptr, const i32_1d& pidx, const i32_1d& slot_node,
+           const Rows3f& w, const i32_1d& status, uintptr_t stream,
+           const std::optional<i32_1d>& active) {
+            const std::size_t n_slots = pptr.shape(0) - 1;
+            require(w.shape(0) == pidx.shape(0), "hpr_weights: w must be (nnz, 3)");
+            require(slot_node.shape(0) == n_slots && status.shape(0) == n_slots,
+                    "hpr_weights: slot_node/status must be per slot");
             launch_hpr_weights(nodes_mm.data(), pptr.data(), pidx.data(), slot_node.data(),
-                               w.data(), status.data(),
-                               active.has_value() ? active->data() : nullptr,
-                               active.has_value() ? static_cast<int>(active->shape(0)) : n_slots,
-                               reinterpret_cast<cudaStream_t>(stream));
+                               w.data(), status.data(), data_or_null(active),
+                               static_cast<int>(active ? active->shape(0) : n_slots),
+                               as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("pptr").noconvert(), nb::arg("pidx").noconvert(),
@@ -768,30 +678,24 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "hpr_grad",
-        [](f64_cuda_2d v_block, f32_cuda_2d w, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node,
-           std::vector<f32_cuda_2d> dadt_nodes, std::vector<f32_cuda_2d> e_slots,
-           uintptr_t stream, std::optional<i32_cuda> active) {
-            const int k = static_cast<int>(dadt_nodes.size());
-            if (k < 1 || k > kMaxStageBlock || e_slots.size() != dadt_nodes.size()) {
-                throw std::invalid_argument("hpr_grad: bad list sizes");
-            }
+        [](const f64_2d& v_block, const Rows3f& w, const i32_1d& pptr, const i32_1d& pidx,
+           const i32_1d& slot_node, const std::vector<Rows3f>& dadt_nodes,
+           const std::vector<Rows3f>& e_slots, uintptr_t stream,
+           const std::optional<i32_1d>& active) {
+            const int k = block_width(dadt_nodes.size(), "hpr_grad: bad list sizes");
             const int stride = static_cast<int>(v_block.shape(1));
-            if (stride < k) {
-                throw std::invalid_argument("hpr_grad: v_block has fewer columns than placements");
-            }
-            const float* da_ptrs[kMaxStageBlock];
-            float* out_ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                da_ptrs[c] = dadt_nodes[c].data();
-                out_ptrs[c] = e_slots[c].data();
-            }
-            const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
+            require(stride >= k, "hpr_grad: v_block has fewer columns than placements");
+            const std::size_t n_nodes = v_block.shape(0);
+            const std::size_t n_slots = pptr.shape(0) - 1;
+            const auto da = pack<const float*>(dadt_nodes, k, n_nodes,
+                                               "hpr_grad: dadt_nodes must be k (n_nodes, 3)");
+            const auto out = pack<float*>(e_slots, k, n_slots,
+                                          "hpr_grad: e_slots must be k (n_slots, 3)");
             launch_hpr_grad(v_block.data(), w.data(), pptr.data(), pidx.data(), slot_node.data(),
-                            da_ptrs, out_ptrs, n_slots,
-                            active.has_value() ? active->data() : nullptr,
-                            active.has_value() ? static_cast<int>(active->shape(0)) : n_slots, k,
-                            stride, static_cast<int>(v_block.shape(0)),
-                            reinterpret_cast<cudaStream_t>(stream));
+                            da.data(), out.data(), static_cast<int>(n_slots),
+                            data_or_null(active),
+                            static_cast<int>(active ? active->shape(0) : n_slots), k, stride,
+                            static_cast<int>(n_nodes), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("v_block").noconvert(), nb::arg("w").noconvert(), nb::arg("pptr").noconvert(),
@@ -803,21 +707,16 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "recover_nodes",
-        [](std::vector<f32_cuda_2d> e_in, f32_cuda_1d w, i32_cuda ptr, i32_cuda idx,
-           std::vector<f32_cuda_2d> e_slots, uintptr_t stream) {
-            const int k = static_cast<int>(e_in.size());
-            if (k < 1 || k > kMaxStageBlock || e_slots.size() != e_in.size()) {
-                throw std::invalid_argument("recover_nodes: bad list sizes");
-            }
-            const float* in_ptrs[kMaxStageBlock];
-            float* out_ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                in_ptrs[c] = e_in[c].data();
-                out_ptrs[c] = e_slots[c].data();
-            }
-            const int n_slots = static_cast<int>(ptr.shape(0)) - 1;
-            launch_recover_nodes(in_ptrs, w.data(), ptr.data(), idx.data(), out_ptrs, n_slots, k,
-                                 reinterpret_cast<cudaStream_t>(stream));
+        [](const std::vector<Rows3f>& e_in, const f32_1d& w, const i32_1d& ptr, const i32_1d& idx,
+           const std::vector<Rows3f>& e_slots, uintptr_t stream) {
+            const int k = block_width(e_in.size(), "recover_nodes: bad list sizes");
+            const std::size_t n_slots = ptr.shape(0) - 1;
+            const auto in = pack<const float*>(e_in, k, e_in[0].shape(0),
+                                               "recover_nodes: e_in must be k (n_tet, 3)");
+            const auto out = pack<float*>(e_slots, k, n_slots,
+                                          "recover_nodes: e_slots must be k (n_slots, 3)");
+            launch_recover_nodes(in.data(), w.data(), ptr.data(), idx.data(), out.data(),
+                                 static_cast<int>(n_slots), k, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("e_in").noconvert(), nb::arg("w").noconvert(), nb::arg("ptr").noconvert(),
@@ -827,27 +726,20 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "recover_elements",
-        [](std::vector<f32_cuda_2d> e_slots, i32_cuda slot_of_corner,
-           std::vector<f32_cuda_2d> e_out, std::vector<f32_cuda_1d> magn_out, uintptr_t stream,
-           std::optional<i32_cuda> active) {
-            const int k = static_cast<int>(e_slots.size());
-            if (k < 1 || k > kMaxStageBlock || e_out.size() != e_slots.size() ||
-                magn_out.size() != e_slots.size()) {
-                throw std::invalid_argument("recover_elements: bad list sizes");
-            }
-            const float* in_ptrs[kMaxStageBlock];
-            float* e_ptrs[kMaxStageBlock];
-            float* m_ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                in_ptrs[c] = e_slots[c].data();
-                e_ptrs[c] = e_out[c].data();
-                m_ptrs[c] = magn_out[c].data();
-            }
-            const int n_tet = static_cast<int>(slot_of_corner.shape(0)) / 4;
-            launch_recover_elements(in_ptrs, slot_of_corner.data(), e_ptrs, m_ptrs, n_tet,
-                                    active.has_value() ? active->data() : nullptr,
-                                    active.has_value() ? static_cast<int>(active->shape(0)) : n_tet,
-                                    k, reinterpret_cast<cudaStream_t>(stream));
+        [](const std::vector<Rows3f>& e_slots, const i32_1d& slot_of_corner,
+           const std::vector<Rows3f>& e_out, const std::vector<f32_1d>& magn_out, uintptr_t stream,
+           const std::optional<i32_1d>& active) {
+            const int k = block_width(e_slots.size(), "recover_elements: bad list sizes");
+            const std::size_t n_tet = slot_of_corner.shape(0) / 4;
+            const char* bad = "recover_elements: e_out and magn_out must be k arrays of n_tet";
+            const auto in = pack<const float*>(e_slots, k, e_slots[0].shape(0),
+                                               "recover_elements: e_slots must be k (n_slots, 3)");
+            const auto eo = pack<float*>(e_out, k, n_tet, bad);
+            const auto mo = pack<float*>(magn_out, k, n_tet, bad);
+            launch_recover_elements(in.data(), slot_of_corner.data(), eo.data(), mo.data(),
+                                    static_cast<int>(n_tet), data_or_null(active),
+                                    static_cast<int>(active ? active->shape(0) : n_tet), k,
+                                    as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("e_slots").noconvert(), nb::arg("slot_of_corner").noconvert(),
@@ -857,11 +749,13 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "element_weight",
-        [](f64_cuda values, i32_cuda_2d tet_nodes, f32_cuda_3d g, f32_cuda_1d neg_vc,
-           f64_cuda_2d w_e, uintptr_t stream) {
-            int n_tet = static_cast<int>(tet_nodes.shape(0));
+        [](const f64_1d& values, const Tets& tet_nodes, const TetGradf& g, const f32_1d& neg_vc,
+           const Rows3d& w_e, uintptr_t stream) {
+            require(w_e.shape(0) == tet_nodes.shape(0),
+                    "element_weight: w_e must have one row per tet");
             launch_element_weight(values.data(), tet_nodes.data(), g.data(), neg_vc.data(),
-                                  w_e.data(), n_tet, reinterpret_cast<cudaStream_t>(stream));
+                                  w_e.data(), static_cast<int>(tet_nodes.shape(0)),
+                                  as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("values").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
@@ -870,13 +764,12 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "node_gather",
-        [](f64_cuda corner, i32_cuda ptr, i32_cuda idx, f64_cuda out, uintptr_t stream) {
-            int n_nodes = static_cast<int>(ptr.shape(0)) - 1;
-            if (static_cast<int>(out.shape(0)) != n_nodes) {
-                throw std::invalid_argument("node_gather: out must have one entry per node");
-            }
-            launch_node_gather(corner.data(), ptr.data(), idx.data(), out.data(), n_nodes,
-                               reinterpret_cast<cudaStream_t>(stream));
+        [](const f64_1d& corner, const i32_1d& ptr, const i32_1d& idx, const f64_1d& out,
+           uintptr_t stream) {
+            const std::size_t n_nodes = ptr.shape(0) - 1;
+            require(out.shape(0) == n_nodes, "node_gather: out must have one entry per node");
+            launch_node_gather(corner.data(), ptr.data(), idx.data(), out.data(),
+                               static_cast<int>(n_nodes), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("corner").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
@@ -884,11 +777,14 @@ NB_MODULE(_solver_ext, m) {
         "Node-centric scalar corner gather over the node2corner CSR; into caller-allocated out.");
 
     m.def(
-        "node_scatter3",
-        [](f64_cuda_2d w_e, i32_cuda ptr, i32_cuda idx, f64_cuda_2d node_w, uintptr_t stream) {
-            int n_nodes = static_cast<int>(ptr.shape(0)) - 1;
-            launch_node_scatter3(w_e.data(), ptr.data(), idx.data(), node_w.data(), n_nodes,
-                                 reinterpret_cast<cudaStream_t>(stream));
+        "node_gather3",
+        [](const Rows3d& w_e, const i32_1d& ptr, const i32_1d& idx, const Rows3d& node_w,
+           uintptr_t stream) {
+            const std::size_t n_nodes = ptr.shape(0) - 1;
+            require(node_w.shape(0) == n_nodes,
+                    "node_gather3: node_w must have one row per node");
+            launch_node_gather3(w_e.data(), ptr.data(), idx.data(), node_w.data(),
+                                 static_cast<int>(n_nodes), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("w_e").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
@@ -896,52 +792,25 @@ NB_MODULE(_solver_ext, m) {
         "Node-centric 3-vector corner gather with 1/4 weight; into caller-allocated node_w.");
 
     m.def(
-        "dadt_nbody_multi",
-        [](f32_cuda_2d s, f32_cuda_3d mp, f32_cuda_1d sn, f32_cuda_2d r, f32_cuda_3d out,
-           float didt, float mu0_4pi, uintptr_t stream) {
-            const int n_sets = static_cast<int>(mp.shape(0));
-            const int n_dip = static_cast<int>(s.shape(0));
-            const int n_nodes = static_cast<int>(r.shape(0));
-            if (static_cast<int>(mp.shape(1)) != n_dip || mp.shape(2) != 6 ||
-                static_cast<int>(out.shape(0)) != n_nodes ||
-                static_cast<int>(out.shape(1)) != n_sets || out.shape(2) != 3) {
-                throw std::invalid_argument("dadt_nbody_multi: shape mismatch");
-            }
-            launch_dadt_multi(s.data(), mp.data(), sn.data(), r.data(), out.data(), n_sets,
-                              n_dip, n_nodes, didt, mu0_4pi,
-                              reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
-        nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
-        nb::arg("stream"),
-        "The dA/dt N-body for 1 or 3 moment sets over shared positions: mp is (n_sets, n_dip, 6) "
-        "and out (n_targets, n_sets, 3).");
-
-    m.def(
         "adm_evaluate",
-        [](f64_cuda_3d frames, f32_cuda_2d coil_pos, f32_cuda_2d coil_mom, f32_cuda_1d q,
-           u8_cuda_1d cell_ok, std::vector<double> origin, std::vector<double> spacing,
-           std::vector<int> shape, int n_dir, double didt, f64_cuda_2d out, i32_cuda fault,
-           uintptr_t stream) {
+        [](const Frames& frames, const Rows3f& coil_pos, const Rows3f& coil_mom, const f32_1d& q,
+           const u8_1d& cell_ok, const std::vector<double>& origin,
+           const std::vector<double>& spacing, const std::vector<int>& shape, int n_dir,
+           double didt, const f64_2d& out, const i32_1d& fault, uintptr_t stream) {
             const GridArgs g = grid_args(origin, spacing, shape);
-            const int n_frames = static_cast<int>(frames.shape(0));
-            const int n_dip = static_cast<int>(coil_pos.shape(0));
-            const std::int64_t n_pts = static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2];
+            const std::size_t n_frames = frames.shape(0);
             const std::int64_t n_cells =
                 static_cast<std::int64_t>(shape[0] - 1) * (shape[1] - 1) * (shape[2] - 1);
-            if (frames.shape(1) != 4 || frames.shape(2) != 4 || coil_pos.shape(1) != 3 ||
-                coil_mom.shape(0) != coil_pos.shape(0) || coil_mom.shape(1) != 3 ||
-                static_cast<std::int64_t>(q.shape(0)) != n_pts * n_dir * 3 ||
-                static_cast<std::int64_t>(cell_ok.shape(0)) != n_cells ||
-                static_cast<int>(out.shape(0)) != n_frames ||
-                static_cast<int>(out.shape(1)) != n_dir || fault.shape(0) != 2) {
-                throw std::invalid_argument("adm_evaluate: shape mismatch");
-            }
-            launch_adm_evaluate(frames.data(), n_frames, coil_pos.data(), coil_mom.data(), n_dip,
-                                q.data(), cell_ok.data(), g.origin, g.spacing, g.shape, n_dir,
-                                didt, out.data(), fault.data(),
-                                reinterpret_cast<cudaStream_t>(stream));
+            require(coil_mom.shape(0) == coil_pos.shape(0) &&
+                        static_cast<std::int64_t>(q.shape(0)) == g.points() * n_dir * 3 &&
+                        static_cast<std::int64_t>(cell_ok.shape(0)) == n_cells &&
+                        out.shape(0) == n_frames && static_cast<int>(out.shape(1)) == n_dir &&
+                        fault.shape(0) == 2,
+                    "adm_evaluate: shape mismatch");
+            launch_adm_evaluate(frames.data(), static_cast<int>(n_frames), coil_pos.data(),
+                                coil_mom.data(), static_cast<int>(coil_pos.shape(0)), q.data(),
+                                cell_ok.data(), g.origin, g.spacing, g.shape, n_dir, didt,
+                                out.data(), fault.data(), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(),
@@ -950,21 +819,20 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("didt"), nb::arg("out").noconvert(), nb::arg("fault").noconvert(),
         nb::arg("stream"),
         "Target E-vectors (n_frames, n_dir) of coil frames against a sampled reciprocity field. "
-        "fault (2 ints, zeroed by the caller) receives a fault kind and the first candidate.");
+        "fault (2 ints the caller sets to n_frames) receives the lowest candidate off the grid "
+        "and the lowest reading an unsampled cell.");
 
     m.def(
         "adm_mark",
-        [](f64_cuda_3d frames, f32_cuda_2d coil_pos, std::vector<double> origin,
-           std::vector<double> spacing, std::vector<int> shape, u8_cuda_1d need,
+        [](const Frames& frames, const Rows3f& coil_pos, const std::vector<double>& origin,
+           const std::vector<double>& spacing, const std::vector<int>& shape, const u8_1d& need,
            uintptr_t stream) {
             const GridArgs g = grid_args(origin, spacing, shape);
-            if (static_cast<std::int64_t>(need.shape(0)) !=
-                static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2]) {
-                throw std::invalid_argument("adm_mark: need must have one byte per grid point");
-            }
+            require(static_cast<std::int64_t>(need.shape(0)) == g.points(),
+                    "adm_mark: need must have one byte per grid point");
             launch_adm_mark(frames.data(), static_cast<int>(frames.shape(0)), coil_pos.data(),
                             static_cast<int>(coil_pos.shape(0)), g.origin, g.spacing, g.shape,
-                            need.data(), reinterpret_cast<cudaStream_t>(stream));
+                            need.data(), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(), nb::arg("origin"),
@@ -973,20 +841,17 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "adm_reach",
-        [](std::vector<double> origin, std::vector<double> spacing, std::vector<int> shape,
-           f64_cuda_2d origins, f64_cuda_2d axes, u8_cuda_2d profile, double h0, double cell,
-           u8_cuda_1d mask, uintptr_t stream) {
+        [](const std::vector<double>& origin, const std::vector<double>& spacing,
+           const std::vector<int>& shape, const Rows3d& origins, const Rows3d& axes,
+           const u8_2d& profile, double h0, double cell, const u8_1d& mask, uintptr_t stream) {
             const GridArgs g = grid_args(origin, spacing, shape);
-            if (origins.shape(1) != 3 || axes.shape(1) != 3 ||
-                origins.shape(0) != axes.shape(0) ||
-                static_cast<std::int64_t>(mask.shape(0)) !=
-                    static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2]) {
-                throw std::invalid_argument("adm_reach: shape mismatch");
-            }
+            require(origins.shape(0) == axes.shape(0) &&
+                        static_cast<std::int64_t>(mask.shape(0)) == g.points(),
+                    "adm_reach: shape mismatch");
             launch_adm_reach(g.origin, g.spacing, g.shape, origins.data(), axes.data(),
                              static_cast<int>(origins.shape(0)), profile.data(),
                              static_cast<int>(profile.shape(0)), static_cast<int>(profile.shape(1)),
-                             h0, cell, mask.data(), reinterpret_cast<cudaStream_t>(stream));
+                             h0, cell, mask.data(), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("origins").noconvert(),
@@ -1001,12 +866,11 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "host_copy_async",
         [](uintptr_t src, uintptr_t dst, std::size_t bytes, uintptr_t stream) {
-            auto* copy = new HostCopy{reinterpret_cast<const void*>(src),
-                                      reinterpret_cast<void*>(dst), bytes};
-            const cudaError_t err = cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
-                                                       run_host_copy, copy);
-            if (err != cudaSuccess) delete copy;
-            check_cuda(err, "host_copy_async", "launch host func");
+            auto copy = std::make_unique<HostCopy>(
+                HostCopy{reinterpret_cast<const void*>(src), reinterpret_cast<void*>(dst), bytes});
+            check_cuda(cudaLaunchHostFunc(as_stream(stream), run_host_copy, copy.get()),
+                       "host_copy_async", "launch host func");
+            (void)copy.release();
         },
         nb::call_guard<nb::gil_scoped_release>(), nb::arg("src"), nb::arg("dst"),
         nb::arg("bytes"), nb::arg("stream"),
@@ -1016,7 +880,6 @@ NB_MODULE(_solver_ext, m) {
     m.attr("SUMMARY_LAYOUT") = nb::make_tuple(kSummaryPeak, kSummaryPeakLocation,
                                               kSummaryCenterOfGravity, kSummaryMean, kSummaryStd,
                                               kSummaryQuantiles);
-    m.attr("MAX_SUMMARY_QUANTILES") = kMaxSummaryQuantiles;
     m.def(
         "region_summary_work_size",
         [](int n, int k, bool f64) { return region_summary_work_size(n, k, f64); },
@@ -1024,39 +887,30 @@ NB_MODULE(_solver_ext, m) {
         "Bytes of workspace region_summary needs.");
     m.def(
         "region_summary",
-        [](std::vector<nb::ndarray<nb::ndim<1>, nb::c_contig, nb::device::cuda>> fields,
-           i32_cuda index, f64_cuda w, f64_cuda_2d bary, std::vector<double> qs, int anchor,
-           std::vector<double> fracs, u8_cuda_1d work, f64_cuda_2d out, uintptr_t stream) {
-            const int k = static_cast<int>(fields.size());
-            const int n = static_cast<int>(index.shape(0));
-            if (k < 1 || k > kMaxStageBlock) {
-                throw std::invalid_argument("region_summary: between 1 and 8 fields");
-            }
+        [](const std::vector<nb::ndarray<nb::ndim<1>, nb::c_contig, nb::device::cuda>>& fields,
+           const i32_1d& index, const f64_1d& w, const Rows3d& bary, const std::vector<double>& qs,
+           int anchor, const std::vector<double>& fracs, const u8_1d& work, const f64_2d& out,
+           uintptr_t stream) {
+            const int k = block_width(fields.size(), "region_summary: between 1 and 8 fields");
+            const std::size_t n = index.shape(0);
             const bool f64 = fields[0].dtype() == nb::dtype<double>();
-            const void* ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                const bool ok = fields[c].dtype() == (f64 ? nb::dtype<double>()
-                                                          : nb::dtype<float>()) &&
-                                fields[c].shape(0) == fields[0].shape(0);
-                if (!ok) {
-                    throw std::invalid_argument(
+            const auto ptrs = pack<const void*>(
+                fields, k, fields[0].shape(0),
+                "region_summary: fields must share one length and be float32 or float64");
+            for (const auto& f : fields) {
+                require(f.dtype() == (f64 ? nb::dtype<double>() : nb::dtype<float>()),
                         "region_summary: fields must share one length and be float32 or float64");
-                }
-                ptrs[c] = fields[c].data();
             }
             const int n_q = static_cast<int>(qs.size());
             const int n_f = static_cast<int>(fracs.size());
-            if (static_cast<int>(w.shape(0)) != n || static_cast<int>(bary.shape(0)) != n ||
-                bary.shape(1) != 3 || static_cast<int>(out.shape(0)) != k ||
-                static_cast<int>(out.shape(1)) != kSummaryQuantiles + n_q + n_f) {
-                throw std::invalid_argument("region_summary: shape mismatch");
-            }
-            launch_region_summary(ptrs, f64, k, n, index.data(), w.data(), bary.data(),
-                                  qs.data(), n_q, anchor, fracs.data(), n_f, work.data(),
-                                  work.shape(0), out.data(),
-                                  reinterpret_cast<cudaStream_t>(stream));
+            require(w.shape(0) == n && bary.shape(0) == n && static_cast<int>(out.shape(0)) == k &&
+                        static_cast<int>(out.shape(1)) == kSummaryQuantiles + n_q + n_f,
+                    "region_summary: shape mismatch");
+            launch_region_summary(ptrs.data(), f64, k, static_cast<int>(n), index.data(),
+                                  w.data(), bary.data(), qs.data(), n_q, anchor, fracs.data(),
+                                  n_f, work.data(), work.shape(0), out.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(), nb::arg("fields"),
+        nb::call_guard<nb::gil_scoped_release>(), nb::arg("fields").noconvert(),
         nb::arg("index").noconvert(), nb::arg("w").noconvert(), nb::arg("bary").noconvert(),
         nb::arg("qs"), nb::arg("anchor"), nb::arg("fracs"), nb::arg("work").noconvert(),
         nb::arg("out").noconvert(), nb::arg("stream"),
@@ -1064,52 +918,32 @@ NB_MODULE(_solver_ext, m) {
         "layout of out.");
 
     m.def(
-        "accumulate_moments",
-        [](f32_cuda_1d magn, f64_cuda sum_e, f64_cuda sumsq_e, uintptr_t stream) {
-            int n = static_cast<int>(magn.shape(0));
-            launch_accumulate_moments(magn.data(), sum_e.data(), sumsq_e.data(), n,
-                                      reinterpret_cast<cudaStream_t>(stream));
-        },
-        nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("magn").noconvert(), nb::arg("sum_e").noconvert(), nb::arg("sumsq_e").noconvert(),
-        nb::arg("stream"),
-        "Fused streaming |E| moments: sum_e += magn; sumsq_e += magn^2 (in place).");
-
-    m.def(
         "accumulate_moments_block",
-        [](std::vector<f32_cuda_1d> magn, f64_cuda sum_e, f64_cuda sumsq_e, uintptr_t stream) {
-            const int k = static_cast<int>(magn.size());
-            const int n = static_cast<int>(sum_e.shape(0));
-            if (k < 1 || k > kMaxStageBlock || sumsq_e.shape(0) != sum_e.shape(0)) {
-                throw std::invalid_argument("accumulate_moments_block: bad sizes");
-            }
-            const float* ptrs[kMaxStageBlock];
-            for (int c = 0; c < k; ++c) {
-                if (static_cast<int>(magn[c].shape(0)) != n) {
-                    throw std::invalid_argument("accumulate_moments_block: bad sizes");
-                }
-                ptrs[c] = magn[c].data();
-            }
-            launch_accumulate_moments_block(ptrs, k, sum_e.data(), sumsq_e.data(), n,
-                                            reinterpret_cast<cudaStream_t>(stream));
+        [](const std::vector<f32_1d>& magn, const f64_1d& sum_e, const f64_1d& sumsq_e,
+           uintptr_t stream) {
+            const int k = block_width(magn.size(), "accumulate_moments_block: bad sizes");
+            const std::size_t n = sum_e.shape(0);
+            require(sumsq_e.shape(0) == n, "accumulate_moments_block: bad sizes");
+            const auto ptrs = pack<const float*>(magn, k, n, "accumulate_moments_block: bad sizes");
+            launch_accumulate_moments_block(ptrs.data(), k, sum_e.data(), sumsq_e.data(),
+                                            static_cast<int>(n), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("magn").noconvert(), nb::arg("sum_e").noconvert(), nb::arg("sumsq_e").noconvert(),
         nb::arg("stream"),
-        "accumulate_moments for up to 8 draws at once, folded in the order given.");
+        "Streaming |E| moments for up to 8 draws, folded in the order given: sum_e += magn and "
+        "sumsq_e += magn^2, in place.");
 
     m.def(
         "row_dot",
-        [](f64_cuda_2d a, f64_cuda_2d s, f64_cuda_2d out, uintptr_t stream) {
-            const int n = static_cast<int>(a.shape(0));
-            const int p = static_cast<int>(a.shape(1));
-            const int k = static_cast<int>(s.shape(0));
-            if (static_cast<int>(s.shape(1)) != p || static_cast<int>(out.shape(0)) != n ||
-                static_cast<int>(out.shape(1)) != k) {
-                throw std::invalid_argument("row_dot: a must be (n, p), s (k, p) and out (n, k)");
-            }
-            launch_row_dot(a.data(), s.data(), out.data(), n, p, k,
-                           reinterpret_cast<cudaStream_t>(stream));
+        [](const f64_2d& a, const f64_2d& s, const f64_2d& out, uintptr_t stream) {
+            const std::size_t n = a.shape(0);
+            const std::size_t p = a.shape(1);
+            const std::size_t k = s.shape(0);
+            require(s.shape(1) == p && out.shape(0) == n && out.shape(1) == k,
+                    "row_dot: a must be (n, p), s (k, p) and out (n, k)");
+            launch_row_dot(a.data(), s.data(), out.data(), static_cast<int>(n),
+                           static_cast<int>(p), static_cast<int>(k), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("a").noconvert(), nb::arg("s").noconvert(), nb::arg("out").noconvert(),
@@ -1125,18 +959,18 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "sweep_seed",
-        [](f32_cuda_2d q, f64_cuda_2d b, f64_cuda work, f64_cuda_2d x0, uintptr_t stream) {
+        [](const f32_2d& q, const f64_2d& b, const f64_1d& work, const f64_2d& x0,
+           uintptr_t stream) {
             const int n = static_cast<int>(q.shape(0));
             const int m_basis = static_cast<int>(q.shape(1));
             const int k = static_cast<int>(b.shape(1));
-            if (static_cast<int>(b.shape(0)) != n || static_cast<int>(x0.shape(0)) != n ||
-                static_cast<int>(x0.shape(1)) != k ||
-                static_cast<std::int64_t>(work.shape(0)) < sweep_seed_work_size(n, m_basis, k)) {
-                throw std::invalid_argument(
+            require(static_cast<int>(b.shape(0)) == n && static_cast<int>(x0.shape(0)) == n &&
+                        static_cast<int>(x0.shape(1)) == k &&
+                        static_cast<std::int64_t>(work.shape(0)) >=
+                            sweep_seed_work_size(n, m_basis, k),
                     "sweep_seed: q (n, m), b and x0 (n, k), work sweep_seed_work_size(n, m, k)");
-            }
             launch_sweep_seed(q.data(), b.data(), n, m_basis, k, work.data(), x0.data(),
-                              reinterpret_cast<cudaStream_t>(stream));
+                              as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("q").noconvert(), nb::arg("b").noconvert(), nb::arg("work").noconvert(),
@@ -1146,22 +980,27 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "place_transforms",
-        [](f64_cuda_2d centers, std::optional<f64_cuda_2d> handles, f64_cuda dists, f64_cuda_2d a,
-           f64_cuda_2d b, f64_cuda_2d c, f64_cuda_2d tnorm, f64_cuda_2d out,
-           std::optional<i32_cuda> degenerate, uintptr_t stream) {
-            int n_pl = static_cast<int>(centers.shape(0));
-            int n_tri = static_cast<int>(a.shape(0));
-            launch_place(centers.data(), handles ? handles->data() : nullptr, dists.data(),
-                         a.data(), b.data(), c.data(), tnorm.data(), out.data(),
-                         degenerate ? degenerate->data() : nullptr, n_pl, n_tri,
-                         reinterpret_cast<cudaStream_t>(stream));
+        [](const Rows3d& centers, const std::optional<Rows3d>& handles, const f64_1d& dists,
+           const TriVerts& verts, const Rows3d& tnorm, const Frames& out,
+           const std::optional<i32_1d>& degenerate, uintptr_t stream) {
+            const std::size_t n_pl = centers.shape(0);
+            const std::size_t n_tri = verts.shape(0);
+            require((!handles || handles->shape(0) == n_pl) && dists.shape(0) == n_pl &&
+                        out.shape(0) == n_pl && (!degenerate || degenerate->shape(0) == n_pl),
+                    "place_transforms: handles, dists, out and degenerate must be per placement");
+            require(tnorm.shape(0) == n_tri,
+                    "place_transforms: verts and tnorm must be per triangle");
+            launch_place(centers.data(), data_or_null(handles), dists.data(), verts.data(),
+                         tnorm.data(), out.data(), data_or_null(degenerate),
+                         static_cast<int>(n_pl), static_cast<int>(n_tri), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("centers").noconvert(), nb::arg("handles").noconvert(),
-        nb::arg("dists").noconvert(), nb::arg("a").noconvert(), nb::arg("b").noconvert(),
-        nb::arg("c").noconvert(), nb::arg("tnorm").noconvert(), nb::arg("out").noconvert(),
+        nb::arg("dists").noconvert(), nb::arg("verts").noconvert(),
+        nb::arg("tnorm").noconvert(), nb::arg("out").noconvert(),
         nb::arg("degenerate").noconvert(), nb::arg("stream"),
-        "Batched closest-point scalp projection + coil frame; writes (P,16) row-major 4x4 out "
-        "and a (P,) flag marking placements whose handle left the in-plane axis undefined. "
-        "Pass handles=None for the projection and normal alone, with degenerate=None.");
+        "Batched closest-point scalp projection + coil frame; writes (P, 4, 4) row-major out "
+        "and a (P,) flag marking placements whose handle left the in-plane axis undefined, or "
+        "whose centre was not finite. Pass handles=None for the projection and normal alone, "
+        "with degenerate=None.");
 }

@@ -356,20 +356,16 @@ def test_solver_bindings_reject_dtype_inside_list_arg(cp):
     nanobind's list caster forwards the flags unchanged, so one wrong-dtype entry in the
     per-placement list is rejected rather than silently converted.
     """
-    from cunibs.solver import rhs_assemble_staged_block
+    from cunibs.solver import accumulate_moments_block
 
     stream = cp.cuda.get_current_stream().ptr
-    n_tet, n_nodes, k = 6, 5, 2
-    g = cp.zeros((n_tet, 4, 3), dtype=cp.float32)
-    neg_vc = cp.zeros(n_tet, dtype=cp.float32)
-    ptr = cp.zeros(n_nodes + 1, dtype=cp.int32)
-    idx = cp.zeros(1, dtype=cp.int32)
-    b_block = cp.zeros((n_nodes, k), dtype=cp.float32)
-    good = cp.zeros((n_tet, 3), dtype=cp.float32)
+    n = 6
+    sum_e = cp.zeros(n, dtype=cp.float64)
+    sumsq_e = cp.zeros(n, dtype=cp.float64)
+    good = cp.zeros(n, dtype=cp.float32)
 
-    dadt_elm = [good, good.astype(cp.float64)]
     with pytest.raises(TypeError):
-        rhs_assemble_staged_block(dadt_elm, g, neg_vc, ptr, idx, b_block, stream)
+        accumulate_moments_block([good, good.astype(cp.float64)], sum_e, sumsq_e, stream)
 
 
 @pytest.mark.realmesh
@@ -419,9 +415,25 @@ def test_context_exposes_skin_triangles_on_the_device(patch_subject):
 
     ctx = patch_subject.context
     assert isinstance(ctx.skin_tris, cp.ndarray)
-    assert ctx.skin_tris.shape == (ctx.skin_a.shape[0], 3)
+    assert ctx.skin_tris.shape == (ctx.skin_verts.shape[0], 3)
     np.testing.assert_array_equal(cp.asnumpy(ctx.skin_tris), ctx.mesh.skin_tris)
     # The gathered coordinates are the same triangles, so the two views must agree.
     np.testing.assert_array_equal(
-        cp.asnumpy(ctx.nodes_mm[ctx.skin_tris[:, 0]]), cp.asnumpy(ctx.skin_a)
+        cp.asnumpy(ctx.nodes_mm[ctx.skin_tris]), cp.asnumpy(ctx.skin_verts)
     )
+
+
+def test_csr_matmul_is_the_product_and_repeats_bitwise(cp):
+    """The basis products must not take their bits from a run-time choice of algorithm."""
+    import cupyx.scipy.sparse as csp
+
+    from cunibs.fem.assembly import csr_matmul
+
+    rng = np.random.default_rng(0)
+    a = csp.random(4000, 4000, density=0.004, format="csr", dtype=cp.float64, random_state=1)
+    x = cp.asarray(rng.standard_normal((4000, 8)))
+    y = csr_matmul(a, x)
+    np.testing.assert_allclose(cp.asnumpy(y), cp.asnumpy(a @ x), rtol=1e-12, atol=1e-12)
+    for _ in range(3):
+        np.testing.assert_array_equal(cp.asnumpy(csr_matmul(a, x)), cp.asnumpy(y))
+    np.testing.assert_array_equal(cp.asnumpy(csr_matmul(a, x[:, 3])), cp.asnumpy(y[:, 3]))

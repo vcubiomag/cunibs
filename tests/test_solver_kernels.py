@@ -104,63 +104,12 @@ def rhs_reference(mesh_arrays, wg=None):
 
 
 def test_rhs_assemble_matches_numpy(cp, dev, mesh_arrays, stream):
-    """The unweighted variant folds neg_vc in itself; nothing else in the suite calls it."""
+    """The per-element assembly the UQ draws use, which folds neg_vc in itself."""
     from cunibs.solver import rhs_assemble
 
     b = cp.empty(N_NODES, dtype=cp.float32)
     rhs_assemble(dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b, stream)
     np.testing.assert_allclose(cp.asnumpy(b), rhs_reference(mesh_arrays), rtol=1e-4)
-
-
-def test_rhs_assemble_staged_matches_numpy(cp, dev, mesh_arrays, stream):
-    from cunibs.solver import rhs_assemble_staged
-
-    b = cp.empty(N_NODES, dtype=cp.float32)
-    rhs_assemble_staged(
-        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b, stream
-    )
-    np.testing.assert_allclose(cp.asnumpy(b), rhs_reference(mesh_arrays), rtol=1e-4)
-
-
-def test_rhs_assemble_staged_equals_fused(cp, dev, stream):
-    """Both spellings must produce the same RHS; only their memory traffic differs."""
-    from cunibs.solver import rhs_assemble, rhs_assemble_staged
-
-    fused = cp.empty(N_NODES, dtype=cp.float32)
-    staged = cp.empty(N_NODES, dtype=cp.float32)
-    rhs_assemble(
-        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], fused, stream
-    )
-    rhs_assemble_staged(
-        dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], staged, stream
-    )
-    np.testing.assert_allclose(cp.asnumpy(fused), cp.asnumpy(staged), rtol=1e-5)
-
-
-@pytest.mark.parametrize("k", [1, 2, 3, 8])
-def test_rhs_assemble_staged_block_matches_single(cp, dev, stream, k):
-    """Every column of the block RHS must equal the single-RHS kernel on that column."""
-    from cunibs.solver import rhs_assemble_staged, rhs_assemble_staged_block
-
-    rng = np.random.default_rng(2)
-    columns = [
-        cp.ascontiguousarray(cp.asarray(rng.standard_normal((N_TET, 3)).astype(np.float32)))
-        for _ in range(k)
-    ]
-
-    b_block = cp.empty((N_NODES, k), dtype=cp.float32)
-    rhs_assemble_staged_block(
-        columns, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b_block, stream
-    )
-
-    for c, dadt in enumerate(columns):
-        single = cp.empty(N_NODES, dtype=cp.float32)
-        rhs_assemble_staged(
-            dadt, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], single, stream
-        )
-        np.testing.assert_array_equal(
-            cp.asnumpy(b_block[:, c]), cp.asnumpy(single), err_msg=f"column {c}"
-        )
 
 
 def _rhs_operator(cp, dev, mesh_arrays):
@@ -180,9 +129,9 @@ def _rhs_operator(cp, dev, mesh_arrays):
     return a.indptr, op
 
 
-def test_rhs_operator_matches_the_staged_assembly(cp, dev, mesh_arrays, stream):
-    """B a must equal the staged path fed the element average of the same nodal field."""
-    from cunibs.solver import dadt_node_to_element, rhs_assemble_staged, rhs_operator_apply
+def test_rhs_operator_matches_the_element_assembly(cp, dev, mesh_arrays, stream):
+    """B a must equal the per-element assembly fed the element average of the same nodal field."""
+    from cunibs.solver import dadt_node_to_element, rhs_assemble, rhs_operator_apply
 
     indptr, op = _rhs_operator(cp, dev, mesh_arrays)
     rng = np.random.default_rng(4)
@@ -193,9 +142,11 @@ def test_rhs_operator_matches_the_staged_assembly(cp, dev, mesh_arrays, stream):
 
     elm = cp.empty((N_TET, 3), dtype=cp.float32)
     dadt_node_to_element(nodal, dev["tet_nodes"], elm, stream)
-    staged = cp.empty(N_NODES, dtype=cp.float32)
-    rhs_assemble_staged(elm, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], staged, stream)
-    np.testing.assert_allclose(cp.asnumpy(b[:, 0]), cp.asnumpy(staged), rtol=1e-5, atol=1e-6)
+    by_element = cp.empty(N_NODES, dtype=cp.float32)
+    rhs_assemble(elm, dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], by_element, stream)
+    np.testing.assert_allclose(
+        cp.asnumpy(b[:, 0]), cp.asnumpy(by_element), rtol=1e-5, atol=1e-6
+    )
 
 
 @pytest.mark.parametrize("k", [1, 2, 3, 8])
@@ -237,12 +188,12 @@ def test_dadt_node_to_element_block_matches_single(cp, dev, stream, k):
 
 def test_rhs_assembly_is_bit_reproducible(cp, dev, stream):
     """Node-centric, atomic-free, fixed summation order — repeated calls must be identical."""
-    from cunibs.solver import rhs_assemble_staged
+    from cunibs.solver import rhs_assemble
 
     runs = []
     for _ in range(3):
         b = cp.empty(N_NODES, dtype=cp.float32)
-        rhs_assemble_staged(
+        rhs_assemble(
             dev["dadt_elm"], dev["g"], dev["neg_vc"], dev["ptr"], dev["idx"], b, stream
         )
         runs.append(cp.asnumpy(b))
@@ -406,26 +357,26 @@ def test_element_weight_is_linear_in_values(cp, dev, stream):
     np.testing.assert_allclose(b, 3.0 * a, rtol=1e-12)
 
 
-def test_node_scatter3_matches_numpy(cp, dev, mesh_arrays, stream):
+def test_node_gather3_matches_numpy(cp, dev, mesh_arrays, stream):
     """node_w[n,k] = ¼ Σ_{corners c of n} w_e[c>>2, k]."""
-    from cunibs.solver import node_scatter3
+    from cunibs.solver import node_gather3
 
     rng = np.random.default_rng(4)
     w_e = rng.standard_normal((N_TET, 3))
     node_w = cp.empty((N_NODES, 3), dtype=cp.float64)
-    node_scatter3(cp.asarray(w_e), dev["ptr"], dev["idx"], node_w, stream)
+    node_gather3(cp.asarray(w_e), dev["ptr"], dev["idx"], node_w, stream)
 
     expected = np.zeros((N_NODES, 3))
     np.add.at(expected, mesh_arrays["tet_nodes"].ravel(), np.repeat(w_e, 4, axis=0))
     np.testing.assert_allclose(cp.asnumpy(node_w), 0.25 * expected, rtol=1e-12)
 
 
-def test_node_scatter3_counts_each_incident_corner(cp, dev, mesh_arrays, stream):
+def test_node_gather3_counts_each_incident_corner(cp, dev, mesh_arrays, stream):
     """With w_e ≡ 1 each node gets ¼ × (number of corners it owns)."""
-    from cunibs.solver import node_scatter3
+    from cunibs.solver import node_gather3
 
     node_w = cp.empty((N_NODES, 3), dtype=cp.float64)
-    node_scatter3(cp.ones((N_TET, 3), dtype=cp.float64), dev["ptr"], dev["idx"], node_w, stream)
+    node_gather3(cp.ones((N_TET, 3), dtype=cp.float64), dev["ptr"], dev["idx"], node_w, stream)
     counts = np.bincount(mesh_arrays["tet_nodes"].ravel(), minlength=N_NODES)
     np.testing.assert_allclose(
         cp.asnumpy(node_w), 0.25 * np.tile(counts[:, None], 3), rtol=1e-12
@@ -437,14 +388,14 @@ def test_node_scatter3_counts_each_incident_corner(cp, dev, mesh_arrays, stream)
 
 def test_accumulate_moments_adds_to_the_running_sums(cp, stream):
     """sum_e += |E|, sumsq_e += |E|² — it accumulates, it does not overwrite."""
-    from cunibs.solver import accumulate_moments
+    from cunibs.solver import accumulate_moments_block
 
     rng = np.random.default_rng(5)
     draws = rng.random((6, N_TET)).astype(np.float32) + 0.1
     sum_e = cp.zeros(N_TET, dtype=cp.float64)
     sumsq_e = cp.zeros(N_TET, dtype=cp.float64)
     for magn in draws:
-        accumulate_moments(cp.asarray(magn), sum_e, sumsq_e, stream)
+        accumulate_moments_block([cp.asarray(magn)], sum_e, sumsq_e, stream)
 
     ref = draws.astype(np.float64)
     np.testing.assert_allclose(cp.asnumpy(sum_e), ref.sum(axis=0), rtol=1e-12)
@@ -452,26 +403,26 @@ def test_accumulate_moments_adds_to_the_running_sums(cp, stream):
 
 
 def test_accumulate_moments_respects_a_nonzero_starting_value(cp, stream):
-    from cunibs.solver import accumulate_moments
+    from cunibs.solver import accumulate_moments_block
 
     magn = cp.full(N_TET, 2.0, dtype=cp.float32)
     sum_e = cp.full(N_TET, 10.0, dtype=cp.float64)
     sumsq_e = cp.full(N_TET, 100.0, dtype=cp.float64)
-    accumulate_moments(magn, sum_e, sumsq_e, stream)
+    accumulate_moments_block([magn], sum_e, sumsq_e, stream)
     np.testing.assert_allclose(cp.asnumpy(sum_e), 12.0)
     np.testing.assert_allclose(cp.asnumpy(sumsq_e), 104.0)
 
 
 def test_accumulate_moments_recovers_mean_and_variance(cp, stream):
     """The moments must reproduce the ensemble mean and variance the UQ path derives."""
-    from cunibs.solver import accumulate_moments
+    from cunibs.solver import accumulate_moments_block
 
     rng = np.random.default_rng(6)
     draws = rng.random((64, N_TET)).astype(np.float32) + 0.5
     sum_e = cp.zeros(N_TET, dtype=cp.float64)
     sumsq_e = cp.zeros(N_TET, dtype=cp.float64)
     for magn in draws:
-        accumulate_moments(cp.asarray(magn), sum_e, sumsq_e, stream)
+        accumulate_moments_block([cp.asarray(magn)], sum_e, sumsq_e, stream)
 
     n = draws.shape[0]
     mean = cp.asnumpy(sum_e) / n
@@ -499,7 +450,7 @@ def test_dadt_nbody_matches_analytic_dipoles(cp, stream):
     out = cp.empty((40, 3), dtype=cp.float32)
     dadt_nbody(
         cp.ascontiguousarray(cp.asarray(s.astype(np.float32))),
-        cp.ascontiguousarray(cp.asarray(mp)),
+        cp.ascontiguousarray(cp.asarray(mp[None])),
         cp.ascontiguousarray(cp.asarray((s.astype(np.float32) ** 2).sum(1))),
         cp.ascontiguousarray(cp.asarray(r.astype(np.float32))),
         out,
@@ -524,16 +475,14 @@ def test_place_transforms_batches_independently(cp, cube_subject, stream):
     dists = np.array([4.0, 1.0, 8.0, 0.0])
 
     def run(sel):
-        out = cp.empty((len(sel), 16), dtype=cp.float64)
+        out = cp.empty((len(sel), 4, 4), dtype=cp.float64)
         degenerate = cp.empty(len(sel), dtype=cp.int32)
         place_transforms(
             cp.ascontiguousarray(cp.asarray(centers[sel])),
             cp.ascontiguousarray(cp.asarray(handles[sel])),
             cp.ascontiguousarray(cp.asarray(dists[sel])),
-            ctx.skin_a,
-            ctx.skin_b,
-            ctx.skin_c,
-            cp.ascontiguousarray(ctx.skin_tri_normals, dtype=cp.float64),
+            ctx.skin_verts,
+            ctx.skin_tri_normals,
             out,
             degenerate,
             stream,
