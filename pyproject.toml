@@ -63,7 +63,6 @@ dev = [
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
-pythonpath = ["tools"]
 addopts = "-ra --strict-markers --strict-config --import-mode=importlib --durations=15"
 xfail_strict = true
 markers = [

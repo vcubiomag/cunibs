@@ -19,9 +19,9 @@ import json
 from pathlib import Path
 
 import numpy as np
-from msh_writer import pack_msh
 
 from cunibs.mesh import SKIN_SURFACE_TAG, parse_msh_binary
+from cunibs.mesh import _pack_msh as pack_msh
 
 
 def crop(

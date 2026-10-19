@@ -7,10 +7,14 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn
 
+import h5py
 import numpy as np
 import numpy.typing as npt
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _ELEM_TYPE_TRIANGLE = 2
 _ELEM_TYPE_TET = 4
@@ -164,7 +168,7 @@ def _known_surfaces(block: npt.NDArray[np.int32]) -> _ElementBlock:
     return _ElementBlock(block[:, 3:][keep], tags[keep])
 
 
-def _reject_unknown_volume_tags(tags: npt.NDArray[np.int32], cursor: _MshCursor) -> None:
+def _reject_unknown_volume_tags(tags: npt.NDArray[np.int32], path: Path) -> None:
     """Refuse a mesh whose tetrahedra carry tags this build has no tissue for.
 
     Dropping them instead would delete a whole tissue while the field computed from what is
@@ -176,8 +180,8 @@ def _reject_unknown_volume_tags(tags: npt.NDArray[np.int32], cursor: _MshCursor)
         return
     offenders, counts = np.unique(tags[~known], return_counts=True)
     histogram = ", ".join(f"{int(t)}: {int(c)}" for t, c in zip(offenders, counts, strict=True))
-    cursor.fail(
-        f"{int(counts.sum())} tetrahedra carry volume tags absent from "
+    raise ValueError(
+        f"{path}: {int(counts.sum())} tetrahedra carry volume tags absent from "
         f"VOLUME_KEY_TO_LABEL ({histogram})"
     )
 
@@ -297,7 +301,7 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         # The tag check reads the contiguous copy, which is faster to scan than the stride-28 view
         # over the mapping it comes from.
         tet_tags = np.array(tet.tags)
-        _reject_unknown_volume_tags(tet_tags, cursor)
+        _reject_unknown_volume_tags(tet_tags, mesh_file)
 
         surface = _join_blocks(surf_blocks, _ELEMENT_NODES[_ELEM_TYPE_TRIANGLE])
         nodes_mm, tet_nodes, surf_tris = _reindex_nodes(
@@ -305,6 +309,156 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         )
         _reject_nonfinite_nodes(nodes_mm, mesh_file)
         return MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surface.tags)
+
+
+def _pack_msh(
+    nodes_mm: npt.ArrayLike,
+    tets_1based: npt.ArrayLike,
+    tet_tags: npt.ArrayLike,
+    tris_1based: npt.ArrayLike,
+    tri_tags: npt.ArrayLike,
+    extra_blocks: Sequence[tuple[int, int, bytes]] = (),
+) -> bytes:
+    """Serialize a binary Gmsh 2.2 mesh in the dialect :func:`parse_msh_binary` reads.
+
+    Element ids are assigned triangles first, then tetrahedra. ``extra_blocks`` appends raw
+    ``(elem_type, count, payload)`` blocks after the tets, which the tests use to exercise the
+    reader's element-skipping path.
+    """
+    nodes = np.ascontiguousarray(nodes_mm, dtype=np.float64).reshape(-1, 3)
+    tets = np.ascontiguousarray(tets_1based, dtype=np.int32).reshape(-1, 4)
+    tris = np.ascontiguousarray(tris_1based, dtype=np.int32).reshape(-1, 3)
+    tet_tags = np.ascontiguousarray(tet_tags, dtype=np.int32).reshape(-1)
+    tri_tags = np.ascontiguousarray(tri_tags, dtype=np.int32).reshape(-1)
+    if tet_tags.shape[0] != tets.shape[0] or tri_tags.shape[0] != tris.shape[0]:
+        raise ValueError("Tag counts must match element counts.")
+
+    n_nodes, n_tri, n_tet = nodes.shape[0], tris.shape[0], tets.shape[0]
+
+    node_rec = np.empty(n_nodes, dtype=_NODE_DTYPE)
+    node_rec["id"] = np.arange(1, n_nodes + 1, dtype=np.int32)
+    node_rec["xyz"] = nodes
+
+    tri_blk = np.empty((n_tri, 6), dtype="<i4")
+    tri_blk[:, 0] = np.arange(1, n_tri + 1)
+    tri_blk[:, 1] = tri_tags
+    tri_blk[:, 2] = tri_tags
+    tri_blk[:, 3:] = tris
+
+    tet_blk = np.empty((n_tet, 7), dtype="<i4")
+    tet_blk[:, 0] = np.arange(n_tri + 1, n_tri + n_tet + 1)
+    tet_blk[:, 1] = tet_tags
+    tet_blk[:, 2] = tet_tags
+    tet_blk[:, 3:] = tets
+
+    total = n_tri + n_tet + sum(count for _, count, _ in extra_blocks)
+
+    parts = [
+        b"$MeshFormat\n2.2 1 8\n",
+        struct.pack("<i", 1),
+        b"\n$EndMeshFormat\n",
+        b"$Nodes\n%d\n" % n_nodes,
+        node_rec.tobytes(),
+        b"$EndNodes\n",
+        b"$Elements\n%d\n" % total,
+        struct.pack("<3i", 2, n_tri, 2),
+        tri_blk.tobytes(),
+        struct.pack("<3i", 4, n_tet, 2),
+        tet_blk.tobytes(),
+    ]
+    for elem_type, count, payload in extra_blocks:
+        parts.append(struct.pack("<3i", elem_type, count, 2))
+        parts.append(payload)
+    parts.append(b"$EndElements\n")
+    return b"".join(parts)
+
+
+_H5_MAGIC = b"\x89HDF\r\n\x1a\n"
+_H5_FORMAT_VERSION = 1
+# Tags are stored at the narrowest width that holds every known key and widened on load. Nothing
+# is compressed, because loading has to stay faster than parsing the equivalent .msh.
+_H5_DTYPES = {
+    "nodes_mm": np.dtype("<f8"),
+    "tet_nodes": np.dtype("<i4"),
+    "tet_tags": np.dtype("u1"),
+    "surf_tris": np.dtype("<i4"),
+    "surf_tags": np.dtype("<u2"),
+}
+EEG_POSITIONS_GROUP = "eeg_positions"
+
+
+def is_hdf5(path: str | Path) -> bool:
+    with Path(path).open("rb") as f:
+        return f.read(len(_H5_MAGIC)) == _H5_MAGIC
+
+
+def _write_h5(arrays: MeshArrays, path: Path, caps: dict[str, str]) -> None:
+    with h5py.File(path, "w") as f:
+        f.attrs["format_version"] = _H5_FORMAT_VERSION
+        for name, dtype in _H5_DTYPES.items():
+            f.create_dataset(name, data=np.asarray(getattr(arrays, name)).astype(dtype))
+        if caps:
+            group = f.create_group(EEG_POSITIONS_GROUP)
+            for cap, text in caps.items():
+                group[cap] = text
+
+
+def parse_h5(mesh_file: Path) -> MeshArrays:
+    """Read a mesh written by :meth:`HeadMesh.save`, applying the checks the .msh parser makes."""
+    with h5py.File(mesh_file, "r") as f:
+        stored = int(f.attrs.get("format_version", 0))
+        if stored != _H5_FORMAT_VERSION:
+            raise ValueError(
+                f"{mesh_file}: mesh format version {stored} is not readable by this version of "
+                f"cuNIBS (expected {_H5_FORMAT_VERSION})"
+            )
+        missing = [name for name in _H5_DTYPES if name not in f]
+        if missing:
+            raise ValueError(f"{mesh_file}: no {', '.join(missing)} dataset")
+        arrays = MeshArrays(
+            f["nodes_mm"][...],
+            f["tet_nodes"][...],
+            f["tet_tags"][...].astype(np.int32),
+            f["surf_tris"][...],
+            f["surf_tags"][...].astype(np.int32),
+        )
+
+    for name, width in (("nodes_mm", 3), ("tet_nodes", 4), ("surf_tris", 3)):
+        shape = getattr(arrays, name).shape
+        if len(shape) != 2 or shape[1] != width:
+            raise ValueError(f"{mesh_file}: {name} has shape {shape}, expected (n, {width})")
+    if arrays.tet_tags.shape[0] != arrays.tet_nodes.shape[0]:
+        raise ValueError(f"{mesh_file}: tet_tags and tet_nodes differ in length")
+    if arrays.surf_tags.shape[0] != arrays.surf_tris.shape[0]:
+        raise ValueError(f"{mesh_file}: surf_tags and surf_tris differ in length")
+    if arrays.tet_nodes.shape[0] == 0:
+        raise ValueError(f"{mesh_file}: no tetrahedra")
+    _reject_unknown_volume_tags(arrays.tet_tags, mesh_file)
+    n_nodes = arrays.nodes_mm.shape[0]
+    for index, what in (
+        (arrays.tet_nodes, "a tetrahedron"),
+        (arrays.surf_tris, "a surface triangle"),
+    ):
+        if index.size and index.view(np.dtype(np.uint32)).max() >= n_nodes:
+            raise _node_id_error(mesh_file, what)
+    _reject_nonfinite_nodes(arrays.nodes_mm, mesh_file)
+    return arrays
+
+
+def parse_mesh(mesh_file: Path) -> MeshArrays:
+    """Parse a mesh in either format :meth:`HeadMesh.save` writes, told apart by content."""
+    return parse_h5(mesh_file) if is_hdf5(mesh_file) else parse_msh_binary(mesh_file)
+
+
+def _eeg_caps(source: str | Path | None) -> dict[str, str]:
+    """Cap name -> CSV text, from a CHARM ``eeg_positions`` directory or one cap CSV in it."""
+    if source is None:
+        return {}
+    source = Path(source)
+    files = sorted(source.glob("*.csv")) if source.is_dir() else [source]
+    if not files:
+        raise ValueError(f"{source}: no EEG cap CSV files")
+    return {p.stem: p.read_text() for p in files}
 
 
 def _on_host(array: Any) -> npt.NDArray[Any]:
@@ -441,13 +595,44 @@ class HeadMesh:
             h.update(a)
         return h.hexdigest()
 
+    def save(self, path: str | Path, *, eeg_positions: str | Path | None = None) -> None:
+        """Write this mesh to ``path``, as HDF5 for ``.h5`` or binary Gmsh 2.2 for ``.msh``.
+
+        Either file loads back through :func:`load_mesh` to the same :attr:`content_hash`. The
+        HDF5 file is smaller and faster to load.
+
+        ``eeg_positions`` is a CHARM ``eeg_positions`` directory, or one cap CSV from it. Each cap
+        is stored verbatim in the HDF5 file, so :func:`~cunibs.head.read_cap` reads electrode
+        positions from the mesh file itself. A .msh file has nowhere to put them.
+        """
+        path = Path(path)
+        if path.suffix == ".msh":
+            if eeg_positions is not None:
+                raise ValueError("a .msh file cannot carry EEG positions; save as .h5")
+            path.write_bytes(
+                _pack_msh(
+                    self.nodes_mm,
+                    self.tet_nodes + 1,
+                    self.tet_tags,
+                    self.surf_tris + 1,
+                    self.surf_tags,
+                )
+            )
+        elif path.suffix in (".h5", ".hdf5"):
+            arrays = MeshArrays(
+                self.nodes_mm, self.tet_nodes, self.tet_tags, self.surf_tris, self.surf_tags
+            )
+            _write_h5(arrays, path, _eeg_caps(eeg_positions))
+        else:
+            raise ValueError(f"{path}: expected a .h5 or .msh suffix")
+
     def __repr__(self) -> str:
         return f"HeadMesh(n_nodes={self.n_nodes}, n_tets={self.n_tets})"
 
 
 def load_mesh(mesh_file: str | Path) -> HeadMesh:
-    """Load a binary Gmsh 2.2 tetrahedral head mesh."""
-    return HeadMesh(*parse_msh_binary(Path(mesh_file)))
+    """Load a tetrahedral head mesh from binary Gmsh 2.2 or from :meth:`HeadMesh.save`'s HDF5."""
+    return HeadMesh(*parse_mesh(Path(mesh_file)))
 
 
 # Tissues a head model has to have for a TMS field to mean anything. Deliberately not the whole
@@ -533,7 +718,7 @@ def validate_mesh(mesh_file: str | Path) -> MeshReport:
     """
     path = Path(mesh_file)
     try:
-        arrays = parse_msh_binary(path)
+        arrays = parse_mesh(path)
     except (ValueError, OSError) as exc:
         return MeshReport(path=path, ok=False, errors=(str(exc),))
 

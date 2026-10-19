@@ -6,9 +6,9 @@ import time
 
 import numpy as np
 import pytest
-from msh_writer import pack_msh
 
-from cunibs.mesh import VOLUME_KEY_TO_LABEL, load_mesh, parse_msh_binary
+from cunibs.mesh import VOLUME_KEY_TO_LABEL, HeadMesh, load_mesh, parse_msh_binary
+from cunibs.mesh import _pack_msh as pack_msh
 
 # Node 5 is unused and must be removed during reindexing.
 _NODES = np.array(
@@ -565,3 +565,101 @@ def test_validate_mesh_returns_a_reason_instead_of_raising(tmp_path):
     truncated.write_bytes(_write_mesh(tmp_path, nodes, tets, tags).read_bytes()[:200])
     report = validate_mesh(truncated)
     assert not report.ok and report.errors
+
+
+# --- HeadMesh.save ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("suffix", [".h5", ".msh"])
+def test_save_round_trips_exactly(tmp_path, suffix):
+    mesh = load_mesh(_write(tmp_path))
+    out = tmp_path / f"saved{suffix}"
+    mesh.save(out)
+    assert load_mesh(out).content_hash == mesh.content_hash
+
+
+def test_h5_round_trips_every_tag_at_scale(tmp_path):
+    n = 41_139
+    rng = np.random.default_rng(0)
+    nodes, tets, _ = _disjoint_mesh(n, np.full(n, 2))
+    tags = rng.choice(np.array(sorted(VOLUME_KEY_TO_LABEL), np.int32), n)
+    surf_tags = rng.choice(np.array([1002, 1005, 1099], np.int32), n)
+    mesh = HeadMesh(nodes, tets, tags, tets[:, :3].copy(), surf_tags)
+    mesh.save(tmp_path / "big.h5")
+    loaded = load_mesh(tmp_path / "big.h5")
+    assert loaded.tet_tags.dtype == np.int32 and loaded.surf_tags.dtype == np.int32
+    assert loaded.content_hash == mesh.content_hash
+
+
+def test_validate_mesh_reads_h5(tmp_path):
+    from cunibs.mesh import validate_mesh
+
+    load_mesh(_write(tmp_path)).save(tmp_path / "mesh.h5")
+    report = validate_mesh(tmp_path / "mesh.h5")
+    assert report.ok and report.n_tets == 1 and report.n_skin_tris == 1
+
+
+def test_save_rejects_an_unknown_suffix(tmp_path):
+    with pytest.raises(ValueError, match=r"\.h5 or \.msh"):
+        load_mesh(_write(tmp_path)).save(tmp_path / "mesh.vtk")
+
+
+def test_msh_cannot_carry_eeg_positions(tmp_path):
+    (tmp_path / "cap.csv").write_text("Electrode,0,0,1,Cz\n")
+    with pytest.raises(ValueError, match=r"save as \.h5"):
+        load_mesh(_write(tmp_path)).save(
+            tmp_path / "out.msh", eeg_positions=tmp_path / "cap.csv"
+        )
+
+
+def _rewrite_h5(path, **changes):
+    import h5py
+
+    with h5py.File(path, "r+") as f:
+        for name, value in changes.items():
+            if name == "format_version":
+                f.attrs[name] = value
+            else:
+                del f[name]
+                f[name] = value
+
+
+@pytest.mark.parametrize(
+    ("changes", "match"),
+    [
+        ({"format_version": 99}, "format version 99"),
+        ({"tet_nodes": np.array([[0, 1, 2, 7]], np.int32)}, "outside the node table"),
+        ({"surf_tris": np.array([[0, 1, 9]], np.int32)}, "outside the node table"),
+        ({"tet_tags": np.array([42], np.uint8)}, "absent from"),
+        ({"nodes_mm": np.full((4, 3), np.nan)}, "non-finite"),
+        ({"tet_tags": np.array([2, 2], np.uint8)}, "differ in length"),
+    ],
+)
+def test_h5_load_applies_the_msh_checks(tmp_path, changes, match):
+    path = tmp_path / "mesh.h5"
+    load_mesh(_write(tmp_path)).save(path)
+    _rewrite_h5(path, **changes)
+    with pytest.raises(ValueError, match=match):
+        load_mesh(path)
+
+
+@pytest.mark.realmesh
+def test_patch_round_trips_through_h5(tmp_path, patch_mesh):
+    patch_mesh.save(tmp_path / "patch.h5")
+    assert load_mesh(tmp_path / "patch.h5").content_hash == patch_mesh.content_hash
+
+
+@pytest.mark.reference
+def test_reference_mesh_round_trips_with_its_caps(tmp_path, reference_mesh_path):
+    from cunibs.head import read_cap, read_subject_cap
+
+    mesh = load_mesh(reference_mesh_path)
+    out = tmp_path / "subject.h5"
+    mesh.save(out, eeg_positions=reference_mesh_path.parent / "eeg_positions")
+    assert out.stat().st_size < reference_mesh_path.stat().st_size
+    assert load_mesh(out).content_hash == mesh.content_hash
+    from_csv = read_subject_cap(reference_mesh_path.parent)
+    from_h5 = read_cap(out)
+    assert from_h5.keys() == from_csv.keys()
+    for label, xyz in from_csv.items():
+        np.testing.assert_array_equal(from_h5[label], xyz)

@@ -77,6 +77,22 @@ cuNIBS assigns each tissue the standard SimNIBS conductivity. To check a mesh
 before using it, call `validate_mesh("subject.msh")`. It returns a report instead
 of raising, so you can screen a whole cohort up front.
 
+A mesh can be saved as HDF5, which is smaller and loads faster than the `.msh`.
+Pass the CHARM `eeg_positions` directory to keep the electrode positions in the
+same file. `load_mesh`, `Subject.from_mesh` and `validate_mesh` read either format,
+and `read_cap` reads the positions back.
+
+```python
+from cunibs import Subject, load_mesh
+from cunibs.head import read_cap
+
+load_mesh("m2m_subject_id/subject_id.msh").save(
+    "subject_id.h5", eeg_positions="m2m_subject_id/eeg_positions"
+)
+subject = Subject.from_mesh("subject_id.h5")
+c3 = read_cap("subject_id.h5")["C3"]
+```
+
 ### Coils
 
 cuNIBS includes the 25 validated coil models from Drakaki et al. (2022). Load

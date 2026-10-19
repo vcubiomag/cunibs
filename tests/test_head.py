@@ -272,3 +272,36 @@ def test_thickness_with_the_surfaces_swapped_raises(monkeypatch):
     assert geometry.tissue_thickness_mm(None, None, "cortical_bone", "csf")[0] == 3.0
     with pytest.raises(ValueError, match="swapped"):
         geometry.tissue_thickness_mm(None, None, "csf", "cortical_bone")
+
+
+def _cap_mesh(tmp_path, caps):
+    from cunibs.mesh import HeadMesh
+
+    root = tmp_path / "eeg_positions"
+    root.mkdir()
+    for name in caps:
+        (root / f"{name}.csv").write_text(_CAP)
+    nodes = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64)
+    mesh = HeadMesh(
+        nodes,
+        np.array([[0, 1, 2, 3]], np.int32),
+        np.array([2], np.int32),
+        np.array([[0, 1, 2]], np.int32),
+        np.array([1005], np.int32),
+    )
+    path = tmp_path / "subject.h5"
+    mesh.save(path, eeg_positions=root)
+    return path
+
+
+def test_caps_saved_with_a_mesh_read_back_by_name(tmp_path):
+    path = _cap_mesh(tmp_path, [eeg.DEFAULT_CAP, "EEG10-20_Okamoto_2004"])
+    assert set(eeg.read_cap(path)) == {"Fp1", "AF7", "Cz"}
+    assert set(eeg.read_fiducials(path, "EEG10-20_Okamoto_2004")) == {"Nz", "LPA"}
+    assert set(eeg.read_subject_cap(path)) == {"Fp1", "AF7", "Cz"}
+
+
+def test_a_missing_cap_in_a_mesh_names_what_is_there(tmp_path):
+    path = _cap_mesh(tmp_path, ["EEG10-20_Okamoto_2004"])
+    with pytest.raises(ValueError, match="has: EEG10-20_Okamoto_2004"):
+        eeg.read_cap(path)
