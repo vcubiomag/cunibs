@@ -2,8 +2,8 @@
 
 ``simulate`` batches placements through ``solve_placements_block`` at ``MAX_BLOCK`` wide
 unless memory runs short, so the lockstep k-RHS kernels and the RHS padding are what almost every caller
-actually runs. The oracle throughout is the one-placement-at-a-time ``solve_placement`` path,
-held to the same 2e-5 relative-L2 gate the block probe uses.
+actually runs. The oracle throughout is ``serial`` below, one placement at a time through the
+single-RHS ``solve_grounded``, held to the same 2e-5 relative-L2 gate the block probe uses.
 """
 
 from __future__ import annotations
@@ -11,8 +11,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from cunibs.fem import solve_placement, solve_placements_block
-from cunibs.fem.solve import MAX_BLOCK
+from cunibs.fem import solve_grounded, solve_placements_block
+from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
+from cunibs.fem.solve import MAX_BLOCK, _assemble_rhs, _dadt_node_to_elm, _reconstruct_e_kernel
 from cunibs.simulation import Placement
 
 pytestmark = pytest.mark.gpu
@@ -55,9 +56,27 @@ def patch_sites(patch_mesh):
 
 
 def serial(ctx, coil, sites):
-    return [
-        solve_placement(ctx, coil.positions_m, coil.moments, c, h, d, DIDT) for c, h, d in sites
-    ]
+    """Each site alone through the single-RHS solve and the per-element reconstruction."""
+    out = []
+    for c, h, d in sites:
+        tf = compute_coil_transform(ctx, c, h, d)
+        dadt = coil_dadt_at_nodes(coil.positions_m, coil.moments, tf, DIDT, ctx.nodes_mm)
+        b = _assemble_rhs(ctx, dadt.reshape(ctx.n_nodes, 1, 3)).ravel()
+        v = solve_grounded(ctx.solver, b)
+        e, magn = _reconstruct_e_kernel(
+            v, ctx.tet_nodes, ctx.g, _dadt_node_to_elm(dadt, ctx.tet_nodes)
+        )
+        out.append(
+            {
+                "transform": tf,
+                "E": e,
+                "magnE": magn,
+                "v": v,
+                "iterations": ctx.solver.last_iterations,
+                "relative_residual": ctx.solver.last_relative_residual,
+            }
+        )
+    return out
 
 
 def block(ctx, coil, sites):
@@ -65,7 +84,7 @@ def block(ctx, coil, sites):
 
 
 def test_block_k1_matches_serial(cube_subject, synthetic_coil):
-    """k == 1 runs the block kernels at width 1 and matches ``solve_placement`` bit for bit.
+    """k == 1 runs the block kernels at width 1 and matches the serial path bit for bit.
 
     Two separate implementations over the same operator, agreeing because both reduce in the
     same order.
@@ -106,6 +125,30 @@ def test_single_and_block_solvers_share_one_order(cp, fresh_subject, patch_mesh)
         solver.precond, b_block, x_block, solver.tolerance, solver.max_iters, stream
     )
     np.testing.assert_array_equal(cp.asnumpy(x_block[:, 0]), cp.asnumpy(x_single))
+
+
+def test_a_zero_column_solves_to_zero_beside_a_live_one(cube_subject):
+    """A zero right-hand side has the exact solution zero, and its column changes no other."""
+    import cupy as cp
+
+    solver = cube_subject.context.solver
+    n = int(solver.idx.shape[0])
+    stream = cp.cuda.get_current_stream().ptr
+    b = cp.sin(cp.arange(n, dtype=cp.float64) * 0.5) + 2.0
+
+    def solve(B):
+        X = cp.empty_like(B)
+        _, rels, iters = solver.pcg.solve_mixed_block(
+            solver.precond, B, X, solver.tolerance, solver.max_iters, stream
+        )
+        return X, rels, iters
+
+    alone, _, _ = solve(cp.ascontiguousarray(b[:, None]))
+    mixed, rels, iters = solve(cp.ascontiguousarray(cp.stack([b, cp.zeros(n)], axis=1)))
+    np.testing.assert_array_equal(cp.asnumpy(mixed[:, 0]), cp.asnumpy(alone[:, 0]))
+    assert not bool(mixed[:, 1].any())
+    assert rels[1] == 0.0
+    assert iters[1] == 0
 
 
 @pytest.mark.parametrize("k", [2, 4, 8])
@@ -367,7 +410,9 @@ def test_a_native_allocation_failure_is_a_memory_error(
             piece //= 2
     try:
         with pytest.raises(MemoryError) as raised:
-            PcgAmgSolver(solver.row_ptr, solver.col_idx, solver.values)
+            PcgAmgSolver(
+                solver.row_ptr, solver.col_idx, solver.values, cp.cuda.get_current_stream().ptr
+            )
         assert isinstance(raised.value, CudaOutOfMemory)
         with pytest.raises(MemoryError):
             cp.empty(1 << 30, dtype=cp.uint8)

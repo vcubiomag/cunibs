@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -27,8 +26,8 @@ struct PcgBlockResult {
 
 // A captured CG iteration body, replayed until the preconditioner it was captured against
 // changes. The body only touches solver-owned buffers, so a graph captured in an earlier
-// solve stays valid across solves; `key` is what identifies "the same body" -- the
-// preconditioner's address and generation, plus the block width for the k-RHS solve.
+// solve stays valid across solves; `key` is what identifies "the same body": the
+// preconditioner's address and generation, plus the block width.
 class GraphCache {
 public:
     struct Key {
@@ -40,55 +39,60 @@ public:
         bool operator==(const Key&) const = default;
     };
 
-    ~GraphCache() { reset(); }
+    GraphCache() = default;
+    ~GraphCache() { clear(); }
     GraphCache(const GraphCache&) = delete;
     GraphCache& operator=(const GraphCache&) = delete;
-    GraphCache() = default;
 
     // Runs `body` once on `stream`, replaying the cached graph when there is one.
     //
     // `iteration` is the caller's 1-based loop counter: the first iteration always runs
     // uncaptured so it can warm allocation pools and lazy buffers, which capture forbids.
     // Capture is attempted on the second, and abandoned for the rest of the solve if it
-    // fails -- an invalidated capture records without executing, which PcgAmgSolver has to
+    // fails: an invalidated capture records without executing, which PcgAmgSolver has to
     // survive rather than propagate.
     template <typename Body>
     void run(cudaStream_t stream, const Key& key, int iteration, Body&& body);
 
-private:
-    void reset() noexcept;
-    // Instantiating costs more than updating, so an unchanged topology reuses the executable
-    // graph and only re-instantiates when cudaGraphExecUpdate declines.
-    bool adopt(cudaGraph_t graph) noexcept;
+    void clear() noexcept {
+        if (exec_) cudaGraphExecDestroy(exec_);
+        exec_ = nullptr;
+    }
 
-    cudaGraph_t graph_ = nullptr;
+private:
+    // Records `body` into a fresh executable graph. Returns false, with the stream out of capture
+    // mode and no error left pending, if anything along the way failed.
+    template <typename Body>
+    bool capture(cudaStream_t stream, Body& body);
+
     cudaGraphExec_t exec_ = nullptr;
     Key key_{};
     bool capture_failed_ = false;
 };
 
-inline void GraphCache::reset() noexcept {
-    if (exec_) cudaGraphExecDestroy(exec_);
-    if (graph_) cudaGraphDestroy(graph_);
-    exec_ = nullptr;
-    graph_ = nullptr;
-}
-
-inline bool GraphCache::adopt(cudaGraph_t graph) noexcept {
-    if (exec_ != nullptr && cudaGraphExecUpdate(exec_, graph, nullptr) == cudaSuccess) {
-        if (graph_) cudaGraphDestroy(graph_);
-        graph_ = graph;
-        return true;
-    }
-    // Topology moved (or the update was refused for any other reason): start over.
-    reset();
-    if (cudaGraphInstantiate(&exec_, graph, 0) != cudaSuccess) {
-        exec_ = nullptr;
-        cudaGraphDestroy(graph);
+template <typename Body>
+bool GraphCache::capture(cudaStream_t stream, Body& body) {
+    if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        (void)cudaGetLastError();
         return false;
     }
-    graph_ = graph;
-    return true;
+    bool recorded = true;
+    try {
+        body();
+    } catch (...) {
+        // A call inside an invalidated capture reports the invalidation as its own failure. The
+        // capture still has to be ended, or the stream stays in capture mode for good.
+        recorded = false;
+    }
+    cudaGraph_t graph = nullptr;
+    const bool ended = cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph != nullptr;
+    const bool ok = recorded && ended && cudaGraphInstantiate(&exec_, graph, 0) == cudaSuccess;
+    if (graph) cudaGraphDestroy(graph);
+    if (!ok) {
+        exec_ = nullptr;
+        (void)cudaGetLastError();
+    }
+    return ok;
 }
 
 template <typename Body>
@@ -96,29 +100,18 @@ void GraphCache::run(cudaStream_t stream, const Key& key, int iteration, Body&& 
     // A failed capture is given up on for the rest of that solve but retried by the next one,
     // since whatever invalidated it is usually not a property of this body.
     if (iteration == 1) capture_failed_ = false;
-    if (exec_ != nullptr && !(key_ == key)) reset();
-    if (exec_ != nullptr) {
+    if (exec_ != nullptr && key_ == key) {
         check_cuda(cudaGraphLaunch(exec_, stream), "solver", "graph_launch");
         return;
     }
+    clear();
+    // Iteration 1 warms pools and lazy buffers so capture sees no allocation.
     if (iteration == 1 || capture_failed_) {
-        body();  // iteration 1 warms pools and lazy buffers so capture sees no allocation
-        return;
-    }
-
-    cudaGraph_t captured = nullptr;
-    const cudaError_t begun = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
-    body();
-    const cudaError_t ended = cudaStreamEndCapture(stream, &captured);
-    if (begun != cudaSuccess || ended != cudaSuccess || captured == nullptr) {
-        // An invalidated capture records without executing, so this iteration still has to
-        // run for real. Stop attempting capture for the rest of the solve.
-        if (captured) cudaGraphDestroy(captured);
-        capture_failed_ = true;
         body();
         return;
     }
-    if (!adopt(captured)) {
+    if (!capture(stream, body)) {
+        // The capture recorded without executing, so this iteration still has to run for real.
         capture_failed_ = true;
         body();
         return;
@@ -132,7 +125,6 @@ public:
     // Setup runs on `stream` and synchronises it, so the caller may drop its arrays on return.
     PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_idx, const double* values,
                  cudaStream_t stream);
-    ~PcgAmgSolver();
 
     PcgAmgSolver(const PcgAmgSolver&) = delete;
     PcgAmgSolver& operator=(const PcgAmgSolver&) = delete;
@@ -142,6 +134,8 @@ public:
     int nnz() const { return nnz_; }
 
     void update_values(const double* values, cudaStream_t stream);
+    // The block solve at k = 1, bit for bit, except that a zero b returns a zero x and an x0
+    // already within tolerance is returned as it is.
     PcgResult solve_mixed(NativeVCycle& preconditioner, const double* b, double* x,
                           double tolerance, int max_iters, cudaStream_t stream,
                           const double* x0 = nullptr);
@@ -171,9 +165,10 @@ private:
     // Sets the deflation state from values_, unless it already holds it.
     void deflation_from_values(cudaStream_t stream);
     void apply_operator(int k, bool affine, const double* x, double* y, cudaStream_t stream);
+    enum class Path { kSingle, kBlock, kAffine };
     PcgBlockResult solve_block(NativeVCycle& preconditioner, const double* B, double* X, int k,
                                double tolerance, int max_iters, cudaStream_t stream,
-                               const double* X0, bool affine);
+                               const double* X0, Path path);
 
     // Serialises every call that touches the solver's buffers, since the bindings release the GIL.
     std::mutex mutex_;
@@ -184,18 +179,6 @@ private:
     DeviceBuffer<int> row_ptr_;
     SlotCsr slots_;
     DeviceBuffer<double> values_;
-    DeviceBuffer<double> r_;
-    DeviceBuffer<double> p_;
-    DeviceBuffer<double> ap_;
-    DeviceBuffer<double> x_int_;
-    DeviceBuffer<float> rf_;
-    DeviceBuffer<float> zf_;
-    // CG scalars kept on-device: [rz, pap, alpha, neg_alpha, norm, rsum, beta, shift]. norm and
-    // rsum are adjacent because one reduction writes both. Only the residual norm is copied back,
-    // into pinned host memory, once/iter.
-    DeviceBuffer<double> scalars_;
-    // Per-block partial sums for the fused deterministic reductions, two columns each.
-    DeviceBuffer<double> partials_;
     // Deflation of the constant vector (block_cg.cu): the rows where A 1 is nonzero, chosen once
     // from the pattern's values, then Aw on them per column and 1/E per column. It holds either
     // values_' state or one affine block's; the flag says which.
@@ -204,14 +187,15 @@ private:
     DeviceBuffer<double> defl_aw_;
     DeviceBuffer<double> defl_inv_e_;
     bool defl_affine_ = false;
-    PinnedBuffer<double> h_norm_;
-    // solve_mixed runs on this internal, capture-capable stream because the caller's is usually the
+    // Solves run on this internal, capture-capable stream because the caller's is usually the
     // un-capturable legacy default stream; b/x are handed off via join_event_. The iteration body
-    // only touches solver-owned buffers (x_int_, not the caller's x), so the captured graph is
-    // reused across solves as long as the preconditioner identity/generation is unchanged.
+    // only touches solver-owned buffers (the internal x, not the caller's), so a captured graph
+    // is reused across solves as long as its key holds.
     CudaStream solve_stream_;
     CudaEvent join_event_;
-    GraphCache graph_;
+    // The single path keeps its own graph, so a k = 1 retry between wider block solves does not
+    // evict theirs.
+    GraphCache single_graph_;
     // Block-solve state: (n, k) row-major work buffers, lazily sized to the largest k seen.
     // block_buffers_ counts their allocations and keys both block graphs.
     int block_k_ = 0;
@@ -234,5 +218,5 @@ private:
     AffineSlots affine_;
     DeviceBuffer<double> affine_aw_t_;
     DeviceBuffer<double> affine_sigma_;
-    std::unique_ptr<GraphCache> affine_graph_;
+    GraphCache affine_graph_;
 };

@@ -5,11 +5,14 @@
 // once per nnz and reused across the k columns. Every reduction is a fixed-order two-stage
 // tree per column, so results are run-to-run deterministic and each column's arithmetic is
 // independent of its neighbours.
-#include <cstdint>
-
 #include "amg/cg_kernels.hpp"
 #include "core/device_math.cuh"
 #include "core/slot_csr.cuh"
+
+#include <cub/device/device_select.cuh>
+#include <cuda/iterator>
+
+#include <cstdint>
 
 namespace {
 
@@ -197,31 +200,48 @@ __device__ __forceinline__ void bcg_block_reduce_cols(cuda::std::array<double, K
 // What a column-wise reduction folds each entry into.
 enum class Fold { kDot, kNorm, kSum };
 
-// Column-wise reductions, stage 1: one partial per (column, block).
-template <int K, Fold F>
+// Column-wise reductions, stage 1: one partial per (column, block). y is read only by kDot, and
+// may be fp32, in which case it is widened exactly on the fly. A grid-stride fold that loads and
+// adds one row at a time serialises its loads behind the adds, so the rows are loaded a batch at a
+// time and then folded in row order.
+template <int K, Fold F, typename TY = double>
 __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
-                                    const double* __restrict__ y, double* __restrict__ partials,
+                                    const TY* __restrict__ y, double* __restrict__ partials,
                                     int n_blocks) {
     const WidthView<const double, K> xv(x, n);
-    // Null unless F is kDot, which is the only mode that reads it.
-    const WidthView<const double, K> yv(y, n);
+    const WidthView<const TY, K> yv(y, n);
     cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
     const int stride = gridDim.x * blockDim.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int kBatch = 4;
+    static_assert(kRowsPerThread % kBatch == 0, "batches must tile the rows a thread carries");
 #pragma unroll
-    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
-        if (i >= n) break;
+    for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
+        cuda::std::array<double, K> xb[kBatch];
+        cuda::std::array<TY, K> yb[kBatch];
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            const double xc = xv(i, c);
-            if constexpr (F == Fold::kDot) {
-                local[c] += xc * yv(i, c);
-            } else if constexpr (F == Fold::kNorm) {
-                local[c] += xc * xc;
-            } else {
-                local[c] += xc;
+        for (int t = 0; t < kBatch; ++t) {
+            const int i = i0 + (t0 + t) * stride;
+            if (i < n) {
+                load_row<K>(&xv(i, 0), xb[t]);
+                if constexpr (F == Fold::kDot) load_row<K>(&yv(i, 0), yb[t]);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < kBatch; ++t) {
+            if (i0 + (t0 + t) * stride >= n) break;
+#pragma unroll
+            for (int c = 0; c < K; ++c) {
+                const double xc = xb[t][c];
+                if constexpr (F == Fold::kDot) {
+                    local[c] += xc * static_cast<double>(yb[t][c]);
+                } else if constexpr (F == Fold::kNorm) {
+                    local[c] += xc * xc;
+                } else {
+                    local[c] += xc;
+                }
             }
         }
     }
@@ -239,13 +259,7 @@ __device__ __forceinline__ double bcg_reduce_column(const double* __restrict__ p
     for (int b = threadIdx.x; b < n_blocks; b += kBlock) {
         local += partials[static_cast<std::int64_t>(c) * n_blocks + b];
     }
-    sdata[threadIdx.x] = local;
-    __syncthreads();
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        __syncthreads();
-    }
-    return sdata[0];
+    return block_tree_sum(local, sdata);
 }
 
 __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blocks,
@@ -274,10 +288,10 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
 // own matrix. It never moves the fixed point, only the preconditioner. inv_e = 0 switches it off
 // and leaves every shift exactly zero, which is what an operator with no positive E gets.
 
-// Setup only: each row's sum and l1 norm, which decide the support.
-__global__ void bcg_row_sums_kernel(int n, const int* __restrict__ row_ptr,
-                                    const double* __restrict__ vals, double* __restrict__ sum,
-                                    double* __restrict__ l1) {
+// Setup only: whether a row's sum is more than a rounding residue of its l1 norm.
+__global__ void bcg_support_flags_kernel(int n, const int* __restrict__ row_ptr,
+                                         const double* __restrict__ vals, double tol,
+                                         unsigned char* __restrict__ flags) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n) return;
     double s = 0.0, a = 0.0;
@@ -285,8 +299,7 @@ __global__ void bcg_row_sums_kernel(int n, const int* __restrict__ row_ptr,
         s += vals[j];
         a += fabs(vals[j]);
     }
-    sum[row] = s;
-    l1[row] = a;
+    flags[row] = fabs(s) > tol * a;
 }
 
 // Aw on the support from the operator's own values, the same in every column. In the CSR's own
@@ -390,13 +403,7 @@ __device__ __forceinline__ double bcg_support_dot(int n_s, const int* __restrict
         local += aw[t * kDeflCols + c] *
                  static_cast<double>(zf[static_cast<std::int64_t>(rows[t]) * k + c]);
     }
-    sdot[threadIdx.x] = local;
-    __syncthreads();
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sdot[threadIdx.x] += sdot[threadIdx.x + s];
-        __syncthreads();
-    }
-    return sdot[0];
+    return block_tree_sum(local, sdot);
 }
 
 // A column freezes at the iteration its own residual first meets tolerance, rather than at the
@@ -490,43 +497,6 @@ __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
         }
     }
     bcg_block_reduce_cols<2 * K>(rloc, partials, n_blocks);
-}
-
-// The preconditioned residual is never materialized in fp64: consumers cast the fp32 zf on the
-// fly, which is exact.
-template <int K>
-__global__ void bcg_cast_dot_kernel(int n, const float* __restrict__ zf,
-                                    const double* __restrict__ r, double* __restrict__ partials,
-                                    int n_blocks) {
-    const WidthView<const double, K> rv(r, n);
-    const WidthView<const float, K> zfv(zf, n);
-    cuda::std::array<double, K> local;
-#pragma unroll
-    for (int c = 0; c < K; ++c) local[c] = 0.0;
-    const int stride = gridDim.x * blockDim.x;
-    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
-    // Batched like bcg_update_r_kernel, for the same reason; the fold keeps row order.
-    constexpr int kBatch = 4;
-#pragma unroll
-    for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
-        cuda::std::array<double, K> rb[kBatch];
-        cuda::std::array<float, K> zb[kBatch];
-#pragma unroll
-        for (int t = 0; t < kBatch; ++t) {
-            const int i = i0 + (t0 + t) * stride;
-            if (i < n) {
-                load_row<K>(&rv(i, 0), rb[t]);
-                load_row<K>(&zfv(i, 0), zb[t]);
-            }
-        }
-#pragma unroll
-        for (int t = 0; t < kBatch; ++t) {
-            if (i0 + (t0 + t) * stride >= n) break;
-#pragma unroll
-            for (int c = 0; c < K; ++c) local[c] += rb[t][c] * static_cast<double>(zb[t][c]);
-        }
-    }
-    bcg_block_reduce_cols<K>(local, partials, n_blocks);
 }
 
 // Folds column c of r . zf, adds the support's Aw . zf, and turns them into the deflated r . z
@@ -672,10 +642,13 @@ void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* o
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, Fold::kNorm>
-            <<<n_blocks, kBlock, 0, stream>>>(n, x, nullptr, partials, n_blocks);
+            <<<n_blocks, kBlock, 0, stream>>>(n, x, static_cast<const double*>(nullptr),
+                                              partials, n_blocks);
     });
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
 }
+
+namespace {
 
 void launch_bcg_sum(int n, int k, const double* x, double* partials, double* out,
                     cudaStream_t stream) {
@@ -683,16 +656,36 @@ void launch_bcg_sum(int n, int k, const double* x, double* partials, double* out
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, Fold::kSum>
-            <<<n_blocks, kBlock, 0, stream>>>(n, x, nullptr, partials, n_blocks);
+            <<<n_blocks, kBlock, 0, stream>>>(n, x, static_cast<const double*>(nullptr),
+                                              partials, n_blocks);
     });
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
 }
 
-void launch_bcg_row_sums(int n, const int* row_ptr, const double* vals, double* sum, double* l1,
-                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        bcg_row_sums_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, vals, sum, l1);
-    }
+}  // namespace
+
+int select_deflation_rows(int n, const int* row_ptr, const double* vals, double tol, int* rows,
+                          cudaStream_t stream) {
+    const ScratchBuffer<unsigned char> flags =
+        scratch_alloc<unsigned char>(static_cast<std::size_t>(n), stream, "solver", "support");
+    const ScratchBuffer<int> count = scratch_alloc<int>(1, stream, "solver", "support count");
+    bcg_support_flags_kernel<<<grid_for(n), kBlock, 0, stream>>>(n, row_ptr, vals, tol,
+                                                                 flags.get());
+    const cuda::counting_iterator<int> row_ids(0);
+    std::size_t bytes = 0;
+    check_cuda(cub::DeviceSelect::Flagged(nullptr, bytes, row_ids, flags.get(), rows, count.get(),
+                                          n, stream),
+               "solver", "support select size");
+    const ScratchBuffer<std::byte> temp =
+        scratch_alloc<std::byte>(bytes, stream, "solver", "support select");
+    check_cuda(cub::DeviceSelect::Flagged(temp.get(), bytes, row_ids, flags.get(), rows,
+                                          count.get(), n, stream),
+               "solver", "support select");
+    int n_rows = 0;
+    check_cuda(cudaMemcpyAsync(&n_rows, count.get(), sizeof(int), cudaMemcpyDeviceToHost, stream),
+               "solver", "support count");
+    check_cuda(cudaStreamSynchronize(stream), "solver", "support count");
+    return n_rows;
 }
 
 void launch_bcg_defl_from_values(int n_s, const int* rows, const int* row_ptr,
@@ -757,7 +750,8 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r, De
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
+        bcg_partials_kernel<K, Fold::kDot, float>
+            <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
     });
     bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, converged, defl, zf,
                                                      rsum, rz, beta, shift);
@@ -769,7 +763,8 @@ void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r, De
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        bcg_cast_dot_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, zf, r, partials, n_blocks);
+        bcg_partials_kernel<K, Fold::kDot, float>
+            <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
         bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, rsum, rz,
                                                          shift);
         if (const unsigned blocks = grid_for(n)) {

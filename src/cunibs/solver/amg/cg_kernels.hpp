@@ -30,8 +30,6 @@ void launch_bcg_dot(int n, int k, const double* x, const double* y, double* part
                     double* out, cudaStream_t stream);
 void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
                       cudaStream_t stream);
-void launch_bcg_sum(int n, int k, const double* x, double* partials, double* out,
-                    cudaStream_t stream);
 // Deflation of the constant vector (see block_cg.cu). The state a solve reads: the rows of the
 // support of A 1, Aw on them laid out [row][column] for kMaxStageBlock columns, and 1/E per column
 // (0 switches that column's deflation off).
@@ -41,9 +39,10 @@ struct Deflation {
     const double* aw = nullptr;
     const double* inv_e = nullptr;
 };
-// Setup only: every row's sum and l1 norm, from which the caller picks the support.
-void launch_bcg_row_sums(int n, const int* row_ptr, const double* vals, double* sum, double* l1,
-                         cudaStream_t stream);
+// Setup only: writes into rows (n entries) the rows whose sum exceeds tol times their l1 norm, in
+// row order, and returns how many there are. Synchronises the stream.
+int select_deflation_rows(int n, const int* row_ptr, const double* vals, double tol, int* rows,
+                          cudaStream_t stream);
 // Aw on the support from the operator's values, the same in every column, and 1/E.
 void launch_bcg_defl_from_values(int n_s, const int* rows, const int* row_ptr,
                                  const double* vals, double* aw, double* inv_e,

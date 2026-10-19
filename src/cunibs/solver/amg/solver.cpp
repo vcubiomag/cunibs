@@ -1,11 +1,11 @@
 #include "amg/solver.hpp"
 
-#include "amg/cg_kernels.hpp"
 #include "amg/vcycle.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -39,15 +39,6 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     values_ = alloc<double>(static_cast<size_t>(slots_.n_slots), "values");
     launch_slot_scatter(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values,
                         values_.get(), stream);
-    r_ = alloc<double>(n_, "r");
-    p_ = alloc<double>(n_, "p");
-    ap_ = alloc<double>(n_, "ap");
-    x_int_ = alloc<double>(n_, "x_int");
-    rf_ = alloc<float>(n_, "rf");
-    zf_ = alloc<float>(n_, "zf");
-    scalars_ = alloc<double>(8, "scalars");
-    partials_ = alloc<double>(static_cast<size_t>(2) * bcg_partials_blocks(n_), "partials");
-    h_norm_ = pinned_alloc<double>(1, "solver", "norm");
 
     cudaStream_t solve_stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&solve_stream, cudaStreamNonBlocking),
@@ -64,29 +55,14 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     // wait for, so it is drained before any solve can start.
     constexpr double kSupportTol = 1e-10;
     {
-        DeviceBuffer<double> sums = alloc<double>(n_, "row sums");
-        DeviceBuffer<double> l1 = alloc<double>(n_, "row l1");
-        launch_bcg_row_sums(n_, slots_.ptr.get(), values_.get(), sums.get(), l1.get(), stream);
-        std::vector<double> h_sums(n_), h_l1(n_);
-        check_cuda(cudaMemcpyAsync(h_sums.data(), sums.get(), n_ * sizeof(double),
-                                   cudaMemcpyDeviceToHost, stream),
-                   "copy(row sums)");
-        check_cuda(cudaMemcpyAsync(h_l1.data(), l1.get(), n_ * sizeof(double),
-                                   cudaMemcpyDeviceToHost, stream),
-                   "copy(row l1)");
-        check_cuda(cudaStreamSynchronize(stream), "sync(row sums)");
-        std::vector<int> rows;
-        for (int i = 0; i < n_; ++i) {
-            if (std::fabs(h_sums[i]) > kSupportTol * h_l1[i]) rows.push_back(i);
-        }
-        defl_n_ = static_cast<int>(rows.size());
-        defl_rows_ = alloc<int>(std::max<size_t>(rows.size(), 1), "deflation rows");
-        if (!rows.empty()) {
-            check_cuda(cudaMemcpyAsync(defl_rows_.get(), rows.data(), rows.size() * sizeof(int),
-                                       cudaMemcpyHostToDevice, stream),
-                       "copy(deflation rows)");
-            check_cuda(cudaStreamSynchronize(stream), "sync(deflation rows)");
-        }
+        const ScratchBuffer<int> rows =
+            scratch_alloc<int>(static_cast<size_t>(n_), stream, "solver", "deflation rows");
+        defl_n_ = select_deflation_rows(n_, slots_.ptr.get(), values_.get(), kSupportTol,
+                                        rows.get(), stream);
+        defl_rows_ = alloc<int>(std::max(defl_n_, 1), "deflation rows");
+        check_cuda(cudaMemcpyAsync(defl_rows_.get(), rows.get(), defl_n_ * sizeof(int),
+                                   cudaMemcpyDeviceToDevice, stream),
+                   "copy(deflation rows)");
     }
     defl_aw_ = alloc<double>(std::max<size_t>(defl_n_, 1) * kMaxStageBlock, "deflation aw");
     defl_inv_e_ = alloc<double>(kMaxStageBlock, "deflation inv_e");
@@ -94,8 +70,6 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     deflation_from_values(stream);
     check_cuda(cudaStreamSynchronize(stream), "sync(deflation setup)");
 }
-
-PcgAmgSolver::~PcgAmgSolver() = default;
 
 Deflation PcgAmgSolver::deflation() const {
     return Deflation{defl_n_, defl_rows_.get(), defl_aw_.get(), defl_inv_e_.get()};
@@ -130,7 +104,7 @@ void PcgAmgSolver::set_affine_terms(int n_terms, const double* term_values,
     launch_term_row_sums(defl_n_, defl_rows_.get(), row_ptr_.get(), term_values, nnz_, n_terms,
                          affine_aw_t_.get(), stream);
     affine_sigma_ = alloc<double>(static_cast<size_t>(kMaxStageBlock) * n_terms, "affine sigma");
-    affine_graph_ = std::make_unique<GraphCache>();
+    affine_graph_.clear();
     check_cuda(cudaGetLastError(), "affine terms");
     check_cuda(cudaStreamSynchronize(stream), "sync(affine terms)");
 }
@@ -174,7 +148,7 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                                int max_iters, cudaStream_t stream,
                                                const double* X0) {
     const std::scoped_lock lock(mutex_, preconditioner.mutex());
-    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, false);
+    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kBlock);
 }
 
 PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, const double* B,
@@ -185,7 +159,9 @@ PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, co
     if (affine_.n_terms == 0) {
         throw std::runtime_error("solve_affine_block: no affine terms set");
     }
-    if (k < 1 || k > kMaxStageBlock) throw std::invalid_argument("solve_affine_block: bad k");
+    if (!is_block_width(k)) {
+        throw std::invalid_argument("solve_affine_block supports k in {1, 2, 4, 8}");
+    }
     // Columns past k repeat the last, so the deflation state for every held column is defined.
     const int t = affine_.n_terms;
     std::vector<double> padded(static_cast<size_t>(kMaxStageBlock) * t);
@@ -202,13 +178,18 @@ PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, co
     defl_affine_ = true;
     // The copy reads a host vector that dies with this call, so it has to land before returning.
     check_cuda(cudaStreamSynchronize(stream), "sync(sigma)");
-    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, true);
+    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kAffine);
 }
 
 PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const double* B,
                                          double* X, int k, double tolerance, int max_iters,
-                                         cudaStream_t stream, const double* X0, bool affine) {
+                                         cudaStream_t stream, const double* X0, Path path) {
     if (max_iters <= 0) throw std::invalid_argument("solve_mixed_block: max_iters must be > 0");
+    if (!is_block_width(k)) {
+        throw std::invalid_argument("solve_mixed_block supports k in {1, 2, 4, 8}");
+    }
+    const bool affine = path == Path::kAffine;
+    const bool single = path == Path::kSingle;
     ensure_block_buffers(k);
     if (!affine) deflation_from_values(stream);
     // The solve runs on an internal capture-capable stream because the caller's is usually the
@@ -242,9 +223,9 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     float* const RF = rf_blk_.get();
     float* const ZF = zf_blk_.get();
 
-    // Reference norms ‖b_c‖ (convergence is measured against b, matching solve_mixed). The
-    // squares stay on the device for the per-column freeze; the host copy drives the block's
-    // stopping test and the reported residuals.
+    // Reference norms ‖b_c‖: convergence is measured against b, not the warm residual, so a warm
+    // start still drives to the same criterion. The squares stay on the device for the per-column
+    // freeze; the host copy drives the block's stopping test and the reported residuals.
     launch_bcg_norm2(n_, k, B, partials, d_ref_sq, s);
     // The freeze reads the tolerance from the device: a captured body replays whatever it was
     // launched with, and the graph is shared by every solve at this width whatever its tolerance.
@@ -254,22 +235,56 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                                cudaMemcpyDeviceToHost, s),
                "block:copy(ref_norms)");
     check_cuda(cudaStreamSynchronize(s), "block:sync(ref_norms)");
+    // A zero column's solution is exactly zero. It starts frozen at x = 0 with an infinite
+    // reference, so the freeze test keeps it there, and the other columns run as they would alone.
     std::vector<double> norm_ref(k);
+    std::vector<double> frozen(k, 0.0);
+    int n_zero = 0;
     for (int c = 0; c < k; ++c) {
         norm_ref[c] = std::sqrt(h_ref[c]);
-        if (norm_ref[c] == 0.0) {
-            throw std::invalid_argument("solve_mixed_block: zero RHS column");
-        }
+        if (norm_ref[c] != 0.0) continue;
+        frozen[c] = 1.0;
+        h_ref[c] = std::numeric_limits<double>::infinity();
+        ++n_zero;
     }
-    // No column starts frozen; the mask is recomputed at the end of each iteration body.
-    check_cuda(cudaMemsetAsync(d_converged, 0, static_cast<size_t>(k) * sizeof(double), s),
-               "block:memset(converged)");
+    if (n_zero == k) {
+        check_cuda(cudaMemsetAsync(X, 0, nk * sizeof(double), s), "memset(x_out)");
+        check_cuda(cudaStreamSynchronize(s), "sync(x_out0)");
+        return {0, std::vector<double>(k, 0.0), std::vector<int>(k, 0)};
+    }
+    check_cuda(cudaMemcpyAsync(d_converged, frozen.data(), static_cast<size_t>(k) * sizeof(double),
+                               cudaMemcpyHostToDevice, s),
+               "block:copy(converged)");
+    if (n_zero) {
+        check_cuda(cudaMemcpyAsync(d_ref_sq, h_ref, static_cast<size_t>(k) * sizeof(double),
+                                   cudaMemcpyHostToDevice, s),
+                   "block:copy(ref_norms)");
+    }
 
     if (X0 != nullptr) {
         check_cuda(cudaMemcpyAsync(X_int, X0, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
                    "block:copy(X0)");
+        for (int c = 0; c < k; ++c) {
+            if (!frozen[c]) continue;
+            check_cuda(cudaMemset2DAsync(X_int + c, k * sizeof(double), 0, sizeof(double), n_, s),
+                       "block:zero(X0 column)");
+        }
         apply_operator(k, affine, X_int, AP, s);
         launch_bcg_residual(nk_signed, B, AP, R, s);
+        if (single) {
+            launch_bcg_norm2(n_, 1, R, partials, d_norm, s);
+            check_cuda(cudaMemcpyAsync(h_norm, d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
+                       "copy(norm r0)");
+            check_cuda(cudaStreamSynchronize(s), "sync(norm r0)");
+            const double rel0 = std::sqrt(*h_norm) / norm_ref[0];
+            if (rel0 <= tolerance) {
+                check_cuda(cudaMemcpyAsync(X, X_int, nk * sizeof(double),
+                                           cudaMemcpyDeviceToDevice, s),
+                           "copy(x_int,x)");
+                check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
+                return {0, {rel0}, {0}};
+            }
+        }
     } else {
         check_cuda(cudaMemsetAsync(X_int, 0, nk * sizeof(double), s), "block:memset(X)");
         check_cuda(cudaMemcpyAsync(R, B, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
@@ -300,12 +315,17 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     // max_iters doubles as the default for a column that never reaches tolerance and as the
     // value a column crossing on the last iteration would be given.
     std::vector<int> col_iters(k, max_iters);
+    for (int c = 0; c < k; ++c) {
+        if (frozen[c]) col_iters[c] = 0;
+    }
     int result_iters = max_iters;
     for (int it = 1; it <= max_iters; ++it) {
-        (affine ? *affine_graph_ : block_graph_).run(s, key, it, run_body);
+        GraphCache& graph = affine ? affine_graph_ : single ? single_graph_ : block_graph_;
+        graph.run(s, key, it, run_body);
         check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
         double worst = 0.0;
         for (int c = 0; c < k; ++c) {
+            if (frozen[c]) continue;
             rel[c] = std::sqrt(h_norm[c]) / norm_ref[c];
             if (rel[c] > worst) worst = rel[c];
             // First crossing only: launch_bcg_mark_converged froze the column on the same
@@ -330,125 +350,8 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
 PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* b,
                                     double* x, double tolerance, int max_iters,
                                     cudaStream_t stream, const double* x0) {
-    // The solve runs on an internal capture-capable stream because the caller's is usually the
-    // un-capturable legacy default stream. If capture is invalidated at runtime the loop falls
-    // back to direct execution.
-    if (max_iters <= 0) throw std::invalid_argument("solve_mixed: max_iters must be > 0");
     const std::scoped_lock lock(mutex_, preconditioner.mutex());
-    deflation_from_values(stream);
-    cudaStream_t s = solve_stream_.get();
-    check_cuda(cudaEventRecord(join_event_.get(), stream), "graph:record_in");
-    check_cuda(cudaStreamWaitEvent(s, join_event_.get(), 0), "graph:wait_in");
-    double* const d_rz = scalars_.get() + 0;
-    double* const d_pap = scalars_.get() + 1;
-    double* const d_alpha = scalars_.get() + 2;
-    double* const d_neg_alpha = scalars_.get() + 3;
-    double* const d_norm = scalars_.get() + 4;
-    double* const d_rsum = scalars_.get() + 5;
-    double* const d_beta = scalars_.get() + 6;
-    double* const d_shift = scalars_.get() + 7;
-    const Deflation defl = deflation();
-    double* const r = r_.get();
-    double* const p = p_.get();
-    double* const ap = ap_.get();
-    double* const x_int = x_int_.get();
-    float* const rf = rf_.get();
-    float* const zf = zf_.get();
-    double* const partials = partials_.get();
-
-    // Every reduction here runs the same k = 1 block kernels solve_mixed_block does, so the two
-    // paths sum in the same order: a column that misses tolerance and is retried through this
-    // solver comes back with the numbers the block path would have produced. A vendor BLAS dot or
-    // norm, whose association order is unspecified, could not stand in.
-    auto host_norm = [&](const double* v, const char* what) {
-        launch_bcg_norm2(n_, 1, v, partials, d_norm, s);
-        check_cuda(
-            cudaMemcpyAsync(h_norm_.get(), d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
-            what);
-        check_cuda(cudaStreamSynchronize(s), what);
-        return std::sqrt(*h_norm_.get());
-    };
-
-    // Convergence is measured against ‖b‖, not the warm residual ‖r0‖, so a warm start (x0 != null)
-    // still drives to the same 1e-6-of-field criterion instead of stopping early relative to its
-    // small initial residual.
-    const double norm_ref = host_norm(b, "setup:norm(b)");
-    if (norm_ref == 0.0) {
-        check_cuda(cudaMemsetAsync(x, 0, static_cast<size_t>(n_) * sizeof(double), s),
-                   "memset(x_out)");
-        check_cuda(cudaStreamSynchronize(s), "sync(x_out0)");
-        return {0, 0.0};
-    }
-    // The loop works on the solver-owned x_int_ (not the caller's x) so the captured graph contains
-    // no per-call pointers and can be replayed across solves; the result is copied out at the end.
-    if (x0 != nullptr) {
-        check_cuda(cudaMemcpyAsync(x_int, x0, static_cast<size_t>(n_) * sizeof(double),
-                                   cudaMemcpyDeviceToDevice, s),
-                   "copy(x0,x_int)");
-        // r0 = b - A x0
-        launch_bcsrmv_f64_block(n_, 1, slots_.ptr.get(), slots_.cols.get(), values_.get(), x_int,
-                                ap, s);
-        launch_bcg_residual(n_, b, ap, r, s);
-        const double norm_r0 = host_norm(r, "setup:norm(r0)");
-        if (norm_r0 / norm_ref <= tolerance) {
-            check_cuda(cudaMemcpyAsync(x, x_int, static_cast<size_t>(n_) * sizeof(double),
-                                       cudaMemcpyDeviceToDevice, s),
-                       "copy(x_int,x)");
-            check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
-            return {0, norm_r0 / norm_ref};
-        }
-    } else {
-        check_cuda(cudaMemsetAsync(x_int, 0, static_cast<size_t>(n_) * sizeof(double), s),
-                   "memset(x_int)");
-        check_cuda(cudaMemcpyAsync(r, b, static_cast<size_t>(n_) * sizeof(double),
-                                   cudaMemcpyDeviceToDevice, s),
-                   "copy(b,r)");
-    }
-    launch_bcg_deflate_start(n_, 1, defl, x_int, r, rf, partials, d_rsum, s);
-    preconditioner.apply(n_, rf, zf, s);
-    // p0 = z0 = (double)zf + shift directly; the fp64 z vector is never materialized (the loop
-    // consumes zf on the fly in cast_dot_beta and update_p).
-    launch_bcg_cast_dot_init(n_, 1, zf, r, defl, d_rsum, partials, d_rz, d_shift, p, s);
-
-    // Identical every iteration (fixed buffers updated in place), so it is captured once and
-    // replayed; the residual readback is inside the body but the host convergence test stays outside.
-    auto run_body = [&]() {
-        // p·(Ap) stays a separate pass: folding it into the SpMV epilogue would make the
-        // block-wide reduction tree stall the SpMV's memory pipeline.
-        launch_bcsrmv_f64_block(n_, 1, slots_.ptr.get(), slots_.cols.get(), values_.get(), p, ap,
-                                s);
-        launch_bcg_dot(n_, 1, p, ap, partials, d_pap, s);
-        launch_bcg_alpha(1, d_rz, d_pap, nullptr, d_alpha, d_neg_alpha, s);
-        // r -= α ap; rf = (float)r; d_norm = ‖r‖² (host takes the sqrt), d_rsum = Σr
-        launch_bcg_update_r_norm(n_, 1, d_neg_alpha, ap, r, rf, partials, d_norm, s);
-        check_cuda(
-            cudaMemcpyAsync(h_norm_.get(), d_norm, sizeof(double), cudaMemcpyDeviceToHost, s),
-            "copy(norm)");
-        preconditioner.apply(n_, rf, zf, s);
-        // z = (double)zf + shift; rz' = r·z; beta = rz'/rz; rz <- rz' (no fp64 z vector)
-        launch_bcg_cast_dot_beta(n_, 1, zf, r, defl, nullptr, d_rsum, partials, d_rz, d_beta,
-                                 d_shift, s);
-        // x += α p; p = β p + z
-        launch_bcg_update_p(n_, 1, d_alpha, d_beta, d_shift, zf, p, x_int, s);
-    };
-
-    // The body references only solver-owned buffers plus the preconditioner's hierarchy, so a graph
-    // captured in an earlier solve stays valid until the preconditioner is re-setup (or replaced).
-    const GraphCache::Key key{&preconditioner, preconditioner.generation(), 1};
-    double rel = 0.0;
-    int result_iters = max_iters;
-    for (int it = 1; it <= max_iters; ++it) {
-        graph_.run(s, key, it, run_body);
-        check_cuda(cudaStreamSynchronize(s), "sync(iter)");
-        rel = std::sqrt(*h_norm_.get()) / norm_ref;
-        if (rel <= tolerance) {
-            result_iters = it;
-            break;
-        }
-    }
-    check_cuda(cudaMemcpyAsync(x, x_int, static_cast<size_t>(n_) * sizeof(double),
-                               cudaMemcpyDeviceToDevice, s),
-               "copy(x_int,x)");
-    check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
-    return {result_iters, rel};
+    const PcgBlockResult r =
+        solve_block(preconditioner, b, x, 1, tolerance, max_iters, stream, x0, Path::kSingle);
+    return {r.iterations, r.relative_residual[0]};
 }
