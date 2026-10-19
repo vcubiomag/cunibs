@@ -1,7 +1,8 @@
+#include "core/scan.cuh"
 #include "fem/fem.hpp"
 
-#include <cub/device/device_scan.cuh>
 #include <cub/device/device_segmented_sort.cuh>
+#include <cub/warp/warp_scan.cuh>
 #include <cuda/std/bit>
 #include <cuda/std/limits>
 
@@ -43,20 +44,6 @@ static_assert(static_cast<std::size_t>(kFastPad) * sizeof(int) * kSortWarps <= k
 static_assert(std::has_single_bit(static_cast<unsigned>(kFastPad)),
               "the pad is rounded to a power of two, so the class boundary must be one");
 
-// Inclusive prefix sum across a warp; the total is the last lane's. Every lane must reach it.
-__device__ __forceinline__ int warp_scan(int v, int lane) {
-#pragma unroll
-    for (int d = 1; d < kWarp; d <<= 1) {
-        const int t = __shfl_up_sync(kFullWarp, v, d);
-        if (lane >= d) v += t;
-    }
-    return v;
-}
-
-__device__ __forceinline__ int warp_total(int scan) {
-    return __shfl_sync(kFullWarp, scan, kWarp - 1);
-}
-
 // The warp's index across the grid, for the kernels that put one segment on each. Off blockDim
 // rather than kSortWarps so the mapping holds whatever width the block was launched at.
 __device__ __forceinline__ int warp_in_grid() {
@@ -74,10 +61,10 @@ __device__ __forceinline__ int warp_keep_first_of_each_run(const int* b, int n, 
     for (int base = 0; base < n; base += kWarp) {
         const int i = base + lane;
         const int v = (i < n) ? b[i] : 0;
-        const int keep = (i < n && (i == 0 || v != b[i - 1])) ? 1 : 0;
-        const int scan = warp_scan(keep, lane);
-        if (Fill && keep) dst[kept + scan - keep] = v;
-        kept += warp_total(scan);
+        const bool keep = i < n && (i == 0 || v != b[i - 1]);
+        const unsigned kept_here = __ballot_sync(kFullWarp, keep);
+        if (Fill && keep) dst[kept + __popc(kept_here & ((1u << lane) - 1))] = v;
+        kept += __popc(kept_here);
     }
     return kept;
 }
@@ -88,28 +75,37 @@ __device__ __forceinline__ int warp_keep_first_of_each_run(const int* b, int n, 
 // that many into the buffer it is given and returns the count. The two must agree: the buffer is
 // reserved from `size`, and nothing bounds `load` again.
 
-// Row i's columns are the distinct nodes of the tetrahedra incident to node i, so its candidates
-// are the four nodes of every corner in its node2corner segment: ~90 of them for ~14 distinct
-// columns on a head mesh. Each corner writes a fixed slot, so the layout needs no scan.
+// Row i's columns are the distinct nodes of the tetrahedra incident to node i. Every corner of a
+// segment is one of that node's own, so its candidates are the node itself, once, and the other
+// three nodes of each incident tetrahedron: ~65 of them for ~14 distinct columns on a head mesh.
+// Each corner writes a fixed slot, so the layout needs no scan.
 struct IncidentGather {
     const int* __restrict__ tet_nodes;
     const int* __restrict__ ptr;
     const int* __restrict__ idx;
 
-    __device__ int size(int s) const { return (ptr[s + 1] - ptr[s]) * 4; }
+    __device__ int size(int s) const {
+        const int d = ptr[s + 1] - ptr[s];
+        return d == 0 ? 0 : 3 * d + 1;
+    }
 
     __device__ int load(int s, int* __restrict__ out, int lane) const {
         const int begin = ptr[s], end = ptr[s + 1];
         for (int c = begin + lane; c < end; c += kWarp) {
+            const int corner = idx[c];
             // A 16-byte load: tet_nodes is one contiguous 4 * n_tet block, so a tet's four ids
             // never straddle the boundary and the base is an allocation start, not a strided view.
             const int4 t = *reinterpret_cast<const int4*>(
-                tet_nodes + static_cast<std::int64_t>(idx[c] >> 2) * 4);
-            int* const slot = out + (c - begin) * 4;
-            slot[0] = t.x;
-            slot[1] = t.y;
-            slot[2] = t.z;
-            slot[3] = t.w;
+                tet_nodes + static_cast<std::int64_t>(corner >> 2) * 4);
+            const int own = corner & 3;
+            const int ids[4] = {t.x, t.y, t.z, t.w};
+            int* slot = out + 1 + (c - begin) * 3;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                if (q != own) *slot++ = ids[q];
+            }
+            if (c == begin) out[0] = ids[0] * (own == 0) + ids[1] * (own == 1) +
+                                     ids[2] * (own == 2) + ids[3] * (own == 3);
         }
         return size(s);
     }
@@ -145,7 +141,10 @@ struct PatchGather {
             return ring;
         }
         // Runs of unequal length, so each lane needs where its neighbour's ring starts: a warp
-        // scan of the lengths, chunk by chunk.
+        // scan of the lengths, chunk by chunk. The shuffle scan keeps nothing in memory, so its
+        // storage is an empty local.
+        using WarpScan = cub::WarpScan<int>;
+        typename WarpScan::TempStorage scan_storage;
         int n = 0;
         for (int base = 0; base < ring; base += kWarp) {
             const int j = base + lane;
@@ -155,9 +154,9 @@ struct PatchGather {
                 src = r1_ptr[nb];
                 len = r1_ptr[nb + 1] - src;
             }
-            const int scan = warp_scan(len, lane);
-            const int chunk = warp_total(scan);
-            const int at = n + scan - len;
+            int at = 0, chunk = 0;
+            WarpScan(scan_storage).ExclusiveSum(len, at, chunk);
+            at += n;
             for (int t = 0; t < len; ++t) out[at + t] = r1_idx[src + t];
             n += chunk;
         }
@@ -209,13 +208,13 @@ struct SegmentPlan {
     int fast_pad = 1;
     int n_wide = 0;
     int n_cand = 0;
-    DeviceBuffer<int> wide_ids;
-    DeviceBuffer<int> wide_off;
+    ScratchBuffer<int> wide_ids;
+    ScratchBuffer<int> wide_off;
 };
 
 template <typename Gather>
 SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
-    DeviceBuffer<int> stats = device_alloc<int>(2, "pattern", "segment plan");
+    const ScratchBuffer<int> stats = scratch_alloc<int>(2, stream, "pattern", "segment plan");
     check_cuda(cudaMemsetAsync(stats.get(), 0, 2 * sizeof(int), stream), "memset(segment plan)");
     plan_kernel<<<grid_for(n_seg), kBlock, 0, stream>>>(g, stats.get(), n_seg);
     check_cuda(cudaGetLastError(), "segment plan launch");
@@ -232,31 +231,16 @@ SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
     if (!plan.n_wide) return plan;
 
     const std::size_t wide = static_cast<std::size_t>(plan.n_wide);
-    plan.wide_ids = device_alloc<int>(wide, "pattern", "wide segment ids");
-    plan.wide_off = device_alloc<int>(wide + 1, "pattern", "wide segment offsets");
-    DeviceBuffer<int> sizes = device_alloc<int>(wide + 1, "pattern", "wide segment sizes");
-    DeviceBuffer<int> cursor = device_alloc<int>(1, "pattern", "wide segment cursor");
+    plan.wide_ids = scratch_alloc<int>(wide, stream, "pattern", "wide segment ids");
+    plan.wide_off = scratch_alloc<int>(wide + 1, stream, "pattern", "wide segment offsets");
+    const ScratchBuffer<int> sizes =
+        scratch_alloc<int>(wide + 1, stream, "pattern", "wide segment sizes");
+    const ScratchBuffer<int> cursor = scratch_alloc<int>(1, stream, "pattern", "wide cursor");
     check_cuda(cudaMemsetAsync(cursor.get(), 0, sizeof(int), stream), "memset(wide cursor)");
     compact_wide_kernel<<<grid_for(n_seg), kBlock, 0, stream>>>(
         g, cursor.get(), plan.wide_ids.get(), sizes.get(), n_seg);
     check_cuda(cudaGetLastError(), "wide segment compaction launch");
-    check_cuda(cudaMemsetAsync(sizes.get() + plan.n_wide, 0, sizeof(int), stream),
-               "memset(wide total)");
-
-    std::size_t bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, sizes.get(), plan.wide_off.get(),
-                                             plan.n_wide + 1, stream),
-               "size(wide exclusive sum)");
-    DeviceBuffer<std::byte> temp = device_alloc<std::byte>(bytes, "pattern", "wide scan scratch");
-    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, sizes.get(), plan.wide_off.get(),
-                                             plan.n_wide + 1, stream),
-               "wide exclusive sum");
-
-    check_cuda(cudaMemcpyAsync(&plan.n_cand, plan.wide_off.get() + plan.n_wide, sizeof(int),
-                               cudaMemcpyDeviceToHost, stream),
-               "copy(wide candidate total)");
-    // The scratch above dies with this scope, so the kernels have to have finished reading it.
-    check_cuda(cudaStreamSynchronize(stream), "sync(wide candidate total)");
+    plan.n_cand = scan_counts(plan.n_wide, sizes.get(), plan.wide_off.get(), stream, "pattern");
     return plan;
 }
 
@@ -287,18 +271,15 @@ __device__ __forceinline__ void segment_unique_one(Gather g, const int* __restri
 
     for (int k = 2; k <= m; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = lane; i < m; i += kWarp) {
-                const int ixj = i ^ j;
-                // Only the lower index of a pair acts, so exactly one lane writes each of the two
-                // slots and the stores within a stage never collide. Both values are read into
-                // registers first: this is the innermost loop of the sort, and re-reading shared
-                // memory inside the comparison costs measurably.
-                if (ixj > i) {
-                    const int x = b[i], y = b[ixj];
-                    if ((x > y) == ((i & k) == 0)) {
-                        b[i] = y;
-                        b[ixj] = x;
-                    }
+            // A stage compares m / 2 disjoint pairs (i, i | j), i having bit j clear, so each lane
+            // takes whole pairs and every lane has one: no two stores in a stage collide.
+            for (int q = lane; q < m / 2; q += kWarp) {
+                const int i = ((q & ~(j - 1)) << 1) | (q & (j - 1));
+                const int ixj = i | j;
+                const int x = b[i], y = b[ixj];
+                if ((x > y) == ((i & k) == 0)) {
+                    b[i] = y;
+                    b[ixj] = x;
                 }
             }
             __syncwarp();
@@ -381,8 +362,9 @@ void launch_wide(Gather g, const int* out_ptr, int* out_idx, int* counts, const 
     const unsigned grid = grid_for(n_wide, kSortWarps);
     const std::size_t n_cand = static_cast<std::size_t>(plan.n_cand);
 
-    DeviceBuffer<int> cand = device_alloc<int>(n_cand, "pattern", "wide candidates");
-    DeviceBuffer<int> sorted = device_alloc<int>(n_cand, "pattern", "wide sorted candidates");
+    const ScratchBuffer<int> cand = scratch_alloc<int>(n_cand, stream, "pattern", "candidates");
+    const ScratchBuffer<int> sorted =
+        scratch_alloc<int>(n_cand, stream, "pattern", "sorted candidates");
     gather_wide_kernel<<<grid, kWarp * kSortWarps, 0, stream>>>(g, seg_ids, off, cand.get(),
                                                                 n_wide);
     check_cuda(cudaGetLastError(), "wide segment gather launch");
@@ -391,7 +373,8 @@ void launch_wide(Gather g, const int* out_ptr, int* out_idx, int* counts, const 
     check_cuda(cub::DeviceSegmentedSort::SortKeys(nullptr, bytes, cand.get(), sorted.get(),
                                                   plan.n_cand, n_wide, off, off + 1, stream),
                "size(wide segmented sort)");
-    DeviceBuffer<std::byte> temp = device_alloc<std::byte>(bytes, "pattern", "wide sort scratch");
+    const ScratchBuffer<std::byte> temp =
+        scratch_alloc<std::byte>(bytes, stream, "pattern", "wide sort");
     check_cuda(cub::DeviceSegmentedSort::SortKeys(temp.get(), bytes, cand.get(), sorted.get(),
                                                   plan.n_cand, n_wide, off, off + 1, stream),
                "wide segmented sort");
@@ -399,8 +382,6 @@ void launch_wide(Gather g, const int* out_ptr, int* out_idx, int* counts, const 
     dedupe_wide_kernel<Fill><<<grid, kWarp * kSortWarps, 0, stream>>>(
         sorted.get(), off, seg_ids, out_ptr, out_idx, counts, n_wide);
     check_cuda(cudaGetLastError(), "wide segment dedupe launch");
-    // Every buffer above dies with this call, so the kernels have to have finished reading them.
-    check_cuda(cudaStreamSynchronize(stream), "sync(wide segment scratch)");
 }
 
 // Distinct counts per segment, exclusive-scanned into out_ptr. Returns the total, which is the
@@ -409,27 +390,11 @@ template <typename Gather>
 int count_rows(Gather g, int* out_ptr, int n_seg, cudaStream_t stream) {
     if (n_seg <= 0) return 0;
     const SegmentPlan plan = plan_segments(g, n_seg, stream);
-    DeviceBuffer<int> counts =
-        device_alloc<int>(static_cast<std::size_t>(n_seg) + 1, "pattern", "row counts");
+    const ScratchBuffer<int> counts =
+        scratch_alloc<int>(static_cast<std::size_t>(n_seg) + 1, stream, "pattern", "row counts");
     launch_fast<false>(g, nullptr, nullptr, counts.get(), n_seg, plan.fast_pad, stream);
     launch_wide<false>(g, nullptr, nullptr, counts.get(), plan, stream);
-    check_cuda(cudaMemsetAsync(counts.get() + n_seg, 0, sizeof(int), stream), "memset(total)");
-
-    std::size_t bytes = 0;
-    check_cuda(
-        cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts.get(), out_ptr, n_seg + 1, stream),
-        "size(exclusive sum)");
-    DeviceBuffer<std::byte> temp = device_alloc<std::byte>(bytes, "pattern", "scan scratch");
-    check_cuda(
-        cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts.get(), out_ptr, n_seg + 1, stream),
-        "exclusive sum");
-
-    int nnz = 0;
-    check_cuda(
-        cudaMemcpyAsync(&nnz, out_ptr + n_seg, sizeof(int), cudaMemcpyDeviceToHost, stream),
-        "copy(nnz)");
-    check_cuda(cudaStreamSynchronize(stream), "sync(nnz)");
-    return nnz;
+    return scan_counts(n_seg, counts.get(), out_ptr, stream, "pattern");
 }
 
 template <typename Gather>

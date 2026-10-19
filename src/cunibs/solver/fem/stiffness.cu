@@ -1,6 +1,8 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
+#include <cuda/std/algorithm>
+
 #include <cstdint>
 
 // One thread per row, the same shape rhs.cu uses for the node gather and for the same reason:
@@ -14,20 +16,6 @@
 // mesh.
 
 namespace {
-
-// The column list of a row is sorted (the caller canonicalises the pattern), so a contribution
-// finds its slot by bisection rather than by scanning.
-__device__ __forceinline__ int find_col(const int* __restrict__ indices, int lo, int hi, int col) {
-    while (lo < hi) {
-        const int mid = lo + ((hi - lo) >> 1);
-        if (indices[mid] < col) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
 
 __global__ void stiffness_rows_kernel(const double* __restrict__ g,
                                       const double* __restrict__ scale,
@@ -43,8 +31,8 @@ __global__ void stiffness_rows_kernel(const double* __restrict__ g,
     const int row_end = indptr[row + 1];
     for (int p = row_begin; p < row_end; ++p) data[p] = 0.0;
 
-    const Vec3View<const double, std::int64_t> gv(g, kUnsizedRows);
-    const Tet4View<const int, std::int64_t> tn(tet_nodes, kUnsizedRows);
+    const auto gv = unsized<Vec3View<const double, std::int64_t>>(g);
+    const auto tn = unsized<Tet4View<const int, std::int64_t>>(tet_nodes);
 
     const int begin = ptr[row];
     const int end = ptr[row + 1];
@@ -59,7 +47,9 @@ __global__ void stiffness_rows_kernel(const double* __restrict__ g,
             const std::int64_t cj = static_cast<std::int64_t>(e) * 4 + j;
             const double dot = gi0 * gv(cj, 0) + gi1 * gv(cj, 1) + gi2 * gv(cj, 2);
             const int col = tn(e, j);
-            data[find_col(indices, row_begin, row_end, col)] += s * dot;
+            // The row's columns are sorted, since the caller canonicalises the pattern.
+            data[cuda::std::lower_bound(indices + row_begin, indices + row_end, col) - indices] +=
+                s * dot;
         }
     }
 }
