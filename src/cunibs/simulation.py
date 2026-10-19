@@ -199,17 +199,6 @@ def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     return p
 
 
-def _scratch_pool() -> cp.cuda.MemoryPool:
-    """A pool for chunk-scoped temporaries, with the default pool's free blocks handed back.
-
-    A fresh pool cannot draw on blocks the default pool is holding free, so whatever the caller's
-    setup churned through would stay stranded for as long as the scratch pool lives -- several GB
-    on a full head mesh.
-    """
-    cp.get_default_memory_pool().free_all_blocks()
-    return cp.cuda.MemoryPool()
-
-
 def _sites(placements: Sequence[Placement], method: str) -> list[Placement]:
     if isinstance(placements, Placement):
         raise TypeError(
@@ -280,6 +269,7 @@ class Subject:
         ] = {}
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
+        self._scratch: cp.cuda.MemoryPool | None = None
         # Guards every lazy field above: under the free-threaded build two threads sharing a
         # subject would otherwise each build a solver context, and free() could clear one out
         # from under a reader mid-sweep. Reentrant because _region_slice and
@@ -291,7 +281,7 @@ class Subject:
         return cls(load_mesh(mesh_file))
 
     def free(self) -> None:
-        """Release cached GPU state (solver context, AMG hierarchies, UQ precompute).
+        """Release cached GPU state: solver context, AMG hierarchies, UQ precompute and scratch.
 
         Dropping the cached solver objects triggers their teardown, so a loop over many subjects
         can reclaim device memory as it goes. The subject stays usable afterwards; cached state is
@@ -306,6 +296,9 @@ class Subject:
             self._host_tets = None
             self._host_slots.clear()
             self._region_slices.clear()
+            if self._scratch is not None:
+                self._scratch.free_all_blocks()
+                self._scratch = None
         cp.get_default_memory_pool().free_all_blocks()
 
     def __enter__(self) -> Self:
@@ -313,6 +306,19 @@ class Subject:
 
     def __exit__(self, *exc: object) -> None:
         self.free()
+
+    def _scratch_pool(self) -> cp.cuda.MemoryPool:
+        """The pool a call's chunk-scoped temporaries come from, kept until :meth:`free`.
+
+        Keeping it lets repeated calls reuse its blocks rather than allocate and release them each
+        time. It is created with the default pool's free blocks handed back, since a separate pool
+        cannot draw on them and whatever setup churned through would stay stranded beside it.
+        """
+        with self._lock:
+            if self._scratch is None:
+                cp.get_default_memory_pool().free_all_blocks()
+                self._scratch = cp.cuda.MemoryPool()
+            return self._scratch
 
     @property
     def mesh(self) -> HeadMesh:
@@ -543,9 +549,9 @@ class Subject:
     ) -> Iterator[FieldResult]:
         """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
 
-        The reduction runs under the scratch allocator so every intermediate is bulk-freed
-        with its chunk, but the yield happens after the allocator is popped: control passes
-        to caller code between chunks, and its allocations must not land in our pool.
+        The reduction runs under the subject's scratch allocator, whose blocks every chunk and
+        every later call reuse, but the yield happens after the allocator is popped: control
+        passes to caller code between chunks, and its allocations must not land in our pool.
         """
         ctx = self.context
         # Held across chunks, so these are allocated outside the scratch pool.
@@ -559,28 +565,25 @@ class Subject:
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
         # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
         chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
-        temp_pool = _scratch_pool()
-        try:
-            for start in range(0, len(sites), chunk_k):
-                chunk = sites[start : start + chunk_k]
-                site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
-                with cp.cuda.using_allocator(temp_pool.malloc):
-                    outs = solve_placements_block(
-                        ctx,
-                        dip_pos_m,
-                        dip_moment,
-                        site_args,
-                        didt,
-                        recovery=op,
-                        nodal=retain.nodal,
-                    )
-                    batch = self._reduce_chunk(
-                        chunk, outs, coil, didt, retain, region, recovery, op, rois, provenance
-                    )
-                    del outs
-                yield from batch
-        finally:
-            temp_pool.free_all_blocks()
+        temp_pool = self._scratch_pool()
+        for start in range(0, len(sites), chunk_k):
+            chunk = sites[start : start + chunk_k]
+            site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
+            with cp.cuda.using_allocator(temp_pool.malloc):
+                outs = solve_placements_block(
+                    ctx,
+                    dip_pos_m,
+                    dip_moment,
+                    site_args,
+                    didt,
+                    recovery=op,
+                    nodal=retain.nodal,
+                )
+                batch = self._reduce_chunk(
+                    chunk, outs, coil, didt, retain, region, recovery, op, rois, provenance
+                )
+                del outs
+            yield from batch
 
     def prepare_sweep(self, coil: Coil, size: int = 128) -> None:
         """Seed every later solve on this subject from a basis of ``size`` scalp placements.
@@ -689,7 +692,6 @@ class Subject:
                 "simulate() takes a single Placement. Use Subject.iter_simulate(...) to "
                 "stream a sequence, wrapping it in list() if you want them all at once."
             )
-        # Unpacking drives the generator to exhaustion, so its scratch pool is released.
         (result,) = self.iter_simulate(
             coil,
             [placement],
@@ -727,37 +729,34 @@ class Subject:
         # cached on the context and outlive the placement that first asked for them.
         op = self._recovery_operator(recovery)
         provenance = self._provenance(coil, seeded=False)
-        temp_pool = _scratch_pool()
-        try:
-            for site in sites:
-                with cp.cuda.using_allocator(temp_pool.malloc):
-                    result = run_conductivity_uq(
-                        ctx,
-                        pre,
-                        coil,
-                        site,
-                        config,
-                        didt=didt,
-                        record_rois=record_rois,
-                        recovery=op,
-                    )
-                    # Summarised on the device before anything is copied back.
-                    host = self._host_metric_inputs if moments else None
-                    reduced = replace(
-                        result,
-                        summary=result.compute_summary(),
-                        mean_magnE=cp.asnumpy(result.mean_magnE) if moments else None,
-                        std_magnE=cp.asnumpy(result.std_magnE) if moments else None,
-                        cov_magnE=cp.asnumpy(result.cov_magnE) if moments else None,
-                        vols=host[0] if host else None,
-                        tet_tags=host[1] if host else None,
-                        barycenters_mm=host[2] if host else None,
-                        provenance=provenance,
-                    )
-                    del result
-                yield reduced
-        finally:
-            temp_pool.free_all_blocks()
+        temp_pool = self._scratch_pool()
+        for site in sites:
+            with cp.cuda.using_allocator(temp_pool.malloc):
+                result = run_conductivity_uq(
+                    ctx,
+                    pre,
+                    coil,
+                    site,
+                    config,
+                    didt=didt,
+                    record_rois=record_rois,
+                    recovery=op,
+                )
+                # Summarised on the device before anything is copied back.
+                host = self._host_metric_inputs if moments else None
+                reduced = replace(
+                    result,
+                    summary=result.compute_summary(),
+                    mean_magnE=cp.asnumpy(result.mean_magnE) if moments else None,
+                    std_magnE=cp.asnumpy(result.std_magnE) if moments else None,
+                    cov_magnE=cp.asnumpy(result.cov_magnE) if moments else None,
+                    vols=host[0] if host else None,
+                    tet_tags=host[1] if host else None,
+                    barycenters_mm=host[2] if host else None,
+                    provenance=provenance,
+                )
+                del result
+            yield reduced
 
     def iter_simulate_conductivity_uq(
         self,
@@ -819,7 +818,6 @@ class Subject:
                 "Subject.iter_simulate_conductivity_uq(...) to stream a sequence, "
                 "wrapping it in list() if you want them all at once."
             )
-        # Unpacking drives the generator to exhaustion, so its scratch pool is released.
         (result,) = self.iter_simulate_conductivity_uq(
             coil,
             [placement],
