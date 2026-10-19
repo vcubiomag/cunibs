@@ -33,7 +33,7 @@ from cunibs.fem import (
 from cunibs.mesh import HeadMesh, load_mesh
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Collection, Iterator, Mapping, Sequence
     from typing import Self
 
     from cunibs.adm.target import ResolvedTarget
@@ -442,17 +442,36 @@ class Subject:
                 )
             return self._host_metrics
 
-    def _recovery_operator(self, recovery: Recovery) -> RecoveryOperator | None:
+    def _recovery_operator(
+        self, recovery: Recovery, tissues: Collection[int] | None = None
+    ) -> RecoveryOperator | None:
         """Build (and cache on the context) the patch weights for ``recovery``.
 
         Held here rather than reached from inside a solve so the build is serialised against
         other threads sharing this subject, and so it lands outside the caller's scratch
-        allocator -- the operator outlives the chunk that first asked for it.
+        allocator -- the operator outlives the chunk that first asked for it. ``tissues`` is
+        what the call reads; see :meth:`_needed_tissues`.
         """
         if recovery == "raw":
             return None
         with self._lock:
-            return ensure_recovery(self.context, recovery)
+            return ensure_recovery(self.context, recovery, tissues)
+
+    def _needed_tissues(
+        self, full_volume: bool, record_rois: Mapping[str, ResolvedTarget]
+    ) -> frozenset[int] | None:
+        """The tissues a call reads the recovered field on, or ``None`` for all of them.
+
+        A call that keeps no full-volume array reads only its summary region and its ROIs, so the
+        recovery can skip the rest of the head.
+        """
+        if full_volume:
+            return None
+        tags = {metrics.region_tag(_DEFAULT_REGION)}
+        tet_tags = self.context.tet_tags
+        for target in record_rois.values():
+            tags.update(int(t) for t in cp.asnumpy(cp.unique(tet_tags[target.elem_idx])))
+        return frozenset(tags)
 
     def _reduce_chunk(
         self,
@@ -559,7 +578,10 @@ class Subject:
         dip_moment = cp.asarray(coil.moments)
         region = self._region_slice(_DEFAULT_REGION)
         # Same reason: the patch weights outlive the chunk that first needs them.
-        op = self._recovery_operator(recovery)
+        tissues = self._needed_tissues(
+            retain.magnitude or retain.vectors or retain.nodal, record_rois
+        )
+        op = self._recovery_operator(recovery, tissues)
         rois = _roi_probes(record_rois)
         provenance = self._provenance(coil)
         # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
@@ -578,6 +600,7 @@ class Subject:
                     didt,
                     recovery=op,
                     nodal=retain.nodal,
+                    tissues=tissues,
                 )
                 batch = self._reduce_chunk(
                     chunk, outs, coil, didt, retain, region, recovery, op, rois, provenance
@@ -727,7 +750,8 @@ class Subject:
         pre = self._conductivity_uq_precompute(config)
         # Outside the pool below, for the same reason the precompute is: the patch weights are
         # cached on the context and outlive the placement that first asked for them.
-        op = self._recovery_operator(recovery)
+        tissues = self._needed_tissues(moments, record_rois)
+        op = self._recovery_operator(recovery, tissues)
         provenance = self._provenance(coil, seeded=False)
         temp_pool = self._scratch_pool()
         for site in sites:
@@ -741,6 +765,7 @@ class Subject:
                     didt=didt,
                     record_rois=record_rois,
                     recovery=op,
+                    tissues=tissues,
                 )
                 # Summarised on the device before anything is copied back.
                 host = self._host_metric_inputs if moments else None

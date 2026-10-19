@@ -508,11 +508,12 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
 
 // One warp per slot over the node patch, taking the widest basis the patch can carry and
 // dropping a rung where it cannot. status records which rung each slot took, counted down from
-// the widest: 0 cubic, 1 quadratic, 2 linear, 3 no gradient determined.
+// the widest: 0 cubic, 1 quadratic, 2 linear, 3 no gradient determined. The slots are active[0,
+// n), or [0, n) when active is null; a slot's fit reads only its own patch.
 __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
     const double* __restrict__ nodes_mm, const int* __restrict__ pptr,
     const int* __restrict__ pidx, const int* __restrict__ slot_node, float* __restrict__ w,
-    int* __restrict__ status, int n_slots) {
+    int* __restrict__ status, const int* __restrict__ active, int n) {
     constexpr int kMaxTerms = CubicHarmonicBasis::kTerms;
     __shared__ double warp_q[kFitWarps][kFitChunk * kMaxTerms];
     __shared__ double warp_a[kFitWarps][kMaxTerms * kMaxTerms];
@@ -523,8 +524,9 @@ __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
     const int lane = threadIdx.x % kWarp;
     // Every lane of a warp takes the same slot, so this exit and every rung decision below are
     // warp-uniform and the __syncwarp calls inside a fit always meet the whole warp.
-    const int s = blockIdx.x * kFitWarps + warp;
-    if (s >= n_slots) return;
+    const int i = blockIdx.x * kFitWarps + warp;
+    if (i >= n) return;
+    const int s = active ? active[i] : i;
     const FitScratch scratch{warp_q[warp], warp_a[warp], warp_yz[warp], &warp_singular[warp]};
 
     const int begin = pptr[s], end = pptr[s + 1];
@@ -595,9 +597,11 @@ template <int K>
 __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __restrict__ v_lo,
                                 const float* __restrict__ w, const int* __restrict__ pptr,
                                 const int* __restrict__ pidx, const int* __restrict__ slot_node,
-                                ConstPtrPack dadt_nodes, PtrPack e_slots, int n_slots) {
-    const int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= n_slots) return;
+                                ConstPtrPack dadt_nodes, PtrPack e_slots, int n_slots,
+                                const int* __restrict__ active, int n) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const int s = active ? active[t] : t;
 
     const Vec3View<const float> wv(w, kUnsizedRows);
     const WidthView<const float, K> hi(v_hi, kUnsizedRows);
@@ -702,9 +706,11 @@ __device__ __forceinline__ float two_sum(float a, float b, float& e) {
 template <int K>
 __global__ void recover_elements_kernel(ConstPtrPack e_slots,
                                         const int* __restrict__ slot_of_corner, PtrPack e_out,
-                                        PtrPack magn_out, int n_tet) {
-    const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= n_tet) return;
+                                        PtrPack magn_out, int n_tet,
+                                        const int* __restrict__ active, int n) {
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const int e = active ? active[t] : t;
 
     const Tet4View<const int> soc(slot_of_corner, n_tet);
     int slots[4];
@@ -752,21 +758,22 @@ void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const floa
 }
 
 void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
-                        const int* slot_node, float* w, int* status, int n_slots,
+                        const int* slot_node, float* w, int* status, const int* active, int n,
                         cudaStream_t stream) {
     // One warp per slot, so the grid is sized in slots per block rather than in threads.
-    if (const unsigned blocks = grid_for(n_slots, kFitWarps)) {
+    if (const unsigned blocks = grid_for(n, kFitWarps)) {
         hpr_weights_kernel<<<blocks, kFitBlock, 0, stream>>>(nodes_mm, pptr, pidx, slot_node, w,
-                                                             status, n_slots);
+                                                             status, active, n);
     }
 }
 
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
-                     int n_slots, int k, int stride, int n_nodes, cudaStream_t stream) {
+                     int n_slots, const int* active, int n, int k, int stride, int n_nodes,
+                     cudaStream_t stream) {
     const ConstPtrPack da = const_ptr_pack(dadt_nodes, k);
     const PtrPack out = ptr_pack(e_slots, k);
-    const unsigned blocks = grid_for(n_slots);
+    const unsigned blocks = grid_for(n);
     if (!blocks) return;
     const std::size_t count = static_cast<std::size_t>(n_nodes) * k;
     float* split = nullptr;
@@ -782,7 +789,7 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
                 <<<sb, kBlock, 0, stream>>>(v_block, stride, n_nodes, v_hi, v_lo);
         }
         hpr_grad_kernel<K><<<blocks, kBlock, 0, stream>>>(v_hi, v_lo, w, pptr, pidx, slot_node,
-                                                          da, out, n_slots);
+                                                          da, out, n_slots, active, n);
     });
     check_cuda(cudaFreeAsync(split, stream), "hpr_grad", "freeAsync(split)");
 }
@@ -803,16 +810,16 @@ void launch_recover_nodes(const float* const* e_in, const float* w, const int* p
 }
 
 void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,
-                             float* const* e_out, float* const* magn_out, int n_tet, int k,
-                             cudaStream_t stream) {
+                             float* const* e_out, float* const* magn_out, int n_tet,
+                             const int* active, int n, int k, cudaStream_t stream) {
     const ConstPtrPack in = const_ptr_pack(e_slots, k);
     const PtrPack eo = ptr_pack(e_out, k);
     const PtrPack mo = ptr_pack(magn_out, k);
-    const unsigned blocks = grid_for(n_tet);
+    const unsigned blocks = grid_for(n);
     if (!blocks) return;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(
         k, "recover_elements: unsupported block width", [&](auto kk) {
             recover_elements_kernel<decltype(kk)::value>
-                <<<blocks, kBlock, 0, stream>>>(in, slot_of_corner, eo, mo, n_tet);
+                <<<blocks, kBlock, 0, stream>>>(in, slot_of_corner, eo, mo, n_tet, active, n);
         });
 }

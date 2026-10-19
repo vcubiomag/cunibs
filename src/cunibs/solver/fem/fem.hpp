@@ -120,20 +120,24 @@ void launch_skin_normals(const double* nodes_mm, const int* tris, const int* nod
 // The fit takes the widest basis its patch can carry and drops a rung where it cannot. status[s]
 // records which one it took, counted down from the widest: 0 harmonic cubic, 1 harmonic quadratic,
 // 2 linear, 3 no gradient determined.
+// The fitted slots are active[0, n), or every slot when active is null and n is the slot count.
 void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
-                        const int* slot_node, float* w, int* status, int n_slots,
+                        const int* slot_node, float* w, int* status, const int* active, int n,
                         cudaStream_t stream);
 
 // v_block is row-major (n_nodes, stride) float64; column c of each slot uses dadt_nodes[c].
 // stride is the block width the potential was solved at, which is k except on the serial path.
+// Only the slots active[0, n) are written, or all n_slots when active is null.
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
                      const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
-                     int n_slots, int k, int stride, int n_nodes, cudaStream_t stream);
+                     int n_slots, const int* active, int n, int k, int stride, int n_nodes,
+                     cudaStream_t stream);
 
 // slot_of_corner is (4 * n_tet,): the slot each corner reads back from.
+// Only the elements active[0, n) are written, or all n_tet when active is null.
 void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,
-                             float* const* e_out, float* const* magn_out, int n_tet, int k,
-                             cudaStream_t stream);
+                             float* const* e_out, float* const* magn_out, int n_tet,
+                             const int* active, int n, int k, cudaStream_t stream);
 
 // --- raycast.cu: first hit of a ray against a tissue surface --------------------------------
 // verts is (n_tri, 3, 3), the three corner coordinates of each triangle; out_t is one distance

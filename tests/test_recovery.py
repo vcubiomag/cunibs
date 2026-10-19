@@ -1095,3 +1095,44 @@ def test_recovery_does_not_raise_the_peak(patch_subject, d70_coil, patch_placeme
     assert recovered.peak_magnE() <= raw.peak_magnE(), (
         f"{mode} peak {recovered.peak_magnE()} exceeds raw {raw.peak_magnE()}"
     )
+
+
+@pytest.mark.realmesh
+def test_a_summary_only_run_fits_only_the_tissues_it_reads(
+    cp, fresh_subject, patch_mesh, d70_coil, patch_placement
+):
+    """Gray matter alone is fitted for a summary, and fitting the rest later changes nothing."""
+    from cunibs.fem.recovery import ensure_recovery
+
+    subject = fresh_subject(patch_mesh)
+    summary_only = subject.simulate(d70_coil, patch_placement)
+    op = subject.context.recovery["harmonic"]
+    assert op.fitted == {2}
+    assert len(op.tags) > 1
+
+    full_volume = subject.simulate(d70_coil, patch_placement, magnitude=True)
+    assert op.fitted == op.tags
+    for key, value in summary_only.summary.items():
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(value, full_volume.summary[key], err_msg=key)
+        else:
+            assert value == full_volume.summary[key], key
+
+    whole = ensure_recovery(fresh_subject(patch_mesh).context, "harmonic")
+    np.testing.assert_array_equal(cp.asnumpy(op.w), cp.asnumpy(whole.w))
+    np.testing.assert_array_equal(cp.asnumpy(op.status), cp.asnumpy(whole.status))
+    assert op.n_fallback == whole.n_fallback
+
+
+@pytest.mark.realmesh
+def test_a_partly_fitted_operator_refuses_a_full_apply(cp, fresh_subject, patch_mesh):
+    from cunibs.fem.recovery import RecoveredField, apply_recovery_into, ensure_recovery
+
+    ctx = fresh_subject(patch_mesh).context
+    op = ensure_recovery(ctx, "harmonic", {2})
+    out = RecoveredField.allocate(op, int(ctx.tet_nodes.shape[0]))
+    potential = cp.zeros((ctx.n_nodes, 1))
+    dadt = [cp.zeros((ctx.n_nodes, 3), dtype=cp.float32)]
+    with pytest.raises(ValueError, match="fitted for tissues"):
+        apply_recovery_into(op, out, potential=potential, dadt_nodes=dadt)
+    apply_recovery_into(op, out, potential=potential, dadt_nodes=dadt, tissues={2})

@@ -48,7 +48,7 @@ from cunibs.solver import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from cunibs.fem.sweep import SweepBasis
     from cunibs.simulation import Subject
@@ -931,6 +931,7 @@ def solve_placements_block(
     *,
     recovery: RecoveryOperator | None = None,
     nodal: bool = False,
+    tissues: Collection[int] | None = None,
 ) -> list[PlacementResult]:
     """Solve up to MAX_BLOCK placements with block kernels end to end.
 
@@ -946,7 +947,8 @@ def solve_placements_block(
     for the raw per-tetrahedron field; see :func:`_check_operator` for why this layer will not
     build one. It is another placement-independent array read once per chunk, and its per-slot
     reduction order does not depend on k, so a placement's recovered field is the same at every
-    block width.
+    block width. ``tissues`` limits the recovered field to those tissues' elements, leaving the
+    rest of ``E`` and ``magnE`` unwritten; see :func:`~cunibs.fem.apply_recovery_into`.
     """
     k = len(sites)
     solver = ctx.solver
@@ -1009,6 +1011,7 @@ def solve_placements_block(
             elements=None if on_potential else es,
             potential=v_block,
             dadt_nodes=dadt_nodal if on_potential else None,
+            tissues=tissues,
         )
         slots, es, magns = rec.E_slots, rec.E, rec.magnE
 

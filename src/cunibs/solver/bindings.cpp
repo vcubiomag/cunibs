@@ -726,7 +726,7 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "hpr_weights",
         [](f64_cuda_2d nodes_mm, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node, f32_cuda_2d w,
-           i32_cuda status, uintptr_t stream) {
+           i32_cuda status, uintptr_t stream, std::optional<i32_cuda> active) {
             const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
             if (w.shape(0) != pidx.shape(0) || w.shape(1) != 3) {
                 throw std::invalid_argument("hpr_weights: w must be (nnz, 3)");
@@ -736,13 +736,15 @@ NB_MODULE(_solver_ext, m) {
                 throw std::invalid_argument("hpr_weights: slot_node/status must be per slot");
             }
             launch_hpr_weights(nodes_mm.data(), pptr.data(), pidx.data(), slot_node.data(),
-                               w.data(), status.data(), n_slots,
+                               w.data(), status.data(),
+                               active.has_value() ? active->data() : nullptr,
+                               active.has_value() ? static_cast<int>(active->shape(0)) : n_slots,
                                reinterpret_cast<cudaStream_t>(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("pptr").noconvert(), nb::arg("pidx").noconvert(),
         nb::arg("slot_node").noconvert(), nb::arg("w").noconvert(), nb::arg("status").noconvert(),
-        nb::arg("stream"),
+        nb::arg("stream"), nb::arg("active").noconvert() = nb::none(),
         "Harmonic-constrained potential-recovery weights: grad_v[s] = sum_m w[s,m] v[m]. "
         "status is the rung the fit took, counted down from the widest basis: 0 harmonic cubic, "
         "1 harmonic quadratic, 2 linear, 3 no gradient determined.");
@@ -751,7 +753,7 @@ NB_MODULE(_solver_ext, m) {
         "hpr_grad",
         [](f64_cuda_2d v_block, f32_cuda_2d w, i32_cuda pptr, i32_cuda pidx, i32_cuda slot_node,
            std::vector<f32_cuda_2d> dadt_nodes, std::vector<f32_cuda_2d> e_slots,
-           uintptr_t stream) {
+           uintptr_t stream, std::optional<i32_cuda> active) {
             const int k = static_cast<int>(dadt_nodes.size());
             if (k < 1 || k > kMaxStageBlock || e_slots.size() != dadt_nodes.size()) {
                 throw std::invalid_argument("hpr_grad: bad list sizes");
@@ -768,14 +770,17 @@ NB_MODULE(_solver_ext, m) {
             }
             const int n_slots = static_cast<int>(pptr.shape(0)) - 1;
             launch_hpr_grad(v_block.data(), w.data(), pptr.data(), pidx.data(), slot_node.data(),
-                            da_ptrs, out_ptrs, n_slots, k, stride,
-                            static_cast<int>(v_block.shape(0)),
+                            da_ptrs, out_ptrs, n_slots,
+                            active.has_value() ? active->data() : nullptr,
+                            active.has_value() ? static_cast<int>(active->shape(0)) : n_slots, k,
+                            stride, static_cast<int>(v_block.shape(0)),
                             reinterpret_cast<cudaStream_t>(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("v_block").noconvert(), nb::arg("w").noconvert(), nb::arg("pptr").noconvert(),
         nb::arg("pidx").noconvert(), nb::arg("slot_node").noconvert(),
         nb::arg("dadt_nodes").noconvert(), nb::arg("e_slots").noconvert(), nb::arg("stream"),
+        nb::arg("active").noconvert() = nb::none(),
         "Recovered E on slots from the nodal potential: E = -grad_v - dA/dt, with dA/dt taken "
         "exactly at the node rather than averaged over an element.");
 
@@ -806,7 +811,8 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "recover_elements",
         [](std::vector<f32_cuda_2d> e_slots, i32_cuda slot_of_corner,
-           std::vector<f32_cuda_2d> e_out, std::vector<f32_cuda_1d> magn_out, uintptr_t stream) {
+           std::vector<f32_cuda_2d> e_out, std::vector<f32_cuda_1d> magn_out, uintptr_t stream,
+           std::optional<i32_cuda> active) {
             const int k = static_cast<int>(e_slots.size());
             if (k < 1 || k > kMaxStageBlock || e_out.size() != e_slots.size() ||
                 magn_out.size() != e_slots.size()) {
@@ -821,12 +827,15 @@ NB_MODULE(_solver_ext, m) {
                 m_ptrs[c] = magn_out[c].data();
             }
             const int n_tet = static_cast<int>(slot_of_corner.shape(0)) / 4;
-            launch_recover_elements(in_ptrs, slot_of_corner.data(), e_ptrs, m_ptrs, n_tet, k,
-                                    reinterpret_cast<cudaStream_t>(stream));
+            launch_recover_elements(in_ptrs, slot_of_corner.data(), e_ptrs, m_ptrs, n_tet,
+                                    active.has_value() ? active->data() : nullptr,
+                                    active.has_value() ? static_cast<int>(active->shape(0)) : n_tet,
+                                    k, reinterpret_cast<cudaStream_t>(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("e_slots").noconvert(), nb::arg("slot_of_corner").noconvert(),
         nb::arg("e_out").noconvert(), nb::arg("magn_out").noconvert(), nb::arg("stream"),
+        nb::arg("active").noconvert() = nb::none(),
         "Sample the recovered field back at the barycentres and take its magnitude.");
 
     m.def(

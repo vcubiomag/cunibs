@@ -50,7 +50,7 @@ outside the head. It would not carry to a problem with interior current sources.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 import cupy as cp
@@ -70,7 +70,7 @@ from cunibs.solver import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Sequence
 
     from cunibs.fem.solve import SolverContext
 
@@ -325,9 +325,13 @@ class RecoveryOperator:
     there; that takes an all-coplanar patch, so anything but zero is worth investigating.
 
     ``status`` is the harmonic mode's per-slot rung and is ``None`` elsewhere: 0 harmonic cubic,
-    1 harmonic quadratic, 2 linear, 3 undetermined. It is the array the two counts above are
-    reductions of, and what makes a rejected fit attributable to a place on the mesh rather than
-    only countable.
+    1 harmonic quadratic, 2 linear, 3 undetermined, and -1 for a slot not fitted yet. It is the
+    array the two counts above are reductions of, and what makes a rejected fit attributable to a
+    place on the mesh rather than only countable.
+
+    A harmonic operator fits its slots per tissue, on demand: ``fitted`` holds the tissues done so
+    far and ``tags`` every tissue the mesh has. A slot's fit reads only its own patch, so fitting
+    another tissue later leaves the earlier weights exactly as they were.
     """
 
     mode: Recovery
@@ -337,10 +341,39 @@ class RecoveryOperator:
     slot_of_corner: cp.ndarray
     slot_node: cp.ndarray
     n_slots: int
-    n_fallback: int
     slot_tag: cp.ndarray | None = None
-    n_undetermined: int = 0
     status: cp.ndarray | None = None
+    spr_fallbacks: int = 0
+    fitted: set[int] | None = None
+    tags: frozenset[int] = frozenset()
+    # The slots and elements of each tissue set an apply was restricted to, keyed by the set.
+    active: dict[frozenset[int], tuple[cp.ndarray, cp.ndarray]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    @property
+    def n_fallback(self) -> int:
+        if self.status is None:
+            return self.spr_fallbacks
+        return int((self.status >= 2).sum())
+
+    @property
+    def n_undetermined(self) -> int:
+        return 0 if self.status is None else int((self.status == 3).sum())
+
+    def restricted_to(self, tissues: Collection[int]) -> tuple[cp.ndarray, cp.ndarray]:
+        """The slots and elements of ``tissues``, for an apply that needs only those."""
+        key = frozenset(int(t) for t in tissues)
+        cached = self.active.get(key)
+        if cached is None:
+            assert self.slot_tag is not None
+            wanted = cp.asarray(sorted(key), dtype=self.slot_tag.dtype)
+            slots = cp.flatnonzero(cp.isin(self.slot_tag, wanted)).astype(cp.int32)
+            element_tag = self.slot_tag[self.slot_of_corner[::4]]
+            elements = cp.flatnonzero(cp.isin(element_tag, wanted)).astype(cp.int32)
+            cached = (cp.ascontiguousarray(slots), cp.ascontiguousarray(elements))
+            self.active[key] = cached
+        return cached
 
     @property
     def on_potential(self) -> bool:
@@ -348,38 +381,55 @@ class RecoveryOperator:
         return self.mode in POTENTIAL_MODES
 
 
-def _build_harmonic_operator(ctx: SolverContext) -> RecoveryOperator:
-    """Fit the potential over same-tissue node patches, in the harmonic-polynomial space."""
+def _build_harmonic_operator(
+    ctx: SolverContext, tissues: Collection[int] | None
+) -> RecoveryOperator:
+    """Fit the potential over same-tissue node patches, in the harmonic-polynomial space.
+
+    Only the slots of ``tissues`` are fitted, or every slot when it is ``None``.
+    """
     slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
     pptr, pidx = node_patches(ctx, slots)
     n_slots = int(slots.slot_node.shape[0])
+    op = RecoveryOperator(
+        mode="harmonic",
+        ptr=pptr,
+        idx=pidx,
+        w=cp.empty((int(pidx.shape[0]), 3), dtype=cp.float32),
+        slot_of_corner=slots.slot_of_corner,
+        slot_node=slots.slot_node,
+        slot_tag=slots.slot_tag,
+        n_slots=n_slots,
+        status=cp.full(n_slots, -1, dtype=cp.int32),
+        fitted=set(),
+        tags=frozenset(int(t) for t in cp.asnumpy(cp.unique(slots.slot_tag))),
+    )
+    fit_harmonic(ctx, op, op.tags if tissues is None else tissues)
+    return op
 
-    w = cp.empty((int(pidx.shape[0]), 3), dtype=cp.float32)
-    status = cp.empty(n_slots, dtype=cp.int32)
+
+def fit_harmonic(ctx: SolverContext, op: RecoveryOperator, tissues: Collection[int]) -> None:
+    """Fit the slots of whichever of ``tissues`` ``op`` has not fitted yet."""
+    assert op.fitted is not None and op.slot_tag is not None and op.status is not None
+    missing = sorted(({int(t) for t in tissues} & op.tags) - op.fitted)
+    if not missing:
+        return
+    active = cp.flatnonzero(cp.isin(op.slot_tag, cp.asarray(missing, dtype=op.slot_tag.dtype)))
     # In metres, not millimetres. These weights differentiate, so unlike the SPR ones they carry
     # a length unit: v is in volts and E has to come out in V/m. The scaling cancels in any check
     # whose reference gradient is also per millimetre, so it stays invisible until dA/dt is added.
     nodes_m = cp.ascontiguousarray(ctx.nodes_mm * 1e-3)
     hpr_weights(
-        nodes_m, pptr, pidx, slots.slot_node, w, status, cp.cuda.get_current_stream().ptr
+        nodes_m,
+        op.ptr,
+        op.idx,
+        op.slot_node,
+        op.w,
+        op.status,
+        cp.cuda.get_current_stream().ptr,
+        cp.ascontiguousarray(active.astype(cp.int32)),
     )
-    del nodes_m
-
-    return RecoveryOperator(
-        mode="harmonic",
-        ptr=pptr,
-        idx=pidx,
-        w=w,
-        slot_of_corner=slots.slot_of_corner,
-        slot_node=slots.slot_node,
-        slot_tag=slots.slot_tag,
-        n_slots=n_slots,
-        # Dropping from the cubic rung to the quadratic one is still a harmonic fit, so it is not
-        # a fallback; only leaving the harmonic ladder is.
-        n_fallback=int((status >= 2).sum()),
-        n_undetermined=int((status == 3).sum()),
-        status=status,
-    )
+    op.fitted.update(missing)
 
 
 def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
@@ -429,22 +479,33 @@ def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
         slot_node=slot_node,
         slot_tag=slot_tag,
         n_slots=int(slot_node.shape[0]),
-        n_fallback=int(counter[0]),
+        spr_fallbacks=int(counter[0]),
     )
 
 
-def build_recovery_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
-    """Build the patch weights for ``mode``. Costs one pass over the mesh, once per subject."""
+def build_recovery_operator(
+    ctx: SolverContext, mode: Recovery, tissues: Collection[int] | None = None
+) -> RecoveryOperator:
+    """Build the patch weights for ``mode``. Costs one pass over the mesh, once per subject.
+
+    ``tissues`` limits a harmonic operator's fit to those tissues' slots; the SPR modes always
+    fit every slot.
+    """
     mode = validate_recovery(mode)
     if mode == "raw":
         raise ValueError("The raw mode has no recovery operator to build.")
     if mode in POTENTIAL_MODES:
-        return _build_harmonic_operator(ctx)
+        return _build_harmonic_operator(ctx, tissues)
     return _build_spr_operator(ctx, mode)
 
 
-def ensure_recovery(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
+def ensure_recovery(
+    ctx: SolverContext, mode: Recovery, tissues: Collection[int] | None = None
+) -> RecoveryOperator:
     """Return ``mode``'s operator for ``ctx``, building and caching it on first use.
+
+    The operator returned is fitted at least for ``tissues``, or for every tissue when it is
+    ``None``.
 
     Callers that hold a :class:`~cunibs.simulation.Subject` should go through it instead, so the
     build is serialised by its lock and lands outside any scratch allocator.
@@ -452,8 +513,10 @@ def ensure_recovery(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
     mode = validate_recovery(mode)
     cached = ctx.recovery.get(mode)
     if cached is None:
-        cached = build_recovery_operator(ctx, mode)
+        cached = build_recovery_operator(ctx, mode, tissues)
         ctx.recovery[mode] = cached
+    elif cached.fitted is not None:
+        fit_harmonic(ctx, cached, cached.tags if tissues is None else tissues)
     return cached
 
 
@@ -486,6 +549,7 @@ def apply_recovery_into(
     elements: Sequence[cp.ndarray] | None = None,
     potential: cp.ndarray | None = None,
     dadt_nodes: Sequence[cp.ndarray] | None = None,
+    tissues: Collection[int] | None = None,
 ) -> None:
     """Recover a block of placements into caller-allocated buffers.
 
@@ -501,8 +565,21 @@ def apply_recovery_into(
 
     The buffer-taking form exists for the UQ loop, which reuses one set of arrays across every
     draw rather than allocating per sample.
+
+    ``tissues`` limits a harmonic operator to those tissues' slots and elements; every other entry
+    of the outputs is left unwritten, so pass it only when nothing reads them.
     """
     stream = cp.cuda.get_current_stream().ptr
+    slots = elements_out = None
+    if op.fitted is not None:
+        wanted = op.tags if tissues is None else frozenset(int(t) for t in tissues) & op.tags
+        if not wanted <= op.fitted:
+            raise ValueError(
+                f"recovery={op.mode!r} is fitted for tissues {sorted(op.fitted)}, not "
+                f"{sorted(wanted)}. Get the operator from ensure_recovery(ctx, mode, tissues)."
+            )
+        if tissues is not None:
+            slots, elements_out = op.restricted_to(wanted)
     if op.on_potential:
         if potential is None or dadt_nodes is None:
             missing = "potential" if potential is None else "dadt_nodes"
@@ -512,7 +589,15 @@ def apply_recovery_into(
             )
         _check_width(len(dadt_nodes), out, op.mode)
         hpr_grad(
-            potential, op.w, op.ptr, op.idx, op.slot_node, list(dadt_nodes), out.E_slots, stream
+            potential,
+            op.w,
+            op.ptr,
+            op.idx,
+            op.slot_node,
+            list(dadt_nodes),
+            out.E_slots,
+            stream,
+            slots,
         )
     else:
         if elements is None:
@@ -522,7 +607,7 @@ def apply_recovery_into(
             )
         _check_width(len(elements), out, op.mode)
         recover_nodes(list(elements), op.w, op.ptr, op.idx, out.E_slots, stream)
-    recover_elements(out.E_slots, op.slot_of_corner, out.E, out.magnE, stream)
+    recover_elements(out.E_slots, op.slot_of_corner, out.E, out.magnE, stream, elements_out)
 
 
 def _check_width(k: int, out: RecoveredField, mode: Recovery) -> None:

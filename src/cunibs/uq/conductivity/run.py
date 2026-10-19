@@ -30,7 +30,7 @@ from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductiv
 from cunibs.uq.conductivity.result import ConductivityUQResult
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Collection, Mapping
 
     from cunibs.adm.target import ResolvedTarget
     from cunibs.coil import Coil
@@ -275,6 +275,7 @@ def run_conductivity_uq(
     record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
     focality_frac: float = 0.5,
     recovery: RecoveryOperator | None = None,
+    tissues: Collection[int] | None = None,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
 
@@ -296,6 +297,8 @@ def run_conductivity_uq(
     ``recovery`` post-processes each draw's field before any statistic is taken, so the moment
     arrays and the per-draw scalars all describe the same field. It is a prebuilt operator from
     :func:`~cunibs.fem.ensure_recovery`, or ``None`` for the raw per-tetrahedron field.
+    ``tissues`` limits it to those tissues' elements, which leaves the moment arrays defined only
+    there.
     """
     _check_operator(ctx, recovery, False, "run_conductivity_uq")
     wanted = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
@@ -449,6 +452,7 @@ def run_conductivity_uq(
                 elements=None if on_potential else e_bufs,
                 potential=v_blk,
                 dadt_nodes=dadt_nodal if on_potential else None,
+                tissues=tissues,
             )
 
         accumulate_moments_block(magn_stat[: len(draws)], sum_e, sumsq_e, stream)
