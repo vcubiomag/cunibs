@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
+from cunibs.fem.assembly import csr_matmul
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transforms
 from cunibs.solver import sweep_seed, sweep_seed_work_size
 
@@ -141,10 +142,10 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
         x = x[:, :k].astype(cp.float32)
         for _ in range(2):
             if q.shape[1]:
-                x -= q @ (q.T @ (a @ x))
-        g = x.T @ (a @ x)
+                x -= q @ (q.T @ csr_matmul(a, x))
+        g = x.T @ csr_matmul(a, x)
         w, u = cp.linalg.eigh(0.5 * (g + g.T))
-        keep = w > _SPAN_RTOL * float(w[-1]) if w.size else w > 0
+        keep = w > _SPAN_RTOL * float(w[-1])
         if bool(keep.any()):
             new = x @ (u[:, keep] / cp.sqrt(w[keep]))
             q = cp.ascontiguousarray(cp.concatenate([q, new.astype(cp.float32)], axis=1))

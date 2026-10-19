@@ -2,26 +2,26 @@
 
 from __future__ import annotations
 
-from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import cupy as cp
 import numpy as np
 
 from cunibs import metrics
-from cunibs.fem.assembly import conductivity_per_tet
+from cunibs._common import NO_ROIS
+from cunibs.fem.assembly import conductivity_per_tet, csr_matmul
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.fem.recovery import RecoveredField, RecoveryOperator, apply_recovery_into
 from cunibs.fem.solve import (
     MAX_BLOCK,
     SolverConvergenceError,
     _check_operator,
+    _dadt_node_to_elm,
     _pad_block,
 )
 from cunibs.solver import (
     SUMMARY_LAYOUT,
     accumulate_moments_block,
-    dadt_node_to_element,
     reconstruct_e_block,
     rhs_assemble,
     row_dot,
@@ -39,8 +39,6 @@ if TYPE_CHECKING:
     from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
 
 
-_NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
-
 # Tolerance for the sensitivity solves that span the warm-start basis. Deliberately far looser
 # than the draw tolerance: the basis only has to point in the right directions for an initial
 # guess that CG then refines to `pre.tolerance` anyway, so its accuracy sets the rate and never
@@ -55,18 +53,6 @@ _SECOND_ORDER_PAIRS = 16
 # Relative eigenvalue below which a basis direction counts as dependent on the others and is
 # dropped, in the nominal energy norm.
 _BASIS_RTOL = 1e-12
-
-
-def _dadt_node_to_elm(dadt_nodes: cp.ndarray, tet_nodes: cp.ndarray) -> cp.ndarray:
-    """Average nodal dA/dt over each tetrahedron (σ-independent, computed once)."""
-    dadt_elm = cp.empty((int(tet_nodes.shape[0]), 3), dtype=cp.float32)
-    dadt_node_to_element(
-        cp.ascontiguousarray(dadt_nodes),
-        tet_nodes,
-        dadt_elm,
-        cp.cuda.get_current_stream().ptr,
-    )
-    return dadt_elm
 
 
 def _placement_rhs(
@@ -181,10 +167,12 @@ class _ReducedBasis:
     ) -> None:
         idx = pre.idx
         p = len(pre.tissue_ops)
-        ax = cp.stack([op @ x_nominal for op in pre.tissue_ops], axis=1)  # (n_red, P)
+        ax = cp.stack(
+            [csr_matmul(op, x_nominal) for op in pre.tissue_ops], axis=1
+        )  # (n_red, P)
         rhs1 = cp.ascontiguousarray(b_tissue[:, idx].astype(cp.float64).T - ax)
         sens = _solve_columns(pre, rhs1, _SENSITIVITY_TOL, stream)
-        a_sens = [op @ sens for op in pre.tissue_ops]
+        a_sens = [csr_matmul(op, sens) for op in pre.tissue_ops]
 
         pairs = [(s, t) for s in range(p) for t in range(s, p)]
         std = cp.asnumpy(pre.nominal_sigma) * spreads
@@ -215,11 +203,13 @@ class _ReducedBasis:
         # sides; only the second-order columns need a product of their own.
         e_tissue = []
         for t, op in enumerate(pre.tissue_ops):
-            av = cp.concatenate([ax[:, t : t + 1], a_sens[t], op @ sens2], axis=1)
+            av = cp.concatenate([ax[:, t : t + 1], a_sens[t], csr_matmul(op, sens2)], axis=1)
             e_tissue.append(cp.asnumpy(v.T @ av))
         e_terms = np.stack(e_tissue)
         if pre.base_op is not None:
-            e_terms = np.concatenate([cp.asnumpy(v.T @ (pre.base_op @ v))[None], e_terms])
+            e_terms = np.concatenate(
+                [cp.asnumpy(v.T @ csr_matmul(pre.base_op, v))[None], e_terms]
+            )
         e_terms = 0.5 * (e_terms + e_terms.transpose(0, 2, 1))
         b_cols = cp.concatenate([b_base[idx][:, None], b_tissue[:, idx].T], axis=1)
         b_terms = cp.asnumpy(v.T @ b_cols.astype(cp.float64)).T  # (1 + P, m)
@@ -272,10 +262,11 @@ def run_conductivity_uq(
     config: ConductivityUQConfig,
     *,
     didt: float = 1e6,
-    record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+    record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
     focality_frac: float = 0.5,
     recovery: RecoveryOperator | None = None,
     tissues: Collection[int] | None = None,
+    region: metrics.RegionSlice | None = None,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
 
@@ -298,8 +289,41 @@ def run_conductivity_uq(
     arrays and the per-draw scalars all describe the same field. It is a prebuilt operator from
     :func:`~cunibs.fem.ensure_recovery`, or ``None`` for the raw per-tetrahedron field.
     ``tissues`` limits it to those tissues' elements, which leaves the moment arrays defined only
-    there.
+    there, and zero elsewhere.
+
+    ``region`` is the gray-matter slice the per-draw scalars are taken over, built here when not
+    given.
     """
+    with pre.lock:
+        return _run_locked(
+            ctx,
+            pre,
+            coil,
+            placement,
+            config,
+            didt=didt,
+            record_rois=record_rois,
+            focality_frac=focality_frac,
+            recovery=recovery,
+            tissues=tissues,
+            region=region,
+        )
+
+
+def _run_locked(
+    ctx: SolverContext,
+    pre: ConductivityUQPrecompute,
+    coil: Coil,
+    placement: Placement,
+    config: ConductivityUQConfig,
+    *,
+    didt: float,
+    record_rois: Mapping[str, ResolvedTarget],
+    focality_frac: float,
+    recovery: RecoveryOperator | None,
+    tissues: Collection[int] | None,
+    region: metrics.RegionSlice | None,
+) -> ConductivityUQResult:
     _check_operator(ctx, recovery, False, "run_conductivity_uq")
     wanted = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
     if wanted != tuple(sorted(pre.perturbed_tags)):
@@ -352,7 +376,7 @@ def run_conductivity_uq(
         e_bufs = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(width)]
         magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(width)]
     if recovery is not None:
-        rec = RecoveredField.allocate(recovery, n_tet, width)
+        rec = RecoveredField.allocate(recovery, n_tet, width, zeroed=tissues is not None)
     # magn_stat is what every statistic below reads: binding it once is what keeps the moments
     # and the per-draw scalars describing the same field.
     magn_stat = magns if rec is None else rec.magnE
@@ -376,19 +400,15 @@ def run_conductivity_uq(
 
     spreads = np.array([config.cov_for(t) for t in pre.perturbed_tags], dtype=np.float64)
     basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream)
-    y_all = cp.asarray(basis.coefficients(cp.asnumpy(sigmas)))
+    sigmas_host = cp.asnumpy(sigmas)
+    y_all = basis.coefficients(sigmas_host)
 
-    gm = metrics.region_slice(ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, "gray_matter")
+    gm = region or metrics.region_slice(
+        ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, "gray_matter"
+    )
     anchor_q = [metrics.FOCALITY_ANCHOR_PERCENTILE / 100.0]
     peak_col, loc_col, q0 = SUMMARY_LAYOUT[0], SUMMARY_LAYOUT[1], SUMMARY_LAYOUT[5]
     roi_names = list(record_rois)
-    probes = [
-        (
-            cp.ascontiguousarray(record_rois[name].elem_idx.astype(cp.int64)),
-            cp.ascontiguousarray(record_rois[name].weights.astype(cp.float64)),
-        )
-        for name in roi_names
-    ]
     roi_s = cp.empty((config.n_samples, len(roi_names)), dtype=cp.float64)
     peak_s = cp.empty(config.n_samples, dtype=cp.float64)
     foc_s = cp.empty(config.n_samples, dtype=cp.float64)
@@ -406,6 +426,7 @@ def run_conductivity_uq(
         log_ratio = log_ratio - log_ratio.mean(axis=1, keepdims=True)
     log_dist = cp.asnumpy(cp.sqrt((log_ratio**2).sum(axis=1)))
     schedule = [int(k) for k in np.argsort(log_dist, kind="stable")]
+    schedule_dev = cp.asarray(schedule)
     for start in range(0, config.n_samples, width):
         draws = schedule[start : start + width]
         cols = draws + [draws[-1]] * (width - len(draws))
@@ -413,12 +434,12 @@ def run_conductivity_uq(
         # column by column, so neither depends on which block the draw landed in.
         for c, k in enumerate(cols):
             b_blk[:, c] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        basis.guess_into(cp.ascontiguousarray(y_all[cp.asarray(cols)]), x0_blk, stream)
+        basis.guess_into(cp.asarray(y_all[cols]), x0_blk, stream)
         _, rels, _ = pcg.solve_affine_block(
             precond,
             b_blk,
             x_blk,
-            pre.affine_coefficients(sigmas[cp.asarray(cols)]),
+            pre.affine_coefficients(sigmas_host[cols]),
             pre.tolerance,
             pre.max_iters,
             stream,
@@ -445,7 +466,7 @@ def run_conductivity_uq(
         v_blk[pre.idx] = x_blk
         if not on_potential:
             reconstruct_e_block(v_blk, ctx.tet_nodes, ctx.g, dadt_elms, e_bufs, magns, stream)
-        if rec is not None:
+        if recovery is not None and rec is not None:
             apply_recovery_into(
                 recovery,
                 rec,
@@ -459,14 +480,14 @@ def run_conductivity_uq(
         # The summary's own kernel, so a per-draw peak and focality are the summary's
         # definitions. The table stays on the device.
         table = gm.summary_table(magn_stat[: len(draws)], anchor_q, 0, [focality_frac])
-        drawn = cp.asarray(draws)
+        drawn = schedule_dev[start : start + len(draws)]
         peak_s[drawn] = table[:, peak_col]
         peakloc_s[drawn] = table[:, loc_col : loc_col + 3]
         foc_s[drawn] = table[:, q0 + 1]
         for c, k in enumerate(draws):
-            magn_k = magn_stat[c]
-            for j, (idx, w) in enumerate(probes):
-                roi_s[k, j] = (magn_k[idx].astype(cp.float64) * w).sum()
+            for j, name in enumerate(roi_names):
+                roi = record_rois[name]
+                roi_s[k, j] = metrics.roi_mean(magn_stat[c], roi.elem_idx, roi.weights)
 
     n = config.n_samples
     mean = sum_e / n
@@ -480,7 +501,7 @@ def run_conductivity_uq(
         cov_magnE=cov.astype(cp.float32),
         n_samples=n,
         perturbed_tags=pre.perturbed_tags,
-        sigma_samples=cp.asnumpy(sigmas),
+        sigma_samples=sigmas_host,
         vols=ctx.vols,
         tet_tags=ctx.tet_tags,
         barycenters_mm=ctx.tet_barycenters_mm,

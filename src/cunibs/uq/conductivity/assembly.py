@@ -8,7 +8,8 @@ coefficients without re-analysing structure.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
@@ -18,7 +19,6 @@ import numpy.typing as npt
 from cunibs.fem.assembly import (
     TISSUE_CONDUCTIVITY,
     as_int32_tets,
-    build_node2corner,
     conductivity_per_tet,
     fill_stiffness_values,
     gradient_operator,
@@ -29,9 +29,7 @@ from cunibs.fem.solve import (
     DEFAULT_TOLERANCE,
     SolverContext,
     build_native_vcycle,
-    ground_node_of,
     reduce_matrix,
-    solve_ordering,
 )
 from cunibs.solver import NativeVCycle, PcgAmgSolver
 
@@ -59,10 +57,13 @@ class ConductivityUQPrecompute:
     # product with one part streams only that tissue's entries. The warm start forms many.
     tissue_ops: list[csp.csr_matrix]
     base_op: csp.csr_matrix | None  # the fixed part, or None when every tissue is perturbed
+    # Held for a whole placement: it resets pcg's values to nominal and a fallback draw swaps in
+    # its own, so two placements sharing this state must not interleave.
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
-    def affine_coefficients(self, sigmas: cp.ndarray) -> npt.NDArray[np.float64]:
+    def affine_coefficients(self, sigmas: npt.ArrayLike) -> npt.NDArray[np.float64]:
         """Host ``(k, n_terms)`` coefficients of the affine operator for draws ``sigmas``."""
-        sig = cp.asnumpy(sigmas).astype(np.float64)
+        sig = np.asarray(cp.asnumpy(sigmas), dtype=np.float64)
         if not self.affine_has_base:
             return np.ascontiguousarray(sig)
         return np.ascontiguousarray(np.hstack([np.ones((sig.shape[0], 1)), sig]))
@@ -81,7 +82,7 @@ class ConductivityUQPrecompute:
         return build_native_vcycle(
             self.indptr,
             self.indices,
-            cp.ascontiguousarray(sample_data.astype(cp.float32)),
+            sample_data.astype(cp.float32),
         )
 
 
@@ -90,14 +91,12 @@ def build_conductivity_uq_precompute(
 ) -> ConductivityUQPrecompute:
     """Assemble the reference pattern, per-tissue components, and the nominal-σ preconditioner."""
     g64, vols = gradient_operator(ctx.nodes_mm, ctx.tet_nodes)
-    ground_node = ground_node_of(ctx.nodes_mm)
-    # Must match prepare_grounded_solver's ordering, or this frozen CSR pattern would not be
-    # the one the forward solver's hierarchy was built on.
-    idx = solve_ordering(ctx.nodes_mm, ground_node)
+    # The forward solver's ordering, so the reduced pattern is the one its hierarchy was built on.
+    idx = ctx.solver.idx
 
     tets = as_int32_tets(ctx.tet_nodes)
     n_nodes = int(ctx.n_nodes)
-    n2c_ptr, n2c_idx = build_node2corner(tets, n_nodes)
+    n2c_ptr, n2c_idx = ctx.node2corner_ptr, ctx.node2corner_idx
     a_full = stiffness_pattern(tets, n_nodes, n2c_ptr, n2c_idx)
 
     # Grounding selects a submatrix of a pattern that never moves, so every reduced nonzero comes
@@ -105,9 +104,9 @@ def build_conductivity_uq_precompute(
     # recovers that map once, which turns every component into a refill plus a gather.
     a_full.data[:] = cp.arange(a_full.nnz, dtype=g64.dtype)
     k_ref = reduce_matrix(a_full, idx)
-    gather = cp.ascontiguousarray(k_ref.data.astype(cp.int32))
-    row_ptr = cp.ascontiguousarray(k_ref.indptr.astype(cp.int32))
-    col_idx = cp.ascontiguousarray(k_ref.indices.astype(cp.int32))
+    gather = k_ref.data.astype(cp.int32)
+    row_ptr = k_ref.indptr.astype(cp.int32)
+    col_idx = k_ref.indices.astype(cp.int32)
     nnz_red = int(gather.shape[0])
     del k_ref
 
@@ -139,8 +138,9 @@ def build_conductivity_uq_precompute(
 
     nominal_data = cp.ascontiguousarray(recon)
 
-    nominal_f32 = cp.ascontiguousarray(nominal_data.astype(cp.float32))
-    precond = build_native_vcycle(row_ptr, col_idx, nominal_f32)
+    # Nominal sigma is the forward conductivity table, so the nominal operator is the forward one
+    # and its hierarchy serves as is.
+    precond = ctx.solver.precond
     stream = cp.cuda.get_current_stream().ptr
     pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data, stream)
     # The draws' operators, A(sigma) = base + sum_t sigma_t A_t, as one affine operator: a block of

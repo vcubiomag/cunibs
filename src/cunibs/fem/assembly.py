@@ -25,7 +25,31 @@ TISSUE_CONDUCTIVITY: dict[int, float] = {
     10: 0.16,  # muscle
 }
 
-GM_TAG = 2
+# y[i, c] = sum_p data[p] x[indices[p], c] over row i's entries in CSR order, one thread per output
+# entry. A cuSPARSE SpMM picks its association at run time and returns different bits for the
+# same call, which would reach every solve seeded from a product of it.
+_csr_matmul = cp.ElementwiseKernel(
+    "raw int32 indptr, raw int32 indices, raw T data, raw T x, int64 k",
+    "T y",
+    """
+    const long long row = i / k;
+    const long long col = i - row * k;
+    T acc = 0;
+    for (int p = indptr[row]; p < indptr[row + 1]; ++p) {
+        acc += data[p] * x[(long long)indices[p] * k + col];
+    }
+    y = acc;
+    """,
+    "cunibs_csr_matmul",
+)
+
+
+def csr_matmul(a: csp.csr_matrix, x: cp.ndarray) -> cp.ndarray:
+    """``a @ x`` for a dense ``x`` of one or two dimensions, summed in a fixed order."""
+    x2 = cp.ascontiguousarray(x.reshape(x.shape[0], -1), dtype=a.dtype)
+    y = cp.empty((a.shape[0], x2.shape[1]), dtype=a.dtype)
+    _csr_matmul(a.indptr, a.indices, a.data, x2, x2.shape[1], y)
+    return y.reshape((a.shape[0], *x.shape[1:]))
 
 
 def conductivity_per_tet(tet_tags: cp.ndarray) -> cp.ndarray:

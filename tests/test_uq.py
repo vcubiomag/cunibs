@@ -258,6 +258,21 @@ def test_uq_default_sequence_returns_summaries(two_tissue_cube):
         assert item.max_local_cov() >= 0.0
 
 
+def test_max_local_cov_does_not_depend_on_retaining_the_moments(two_tissue_cube):
+    """Without moments the recovery covers only the summary's tissues; the rest must not leak in."""
+    from cunibs import ConductivityUQConfig, Subject
+
+    subj = Subject(two_tissue_cube)
+    config = ConductivityUQConfig(n_samples=8, seed=3)
+    # Pool memory left full of NaN, which an unwritten element would otherwise read back.
+    import cupy as cp
+
+    cp.full(1 << 24, cp.nan, dtype=cp.float32)
+    lean = subj.simulate_conductivity_uq(_coil(), _placement(), config)
+    full = subj.simulate_conductivity_uq(_coil(), _placement(), config, moments=True)
+    assert lean.max_local_cov() == full.max_local_cov()
+
+
 def test_uq_streamed_sequence_results_are_host_backed(cp, two_tissue_cube):
     from cunibs import ConductivityUQConfig, Placement, Subject
 
@@ -629,14 +644,14 @@ def test_a_block_solve_after_a_wider_one_reads_the_current_buffers(cp, two_tissu
 
 
 def test_block_moments_and_row_dot_match_their_serial_forms(cp):
-    from cunibs.solver import accumulate_moments, accumulate_moments_block, row_dot
+    from cunibs.solver import accumulate_moments_block, row_dot
 
     rng = np.random.default_rng(4)
     stream = cp.cuda.get_current_stream().ptr
     magn = [cp.asarray(rng.random(1000).astype(np.float32)) for _ in range(5)]
     s1, q1 = cp.zeros(1000), cp.zeros(1000)
     for m in magn:
-        accumulate_moments(m, s1, q1, stream)
+        accumulate_moments_block([m], s1, q1, stream)
     s2, q2 = cp.zeros(1000), cp.zeros(1000)
     accumulate_moments_block(magn, s2, q2, stream)
     np.testing.assert_array_equal(cp.asnumpy(s1), cp.asnumpy(s2))

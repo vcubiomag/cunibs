@@ -12,16 +12,16 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
-from cunibs.simulation import (
-    _DEFAULT_REGION,
-    Placement,
-    _check_format_version,
-    _opt_array,
-    _read_metrics,
-    _read_provenance,
-    _write_metrics,
-    _write_provenance,
+from cunibs._common import (
+    DEFAULT_REGION,
+    check_format_version,
+    opt_array,
+    read_metrics,
+    read_provenance,
+    write_metrics,
+    write_provenance,
 )
+from cunibs.simulation import Placement
 
 if TYPE_CHECKING:
     from cunibs.fem import Recovery
@@ -117,13 +117,16 @@ class ConductivityUQResult:
     provenance: dict[str, Any] | None = None
 
     def compute_summary(
-        self, region: metrics.Region = _DEFAULT_REGION
+        self,
+        region: metrics.Region = DEFAULT_REGION,
+        *,
+        region_slice: metrics.RegionSlice | None = None,
     ) -> ConductivityUQSummary:
         """Summarise the moment arrays over ``region``, which needs ``moments=True``.
 
         Results from :class:`~cunibs.Subject` already carry a gray-matter ``summary``. One
         straight from :func:`~cunibs.uq.run_conductivity_uq` does not, so call this before
-        :meth:`save`.
+        :meth:`save`. ``region_slice``, when given, is that region's prebuilt slice.
         """
         if self.mean_magnE is None or self.cov_magnE is None:
             raise ValueError(
@@ -132,13 +135,13 @@ class ConductivityUQResult:
             )
         assert self.vols is not None and self.tet_tags is not None
         assert self.barycenters_mm is not None
+        if region_slice is None or region_slice.region != region:
+            region_slice = metrics.region_slice(
+                self.vols, self.barycenters_mm, self.tet_tags, region
+            )
         return ConductivityUQSummary(
-            mean_field=metrics.compute_metrics(
-                self.mean_magnE, self.vols, self.barycenters_mm, self.tet_tags, region=region
-            ),
-            max_local_cov=metrics.peak_magnitude(
-                self.cov_magnE, metrics.region_mask(self.tet_tags, region)
-            ),
+            mean_field=region_slice.summarize(self.mean_magnE),
+            max_local_cov=float(self.cov_magnE[region_slice.index].max()),
         )
 
     def _summary_for(self, region: metrics.Region) -> ConductivityUQSummary:
@@ -146,11 +149,11 @@ class ConductivityUQResult:
             return self.summary
         return self.compute_summary(region)
 
-    def peak_mean_magnE(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+    def peak_mean_magnE(self, region: metrics.Region = DEFAULT_REGION) -> float:
         """Peak of the mean field in a region."""
         return self._summary_for(region).mean_field["peak_magnE"]
 
-    def max_local_cov(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+    def max_local_cov(self, region: metrics.Region = DEFAULT_REGION) -> float:
         """Largest per-tetrahedron coefficient of variation (std / mean) of |E| in a region.
 
         This is the worst local sensitivity to conductivity uncertainty, not the coefficient
@@ -210,7 +213,7 @@ class ConductivityUQResult:
                 h5f.create_dataset(name, data=cp.asnumpy(arr), compression="gzip")
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
             grp = h5f.create_group("summary")
-            _write_metrics(grp.create_group("mean_field"), self.summary.mean_field)
+            write_metrics(grp.create_group("mean_field"), self.summary.mean_field)
             grp.attrs["max_local_cov"] = self.summary.max_local_cov
             roi = h5f.create_group("roi_samples")
             for roi_name, arr in self.roi_samples.items():
@@ -227,23 +230,23 @@ class ConductivityUQResult:
             h5f.attrs["placement_handle_mm"] = self.placement.handle_mm
             h5f.attrs["placement_distance_mm"] = self.placement.distance_mm
             if self.provenance is not None:
-                _write_provenance(h5f, self.provenance)
+                write_provenance(h5f, self.provenance)
 
     @classmethod
     def load(cls, path: str | Path) -> ConductivityUQResult:
         """Read a saved conductivity-UQ result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
-            _check_format_version(h5f, path, _FORMAT_VERSION)
+            check_format_version(h5f, path, _FORMAT_VERSION)
             return cls(
-                mean_magnE=_opt_array(h5f, "mean_magnE"),
-                std_magnE=_opt_array(h5f, "std_magnE"),
-                cov_magnE=_opt_array(h5f, "cov_magnE"),
+                mean_magnE=opt_array(h5f, "mean_magnE"),
+                std_magnE=opt_array(h5f, "std_magnE"),
+                cov_magnE=opt_array(h5f, "cov_magnE"),
                 n_samples=int(h5f.attrs["n_samples"]),
                 perturbed_tags=tuple(int(t) for t in h5f.attrs["perturbed_tags"]),
                 sigma_samples=np.asarray(h5f["sigma_samples"]),
-                vols=_opt_array(h5f, "vols"),
-                tet_tags=_opt_array(h5f, "tet_tags"),
-                barycenters_mm=_opt_array(h5f, "barycenters_mm"),
+                vols=opt_array(h5f, "vols"),
+                tet_tags=opt_array(h5f, "tet_tags"),
+                barycenters_mm=opt_array(h5f, "barycenters_mm"),
                 placement=Placement(
                     center_mm=h5f.attrs["placement_center_mm"],
                     handle_mm=h5f.attrs["placement_handle_mm"],
@@ -252,9 +255,9 @@ class ConductivityUQResult:
                 coil_name=str(h5f.attrs["coil_name"]),
                 didt=float(h5f.attrs["didt"]),
                 recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
-                provenance=_read_provenance(h5f),
+                provenance=read_provenance(h5f),
                 summary=ConductivityUQSummary(
-                    mean_field=_read_metrics(h5f["summary"]["mean_field"]),
+                    mean_field=read_metrics(h5f["summary"]["mean_field"]),
                     max_local_cov=float(h5f["summary"].attrs["max_local_cov"]),
                 ),
                 roi_samples={k: np.asarray(v) for k, v in h5f["roi_samples"].items()},
