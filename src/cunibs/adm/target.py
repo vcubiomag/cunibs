@@ -10,6 +10,7 @@ import cupy as cp
 import numpy as np
 import numpy.typing as npt
 
+from cunibs._common import as_point
 from cunibs.metrics import Region, region_mask
 
 if TYPE_CHECKING:
@@ -20,12 +21,24 @@ if TYPE_CHECKING:
 # coordinate lands 10-20 mm from gray matter.
 FAR_FROM_REGION_MM = 5.0
 
-
-def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
-    p = np.ascontiguousarray(value, dtype=np.float64).reshape(-1)
-    if p.shape != (3,):
-        raise ValueError(f"Expected a 3-vector, got shape {np.shape(value)}.")
-    return p
+# How far a point at squared distance d2 from element e's barycentre lies outside the ball about
+# that barycentre reaching its farthest corner, or 0 inside it.
+_outside_reach = cp.ElementwiseKernel(
+    "raw float64 nodes, raw int32 tets, raw float64 barys, int32 e, float64 d2",
+    "float64 gap",
+    """
+    double reach2 = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        const long long n = tets[4LL * e + k];
+        const double dx = nodes[3 * n] - barys[3LL * e];
+        const double dy = nodes[3 * n + 1] - barys[3LL * e + 1];
+        const double dz = nodes[3 * n + 2] - barys[3LL * e + 2];
+        reach2 = fmax(reach2, dx * dx + dy * dy + dz * dz);
+    }
+    gap = fmax(sqrt(d2) - sqrt(reach2), 0.0);
+    """,
+    "cunibs_outside_reach",
+)
 
 
 @dataclass(frozen=True, init=False)
@@ -54,11 +67,11 @@ class Target:
         region: Region = "gray_matter",
         radius_mm: float = 0.0,
     ) -> None:
-        object.__setattr__(self, "position_mm", _as_point(position_mm))
+        object.__setattr__(self, "position_mm", as_point(position_mm))
         if direction is None:
             object.__setattr__(self, "direction", None)
         else:
-            d = _as_point(direction)
+            d = as_point(direction)
             n = float(np.linalg.norm(d))
             if n == 0.0:
                 raise ValueError("direction must be non-zero.")
@@ -113,10 +126,7 @@ def resolve_target(
         if not bool(within.any()):
             within = d2 == d2.min()
         sel = region_ids[within]
-    corners = ctx.nodes_mm[ctx.tet_nodes[region_ids]]
-    reach = cp.sqrt(((corners - region_barys[:, None, :]) ** 2).sum(-1).max(axis=1))
-    offset_mm = float(cp.maximum(cp.sqrt(d2) - reach, 0.0).min())
-    del corners
+    offset_mm = float(_outside_reach(ctx.nodes_mm, ctx.tet_nodes, barys, region_ids, d2).min())
     if offset_mm > FAR_FROM_REGION_MM:
         warnings.warn(
             f"The target at {np.array2string(target.position_mm, precision=1)} mm lies "

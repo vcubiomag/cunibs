@@ -533,12 +533,19 @@ class RecoveredField(NamedTuple):
     magnE: list[cp.ndarray]
 
     @classmethod
-    def allocate(cls, op: RecoveryOperator, n_tet: int, k: int = 1) -> RecoveredField:
-        """Buffers for ``k`` placements against ``op``."""
+    def allocate(
+        cls, op: RecoveryOperator, n_tet: int, k: int = 1, *, zeroed: bool = False
+    ) -> RecoveredField:
+        """Buffers for ``k`` placements against ``op``.
+
+        A recovery limited to some tissues leaves the other elements unwritten; ``zeroed`` makes
+        those read as zero for a caller that reduces over every element.
+        """
+        new = cp.zeros if zeroed else cp.empty
         return cls(
             E_slots=[cp.empty((op.n_slots, 3), dtype=cp.float32) for _ in range(k)],
-            E=[cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)],
-            magnE=[cp.empty(n_tet, dtype=cp.float32) for _ in range(k)],
+            E=[new((n_tet, 3), dtype=cp.float32) for _ in range(k)],
+            magnE=[new(n_tet, dtype=cp.float32) for _ in range(k)],
         )
 
 

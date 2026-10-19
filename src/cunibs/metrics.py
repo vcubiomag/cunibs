@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 import cupy as cp
@@ -44,6 +44,24 @@ class FieldMetrics(TypedDict):
     region_volume_m3: float
     focality_m3: dict[str, float]
     distribution: dict[str, float]
+
+
+# One ROI's terms |E|[e] * w, gathered and widened in one pass; summing them gives the ROI's
+# volume-weighted mean.
+_roi_terms = cp.ElementwiseKernel(
+    "raw T magn, I elem, float64 w",
+    "float64 y",
+    "y = (double)magn[elem] * w",
+    "cunibs_roi_terms",
+)
+
+
+def roi_mean(magnE: cp.ndarray, elem_idx: cp.ndarray, weights: cp.ndarray) -> cp.ndarray:
+    """Volume-weighted mean |E| over an ROI's elements, as a device scalar.
+
+    ``weights`` are the ROI's normalised volumes, as :class:`~cunibs.ResolvedTarget` carries them.
+    """
+    return _roi_terms(magnE, elem_idx, weights).sum()
 
 
 def region_tag(region: Region) -> int:
@@ -124,7 +142,7 @@ def _percentile(m: ArrayT, w: ArrayT, percentile: float) -> float:
 
 
 def _stimulated(m: ArrayT, w: ArrayT, threshold: float) -> float:
-    return float(w[m >= threshold].sum())
+    return float(w[m >= threshold].sum(dtype=np.float64))
 
 
 def _center_of_gravity_mm(m: ArrayT, w: ArrayT, bary: ArrayT) -> npt.NDArray[np.float64]:
@@ -136,7 +154,7 @@ def _distribution(m: ArrayT, w: ArrayT, percentiles: tuple[float, ...]) -> dict[
     xp = cp.get_array_module(m)
     wsum = w.sum()
     mean = float((w * m).sum() / wsum)
-    var = float((w * (m - mean) ** 2).sum() / wsum)
+    var = float((w * (m.astype(xp.float64) - mean) ** 2).sum() / wsum)
     qs = xp.asarray([p / 100.0 for p in percentiles], dtype=xp.float64)
     pvals = cp.asnumpy(weighted_quantiles(m, w, qs))
     out = {"mean": mean, "std": float(np.sqrt(var))}
@@ -144,9 +162,14 @@ def _distribution(m: ArrayT, w: ArrayT, percentiles: tuple[float, ...]) -> dict[
     return out
 
 
+def _weights(vols: ArrayT, mask: ArrayT) -> ArrayT:
+    """The region's volumes in float64, the precision every weighted sum here accumulates in."""
+    return vols[mask].astype(np.float64)
+
+
 def percentile_magnitude(magnE: ArrayT, vols: ArrayT, mask: ArrayT, percentile: float) -> float:
     """Volume-weighted percentile of |E| in the region."""
-    return _percentile(magnE[mask], vols[mask], percentile)
+    return _percentile(magnE[mask], _weights(vols, mask), percentile)
 
 
 def peak_location_mm(
@@ -162,7 +185,7 @@ def peak_location_mm(
 def stimulated_volume(magnE: ArrayT, vols: ArrayT, mask: ArrayT, threshold: float) -> float:
     """Total tissue volume (m³) with |E| ≥ ``threshold`` in the region."""
     hit = mask & (magnE >= threshold)
-    return float(vols[hit].sum())
+    return float(vols[hit].sum(dtype=np.float64))
 
 
 def focality(
@@ -184,7 +207,7 @@ def center_of_gravity_mm(
     magnE: ArrayT, vols: ArrayT, barycenters_mm: ArrayT, mask: ArrayT
 ) -> npt.NDArray[np.float64]:
     """Volume·|E|-weighted centroid (mm) of the field in the region."""
-    return _center_of_gravity_mm(magnE[mask], vols[mask], barycenters_mm[mask])
+    return _center_of_gravity_mm(magnE[mask], _weights(vols, mask), barycenters_mm[mask])
 
 
 def distribution(
@@ -194,7 +217,7 @@ def distribution(
     percentiles: tuple[float, ...] = _SUMMARY_PERCENTILES,
 ) -> dict[str, float]:
     """Volume-weighted mean/std and percentiles of |E| in the region."""
-    return _distribution(magnE[mask], vols[mask], percentiles)
+    return _distribution(magnE[mask], _weights(vols, mask), percentiles)
 
 
 @dataclass(frozen=True)
@@ -206,7 +229,8 @@ class RegionSlice:
     mesh the gray matter slice is 1.16M elements.
 
     Build with :func:`region_slice`, outside any scratch allocator whose lifetime is shorter
-    than the sweep.
+    than the sweep. Volumes and barycentres are float64; a device slice's index is int32, the
+    layout the native summary reads.
     """
 
     region: Region
@@ -214,11 +238,10 @@ class RegionSlice:
     vols: ArrayT
     barycenters_mm: ArrayT
     volume_m3: float
-    # For a device slice: the index as int32 and the volumes and barycentres as float64, the
-    # layout the native summary reads.
-    native: tuple[cp.ndarray, cp.ndarray, cp.ndarray] | None = field(
-        default=None, repr=False, compare=False
-    )
+
+    @property
+    def on_device(self) -> bool:
+        return isinstance(self.index, cp.ndarray)
 
     def summarize(
         self,
@@ -232,7 +255,7 @@ class RegionSlice:
         ``peak_magnE`` is the true maximum; the focality volumes are measured against
         :data:`FOCALITY_ANCHOR_PERCENTILE` of |E| instead (see :func:`focality`).
         """
-        if self.native is not None:
+        if self.on_device:
             (summary,) = self.summarize_block(
                 [magnE], focality_fracs=focality_fracs, percentiles=percentiles
             )
@@ -307,9 +330,9 @@ class RegionSlice:
         last offset, then the volumes at or above each fraction of quantile ``qs[anchor]``.
         Nothing is copied to the host, so a caller can keep the table on the device.
         """
-        if self.native is None:
+        if not self.on_device:
             raise ValueError("summary_table needs a slice built from device arrays")
-        index, w, bary = self.native
+        index, w, bary = self.index, self.vols, self.barycenters_mm
         stream = cp.cuda.get_current_stream().ptr
         rows = []
         for start in range(0, len(fields), MAX_STAGE_BLOCK):
@@ -339,23 +362,16 @@ def region_slice(
 ) -> RegionSlice:
     """Gather the field-independent arrays for ``region`` once."""
     xp = cp.get_array_module(vols)
-    index = xp.where(region_mask(tet_tags, region))[0]
-    v = vols[index]
-    bary = barycenters_mm[index]
-    native = None
+    index = xp.flatnonzero(region_mask(tet_tags, region))
     if xp is cp:
-        native = (
-            cp.ascontiguousarray(index, dtype=cp.int32),
-            cp.ascontiguousarray(v, dtype=cp.float64),
-            cp.ascontiguousarray(bary, dtype=cp.float64),
-        )
+        index = index.astype(cp.int32)
+    v = xp.ascontiguousarray(vols[index], dtype=xp.float64)
     return RegionSlice(
         region=region,
         index=index,
         vols=v,
-        barycenters_mm=bary,
+        barycenters_mm=xp.ascontiguousarray(barycenters_mm[index], dtype=xp.float64),
         volume_m3=float(v.sum()),
-        native=native,
     )
 
 

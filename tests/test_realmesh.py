@@ -146,7 +146,7 @@ def test_patch_solve_converged(patch_subject, patch_placement, d70_coil):
     from cunibs.fem import solve_placement
 
     ctx = patch_subject.context
-    solve_placement(
+    out = solve_placement(
         ctx,
         d70_coil.positions_m,
         d70_coil.moments,
@@ -155,8 +155,8 @@ def test_patch_solve_converged(patch_subject, patch_placement, d70_coil):
         patch_placement.distance_mm,
         1e6,
     )
-    assert ctx.solver.last_relative_residual <= ctx.solver.tolerance
-    assert 0 < ctx.solver.last_iterations < ctx.solver.max_iters
+    assert out["relative_residual"] <= ctx.solver.tolerance
+    assert 0 < out["iterations"] < ctx.solver.max_iters
 
 
 @pytest.mark.realmesh

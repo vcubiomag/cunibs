@@ -13,7 +13,6 @@ from cunibs.solver import host_copy_async
 # Two slots, so one drains into its host array while the other fills.
 _SLOT_BYTES = 64 << 20
 _SLOTS = 2
-_DEVICE_TO_HOST = 2
 
 
 class Fence(NamedTuple):
@@ -62,7 +61,11 @@ class AsyncCopier:
                 n = min(_SLOT_BYTES, src.nbytes - offset)
                 stream, slot = self._streams[i], self._slots[i].ptr
                 cp.cuda.runtime.memcpyAsync(
-                    slot, src.data.ptr + offset, n, _DEVICE_TO_HOST, stream.ptr
+                    slot,
+                    src.data.ptr + offset,
+                    n,
+                    cp.cuda.runtime.memcpyDeviceToHost,
+                    stream.ptr,
                 )
                 host_copy_async(slot, dst.ctypes.data + offset, n, stream.ptr)
                 offset += n

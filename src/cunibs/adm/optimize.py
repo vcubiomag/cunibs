@@ -69,6 +69,23 @@ def _objective(e: cp.ndarray, magnitude: bool) -> cp.ndarray:
     return cp.linalg.norm(e, axis=-1) if magnitude else e[..., 0]
 
 
+def _assemble_frames(
+    proj: cp.ndarray, normal: cp.ndarray, y: cp.ndarray, distance_mm: float
+) -> cp.ndarray:
+    """Coil-to-head affines ``(..., 4, 4)`` for handle axes ``y`` (..., 3).
+
+    ``proj`` and ``normal`` broadcast against ``y``; ``z = -normal`` and ``x = y × z``.
+    """
+    z = cp.broadcast_to(-normal, y.shape)
+    m = cp.zeros((*y.shape[:-1], 4, 4), dtype=cp.float64)
+    m[..., :3, 0] = cp.cross(y, z)
+    m[..., :3, 1] = y
+    m[..., :3, 2] = z
+    m[..., :3, 3] = proj + distance_mm * normal
+    m[..., 3, 3] = 1.0
+    return m
+
+
 def _frames(
     proj: cp.ndarray,
     normal: cp.ndarray,
@@ -79,23 +96,13 @@ def _frames(
 ) -> cp.ndarray:
     """Coil-to-head affines ``(C·A, 4, 4)`` for each (position, angle) from a fixed projection.
 
-    ``angles`` (A,) is shared across positions; ``y = cosθ·u + sinθ·v``, ``z = -normal``.
+    ``angles`` (A,) is shared across positions; ``y = cosθ·u + sinθ·v``.
     """
-    c = proj.shape[0]
-    a = angles.shape[0]
     cos = cp.cos(angles)[None, :, None]
     sin = cp.sin(angles)[None, :, None]
     y = cos * u[:, None, :] + sin * v[:, None, :]  # (C,A,3)
-    z = cp.broadcast_to((-normal)[:, None, :], (c, a, 3))
-    x = cp.cross(y, z)
-    t = cp.broadcast_to((proj + distance_mm * normal)[:, None, :], (c, a, 3))
-    m = cp.zeros((c, a, 4, 4), dtype=cp.float64)
-    m[..., :3, 0] = x
-    m[..., :3, 1] = y
-    m[..., :3, 2] = z
-    m[..., :3, 3] = t
-    m[..., 3, 3] = 1.0
-    return m.reshape(c * a, 4, 4)
+    m = _assemble_frames(proj[:, None, :], normal[:, None, :], y, distance_mm)
+    return m.reshape(-1, 4, 4)
 
 
 def _sample_objective(
@@ -242,7 +249,11 @@ def optimize_placement(
         kernel += 2.0 * cp.cos(h * d)
     kernel /= n_samples  # interpolating Dirichlet kernel (exact for band limit ``order``)
 
-    e_f = cp.tensordot(e_s, kernel, axes=([1], [1]))  # (C,D,F)
+    # Summed over the samples in order rather than through a GEMM, whose algorithm, and so whose
+    # bits, can change with the number of candidates.
+    e_f = sum(
+        e_s[:, k, :, None] * kernel[None, None, :, k] for k in range(n_samples)
+    )  # (C,D,F)
     obj_f = _objective(cp.moveaxis(e_f, 1, 2), recip.magnitude)  # (C,F)
     theta = _parabolic_refine(obj_f, cp.argmax(obj_f, axis=1), theta_f)
 
@@ -281,13 +292,4 @@ def _eval_per_position(
 ) -> cp.ndarray:
     """Target E-vectors ``(C, D)`` with one angle ``theta[c]`` per position."""
     y = cp.cos(theta)[:, None] * u + cp.sin(theta)[:, None] * v
-    z = -normal
-    x = cp.cross(y, z)
-    t = proj + distance_mm * normal
-    m = cp.zeros((proj.shape[0], 4, 4), dtype=cp.float64)
-    m[:, :3, 0] = x
-    m[:, :3, 1] = y
-    m[:, :3, 2] = z
-    m[:, :3, 3] = t
-    m[:, 3, 3] = 1.0
-    return _evaluate_native(recip, coil, m, didt)
+    return _evaluate_native(recip, coil, _assemble_frames(proj, normal, y, distance_mm), didt)

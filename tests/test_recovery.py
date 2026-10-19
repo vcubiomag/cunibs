@@ -864,32 +864,6 @@ def test_harmonic_is_reproducible_and_block_width_invariant(
             np.testing.assert_array_equal(a, b, err_msg=f"width={width}, placement {i}")
 
 
-@pytest.mark.realmesh
-def test_harmonic_serial_matches_the_block_path(patch_subject, d70_coil, patch_placement):
-    """solve_placement keeps its own code path, so it has to agree with the width-1 block one."""
-    from cunibs.fem import ensure_recovery, solve_placement
-
-    ctx = patch_subject.context
-    serial = solve_placement(
-        ctx,
-        d70_coil.positions_m,
-        d70_coil.moments,
-        patch_placement.center_mm,
-        patch_placement.handle_mm,
-        patch_placement.distance_mm,
-        1e6,
-        recovery=ensure_recovery(ctx, "harmonic"),
-    )
-    blocked = patch_subject.simulate(
-        d70_coil, patch_placement, 1e6, magnitude=True, recovery="harmonic"
-    )
-    import cupy as cp_
-
-    np.testing.assert_allclose(
-        cp_.asnumpy(serial["magnE"]), blocked.magnE, rtol=2e-5, atol=1e-6
-    )
-
-
 # --- the interface comparison ------------------------------------------------------------------
 
 _SIGMA = {2: 0.275, 3: 1.654}  # gray matter, CSF -- the table cuNIBS solves with

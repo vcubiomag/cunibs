@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import numpy as np
 
 from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.place import place_coil_dipoles_batch
@@ -15,7 +16,6 @@ from cunibs.solver import adm_evaluate, adm_mark, dadt_nbody
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import numpy as np
     import numpy.typing as npt
 
     from cunibs.adm.reciprocity import AdjointField, ReciprocityField
@@ -25,9 +25,9 @@ if TYPE_CHECKING:
 
 def _placement_frames(ctx: SolverContext, placements: Sequence[Placement]) -> cp.ndarray:
     """Coil-to-head affines ``(P,4,4)`` for ``placements``, translation in mm."""
-    centers = cp.asarray([pl.center_mm for pl in placements], dtype=cp.float64)
-    handles = cp.asarray([pl.handle_mm for pl in placements], dtype=cp.float64)
-    dists = cp.asarray([pl.distance_mm for pl in placements], dtype=cp.float64)
+    centers = np.stack([pl.center_mm for pl in placements])
+    handles = np.stack([pl.handle_mm for pl in placements])
+    dists = np.array([pl.distance_mm for pl in placements], dtype=np.float64)
     return compute_coil_transforms(ctx, centers, handles, dists)
 
 
@@ -122,11 +122,12 @@ def _evaluate_native(
     shape = list(grid.shape)
     stream = cp.cuda.get_current_stream().ptr
     n_dir = recip.n_directions
-    out = cp.empty((int(frames.shape[0]), n_dir), dtype=cp.float64)
-    fault = cp.zeros(2, dtype=cp.int32)
+    n_frames = int(frames.shape[0])
+    out = cp.empty((n_frames, n_dir), dtype=cp.float64)
+    fault = cp.empty(2, dtype=cp.int32)
     q = recip.q.reshape(-1)
     for attempt in range(2):
-        fault[:] = 0
+        fault.fill(n_frames)
         adm_evaluate(
             frames,
             pos,
@@ -142,11 +143,11 @@ def _evaluate_native(
             fault,
             stream,
         )
-        kind, cand = (int(x) for x in cp.asnumpy(fault))
-        if kind == 0:
+        off_grid, unsampled = (int(x) for x in cp.asnumpy(fault))
+        if off_grid < n_frames:
+            _raise_off_grid(recip, coil, frames, off_grid)
+        if unsampled == n_frames:
             return out
-        if kind == 1:
-            _raise_off_grid(recip, coil, frames, cand)
         if attempt == 0:
             need = cp.zeros(grid.n_points, dtype=cp.uint8)
             adm_mark(frames, pos, origin, spacing, shape, need, stream)
@@ -223,13 +224,19 @@ def evaluate_exact(
     tgt = cp.ascontiguousarray((s.reshape(-1, 3) - center[None, :]).astype(cp.float32))
 
     n_dir = int(adjoint.node_weights.shape[0])
-    dipole_q = cp.empty((n_dir, p * n, 3), dtype=cp.float64)
-    out = cp.empty((p * n, 3), dtype=cp.float32)
-    stream = cp.cuda.get_current_stream().ptr
-    for d in range(n_dir):
-        w = adjoint.node_weights[d].astype(cp.float32)
-        mp = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, src)], axis=1))
-        dadt_nbody(src, mp, sn, tgt, out, 1.0, MU0_OVER_4PI, stream)
-        dipole_q[d] = out.astype(cp.float64)
+    w = adjoint.node_weights.astype(cp.float32)
+    mp = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, src[None])], axis=2))
+    out = cp.empty((p * n, n_dir, 3), dtype=cp.float32)
+    dadt_nbody(
+        src,
+        mp,
+        sn,
+        tgt,
+        out.reshape(p * n, -1),
+        1.0,
+        MU0_OVER_4PI,
+        cp.cuda.get_current_stream().ptr,
+    )
+    dipole_q = out.transpose(1, 0, 2).astype(cp.float64)
     e = _reduce(dipole_q.reshape(n_dir, p, n, 3), m, didt)
     return e[0] if single else e

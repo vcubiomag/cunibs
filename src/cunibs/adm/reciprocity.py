@@ -30,10 +30,10 @@ from cunibs.fem.solve import (
 )
 from cunibs.solver import (
     adm_reach,
-    dadt_nbody_multi,
+    dadt_nbody,
     element_weight,
     node_gather,
-    node_scatter3,
+    node_gather3,
 )
 
 if TYPE_CHECKING:
@@ -138,7 +138,7 @@ def _node_weights(
 
     # W_n = ¼ Σ_{e∋n} w_e, the transpose of the node2corner reduction.
     node_w = cp.empty((ctx.n_nodes, 3), dtype=cp.float64)
-    node_scatter3(w_e, ctx.node2corner_ptr, ctx.node2corner_idx, node_w, stream)
+    node_gather3(w_e, ctx.node2corner_ptr, ctx.node2corner_idx, node_w, stream)
     return node_w
 
 
@@ -238,14 +238,14 @@ class ReciprocityField:
             return
         grid = self.grid
         flat = grid_points_m(grid, points) - grid.center_m[None, :]
-        r = cp.ascontiguousarray(flat.astype(cp.float32))
+        r = flat.astype(cp.float32)
         out = cp.empty((int(points.size), self.n_directions, 3), dtype=cp.float32)
-        dadt_nbody_multi(
+        dadt_nbody(
             self.src,
             self.moments,
             self.src_sq,
             r,
-            out,
+            out.reshape(int(points.size), -1),
             1.0,
             MU0_OVER_4PI,
             cp.cuda.get_current_stream().ptr,

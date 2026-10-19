@@ -57,16 +57,17 @@ def _tangent_basis(centroids: cp.ndarray, normal: cp.ndarray) -> tuple[cp.ndarra
     nearly flat, in-plane axes derived from a single normal swing with tiny changes in it, while
     the patch fit is stable. Only the plane's orientation is used, so its handedness is free.
     """
-    centred = centroids - centroids.mean(axis=0)
-    _, _, vh = cp.linalg.svd(centred, full_matrices=False)
-    u, v = vh[0], vh[1]
-    # A patch that is a line, or a single triangle, leaves the fit degenerate.
-    if not bool(cp.isfinite(u).all() and cp.isfinite(v).all()):
-        ref = cp.eye(3, dtype=cp.float64)[int(cp.argmin(cp.abs(normal)))]
-        u = cp.cross(normal, ref)
-        u /= cp.linalg.norm(u)
-        v = cp.cross(normal, u)
-    return u, v
+    if centroids.shape[0] >= 3:
+        centred = centroids - centroids.mean(axis=0)
+        _, s, vh = cp.linalg.svd(centred, full_matrices=False)
+        s = cp.asnumpy(s)
+        if s[1] > 1e-12 * s[0]:
+            return vh[0], vh[1]
+    # A patch that is a point or a line does not fix a plane, so the axes come from the normal.
+    ref = cp.eye(3, dtype=cp.float64)[int(cp.argmin(cp.abs(normal)))]
+    u = cp.cross(normal, ref)
+    u /= cp.linalg.norm(u)
+    return u, cp.cross(normal, u)
 
 
 def _subdivide(verts: cp.ndarray, levels: int) -> cp.ndarray:
@@ -107,13 +108,22 @@ def _thin_to_spacing(
     return cp.sort(order[first])
 
 
+_NN_BLOCK = 1024
+
+
 def _median_nn(points: npt.NDArray[np.float64]) -> float:
     """Median nearest-neighbour distance, the resolution the returned set actually has."""
-    if points.shape[0] < 2:
+    n = points.shape[0]
+    if n < 2:
         return float("nan")
-    d2 = ((points[:, None, :] - points[None, :, :]) ** 2).sum(-1)
-    np.fill_diagonal(d2, np.inf)
-    return float(np.median(np.sqrt(d2.min(axis=1))))
+    # A block of rows at a time, so a dense grid never holds every pairwise distance at once.
+    nearest = np.empty(n)
+    for start in range(0, n, _NN_BLOCK):
+        rows = points[start : start + _NN_BLOCK]
+        d2 = ((rows[:, None, :] - points[None, :, :]) ** 2).sum(-1)
+        d2[np.arange(rows.shape[0]), np.arange(start, start + rows.shape[0])] = np.inf
+        nearest[start : start + rows.shape[0]] = d2.min(axis=1)
+    return float(np.median(np.sqrt(nearest)))
 
 
 def scalp_grid(

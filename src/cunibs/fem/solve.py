@@ -16,16 +16,11 @@ from cunibs.fem.assembly import (
     conductivity_per_tet,
     gradient_operator,
 )
-from cunibs.fem.placement import (
-    coil_dadt_at_nodes,
-    compute_coil_transform,
-    compute_coil_transforms,
-)
+from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transforms
 from cunibs.fem.recovery import (
     RecoveredField,
     Recovery,
     RecoveryOperator,
-    apply_recovery,
     apply_recovery_into,
 )
 from cunibs.mesh import SKIN_SURFACE_TAG, HeadMesh
@@ -335,8 +330,13 @@ def invert_permutation(perm: cp.ndarray) -> cp.ndarray:
     return inverse
 
 
-def spatial_order(nodes_mm: cp.ndarray, tet_nodes: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+def spatial_order(
+    nodes_mm: cp.ndarray, tet_nodes: cp.ndarray
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Node and tetrahedron permutations that lay a mesh out along a Morton curve.
+
+    Returns the node permutation, its inverse (old node id to new), and the tetrahedron
+    permutation.
 
     Nodes are ordered by position and tetrahedra by their lowest renumbered node. Gmsh order
     bears no relation to position: on a head mesh the four node indices of a tetrahedron span
@@ -350,7 +350,7 @@ def spatial_order(nodes_mm: cp.ndarray, tet_nodes: cp.ndarray) -> tuple[cp.ndarr
     lowest = cp.empty(int(tets.shape[0]), dtype=cp.int32)
     tet_lowest_node(inverse, tets, lowest, cp.cuda.get_current_stream().ptr)
     tet_perm = cp.argsort(lowest, kind="stable").astype(cp.int32)
-    return node_perm, tet_perm
+    return node_perm, inverse, tet_perm
 
 
 def solve_ordering(nodes_mm: cp.ndarray, ground_node: int) -> cp.ndarray:
@@ -443,7 +443,7 @@ class GroundedSolver:
         self.precond = build_native_vcycle(
             self.row_ptr,
             self.col_idx,
-            cp.ascontiguousarray(self.values.astype(cp.float32)),
+            self.values.astype(cp.float32),
         )
 
 
@@ -564,8 +564,7 @@ def _pad_block(B: cp.ndarray, k: int) -> cp.ndarray:
         return cp.ascontiguousarray(B)
     padded = cp.empty((int(B.shape[0]), k_pad), dtype=B.dtype)
     padded[:, :k] = B
-    for c in range(k, k_pad):
-        padded[:, c] = B[:, k - 1]
+    padded[:, k:] = B[:, k - 1 : k]
     return padded
 
 
@@ -667,11 +666,10 @@ class SolverContext:
     # The forward RHS operator from build_rhs_operator, over the stiffness pattern's rows.
     rhs_indptr: cp.ndarray
     rhs_op: cp.ndarray
-    skin_a: cp.ndarray
-    skin_b: cp.ndarray
-    skin_c: cp.ndarray
+    # (n_tri, 3, 3) corner coordinates of the scalp triangles, and their outward normals.
+    skin_verts: cp.ndarray
     skin_tri_normals: cp.ndarray
-    # The same triangles as skin_a/b/c, as node indices rather than gathered coordinates, and on
+    # The same triangles as skin_verts, as node indices rather than gathered coordinates, and on
     # the device: mesh.skin_tris fetches to the host on first read.
     skin_tris: cp.ndarray
     # Filled on first use by ensure_recovery, never by build_context, so a run that asks for no
@@ -705,8 +703,7 @@ def _spatially_ordered(
     """
     nodes_mm = cp.asarray(mesh.nodes_mm)
     tet_nodes = cp.asarray(mesh.tet_nodes)
-    node_perm, tet_perm = spatial_order(nodes_mm, tet_nodes)
-    inverse = invert_permutation(node_perm)
+    node_perm, inverse, tet_perm = spatial_order(nodes_mm, tet_nodes)
 
     nodes_mm = cp.ascontiguousarray(nodes_mm[node_perm])
     tet_nodes = cp.ascontiguousarray(inverse[tet_nodes[tet_perm]])
@@ -741,6 +738,22 @@ def skin_triangle_normals(nodes_mm: cp.ndarray, skin_tris: cp.ndarray) -> cp.nda
     return out
 
 
+# Each tetrahedron's corner mean, gathered in one pass. Corners pair (0, 2) and (1, 3), the
+# order cupy's mean over a corner axis sums in, so this matches HeadMesh.tet_barycenters_mm.
+_barycentres = cp.ElementwiseKernel(
+    "raw float64 x, raw int32 t",
+    "float64 y",
+    """
+    const long long e = i / 3;
+    const long long c = i % 3;
+    const double p = x[3LL * t[4 * e] + c], q = x[3LL * t[4 * e + 1] + c];
+    const double r = x[3LL * t[4 * e + 2] + c], s = x[3LL * t[4 * e + 3] + c];
+    y = ((p + r) + (q + s)) / 4.0;
+    """,
+    "cunibs_barycentres",
+)
+
+
 def build_context(mesh: HeadMesh) -> SolverContext:
     """Build the GPU state shared by all placements.
 
@@ -768,15 +781,14 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     rhs_indptr = stiffness.indptr
     del stiffness
 
-    g = cp.ascontiguousarray(g.astype(RESIDENT_G_DTYPE))
+    g = g.astype(RESIDENT_G_DTYPE)
     neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
-    vols = cp.ascontiguousarray(vols.astype(cp.float32))
+    vols = vols.astype(cp.float32)
     del cond
-    barycenters = cp.ascontiguousarray(nodes_mm[tet_nodes].mean(axis=1))
+    barycenters = cp.empty((int(tet_nodes.shape[0]), 3), dtype=cp.float64)
+    _barycentres(nodes_mm, tet_nodes, barycenters)
 
-    skin_a = cp.ascontiguousarray(nodes_mm[skin_tris[:, 0]])
-    skin_b = cp.ascontiguousarray(nodes_mm[skin_tris[:, 1]])
-    skin_c = cp.ascontiguousarray(nodes_mm[skin_tris[:, 2]])
+    skin_verts = nodes_mm[skin_tris]
     skin_tri_normals = skin_triangle_normals(nodes_mm, skin_tris)
     # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
     # rather than a cost of building the context.
@@ -796,9 +808,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         idx,
         rhs_indptr,
         rhs_op,
-        skin_a,
-        skin_b,
-        skin_c,
+        skin_verts,
         skin_tri_normals,
         skin_tris,
     )
@@ -810,14 +820,16 @@ class PlacementResult(TypedDict):
     """Arrays produced for one placement, plus how its linear solve went.
 
     ``E``/``magnE`` are whichever field the run's ``recovery`` mode asked for. ``E_slots`` is
-    present only when a recovery mode ran and the caller asked for it.
+    present only when a recovery mode ran and the caller asked for it. ``dadt_elm``, the
+    element-averaged dA/dt, is present only when the field was reconstructed per element, which
+    a potential-consuming recovery skips.
 
     ``iterations``/``relative_residual`` are this placement's own, not its block's: in a k-RHS
     solve every column freezes at its own residual.
     """
 
     transform: npt.NDArray[np.float64]
-    dadt_elm: cp.ndarray
+    dadt_elm: NotRequired[cp.ndarray]
     E: cp.ndarray
     magnE: cp.ndarray
     v: cp.ndarray
@@ -872,53 +884,16 @@ def solve_placement(
 ) -> PlacementResult:
     """Solve one placement and return device arrays plus the host transform.
 
-    ``recovery`` is a prebuilt operator from :func:`~cunibs.fem.ensure_recovery`, or ``None``
-    for the raw per-tetrahedron field; see :func:`_check_operator` for why this layer will not
-    build one. ``nodal`` additionally keeps the recovered field on its slots.
+    The width-1 case of :func:`solve_placements_block`, so a placement's result is the same
+    whichever of the two solved it. ``recovery`` is a prebuilt operator from
+    :func:`~cunibs.fem.ensure_recovery`, or ``None`` for the raw per-tetrahedron field; see
+    :func:`_check_operator` for why this layer will not build one. ``nodal`` additionally keeps
+    the recovered field on its slots.
     """
-    _check_operator(ctx, recovery, nodal, "solve_placement")
-
-    transform = compute_coil_transform(ctx, center_mm, handle_mm, distance_mm)
-    dadt_nodes = coil_dadt_at_nodes(dip_pos_m, dip_moment, transform, didt, ctx.nodes_mm)
-    dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
-
-    b = _assemble_rhs(ctx, dadt_nodes.reshape(ctx.n_nodes, 1, 3)).ravel()
-
-    v = solve_grounded(ctx.solver, b)
-    # The solver's last-solve state belongs to the call above only until the next solve on this
-    # context, so read it before anything else can run.
-    telemetry = ColumnTelemetry(
-        int(ctx.solver.last_iterations), float(ctx.solver.last_relative_residual)
+    site = (np.asarray(center_mm), np.asarray(handle_mm), float(distance_mm))
+    (result,) = solve_placements_block(
+        ctx, dip_pos_m, dip_moment, [site], didt, recovery=recovery, nodal=nodal
     )
-
-    n_tet = int(ctx.tet_nodes.shape[0])
-    # The potential path never reads the raw field, so reconstructing it there would be a full
-    # mesh pass and an (n_tet, 3) + (n_tet,) transient thrown straight away.
-    on_potential = recovery is not None and recovery.on_potential
-    e = magn_e = slots = None
-    if not on_potential:
-        e, magn_e = _reconstruct_e_kernel(v, ctx.tet_nodes, ctx.g, dadt_elm)
-    if recovery is not None:
-        rec = apply_recovery(
-            recovery,
-            n_tet,
-            elements=None if on_potential else [e],
-            potential=cp.ascontiguousarray(v.reshape(-1, 1)) if on_potential else None,
-            dadt_nodes=[cp.ascontiguousarray(dadt_nodes)] if on_potential else None,
-        )
-        e, magn_e, slots = rec.E[0], rec.magnE[0], rec.E_slots[0]
-
-    result: PlacementResult = {
-        "transform": transform,
-        "dadt_elm": dadt_elm,
-        "E": e,
-        "magnE": magn_e,
-        "v": v,
-        "iterations": telemetry.iterations,
-        "relative_residual": telemetry.relative_residual,
-    }
-    if nodal:
-        result["E_slots"] = slots
     return result
 
 
@@ -932,6 +907,7 @@ def solve_placements_block(
     recovery: RecoveryOperator | None = None,
     nodal: bool = False,
     tissues: Collection[int] | None = None,
+    transforms: npt.NDArray[np.float64] | None = None,
 ) -> list[PlacementResult]:
     """Solve up to MAX_BLOCK placements with block kernels end to end.
 
@@ -949,6 +925,10 @@ def solve_placements_block(
     reduction order does not depend on k, so a placement's recovered field is the same at every
     block width. ``tissues`` limits the recovered field to those tissues' elements, leaving the
     rest of ``E`` and ``magnE`` unwritten; see :func:`~cunibs.fem.apply_recovery_into`.
+
+    ``transforms``, when given, are the sites' ``(k, 4, 4)`` coil transforms from
+    :func:`~cunibs.fem.compute_coil_transforms`, which a sweep computes for all of its sites at
+    once.
     """
     k = len(sites)
     solver = ctx.solver
@@ -959,29 +939,39 @@ def solve_placements_block(
     stream = cp.cuda.get_current_stream().ptr
     n_tet = int(ctx.tet_nodes.shape[0])
 
-    transforms = cp.asnumpy(
-        compute_coil_transforms(
-            ctx,
-            np.asarray([s[0] for s in sites], dtype=np.float64).reshape(k, 3),
-            np.asarray([s[1] for s in sites], dtype=np.float64).reshape(k, 3),
-            np.asarray([s[2] for s in sites], dtype=np.float64),
+    if transforms is None:
+        transforms = cp.asnumpy(
+            compute_coil_transforms(
+                ctx,
+                np.asarray([s[0] for s in sites], dtype=np.float64).reshape(k, 3),
+                np.asarray([s[1] for s in sites], dtype=np.float64).reshape(k, 3),
+                np.asarray([s[2] for s in sites], dtype=np.float64),
+            )
         )
-    )
+    device_transforms = cp.asarray(transforms)
 
     # Staged interleaved, so that a node's k values are one contiguous gather for both the
     # element average and the RHS operator.
     dadt_block = cp.empty((ctx.n_nodes, k, 3), dtype=cp.float32)
     for i in range(k):
         coil_dadt_at_nodes(
-            dip_pos_m, dip_moment, transforms[i], didt, ctx.nodes_mm, out=dadt_block, column=i
+            dip_pos_m,
+            dip_moment,
+            device_transforms[i],
+            didt,
+            ctx.nodes_mm,
+            out=dadt_block,
+            column=i,
         )
-    dadt_elms = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
-    dadt_node_to_element_block(dadt_block, ctx.tet_nodes, dadt_elms, stream)
     # A potential-consuming operator adds dA/dt back at the nodes, where it is exact, so that
-    # path keeps the nodal field the others average away.
-    dadt_nodal: list[cp.ndarray] = (
-        [cp.ascontiguousarray(dadt_block[:, i, :]) for i in range(k)] if on_potential else []
-    )
+    # path keeps the nodal field the others average onto the elements.
+    dadt_elms: list[cp.ndarray] = []
+    dadt_nodal: list[cp.ndarray] = []
+    if on_potential:
+        dadt_nodal = [cp.ascontiguousarray(dadt_block[:, i, :]) for i in range(k)]
+    else:
+        dadt_elms = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
+        dadt_node_to_element_block(dadt_block, ctx.tet_nodes, dadt_elms, stream)
 
     b_block = _assemble_rhs(ctx, dadt_block)
     del dadt_block
@@ -992,7 +982,6 @@ def solve_placements_block(
 
     v_block = cp.zeros((solver.n, k), dtype=cp.float64)
     v_block[solver.idx, :] = X[:, :k]
-    v_block = cp.ascontiguousarray(v_block)
 
     # The potential path never reads the raw field, so it neither reconstructs nor allocates one.
     es: list[cp.ndarray] = []
@@ -1018,7 +1007,6 @@ def solve_placements_block(
     results: list[PlacementResult] = [
         {
             "transform": transforms[i],
-            "dadt_elm": dadt_elms[i],
             "E": es[i],
             "magnE": magns[i],
             "v": cp.ascontiguousarray(v_block[:, i]),
@@ -1027,8 +1015,9 @@ def solve_placements_block(
         }
         for i in range(k)
     ]
-    if nodal:
-        for i, result in enumerate(results):
+    for i, result in enumerate(results):
+        if dadt_elms:
+            result["dadt_elm"] = dadt_elms[i]
+        if nodal:
             result["E_slots"] = slots[i]
-
     return results

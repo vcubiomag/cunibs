@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from functools import cache
 from importlib.metadata import version
 from pathlib import Path
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import cupy as cp
@@ -18,6 +17,17 @@ import numpy as np
 import numpy.typing as npt
 
 from cunibs import metrics
+from cunibs._common import (
+    DEFAULT_REGION,
+    NO_ROIS,
+    as_point,
+    check_format_version,
+    opt_array,
+    read_metrics,
+    read_provenance,
+    write_metrics,
+    write_provenance,
+)
 from cunibs._transfer import AsyncCopier, Fence
 from cunibs.fem import (
     MAX_BLOCK,
@@ -26,6 +36,7 @@ from cunibs.fem import (
     RecoveryOperator,
     SolverContext,
     build_context,
+    compute_coil_transforms,
     ensure_recovery,
     ensure_sweep_basis,
     solve_placements_block,
@@ -47,29 +58,6 @@ if TYPE_CHECKING:
     )
 
 _FORMAT_VERSION = 1
-
-# Root attributes that describe the run rather than the result, read back as a unit. Additive, so
-# a file written before they existed still loads and reports None.
-_PROVENANCE_KEYS = (
-    "software",
-    "softwareVersion",
-    "softwareDependencies",
-    "date",
-    "machine",
-    "mesh_content_hash",
-    "mesh_n_nodes",
-    "mesh_n_tets",
-    "coil_n_dipoles",
-    "solver_tolerance",
-    "sweep_basis_coil",
-    "sweep_basis_size",
-)
-
-# The region every result is summarised over up front. Others are computed on demand from
-# a retained magnE.
-_DEFAULT_REGION: metrics.Region = "gray_matter"
-
-_NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
 
 # The widest chunk a sweep starts at. Only _block_width changes it.
 _widest_block = MAX_BLOCK
@@ -96,8 +84,15 @@ type _HostMetricInputs = tuple[
     npt.NDArray[np.float32], npt.NDArray[np.int32], npt.NDArray[np.float64]
 ]
 
-# One ROI's name and the element indices and volume weights it reduces over.
-type _RoiProbe = tuple[str, cp.ndarray, cp.ndarray]
+
+def _published[T](value: T) -> T:
+    """``value``, once the stream that built it has finished.
+
+    The subject caches device state built on whichever stream first asked for it, and a later
+    call may read it from another; waiting here orders every stream after the build.
+    """
+    cp.cuda.get_current_stream().synchronize()
+    return value
 
 
 @cache
@@ -138,87 +133,23 @@ def _environment() -> dict[str, str]:
     return info
 
 
-def _write_provenance(h5f: h5py.File, provenance: Mapping[str, object]) -> None:
-    """Stamp the provenance as root attributes, beside the inputs already written there."""
-    for key, value in provenance.items():
-        if value is not None:
-            h5f.attrs[key] = value
-
-
-def _plain(value: Any) -> Any:
-    """An HDF5 attribute as a plain Python value."""
-    if isinstance(value, bytes):
-        return value.decode()
-    return value.item() if hasattr(value, "item") else value
-
-
-def _read_provenance(h5f: h5py.File) -> dict[str, Any] | None:
-    """The provenance attributes, or ``None`` for a file that carries none."""
-    return {k: _plain(h5f.attrs[k]) for k in _PROVENANCE_KEYS if k in h5f.attrs} or None
-
-
-def _roi_means(magn: cp.ndarray, probes: Sequence[_RoiProbe]) -> dict[str, float] | None:
-    """Volume-weighted mean ``|E|`` per ROI, reduced on the device against the solved field."""
-    if not probes:
-        return None
-    return {name: float((magn[idx].astype(cp.float64) * w).sum()) for name, idx, w in probes}
-
-
-def _roi_probes(record_rois: Mapping[str, ResolvedTarget]) -> list[_RoiProbe]:
-    """The element indices and weights each ROI reduces over, as the UQ path prepares them."""
-    return [
-        (
-            name,
-            cp.ascontiguousarray(target.elem_idx.astype(cp.int64)),
-            cp.ascontiguousarray(target.weights.astype(cp.float64)),
+def _roi_means(
+    fields: Sequence[cp.ndarray], record_rois: Mapping[str, ResolvedTarget]
+) -> list[dict[str, float] | None]:
+    """Each field's volume-weighted mean ``|E|`` per ROI, reduced on the device and copied back
+    together."""
+    if not record_rois:
+        return [None] * len(fields)
+    means = cp.asnumpy(
+        cp.stack(
+            [
+                metrics.roi_mean(magn, roi.elem_idx, roi.weights)
+                for magn in fields
+                for roi in record_rois.values()
+            ]
         )
-        for name, target in record_rois.items()
-    ]
-
-
-def _write_metrics(grp: h5py.Group, m: metrics.FieldMetrics) -> None:
-    grp.attrs["region"] = m["region"]
-    grp.attrs["peak_magnE"] = m["peak_magnE"]
-    grp.attrs["region_volume_m3"] = m["region_volume_m3"]
-    grp.create_dataset("peak_location_mm", data=m["peak_location_mm"])
-    grp.create_dataset("center_of_gravity_mm", data=m["center_of_gravity_mm"])
-    for name in ("focality_m3", "distribution"):
-        sub = grp.create_group(name)
-        for key, value in m[name].items():
-            sub.attrs[key] = float(value)
-
-
-def _read_metrics(grp: h5py.Group) -> metrics.FieldMetrics:
-    return metrics.FieldMetrics(
-        region=cast("metrics.Region", str(grp.attrs["region"])),
-        peak_magnE=float(grp.attrs["peak_magnE"]),
-        peak_location_mm=np.asarray(grp["peak_location_mm"]),
-        center_of_gravity_mm=np.asarray(grp["center_of_gravity_mm"]),
-        region_volume_m3=float(grp.attrs["region_volume_m3"]),
-        focality_m3={k: float(v) for k, v in grp["focality_m3"].attrs.items()},
-        distribution={k: float(v) for k, v in grp["distribution"].attrs.items()},
-    )
-
-
-def _check_format_version(h5f: h5py.File, path: str | Path, expected: int) -> None:
-    stored = int(h5f.attrs.get("format_version", 0))
-    if stored != expected:
-        raise ValueError(
-            f"{path}: file format version {stored} is not readable by this version of "
-            f"cuNIBS (expected {expected})."
-        )
-
-
-def _opt_array(h5f: h5py.File, name: str) -> npt.NDArray[Any] | None:
-    """Read a dataset that the run may not have retained."""
-    return np.asarray(h5f[name]) if name in h5f else None
-
-
-def _as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
-    p = np.ascontiguousarray(value, dtype=np.float64).reshape(-1)
-    if p.shape != (3,):
-        raise ValueError(f"Expected a 3-vector, got shape {np.shape(value)}.")
-    return p
+    ).reshape(len(fields), len(record_rois))
+    return [dict(zip(record_rois, row.tolist(), strict=True)) for row in means]
 
 
 def _sites(placements: Sequence[Placement], method: str) -> list[Placement]:
@@ -262,8 +193,8 @@ class Placement:
         handle_mm: npt.ArrayLike,
         distance_mm: float = 4.0,
     ) -> None:
-        center = _as_point(center_mm)
-        handle = _as_point(handle_mm)
+        center = as_point(center_mm)
+        handle = as_point(handle_mm)
         distance = float(distance_mm)
         if not (np.isfinite(center).all() and np.isfinite(handle).all()):
             raise ValueError("center_mm and handle_mm must be finite 3-vectors.")
@@ -367,7 +298,7 @@ class Subject:
     def context(self) -> SolverContext:
         with self._lock:
             if self._ctx is None:
-                self._ctx = build_context(self._mesh)
+                self._ctx = _published(build_context(self._mesh))
             return self._ctx
 
     def roi(
@@ -396,8 +327,8 @@ class Subject:
         region: metrics.Region = "all",
     ) -> list[ResolvedTarget]:
         """ROIs at increasing depth along ``inward_dir`` from a cortical point."""
-        p = _as_point(cortical_point_mm)
-        d = _as_point(inward_dir)
+        p = as_point(cortical_point_mm)
+        d = as_point(inward_dir)
         norm = float(np.linalg.norm(d))
         if not np.isfinite(norm) or norm == 0.0:
             raise ValueError("inward_dir must be a non-zero, finite 3-vector.")
@@ -420,7 +351,9 @@ class Subject:
         tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
         with self._lock:
             if tags not in self._conductivity_uq_pre:
-                self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
+                self._conductivity_uq_pre[tags] = _published(
+                    build_conductivity_uq_precompute(ctx, tags)
+                )
             return self._conductivity_uq_pre[tags]
 
     def _provenance(self, coil: Coil, *, seeded: bool = True) -> dict[str, Any]:
@@ -456,8 +389,8 @@ class Subject:
             cached = self._region_slices.get(region)
             if cached is None:
                 ctx = self.context
-                cached = metrics.region_slice(
-                    ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, region
+                cached = _published(
+                    metrics.region_slice(ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, region)
                 )
                 self._region_slices[region] = cached
             return cached
@@ -488,7 +421,7 @@ class Subject:
         if recovery == "raw":
             return None
         with self._lock:
-            return ensure_recovery(self.context, recovery, tissues)
+            return _published(ensure_recovery(self.context, recovery, tissues))
 
     def _needed_tissues(
         self, full_volume: bool, record_rois: Mapping[str, ResolvedTarget]
@@ -500,7 +433,7 @@ class Subject:
         """
         if full_volume:
             return None
-        tags = {metrics.region_tag(_DEFAULT_REGION)}
+        tags = {metrics.region_tag(DEFAULT_REGION)}
         tet_tags = self.context.tet_tags
         for target in record_rois.values():
             tags.update(int(t) for t in cp.asnumpy(cp.unique(tet_tags[target.elem_idx])))
@@ -516,7 +449,7 @@ class Subject:
         region: metrics.RegionSlice,
         recovery: Recovery,
         op: RecoveryOperator | None,
-        rois: Sequence[_RoiProbe] = (),
+        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
         provenance: dict[str, Any] | None = None,
         copier: AsyncCopier | None = None,
     ) -> list[FieldResult]:
@@ -546,11 +479,13 @@ class Subject:
         # (node, tissue) slot carries its own tag.
         tet_nodes = self._host_tet_nodes if retain.nodal and slot_tag is None else None
         n_nodes = int(self.context.n_nodes) if retain.nodal else None
-        summaries = region.summarize_block([out["magnE"] for out in outs])
+        fields = [out["magnE"] for out in outs]
+        summaries = region.summarize_block(fields)
+        roi_means = _roi_means(fields, record_rois)
         return [
             FieldResult(
                 summary=summary,
-                roi_means=_roi_means(out["magnE"], rois),
+                roi_means=rois,
                 magnE=to_host(out["magnE"]) if retain.magnitude else None,
                 E=to_host(out["E"]) if retain.vectors else None,
                 v=to_host(out["v"]) if retain.potential else None,
@@ -571,7 +506,7 @@ class Subject:
                 slot_tag=slot_tag,
                 tet_nodes=tet_nodes,
             )
-            for site, out, summary in zip(chunk, outs, summaries, strict=True)
+            for site, out, summary, rois in zip(chunk, outs, summaries, roi_means, strict=True)
         ]
 
     @property
@@ -609,7 +544,7 @@ class Subject:
         didt: float,
         retain: _Retain,
         recovery: Recovery,
-        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
     ) -> Iterator[FieldResult]:
         """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
 
@@ -617,18 +552,29 @@ class Subject:
         every later call reuse, but the yield happens after the allocator is popped: control
         passes to caller code between chunks, and its allocations must not land in our pool.
         """
+        if not sites:
+            return
         ctx = self.context
         # Held across chunks, so these are allocated outside the scratch pool.
         dip_pos_m = cp.asarray(coil.positions_m)
         dip_moment = cp.asarray(coil.moments)
-        region = self._region_slice(_DEFAULT_REGION)
+        region = self._region_slice(DEFAULT_REGION)
         # Same reason: the patch weights outlive the chunk that first needs them.
         tissues = self._needed_tissues(
             retain.magnitude or retain.vectors or retain.nodal, record_rois
         )
         op = self._recovery_operator(recovery, tissues)
-        rois = _roi_probes(record_rois)
         provenance = self._provenance(coil)
+        # Every site's frame in one launch, which also rejects a degenerate handle before any
+        # result is yielded.
+        transforms = cp.asnumpy(
+            compute_coil_transforms(
+                ctx,
+                np.stack([s.center_mm for s in sites]),
+                np.stack([s.handle_mm for s in sites]),
+                np.array([s.distance_mm for s in sites]),
+            )
+        )
         # Placements share the stiffness matrix, so a chunk solves as one lockstep block CG that
         # reads the matrix and hierarchy once for all of it. A chunk starts as wide as the block
         # kernels go and halves when the device runs out of memory for it, which never moves a
@@ -660,6 +606,7 @@ class Subject:
                             recovery=op,
                             nodal=retain.nodal,
                             tissues=tissues,
+                            transforms=transforms[start : start + len(chunk)],
                         )
                         batch = self._reduce_chunk(
                             chunk,
@@ -670,7 +617,7 @@ class Subject:
                             region,
                             recovery,
                             op,
-                            rois,
+                            record_rois,
                             provenance,
                             copier,
                         )
@@ -720,7 +667,7 @@ class Subject:
         any other raises until :meth:`free` discards it.
         """
         with self._lock:
-            ensure_sweep_basis(self.context, coil, size)
+            _published(ensure_sweep_basis(self.context, coil, size))
 
     def iter_simulate(
         self,
@@ -733,7 +680,7 @@ class Subject:
         potential: bool = False,
         nodal: bool = False,
         recovery: Recovery = "harmonic",
-        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
     ) -> Iterator[FieldResult]:
         """Stream one :class:`FieldResult` per placement, in the order given.
 
@@ -794,7 +741,7 @@ class Subject:
         potential: bool = False,
         nodal: bool = False,
         recovery: Recovery = "harmonic",
-        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
     ) -> FieldResult:
         """Solve a single placement, taking the same flags as :meth:`iter_simulate`.
 
@@ -842,6 +789,7 @@ class Subject:
         # cached on the context and outlive the placement that first asked for them.
         tissues = self._needed_tissues(moments, record_rois)
         op = self._recovery_operator(recovery, tissues)
+        gray_matter = self._region_slice(DEFAULT_REGION)
         provenance = self._provenance(coil, seeded=False)
         temp_pool = self._scratch_pool()
         for site in sites:
@@ -856,12 +804,13 @@ class Subject:
                     record_rois=record_rois,
                     recovery=op,
                     tissues=tissues,
+                    region=gray_matter,
                 )
                 # Summarised on the device before anything is copied back.
                 host = self._host_metric_inputs if moments else None
                 reduced = replace(
                     result,
-                    summary=result.compute_summary(),
+                    summary=result.compute_summary(region_slice=gray_matter),
                     mean_magnE=cp.asnumpy(result.mean_magnE) if moments else None,
                     std_magnE=cp.asnumpy(result.std_magnE) if moments else None,
                     cov_magnE=cp.asnumpy(result.cov_magnE) if moments else None,
@@ -881,7 +830,7 @@ class Subject:
         didt: float = 1e6,
         *,
         moments: bool = False,
-        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
         recovery: Recovery = "harmonic",
     ) -> Iterator[ConductivityUQResult]:
         """Stream a conductivity Monte Carlo per placement, in the order given.
@@ -919,7 +868,7 @@ class Subject:
         didt: float = 1e6,
         *,
         moments: bool = False,
-        record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
+        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
         recovery: Recovery = "harmonic",
     ) -> ConductivityUQResult:
         """Run a conductivity Monte Carlo for a single placement.
@@ -1002,7 +951,7 @@ class FieldResult:
     tet_nodes: npt.NDArray[np.int32] | None = None
     _summaries: dict[str, metrics.FieldMetrics] = field(default_factory=dict, repr=False)
 
-    def nodal_field(self, region: metrics.Region = _DEFAULT_REGION) -> npt.NDArray[np.float32]:
+    def nodal_field(self, region: metrics.Region = DEFAULT_REGION) -> npt.NDArray[np.float32]:
         """The recovered field at the mesh nodes, on ``region``'s side of any boundary.
 
         Returns ``(n_nodes, 3)`` with NaN at every node ``region`` does not reach, which is the
@@ -1050,20 +999,20 @@ class FieldResult:
             )
         return self.magnE
 
-    def peak_magnE(self, region: metrics.Region = _DEFAULT_REGION) -> float:
+    def peak_magnE(self, region: metrics.Region = DEFAULT_REGION) -> float:
         return self.summary_for(region)["peak_magnE"]
 
     def peak_location_mm(
-        self, region: metrics.Region = _DEFAULT_REGION
+        self, region: metrics.Region = DEFAULT_REGION
     ) -> npt.NDArray[np.float64]:
         return self.summary_for(region)["peak_location_mm"]
 
     def center_of_gravity_mm(
-        self, region: metrics.Region = _DEFAULT_REGION
+        self, region: metrics.Region = DEFAULT_REGION
     ) -> npt.NDArray[np.float64]:
         return self.summary_for(region)["center_of_gravity_mm"]
 
-    def focality(self, frac: float = 0.5, region: metrics.Region = _DEFAULT_REGION) -> float:
+    def focality(self, frac: float = 0.5, region: metrics.Region = DEFAULT_REGION) -> float:
         """Volume with ``|E| >= frac *`` the 99.9th percentile of |E| in the region.
 
         The anchor is a high percentile rather than :meth:`peak_magnE` so that one outlier
@@ -1121,7 +1070,7 @@ class FieldResult:
                     continue
                 h5f.create_dataset(name, data=arr, compression="gzip")
             h5f.create_dataset("transform", data=self.transform)
-            _write_metrics(h5f.create_group("summary"), self.summary)
+            write_metrics(h5f.create_group("summary"), self.summary)
             h5f.attrs["format_version"] = _FORMAT_VERSION
             h5f.attrs["recovery"] = self.recovery
             if self.n_nodes is not None:
@@ -1136,7 +1085,7 @@ class FieldResult:
             if self.relative_residual is not None:
                 h5f.attrs["relative_residual"] = self.relative_residual
             if self.provenance is not None:
-                _write_provenance(h5f, self.provenance)
+                write_provenance(h5f, self.provenance)
             if self.roi_means is not None:
                 grp = h5f.create_group("roi_means")
                 for name, value in self.roi_means.items():
@@ -1146,12 +1095,12 @@ class FieldResult:
     def load(cls, path: str | Path) -> FieldResult:
         """Read a saved result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
-            _check_format_version(h5f, path, _FORMAT_VERSION)
+            check_format_version(h5f, path, _FORMAT_VERSION)
             return cls(
-                summary=_read_metrics(h5f["summary"]),
-                magnE=_opt_array(h5f, "magnE"),
-                E=_opt_array(h5f, "E"),
-                v=_opt_array(h5f, "v"),
+                summary=read_metrics(h5f["summary"]),
+                magnE=opt_array(h5f, "magnE"),
+                E=opt_array(h5f, "E"),
+                v=opt_array(h5f, "v"),
                 transform=np.asarray(h5f["transform"]),
                 placement=Placement(
                     center_mm=h5f.attrs["placement_center_mm"],
@@ -1160,9 +1109,9 @@ class FieldResult:
                 ),
                 coil_name=str(h5f.attrs["coil_name"]),
                 didt=float(h5f.attrs["didt"]),
-                vols=_opt_array(h5f, "vols"),
-                tet_tags=_opt_array(h5f, "tet_tags"),
-                barycenters_mm=_opt_array(h5f, "barycenters_mm"),
+                vols=opt_array(h5f, "vols"),
+                tet_tags=opt_array(h5f, "tet_tags"),
+                barycenters_mm=opt_array(h5f, "barycenters_mm"),
                 recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
                 iterations=int(h5f.attrs["iterations"]) if "iterations" in h5f.attrs else None,
                 relative_residual=(
@@ -1170,15 +1119,15 @@ class FieldResult:
                     if "relative_residual" in h5f.attrs
                     else None
                 ),
-                provenance=_read_provenance(h5f),
+                provenance=read_provenance(h5f),
                 roi_means=(
                     {k: float(v) for k, v in h5f["roi_means"].attrs.items()}
                     if "roi_means" in h5f
                     else None
                 ),
                 n_nodes=int(h5f.attrs["n_nodes"]) if "n_nodes" in h5f.attrs else None,
-                E_slots=_opt_array(h5f, "E_slots"),
-                slot_node=_opt_array(h5f, "slot_node"),
-                slot_tag=_opt_array(h5f, "slot_tag"),
-                tet_nodes=_opt_array(h5f, "tet_nodes"),
+                E_slots=opt_array(h5f, "E_slots"),
+                slot_node=opt_array(h5f, "slot_node"),
+                slot_tag=opt_array(h5f, "slot_tag"),
+                tet_nodes=opt_array(h5f, "tet_nodes"),
             )
