@@ -154,3 +154,26 @@ def test_coil_load_without_didtmax(tmp_path):
 )
 def test_decode_attr_handles_bytes_and_np_scalars(raw, expected):
     assert _decode_attr(raw) == expected
+
+
+def test_load_takes_a_bundled_name():
+    by_name = Coil.load("MagStim_D70")
+    by_path = Coil.load(coil_registry.MAGSTIM_D70)
+    np.testing.assert_array_equal(by_name.positions_m, by_path.positions_m)
+    assert by_name.name == by_path.name
+
+
+def test_load_reads_a_ccd_as_its_encoding_would(tmp_path):
+    ccd = tmp_path / "synth.ccd"
+    ccd.write_text(_CCD)
+    h5 = tmp_path / "synth.h5"
+    encode_ccd(ccd, h5)
+    direct, encoded = Coil.load(ccd), Coil.load(h5)
+    np.testing.assert_array_equal(direct.moments, encoded.moments)
+    assert direct.didt_max == encoded.didt_max
+    assert direct.name == encoded.name == "Synth"
+
+
+def test_load_names_the_bundled_models_when_nothing_matches():
+    with pytest.raises(FileNotFoundError, match="MagStim_D70"):
+        Coil.load("MagStim_D71")

@@ -74,18 +74,35 @@ class Coil:
 
     @classmethod
     def load(cls, source: str | Path) -> Coil:
-        """Load a coil from a bundled/encoded ``.h5`` file (see :func:`encode_ccd`)."""
-        with h5py.File(Path(source), "r") as h5f:
-            dset = h5f["dipoles"]
-            data = np.asarray(dset, dtype=np.float64)
-            attrs: dict[str, str | int | float] = {
-                k: _decode_attr(v) for k, v in dset.attrs.items()
-            }
+        """Load a coil from a bundled model's name, an HDF5 dipole file, or a SimNIBS ``.ccd``.
+
+        A name is a key of :func:`bundled_coils`, such as ``"MagStim_D70"``; the module constants
+        are the same models as paths. A ``.ccd`` file is read directly; :func:`encode_ccd`
+        converts one to the HDF5 format.
+        """
+        path = Path(source)
+        if not path.exists():
+            bundled = bundled_coils()
+            if isinstance(source, str) and source in bundled:
+                path = bundled[source]
+            else:
+                raise FileNotFoundError(
+                    f"{source!r} is neither a coil file nor a bundled model; bundled models are "
+                    f"{sorted(bundled)}."
+                )
+        if path.suffix.lower() == ".ccd":
+            data, ccd_attrs = _read_ccd(path)
+            attrs: dict[str, str | int | float] = dict(ccd_attrs)
+        else:
+            with h5py.File(path, "r") as h5f:
+                dset = h5f["dipoles"]
+                data = np.asarray(dset, dtype=np.float64)
+                attrs = {k: _decode_attr(v) for k, v in dset.attrs.items()}
         didt_raw = attrs.get("dIdtmax")
         return cls(
             positions_m=np.ascontiguousarray(data[:, 0:3]),
             moments=np.ascontiguousarray(data[:, 3:6]),
-            name=str(attrs.get("coilname", Path(source).stem)),
+            name=str(attrs.get("coilname", path.stem)),
             didt_max=None if didt_raw is None else float(didt_raw) * _CCD_DIDTMAX_TO_A_PER_S,
             metadata=attrs,
         )
@@ -101,17 +118,22 @@ def bundled_coils() -> dict[str, Path]:
     return {p.stem: p for p in sorted(_COILS_ROOT.glob("*.h5"))}
 
 
-def encode_ccd(ccd_file: Path, output_h5: Path) -> None:
+def _read_ccd(ccd_file: Path) -> tuple[npt.NDArray[np.float64], dict[str, str | int]]:
+    """Dipoles ``(N, 6)`` and header fields of a SimNIBS ``.ccd`` file."""
     with Path.open(ccd_file) as f:
         meta_line = f.readline().strip().lstrip("#").strip()
         num_elements = int(f.readline().strip())
-        data = np.loadtxt(f, dtype=np.float64, skiprows=1, max_rows=num_elements)
+        data = np.loadtxt(f, dtype=np.float64, skiprows=1, max_rows=num_elements, ndmin=2)
 
     parts = (p.split("=", 1) for p in meta_line.split(";") if "=" in p)
     metadata: dict[str, str | int] = {k.strip(): v.strip() for k, v in parts}
-
     metadata["num_elements"] = num_elements
+    return data, metadata
 
+
+def encode_ccd(ccd_file: Path, output_h5: Path) -> None:
+    """Convert a SimNIBS ``.ccd`` coil to the HDF5 dipole format :meth:`Coil.load` reads."""
+    data, metadata = _read_ccd(ccd_file)
     with h5py.File(output_h5, "w") as h5f:
         dset = h5f.create_dataset("dipoles", data=data, compression="gzip")
         dset.attrs.update(metadata)

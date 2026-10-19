@@ -109,14 +109,18 @@ The built-in conductivities match the standard SimNIBS values.
 ### Coil models
 
 The package includes the 25 validated coil models from Drakaki et al. (2022).
-Import a bundled-model constant from `cunibs.coil` and pass it to `Coil.load`.
-Custom coil models use an HDF5 dipole format, with positions in metres and
-moments in A m². Convert a SimNIBS CCD coil as follows:
+Pass `Coil.load` a bundled-model constant from `cunibs.coil` or its name, as
+listed by `bundled_coils()`. Custom coil models use an HDF5 dipole format, with
+positions in metres and moments in A m². A SimNIBS CCD coil loads directly, and
+`encode_ccd` converts one to the HDF5 format:
 
 ```python
 from pathlib import Path
 
 from cunibs.coil import Coil, encode_ccd
+
+coil = Coil.load("MagStim_D70")
+coil = Coil.load("coil.ccd")
 
 encode_ccd(Path("coil.ccd"), Path("coil.h5"))
 coil = Coil.load("coil.h5")
