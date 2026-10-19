@@ -110,7 +110,7 @@ def peak_magnitude(magnE: ArrayT, mask: ArrayT) -> float:
 
 def _percentile(m: ArrayT, w: ArrayT, percentile: float) -> float:
     xp = cp.get_array_module(m)
-    q = xp.asarray([percentile / 100.0], dtype=m.dtype)
+    q = xp.asarray([percentile / 100.0], dtype=xp.float64)
     return float(cp.asnumpy(weighted_quantiles(m, w, q))[0])
 
 
@@ -128,7 +128,7 @@ def _distribution(m: ArrayT, w: ArrayT, percentiles: tuple[float, ...]) -> dict[
     wsum = w.sum()
     mean = float((w * m).sum() / wsum)
     var = float((w * (m - mean) ** 2).sum() / wsum)
-    qs = xp.asarray([p / 100.0 for p in percentiles], dtype=m.dtype)
+    qs = xp.asarray([p / 100.0 for p in percentiles], dtype=xp.float64)
     pvals = cp.asnumpy(weighted_quantiles(m, w, qs))
     out = {"mean": mean, "std": float(np.sqrt(var))}
     out.update({f"p{p:g}": float(val) for p, val in zip(percentiles, pvals, strict=False)})

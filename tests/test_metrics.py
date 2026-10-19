@@ -244,3 +244,17 @@ def test_reused_region_slice_matches_a_per_call_summary(cp):
         )
         assert reused["distribution"] == direct["distribution"]
         assert reused["focality_m3"] == direct["focality_m3"]
+
+
+def test_tail_percentiles_use_the_exact_probability_for_float32_fields():
+    """p99.9 is the quantile at 0.999, not at float32(0.999), which sits 1.3e-8 above it."""
+    rng = np.random.default_rng(7)
+    magn = np.sort(rng.pareto(1.5, 200_000)).astype(np.float32)
+    vols = rng.random(200_000).astype(np.float32) + 0.1
+    mask = np.ones(magn.size, dtype=bool)
+    exact = metrics.weighted_quantiles(magn, vols, np.array([99.9 / 100.0]))[0]
+    float32_q = np.array([np.float32(99.9 / 100.0)], dtype=np.float64)
+    rounded = metrics.weighted_quantiles(magn, vols, float32_q)[0]
+    assert exact != rounded, "the tail must be steep enough to tell the two apart"
+    assert metrics.distribution(magn, vols, mask)["p99.9"] == exact
+    assert metrics.percentile_magnitude(magn, vols, mask, 99.9) == exact
