@@ -3,8 +3,7 @@
 The potential a placement induces is a smooth, global field, so the solutions of placements
 spread over the scalp span most of any other placement's solution. With an A-orthonormal basis Q
 of such solutions, ``x0 = Q Q^T b`` is the Galerkin solution over span(Q): the best start that
-span offers in the energy norm CG minimises. On a head mesh, 64 scalp points at two handle angles
-take a dense sweep about one target from 19.3 CG iterations a placement to 13.1.
+span offers in the energy norm CG minimises.
 
 The basis is fixed by the subject and the coil it was built with, never by the placements being
 solved, so a placement's result does not depend on the sweep it is part of. It does depend on
@@ -82,10 +81,7 @@ def _basis_transforms(ctx: SolverContext, size: int) -> np.ndarray:
     """Coil frames for the basis: points on the cap, each taken at two handle angles 90 apart.
 
     The field under a figure-of-eight coil turns with its handle, to first order as
-    (cos t, sin t), so a pair of orthogonal handles at each point spans the rotations there. On a
-    729-placement sweep about one target this left CG at 13.1 iterations against 14.7 for 128
-    points at golden-angle handles, 14.7 for 32 points at four handles and 14.8 for one fixed
-    handle each.
+    (cos t, sin t), so a pair of orthogonal handles at each point spans the rotations there.
     """
     count = (size + 1) // 2
     points = _cap_points(ctx, count)

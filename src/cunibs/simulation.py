@@ -415,7 +415,7 @@ class Subject:
 
         Held here rather than reached from inside a solve so the build is serialised against
         other threads sharing this subject, and so it lands outside the caller's scratch
-        allocator -- the operator outlives the chunk that first asked for it. ``tissues`` is
+        allocator, since the operator outlives the chunk that first asked for it. ``tissues`` is
         what the call reads; see :meth:`_needed_tissues`.
         """
         if recovery == "raw":
@@ -654,8 +654,8 @@ class Subject:
         """Seed every later solve on this subject from a basis of ``size`` scalp placements.
 
         Each solve then starts from the Galerkin solution over those placements' solutions
-        rather than from zero, which on a head mesh takes a dense sweep about one target from 19
-        CG iterations a placement to 13 and from 8.2 to 6.8 ms a placement. Building the basis
+        rather than from zero, which on a head mesh cuts the CG iterations of a dense sweep about
+        one target by about a third. Building the basis
         costs ``size`` solves (about 0.9 s) and ``size`` fp32 vectors of device memory (about
         360 MB at the default on a 700k-node mesh), so it pays from several hundred placements
         and is never built implicitly.
@@ -688,7 +688,7 @@ class Subject:
 
         Every result carries its gray-matter metrics; the flags say which of the full-volume
         arrays to keep as well. All three default to off because they are what makes a result
-        large -- tens of megabytes on a head mesh, against about a kilobyte without them.
+        large: tens of megabytes on a head mesh, against about a kilobyte without them.
 
         Retaining ``magnitude`` also unlocks the metrics a precomputed summary cannot
         answer: :meth:`FieldResult.summary_for` for a non-default region, and
@@ -902,7 +902,7 @@ class FieldResult:
     ``v`` are ``None`` unless the run asked for them with ``magnitude=``, ``vectors=`` or
     ``potential=``. All arrays are NumPy.
 
-    ``vols``, ``tet_tags`` and ``barycenters_mm`` accompany ``magnE`` -- they are what the
+    ``vols``, ``tet_tags`` and ``barycenters_mm`` accompany ``magnE``, since they are what the
     on-demand metrics need. Results from one subject share them, so treat them as
     read-only.
 

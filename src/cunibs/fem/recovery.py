@@ -87,8 +87,8 @@ type Recovery = Literal["raw", "spr_global", "spr_tissue", "harmonic"]
     jump. Corresponds to SimNIBS's ``interpolate_scattered(..., continuous=True)``.
 ``"spr_tissue"``
     The same fit with each patch restricted to one tissue, so the discontinuity survives. ``E``
-    is genuinely two-valued at a conductivity jump -- the tangential component is continuous
-    while the normal one jumps by the conductivity ratio -- and a patch spanning the jump fits a
+    is genuinely two-valued at a conductivity jump (the tangential component is continuous
+    while the normal one jumps by the conductivity ratio), and a patch spanning the jump fits a
     discontinuous function with a linear polynomial. This is what SimNIBS's surface and volume
     overlays report, down to the boundary rule: a tissue-interface node lies on the cropped
     tissue's boundary, so each of its slots takes that tissue's own volume-weighted average
@@ -442,8 +442,7 @@ def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
         slot_arg = slot_node
     else:
         # A slot is a node, so the corner CSR is the one the RHS assembly already carries and a
-        # corner reads back from its own node. No new index arrays at all, and the kernel reads
-        # the slot index directly rather than through an identity map.
+        # corner reads back from its own node, so no index arrays are built.
         ptr, idx = ctx.node2corner_ptr, ctx.node2corner_idx
         slot_of_corner = cp.ascontiguousarray(ctx.tet_nodes.reshape(-1))
         slot_node = cp.arange(n_nodes, dtype=cp.int32)
@@ -523,8 +522,8 @@ def ensure_recovery(
 class RecoveredField(NamedTuple):
     """One recovered field per placement, on slots and sampled back at the barycentres.
 
-    The names match what these arrays become downstream -- ``PlacementResult["E_slots"]`` and
-    :attr:`~cunibs.FieldResult.E_slots`, and likewise for ``E`` and ``magnE`` -- so nothing has
+    The names match what these arrays become downstream (``PlacementResult["E_slots"]`` and
+    :attr:`~cunibs.FieldResult.E_slots`, and likewise for ``E`` and ``magnE``), so nothing has
     to be renamed as a field flows out of the solver.
     """
 

@@ -294,8 +294,8 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
         tet_blocks, surf_blocks = _read_element_blocks(cursor)
 
         tet = _join_blocks(tet_blocks, _ELEMENT_NODES[_ELEM_TYPE_TET])
-        # The tag check reads the contiguous copy, not the stride-28 view over the mapping it
-        # comes from. Validating before the copy is measurably slower on a full head mesh.
+        # The tag check reads the contiguous copy, which is faster to scan than the stride-28 view
+        # over the mapping it comes from.
         tet_tags = np.array(tet.tags)
         _reject_unknown_volume_tags(tet_tags, cursor)
 

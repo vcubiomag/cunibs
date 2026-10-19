@@ -45,9 +45,9 @@ if TYPE_CHECKING:
 # the answer.
 _SENSITIVITY_TOL = 1e-3
 
-# Second-order sensitivities kept in the warm-start basis: two block solves. On sub-004 the
-# strongest 16 of 45 take a block from 15.5 iterations (first order only) to 12.6; all 45 reach
-# 12.5 for three times the setup.
+# Second-order sensitivities kept in the warm-start basis: two block solves. The strongest pairs
+# carry nearly all of what the full set would take off a draw's iterations, for a third of the
+# setup.
 _SECOND_ORDER_PAIRS = 16
 
 # Relative eigenvalue below which a basis direction counts as dependent on the others and is

@@ -59,8 +59,7 @@ def build_adjoint_solver(
 
     The adjoint system is the forward one: the context's stiffness is already assembled in
     float64 from float64 gradients and grounds the same DOF, so its operator and hierarchy are
-    shared and only the stopping rule differs. Reassembling them gave a bitwise-identical matrix
-    for the cost of a second assembly, AMG setup and copy of both on the device.
+    shared and only the stopping rule differs.
     """
     return dataclasses.replace(
         ctx.solver,
@@ -170,16 +169,11 @@ def solve_adjoint(
         _adjoint_rhs(ctx, target.elem_idx, target.weights, directions[d]) for d in range(n_dir)
     ]
     lams = [cp.zeros(ctx.n_nodes, dtype=cp.float64) for _ in range(n_dir)]
-    reduced = cp.ascontiguousarray(cp.stack(rhs, axis=1)[solver.idx])
-    # The block solver refuses an all-zero column; a direction the target cannot see solves to
-    # zero, which is what the single-RHS path returns for it.
-    live = [d for d in range(n_dir) if bool(cp.any(reduced[:, d]))]
-    if live:
-        x, _ = _solve_grounded_block_mat(
-            solver, _pad_block(cp.ascontiguousarray(reduced[:, live]), len(live)), len(live)
-        )
-        for j, d in enumerate(live):
-            lams[d][solver.idx] = x[:, j]
+    reduced = cp.stack(rhs, axis=1)[solver.idx]
+    # A direction the target cannot see has a zero right-hand side and solves to zero.
+    x, _ = _solve_grounded_block_mat(solver, _pad_block(reduced, n_dir), n_dir)
+    for d in range(n_dir):
+        lams[d][solver.idx] = x[:, d]
     node_w = cp.empty((n_dir, ctx.n_nodes, 3), dtype=cp.float64)
     for d in range(n_dir):
         node_w[d] = _node_weights(ctx, lams[d], target.elem_idx, target.weights, directions[d])

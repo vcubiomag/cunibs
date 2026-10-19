@@ -76,9 +76,9 @@ def _l1_dinv(a: csp.csr_matrix) -> cp.ndarray:
     ``rho(D^-1 A) <= 1`` on every level with no estimate needed. Both the Chebyshev interval in
     vcycle.cu and the damping below rest on that bound.
 
-    The row sum is a kernel rather than an SpMV of ``|a|`` against a vector of ones so that its
-    summation order is fixed by the CSR: dinv scales every entry of the smoothed prolongator and
-    reaches every V-cycle level, so any drift in it reaches the whole hierarchy. See l1.cu.
+    The row sum is a kernel so that its summation order is fixed by the CSR: dinv scales every
+    entry of the smoothed prolongator and reaches every V-cycle level, so any drift in it reaches
+    the whole hierarchy. See l1.cu.
     """
     dinv = cp.empty(a.shape[0], dtype=cp.float32)
     l1_dinv(*_csr_f32(a), dinv, cp.cuda.get_current_stream().ptr)
@@ -357,8 +357,8 @@ def solve_ordering(nodes_mm: cp.ndarray, ground_node: int) -> cp.ndarray:
     """Reduced-system row index: the mesh nodes bar the grounded one.
 
     The rows inherit the mesh's spatial order (see :func:`spatial_order`), which is what keeps
-    the SpMV gather over ``x`` local: 92% of the reduced operator's nonzeros sit within a
-    4096-column window, against a quarter of them on an unordered mesh.
+    the SpMV gather over ``x`` local: on a head mesh 92% of the reduced operator's nonzeros sit
+    within a 4096-column window.
     """
     return grounded_index(int(nodes_mm.shape[0]), ground_node)
 
@@ -628,7 +628,8 @@ def _reconstruct_e_kernel(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Reconstruct E and its magnitude for each tetrahedron.
 
-    Accumulate ``grad(v)`` in float64 because ``-grad(v) - dA/dt`` has strong cancellation.
+    The potential's differences across each element are taken in float64, because a grounded
+    potential is large against its change across one element. See reconstruct.cu.
     """
     n_tet = int(tet_nodes.shape[0])
     e = cp.empty((n_tet, 3), dtype=cp.float32)
@@ -719,8 +720,7 @@ def skin_triangle_normals(nodes_mm: cp.ndarray, skin_tris: cp.ndarray) -> cp.nda
     Area-weighted face normals are spread to the triangles' nodes and gathered back twice, and the
     result is the normalised mean of each triangle's three node normals. The spread is a reduction
     over the triangles meeting at a node: it runs over a node-to-corner CSR built by a stable sort,
-    in that CSR's order, so it reduces in the same order on every run. Scattering with atomics
-    would be shorter and would not.
+    in that CSR's order, so it reduces in the same order on every run.
     """
     tris = cp.ascontiguousarray(skin_tris, dtype=cp.int32)
     out = cp.empty((int(tris.shape[0]), 3), dtype=cp.float64)
@@ -916,8 +916,7 @@ def solve_placements_block(
     gradients, node2corner, g) run once per chunk rather than once per placement, and the
     linear solve shares every stiffness/hierarchy read across the k columns.
 
-    k = 1 runs the width-1 block kernels rather than routing to ``solve_placement``, so that
-    every chunk width reaches the same arithmetic.
+    Every chunk width reaches the same arithmetic, and :func:`solve_placement` is k = 1.
 
     ``recovery`` is a prebuilt operator from :func:`~cunibs.fem.ensure_recovery`, or ``None``
     for the raw per-tetrahedron field; see :func:`_check_operator` for why this layer will not
