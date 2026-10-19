@@ -49,9 +49,9 @@ def main() -> None:
     worker.join()
     inside = [t for t in stamps if start <= t <= end]
     gap = max(np.diff([start, *inside, end]))
-    json.dump(
-        {"gil": sys._is_gil_enabled(), "solve_s": elapsed, "max_gap_s": float(gap)}, sys.stdout
-    )
+    # Python 3.12 has no free-threaded build, so its GIL is always enabled.
+    gil = sys._is_gil_enabled() if sys.version_info >= (3, 13) else True
+    json.dump({"gil": gil, "solve_s": elapsed, "max_gap_s": float(gap)}, sys.stdout)
 
 
 if __name__ == "__main__":
