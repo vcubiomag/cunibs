@@ -274,9 +274,12 @@ __global__ void __launch_bounds__(kBlock)
         // Plain, not __restrict__: x_out is allowed to alias x_prev, and from the second step
         // of a sweep it always does.
         cuda::std::array<float, K> out;
+        // Spelled out so that every K contracts the same way: left to choose, the compiler can
+        // fuse a different one of the two products at each width.
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            out[c] = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
+            out[c] = __fmaf_rn(d, __fmaf_rn(-s, sum[c], rhs[c]),
+                               __fmaf_rn(c_cur, cur[c], __fmul_rn(c_prev, prev[c])));
         }
         store_row<K>(&WidthView<float, K>(x_out, n)(row, 0), out);
     }
