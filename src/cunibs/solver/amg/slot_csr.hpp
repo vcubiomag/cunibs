@@ -11,8 +11,9 @@ struct SlotCsr {
     int n_slots = 0;
 };
 
-// Setup only: synchronises the legacy stream it runs on, so the caller may drop its arrays.
-SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, const char* origin);
+// Setup only: runs on `stream` and synchronises it, so the caller may drop its arrays.
+SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, cudaStream_t stream,
+                       const char* origin);
 
 // dst (n_slots) = src (row_ptr's entries) laid out in slots, with a zero in every low-half slot.
 void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
@@ -39,10 +40,10 @@ struct AffineSlots {
 constexpr int kAffineWindow = 32;
 
 // Setup only. term_vals is (n_terms, nnz) over the entry CSR row_ptr, whose slot form is
-// slot_ptr/slot_cols. Synchronises the legacy stream it runs on.
+// slot_ptr/slot_cols. Runs on `stream` and synchronises it.
 AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* slot_ptr,
                                const std::int16_t* slot_cols, const double* term_vals,
-                               int n_terms, const char* origin);
+                               int n_terms, cudaStream_t stream, const char* origin);
 
 // aw_t[t * n_s + s] = the sum of part t's entries in row rows[s], in entry order.
 void launch_term_row_sums(int n_s, const int* rows, const int* row_ptr, const double* term_vals,

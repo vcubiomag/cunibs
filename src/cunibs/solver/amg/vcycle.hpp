@@ -4,6 +4,7 @@
 
 #include <cuda_fp16.h>
 
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -40,14 +41,16 @@ public:
 
     // Chebyshev shape. Must be called before the first add_level.
     void set_smoother(int degree, float lower_ratio);
-    // All pointers are device memory; contents are copied into solver-owned buffers.
+    // All pointers are device memory; contents are copied into solver-owned buffers on `stream`,
+    // which is synchronised before return so the caller may drop its arrays.
     // P is (n_rows, n_coarse) CSR and R is P^T, so both hold p_nnz entries.
     void add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const int* row_ptr,
                    const int* col_idx, const float* values, const float* dinv,
                    const int* p_row_ptr, const int* p_col_idx, const float* p_values,
-                   const int* r_row_ptr, const int* r_col_idx, const float* r_values);
+                   const int* r_row_ptr, const int* r_col_idx, const float* r_values,
+                   cudaStream_t stream);
     // ainv is the dense inverse of the coarsest-level matrix, row-major (n x n).
-    void set_coarse(int n, const float* ainv);
+    void set_coarse(int n, const float* ainv, cudaStream_t stream);
     void finalize();
 
     void apply(int n, const float* b, float* x, cudaStream_t stream);
@@ -55,6 +58,9 @@ public:
     // after a first (warm-up) call.
     void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
     int generation() const { return generation_; }
+    // Held by a solve for its whole length: a replayed graph reads the cycle's buffers without
+    // calling apply, so two solves sharing one cycle must not overlap.
+    std::mutex& mutex() { return mutex_; }
     // Coarsening levels, excluding the coarsest (dense-inverse) one.
     int n_levels() const { return static_cast<int>(levels_.size()); }
 
@@ -126,4 +132,5 @@ private:
     int block_k_ = 0;
     int generation_ = 0;
     bool finalized_ = false;
+    std::mutex mutex_;
 };

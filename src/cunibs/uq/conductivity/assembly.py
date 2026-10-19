@@ -141,13 +141,14 @@ def build_conductivity_uq_precompute(
 
     nominal_f32 = cp.ascontiguousarray(nominal_data.astype(cp.float32))
     precond = build_native_vcycle(row_ptr, col_idx, nominal_f32)
-    pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data)
+    stream = cp.cuda.get_current_stream().ptr
+    pcg = PcgAmgSolver(row_ptr, col_idx, nominal_data, stream)
     # The draws' operators, A(sigma) = base + sum_t sigma_t A_t, as one affine operator: a block of
     # draws then shares every part's read and no draw's matrix is ever assembled. The base is a
     # part whose coefficient is always 1, and is left out when nothing is held fixed.
     has_base = bool(cp.any(base_data))
     terms = cp.concatenate([base_data[None], tissue_data]) if has_base else tissue_data
-    pcg.set_affine_terms(cp.ascontiguousarray(terms))
+    pcg.set_affine_terms(cp.ascontiguousarray(terms), stream)
     del terms
     tolerance = DEFAULT_TOLERANCE
     max_iters = DEFAULT_MAX_ITERS

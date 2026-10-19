@@ -168,6 +168,23 @@ for mesh_file in Path("subjects").glob("m2m_*/*.msh"):
         print(result.peak_magnE())
 ```
 
+`Subject.from_mesh` reads the mesh on the CPU, and simulations release the GIL while the GPU
+works, so the next mesh can be read in a background thread while the current subject runs:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+mesh_files = sorted(Path("subjects").glob("m2m_*/*.msh"))
+with ThreadPoolExecutor(max_workers=1) as reader:
+    upcoming = reader.submit(Subject.from_mesh, mesh_files[0])
+    for following in [*mesh_files[1:], None]:
+        subject = upcoming.result()
+        if following is not None:
+            upcoming = reader.submit(Subject.from_mesh, following)
+        with subject:
+            results = list(subject.iter_simulate(coil, placements, didt=1.0e6))
+```
+
 ## Results
 
 Each `FieldResult` provides gray-matter summary metrics by default:

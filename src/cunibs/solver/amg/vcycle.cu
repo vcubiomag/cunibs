@@ -25,8 +25,8 @@ Buffer<T> device_alloc(std::size_t count, const char* what) {
 }
 
 template <typename T>
-Buffer<T> device_clone(const T* src, std::size_t count, const char* what) {
-    return ::device_clone<T>(src, count, "vcycle", what);
+Buffer<T> device_clone(const T* src, std::size_t count, cudaStream_t stream, const char* what) {
+    return ::device_clone<T>(src, count, stream, "vcycle", what);
 }
 
 // Threads per row for the SpMV-shaped kernels, chosen per level from that level's own shape. The
@@ -564,7 +564,7 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
                              const int* col_idx, const float* values, const float* dinv,
                              const int* p_row_ptr, const int* p_col_idx, const float* p_values,
                              const int* r_row_ptr, const int* r_col_idx,
-                             const float* r_values) {
+                             const float* r_values, cudaStream_t stream) {
     if (finalized_) throw std::runtime_error("NativeVCycle: add_level after finalize");
     if (n_rows <= 0 || n_coarse <= 0 || nnz < 0 || p_nnz < 0) {
         throw std::invalid_argument("NativeVCycle: level dimensions must be positive");
@@ -574,28 +574,29 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     lvl.n = n_rows;
     lvl.n_coarse = n_coarse;
     lvl.tpr = choose_tpr(n_rows, nnz, sm_count());
-    SlotCsr slots = build_slot_csr(n_rows, row_ptr, col_idx, "vcycle");
+    SlotCsr slots = build_slot_csr(n_rows, row_ptr, col_idx, stream, "vcycle");
     lvl.row_ptr = std::move(slots.ptr);
     lvl.cols = std::move(slots.cols);
     lvl.values = device_alloc<__half>(static_cast<std::size_t>(slots.n_slots), "level values");
     lvl.row_scale = device_alloc<float>(static_cast<std::size_t>(n_rows), "level row_scale");
     if (const unsigned blocks = grid_for(n_rows)) {
-        vc_pack_values_kernel<<<blocks, kBlock>>>(n_rows, row_ptr, lvl.row_ptr.get(),
-                                                  lvl.cols.get(), values, lvl.values.get(),
-                                                  lvl.row_scale.get());
+        vc_pack_values_kernel<<<blocks, kBlock, 0, stream>>>(
+            n_rows, row_ptr, lvl.row_ptr.get(), lvl.cols.get(), values, lvl.values.get(),
+            lvl.row_scale.get());
         check_cuda(cudaGetLastError(), "vcycle", "pack values");
-        // Setup only, and it is what lets the caller drop its fp32 values on return.
-        check_cuda(cudaDeviceSynchronize(), "vcycle", "pack values");
     }
-    lvl.dinv = device_clone(dinv, static_cast<std::size_t>(n_rows), "level dinv");
+    lvl.dinv = device_clone(dinv, static_cast<std::size_t>(n_rows), stream, "level dinv");
     lvl.p_row_ptr =
-        device_clone(p_row_ptr, static_cast<std::size_t>(n_rows) + 1, "level P ptr");
-    lvl.p_col_idx = device_clone(p_col_idx, static_cast<std::size_t>(p_nnz), "level P idx");
-    lvl.p_values = device_clone(p_values, static_cast<std::size_t>(p_nnz), "level P val");
+        device_clone(p_row_ptr, static_cast<std::size_t>(n_rows) + 1, stream, "level P ptr");
+    lvl.p_col_idx =
+        device_clone(p_col_idx, static_cast<std::size_t>(p_nnz), stream, "level P idx");
+    lvl.p_values = device_clone(p_values, static_cast<std::size_t>(p_nnz), stream, "level P val");
     lvl.r_row_ptr =
-        device_clone(r_row_ptr, static_cast<std::size_t>(n_coarse) + 1, "level R ptr");
-    lvl.r_col_idx = device_clone(r_col_idx, static_cast<std::size_t>(p_nnz), "level R idx");
-    lvl.r_values = device_clone(r_values, static_cast<std::size_t>(p_nnz), "level R val");
+        device_clone(r_row_ptr, static_cast<std::size_t>(n_coarse) + 1, stream, "level R ptr");
+    lvl.r_col_idx =
+        device_clone(r_col_idx, static_cast<std::size_t>(p_nnz), stream, "level R idx");
+    lvl.r_values = device_clone(r_values, static_cast<std::size_t>(p_nnz), stream, "level R val");
+    check_cuda(cudaStreamSynchronize(stream), "vcycle", "level copies");
     // The finest level reads the caller's b in place, so it needs no RHS of its own.
     if (!levels_.empty()) {
         lvl.b = device_alloc<float>(static_cast<std::size_t>(n_rows), "level b");
@@ -605,10 +606,11 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     levels_.push_back(std::move(lvl));
 }
 
-void NativeVCycle::set_coarse(int n, const float* ainv) {
+void NativeVCycle::set_coarse(int n, const float* ainv, cudaStream_t stream) {
     if (finalized_) throw std::runtime_error("NativeVCycle: set_coarse after finalize");
     if (n <= 0) throw std::invalid_argument("NativeVCycle: coarse size must be positive");
-    coarse_ainv_ = device_clone(ainv, static_cast<std::size_t>(n) * n, "coarse ainv");
+    coarse_ainv_ = device_clone(ainv, static_cast<std::size_t>(n) * n, stream, "coarse ainv");
+    check_cuda(cudaStreamSynchronize(stream), "vcycle", "coarse copy");
     coarse_b_ = device_alloc<float>(static_cast<std::size_t>(n), "coarse b");
     coarse_x_ = device_alloc<float>(static_cast<std::size_t>(n), "coarse x");
     coarse_n_ = n;

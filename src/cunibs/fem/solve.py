@@ -275,15 +275,16 @@ def build_native_vcycle(
     if smoother is None:
         smoother = SmootherParams()
     levels, coarse = aggregation_levels(row_ptr, col_idx, values_f32, params)
+    stream = cp.cuda.get_current_stream().ptr
     vc = NativeVCycle()
     vc.set_smoother(smoother.degree, smoother.lower_ratio)
     for level in levels:
         a, p = level.a, level.p
         r = p.T.tocsr()
         r.sort_indices()
-        vc.add_level(*_csr_f32(a), _l1_dinv(a), *_csr_f32(p), *_csr_f32(r))
+        vc.add_level(*_csr_f32(a), _l1_dinv(a), *_csr_f32(p), *_csr_f32(r), stream)
     ainv = cp.linalg.inv(coarse.todense().astype(cp.float32))
-    vc.set_coarse(cp.ascontiguousarray(ainv))
+    vc.set_coarse(cp.ascontiguousarray(ainv), stream)
     vc.finalize()
     return vc
 
@@ -462,7 +463,7 @@ def prepare_grounded_solver(
     values = a_red.data.astype(cp.float64, copy=False)
     values_f32 = values.astype(cp.float32)
     precond = build_native_vcycle(row_ptr, col_idx, values_f32)
-    pcg = PcgAmgSolver(row_ptr, col_idx, values)
+    pcg = PcgAmgSolver(row_ptr, col_idx, values, cp.cuda.get_current_stream().ptr)
     return GroundedSolver(
         n=n,
         idx=idx,

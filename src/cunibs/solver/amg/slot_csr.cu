@@ -137,7 +137,8 @@ __global__ void term_row_sums_kernel(int n_s, const int* __restrict__ rows,
 
 }  // namespace
 
-SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, const char* origin) {
+SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, cudaStream_t stream,
+                       const char* origin) {
     if (static_cast<std::int64_t>(n) > kSlotMaxColumns) {
         throw std::invalid_argument("slot CSR: too many columns for a far pair to address");
     }
@@ -145,26 +146,30 @@ SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, const char
     out.ptr = device_alloc<int>(static_cast<std::size_t>(n) + 1, origin, "slot ptr");
     DeviceBuffer<int> counts =
         device_alloc<int>(static_cast<std::size_t>(n) + 1, origin, "slot counts");
-    check_cuda(cudaMemsetAsync(counts.get() + n, 0, sizeof(int), nullptr), origin, "slot counts");
+    check_cuda(cudaMemsetAsync(counts.get() + n, 0, sizeof(int), stream), origin, "slot counts");
     if (const unsigned blocks = grid_for(n)) {
-        slot_count_kernel<<<blocks, kBlock>>>(n, row_ptr, col_idx, counts.get());
+        slot_count_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, counts.get());
     }
     std::size_t bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts.get(), out.ptr.get(), n + 1),
+    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts.get(), out.ptr.get(), n + 1,
+                                             stream),
                origin, "slot scan size");
     DeviceBuffer<unsigned char> temp = device_alloc<unsigned char>(bytes, origin, "slot scan");
-    check_cuda(
-        cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts.get(), out.ptr.get(), n + 1),
-        origin, "slot scan");
-    check_cuda(cudaMemcpy(&out.n_slots, out.ptr.get() + n, sizeof(int), cudaMemcpyDeviceToHost),
+    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts.get(), out.ptr.get(),
+                                             n + 1, stream),
+               origin, "slot scan");
+    check_cuda(cudaMemcpyAsync(&out.n_slots, out.ptr.get() + n, sizeof(int),
+                               cudaMemcpyDeviceToHost, stream),
                origin, "slot count");
+    check_cuda(cudaStreamSynchronize(stream), origin, "slot count");
     out.cols = device_alloc<std::int16_t>(static_cast<std::size_t>(out.n_slots), origin,
                                           "slot cols");
     if (const unsigned blocks = grid_for(n)) {
-        slot_fill_kernel<<<blocks, kBlock>>>(n, row_ptr, col_idx, out.ptr.get(), out.cols.get());
+        slot_fill_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, out.ptr.get(),
+                                                        out.cols.get());
     }
     check_cuda(cudaGetLastError(), origin, "slot fill");
-    check_cuda(cudaStreamSynchronize(nullptr), origin, "slot fill");
+    check_cuda(cudaStreamSynchronize(stream), origin, "slot fill");
     return out;
 }
 
@@ -179,15 +184,17 @@ void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
 namespace {
 
 // Exclusive scan of n per-row counts into an (n + 1) pointer; returns the total.
-int scan_counts(int n, const int* counts, int* ptr, const char* origin) {
+int scan_counts(int n, const int* counts, int* ptr, cudaStream_t stream, const char* origin) {
     std::size_t bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts, ptr, n + 1), origin,
+    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts, ptr, n + 1, stream), origin,
                "scan size");
     DeviceBuffer<unsigned char> temp = device_alloc<unsigned char>(bytes, origin, "scan");
-    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts, ptr, n + 1), origin,
-               "scan");
+    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts, ptr, n + 1, stream),
+               origin, "scan");
     int total = 0;
-    check_cuda(cudaMemcpy(&total, ptr + n, sizeof(int), cudaMemcpyDeviceToHost), origin, "total");
+    check_cuda(cudaMemcpyAsync(&total, ptr + n, sizeof(int), cudaMemcpyDeviceToHost, stream),
+               origin, "total");
+    check_cuda(cudaStreamSynchronize(stream), origin, "total");
     return total;
 }
 
@@ -195,7 +202,7 @@ int scan_counts(int n, const int* counts, int* ptr, const char* origin) {
 
 AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* slot_ptr,
                                const std::int16_t* slot_cols, const double* term_vals,
-                               int n_terms, const char* origin) {
+                               int n_terms, cudaStream_t stream, const char* origin) {
     if (n_terms < 1 || n_terms > 255) {
         throw std::invalid_argument("affine operator: between 1 and 255 parts");
     }
@@ -204,16 +211,17 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
     const std::size_t rows1 = static_cast<std::size_t>(n) + 1;
     DeviceBuffer<int> segs = device_alloc<int>(rows1, origin, "affine segs");
     DeviceBuffer<int> slots = device_alloc<int>(rows1, origin, "affine slots");
-    check_cuda(cudaMemsetAsync(segs.get() + n, 0, sizeof(int), nullptr), origin, "affine segs");
-    check_cuda(cudaMemsetAsync(slots.get() + n, 0, sizeof(int), nullptr), origin, "affine slots");
+    check_cuda(cudaMemsetAsync(segs.get() + n, 0, sizeof(int), stream), origin, "affine segs");
+    check_cuda(cudaMemsetAsync(slots.get() + n, 0, sizeof(int), stream), origin, "affine slots");
     if (const unsigned blocks = grid_for(n)) {
-        affine_count_kernel<<<blocks, kBlock>>>(n, nnz, row_ptr, slot_ptr, slot_cols, term_vals,
-                                                n_terms, segs.get(), slots.get());
+        affine_count_kernel<<<blocks, kBlock, 0, stream>>>(n, nnz, row_ptr, slot_ptr, slot_cols,
+                                                           term_vals, n_terms, segs.get(),
+                                                           slots.get());
     }
     out.seg_ptr = device_alloc<int>(rows1, origin, "affine seg_ptr");
     DeviceBuffer<int> slot_base = device_alloc<int>(rows1, origin, "affine slot base");
-    out.n_segs = scan_counts(n, segs.get(), out.seg_ptr.get(), origin);
-    out.n_slots = scan_counts(n, slots.get(), slot_base.get(), origin);
+    out.n_segs = scan_counts(n, segs.get(), out.seg_ptr.get(), stream, origin);
+    out.n_slots = scan_counts(n, slots.get(), slot_base.get(), stream, origin);
     out.seg_start =
         device_alloc<int>(static_cast<std::size_t>(out.n_segs) + 1, origin, "affine seg_start");
     out.seg_term =
@@ -222,20 +230,23 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
                                           "affine cols");
     out.vals = device_alloc<double>(static_cast<std::size_t>(out.n_slots), origin, "affine vals");
     if (const unsigned blocks = grid_for(n)) {
-        affine_fill_kernel<<<blocks, kBlock>>>(n, nnz, row_ptr, slot_ptr, slot_cols, term_vals,
-                                               n_terms, out.seg_ptr.get(), slot_base.get(),
-                                               out.seg_start.get(), out.seg_term.get(),
-                                               out.cols.get(), out.vals.get());
+        affine_fill_kernel<<<blocks, kBlock, 0, stream>>>(
+            n, nnz, row_ptr, slot_ptr, slot_cols, term_vals, n_terms, out.seg_ptr.get(),
+            slot_base.get(), out.seg_start.get(), out.seg_term.get(), out.cols.get(),
+            out.vals.get());
     }
     // The last segment ends where the slots do.
-    check_cuda(cudaMemcpy(out.seg_start.get() + out.n_segs, &out.n_slots, sizeof(int),
-                          cudaMemcpyHostToDevice),
+    check_cuda(cudaMemcpyAsync(out.seg_start.get() + out.n_segs, &out.n_slots, sizeof(int),
+                               cudaMemcpyHostToDevice, stream),
                origin, "affine seg end");
     std::vector<int> h_slots(n), h_segs(n);
-    check_cuda(cudaMemcpy(h_slots.data(), slots.get(), n * sizeof(int), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(h_slots.data(), slots.get(), n * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream),
                origin, "affine lengths");
-    check_cuda(cudaMemcpy(h_segs.data(), segs.get(), n * sizeof(int), cudaMemcpyDeviceToHost),
+    check_cuda(cudaMemcpyAsync(h_segs.data(), segs.get(), n * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream),
                origin, "affine segments");
+    check_cuda(cudaStreamSynchronize(stream), origin, "affine lengths");
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
     for (int lo = 0; lo < n; lo += kAffineWindow) {
@@ -246,10 +257,11 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
         });
     }
     out.order = device_alloc<int>(static_cast<std::size_t>(n), origin, "affine order");
-    check_cuda(cudaMemcpy(out.order.get(), order.data(), n * sizeof(int), cudaMemcpyHostToDevice),
+    check_cuda(cudaMemcpyAsync(out.order.get(), order.data(), n * sizeof(int),
+                               cudaMemcpyHostToDevice, stream),
                origin, "affine order");
     check_cuda(cudaGetLastError(), origin, "affine fill");
-    check_cuda(cudaStreamSynchronize(nullptr), origin, "affine fill");
+    check_cuda(cudaStreamSynchronize(stream), origin, "affine fill");
     return out;
 }
 

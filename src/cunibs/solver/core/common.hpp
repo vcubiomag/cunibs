@@ -160,12 +160,14 @@ DeviceBuffer<T> device_alloc(std::size_t count, const char* origin, const char* 
     return DeviceBuffer<T>(ptr);
 }
 
+// Ordered on `stream`; the caller synchronises it before releasing src.
 template <typename T>
-DeviceBuffer<T> device_clone(const T* src, std::size_t count, const char* origin,
-                             const char* what) {
+DeviceBuffer<T> device_clone(const T* src, std::size_t count, cudaStream_t stream,
+                             const char* origin, const char* what) {
     DeviceBuffer<T> buf = device_alloc<T>(count, origin, what);
-    check_cuda(cudaMemcpy(buf.get(), src, count * sizeof(T), cudaMemcpyDeviceToDevice), origin,
-               what);
+    check_cuda(cudaMemcpyAsync(buf.get(), src, count * sizeof(T), cudaMemcpyDeviceToDevice,
+                               stream),
+               origin, what);
     return buf;
 }
 

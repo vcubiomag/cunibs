@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "amg/cg_kernels.hpp"
@@ -128,7 +129,9 @@ void GraphCache::run(cudaStream_t stream, const Key& key, int iteration, Body&& 
 
 class PcgAmgSolver {
 public:
-    PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_idx, const double* values);
+    // Setup runs on `stream` and synchronises it, so the caller may drop its arrays on return.
+    PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_idx, const double* values,
+                 cudaStream_t stream);
     ~PcgAmgSolver();
 
     PcgAmgSolver(const PcgAmgSolver&) = delete;
@@ -154,7 +157,7 @@ public:
     // An operator affine in per-column coefficients over this solver's pattern,
     // A(sigma) = sum_t sigma_t A_t, given as n_terms value arrays in entry order (n_terms, nnz).
     // Kept beside the values update_values sets, which the other solves go on using.
-    void set_affine_terms(int n_terms, const double* term_values);
+    void set_affine_terms(int n_terms, const double* term_values, cudaStream_t stream);
     int affine_terms() const { return affine_.n_terms; }
     // A block solve in which column c's operator is A(sigma[c]), sigma host (k, n_terms): every
     // column a different matrix, sharing each part's reads and the preconditioner.
@@ -172,6 +175,8 @@ private:
                                double tolerance, int max_iters, cudaStream_t stream,
                                const double* X0, bool affine);
 
+    // Serialises every call that touches the solver's buffers, since the bindings release the GIL.
+    std::mutex mutex_;
     int n_ = 0;
     int nnz_ = 0;
     // The entry CSR's row pointer, kept to lay new values into slots, and the slot CSR the
