@@ -14,6 +14,7 @@ Building it costs ``size`` solves, which a sweep repays after a few hundred plac
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -42,9 +43,16 @@ _SPAN_RTOL = 1e-10
 
 @dataclass
 class SweepBasis:
-    """An A-orthonormal basis ``q`` (n_red, m), fp32, of forward solutions on one subject."""
+    """An A-orthonormal basis ``q`` (n_red, m), fp32, of forward solutions on one subject.
+
+    ``coil_name``, ``coil_digest`` and ``requested_size`` identify what it was built from;
+    ``size`` can be smaller than ``requested_size`` when some placements added no new direction.
+    """
 
     q: cp.ndarray
+    coil_name: str = ""
+    coil_digest: str = ""
+    requested_size: int = 0
 
     @property
     def size(self) -> int:
@@ -140,7 +148,14 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
         if bool(keep.any()):
             new = x @ (u[:, keep] / cp.sqrt(w[keep]))
             q = cp.ascontiguousarray(cp.concatenate([q, new.astype(cp.float32)], axis=1))
-    return SweepBasis(q)
+    return SweepBasis(q, coil.name, coil_digest(coil), size)
+
+
+def coil_digest(coil: Coil) -> str:
+    """A content hash of the coil's dipoles, which is what a basis depends on."""
+    h = hashlib.sha256(np.ascontiguousarray(coil.positions_m, dtype=np.float64).tobytes())
+    h.update(np.ascontiguousarray(coil.moments, dtype=np.float64).tobytes())
+    return h.hexdigest()
 
 
 def _stiffness(ctx: SolverContext):
@@ -157,9 +172,17 @@ def _stiffness(ctx: SolverContext):
 def ensure_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepBasis:
     """Return ``ctx``'s sweep basis, building it on first use; every later block solve seeds from it.
 
-    A basis already present is kept whatever ``coil`` and ``size`` are: replacing it would change
-    where the solves already run against it landed.
+    A basis already present is returned for the same coil and size, and anything else raises:
+    replacing it would change where the solves already run against it landed.
     """
-    if ctx.sweep_basis is None:
+    basis = ctx.sweep_basis
+    if basis is None:
         ctx.sweep_basis = build_sweep_basis(ctx, coil, size)
-    return ctx.sweep_basis
+        return ctx.sweep_basis
+    if basis.coil_digest != coil_digest(coil) or basis.requested_size != size:
+        raise ValueError(
+            f"this subject already seeds its solves from a basis of {basis.requested_size} "
+            f"placements of coil {basis.coil_name!r}. Call Subject.free() before preparing "
+            "another."
+        )
+    return basis

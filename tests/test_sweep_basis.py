@@ -85,7 +85,17 @@ def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
         ):
             np.testing.assert_array_equal(g, r, err_msg=f"block_k={k}, placement {i}")
 
-    # A second prepare keeps the basis the earlier solves ran against.
+    # A second prepare keeps the basis the earlier solves ran against, and refuses another.
     before = ctx.sweep_basis
-    seeded_subject.prepare_sweep(d70_coil, size=32)
+    seeded_subject.prepare_sweep(d70_coil, size=16)
     assert ctx.sweep_basis is before
+    with pytest.raises(ValueError, match="free"):
+        seeded_subject.prepare_sweep(d70_coil, size=32)
+    assert ctx.sweep_basis is before
+
+    provenance = seeded_subject.simulate(d70_coil, placements[0], DIDT).provenance
+    assert provenance["sweep_basis_size"] == 16
+    assert provenance["sweep_basis_coil"] == d70_coil.name
+    assert (
+        plain.simulate(d70_coil, placements[0], DIDT).provenance.get("sweep_basis_size") is None
+    )

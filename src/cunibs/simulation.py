@@ -59,6 +59,8 @@ _PROVENANCE_KEYS = (
     "mesh_n_tets",
     "coil_n_dipoles",
     "solver_tolerance",
+    "sweep_basis_coil",
+    "sweep_basis_size",
 )
 
 # The region every result is summarised over up front. Others are computed on demand from
@@ -382,13 +384,17 @@ class Subject:
                 self._conductivity_uq_pre[tags] = build_conductivity_uq_precompute(ctx, tags)
             return self._conductivity_uq_pre[tags]
 
-    def _provenance(self, coil: Coil) -> dict[str, Any]:
+    def _provenance(self, coil: Coil, *, seeded: bool = True) -> dict[str, Any]:
         """What produced this run: the environment, and the mesh, coil and tolerance it used.
 
         Hashes ``self._mesh``, the mesh as loaded. ``self.mesh`` is the Morton reordering
         ``build_context`` produced, which would force a context build and would digest arrays the
         input file does not contain; the identity worth recording is the file's.
+
+        A sweep basis is recorded for the runs it seeds (``seeded``), since their solves land at a
+        different point within the tolerance.
         """
+        basis = self.context.sweep_basis if seeded else None
         return {
             **_environment(),
             "date": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S %Z"),
@@ -397,6 +403,8 @@ class Subject:
             "mesh_n_tets": self._mesh.n_tets,
             "coil_n_dipoles": coil.n_dipoles,
             "solver_tolerance": float(self.context.solver.tolerance),
+            "sweep_basis_coil": None if basis is None else basis.coil_name,
+            "sweep_basis_size": None if basis is None else basis.requested_size,
         }
 
     def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
@@ -585,8 +593,9 @@ class Subject:
 
         A placement's result does not depend on the other placements in its sweep, with or
         without a basis. It does change, within the solver tolerance, once a basis is present,
-        so prepare before the first solve of a sweep whose results will be compared. A second
-        call keeps the basis already built.
+        so prepare before the first solve of a sweep whose results will be compared. Results record
+        the basis in their provenance. A second call for the same coil and size keeps the basis;
+        any other raises until :meth:`free` discards it.
         """
         with self._lock:
             ensure_sweep_basis(self.context, coil, size)
@@ -716,7 +725,7 @@ class Subject:
         # Outside the pool below, for the same reason the precompute is: the patch weights are
         # cached on the context and outlive the placement that first asked for them.
         op = self._recovery_operator(recovery)
-        provenance = self._provenance(coil)
+        provenance = self._provenance(coil, seeded=False)
         temp_pool = _scratch_pool()
         try:
             for site in sites:
