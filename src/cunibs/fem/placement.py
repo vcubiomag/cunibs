@@ -17,6 +17,16 @@ MU0_OVER_4PI = 1e-7  # μ0 / 4π in T·m/A, the magnetic-dipole vector-potential
 DADT_COMPUTE_DTYPE = cp.float32
 
 
+# Target nodes in metres about the coil origin, narrowed to float32, in one pass. The intrinsics
+# keep the multiply and the subtract separately rounded, as two array operations would round them.
+_centred_m = cp.ElementwiseKernel(
+    "float64 x_mm, raw float64 o",
+    "float32 r",
+    "r = (float)__dsub_rn(__dmul_rn(x_mm, 1e-3), o[i % 3])",
+    "cunibs_centred_m",
+)
+
+
 def _require_defined_handle_axis(
     degenerate: cp.ndarray, transforms: cp.ndarray, handles: cp.ndarray, dists: cp.ndarray
 ) -> None:
@@ -53,6 +63,16 @@ def _require_defined_handle_axis(
     )
 
 
+def _all_finite(*arrays: npt.ArrayLike | None) -> bool:
+    """Whether every value given is finite. Host inputs are checked before they are uploaded,
+    so only device inputs cost a synchronisation."""
+    given = [a for a in arrays if a is not None]
+    if not all(bool(np.isfinite(a).all()) for a in given if not isinstance(a, cp.ndarray)):
+        return False
+    device = [cp.isfinite(a).all() for a in given if isinstance(a, cp.ndarray)]
+    return not device or bool(cp.stack(device).all())
+
+
 def compute_coil_transforms(
     ctx: SolverContext,
     centers_mm: npt.ArrayLike,
@@ -66,6 +86,8 @@ def compute_coil_transforms(
     and normal; the in-plane axes are then arbitrary but orthonormal and deterministic. When it is
     given, a handle that leaves the in-plane axis undefined raises ``ValueError``.
     """
+    if not _all_finite(centers_mm, handles_mm, distances_mm):
+        raise ValueError("centers_mm, handles_mm and distances_mm must be finite.")
     centers = cp.ascontiguousarray(cp.asarray(centers_mm, dtype=cp.float64))
     if centers.ndim != 2 or centers.shape[1] != 3:
         raise ValueError(f"centers_mm must be (P, 3), got shape {centers.shape}.")
@@ -86,21 +108,18 @@ def compute_coil_transforms(
     if dists.shape != (n_pl,):
         raise ValueError(f"distances_mm must be one value or ({n_pl},), got {dists.shape}.")
     dists = cp.ascontiguousarray(dists)
-    out = cp.empty((n_pl, 16), dtype=cp.float64)
+    transforms = cp.empty((n_pl, 4, 4), dtype=cp.float64)
     degenerate = None if handles is None else cp.empty(n_pl, dtype=cp.int32)
     place_transforms(
         centers,
         handles,
         dists,
-        ctx.skin_a,
-        ctx.skin_b,
-        ctx.skin_c,
-        cp.ascontiguousarray(ctx.skin_tri_normals, dtype=cp.float64),
-        out,
+        ctx.skin_verts,
+        ctx.skin_tri_normals,
+        transforms,
         degenerate,
         cp.cuda.get_current_stream().ptr,
     )
-    transforms = out.reshape(n_pl, 4, 4)
     if degenerate is not None:
         _require_defined_handle_axis(degenerate, transforms, handles, dists)
     return transforms
@@ -130,7 +149,7 @@ def compute_coil_transform(
 def coil_dadt_at_nodes(
     dip_pos_m: npt.ArrayLike,
     dip_moment: npt.ArrayLike,
-    transform: npt.NDArray[np.float64],
+    transform: npt.NDArray[np.float64] | cp.ndarray,
     didt: float,
     target_nodes_mm: cp.ndarray,
     *,
@@ -159,15 +178,14 @@ def coil_dadt_at_nodes(
     # P = Σ w_j (m_j × s_j), and w_j = |r - s_j|⁻³.
     o = trans * 1e-3
     s = s - o
-    r = target_nodes_mm * 1e-3 - o
     mp = cp.concatenate([m, cp.cross(m, s)], axis=1)
 
     # Keep centering in float64, then use float32 for the dominant N-body kernel: the
     # coil-scalp gap bounds |r - s| away from zero, so the |r - s|⁻³ weights stay well
     # inside float32 range.
-    s = cp.ascontiguousarray(s.astype(DADT_COMPUTE_DTYPE))
-    r = cp.ascontiguousarray(r.astype(DADT_COMPUTE_DTYPE))
-    mp = cp.ascontiguousarray(mp.astype(DADT_COMPUTE_DTYPE))
+    s = s.astype(DADT_COMPUTE_DTYPE)
+    r = _centred_m(target_nodes_mm, o)
+    mp = mp.astype(DADT_COMPUTE_DTYPE)[None]
     sn = cp.ascontiguousarray((s * s).sum(1))
 
     stream = cp.cuda.get_current_stream().ptr

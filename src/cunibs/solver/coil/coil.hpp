@@ -5,16 +5,12 @@
 // dipoles induce. Nothing here reads the stiffness or the solved potential.
 
 // --- dadt.cu: Biot-Savart dA/dt from the coil's dipoles -----------------------------------
-// out_stride is the distance in floats between consecutive nodes' rows: 3 for a plain (n, 3)
-// field, 3k to write one placement's column of an interleaved (n, k, 3) block.
-void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
-                 int out_stride, int n_dip, int n_nodes, float didt, float mu0_4pi,
-                 cudaStream_t stream);
 // n_sets moment sets (1 or 3) over the same sources and targets in one pass: mp is
-// (n_sets, n_dip, 6) and out (n_nodes, n_sets, 3).
-void launch_dadt_multi(const float* s, const float* mp, const float* sn, const float* r,
-                       float* out, int n_sets, int n_dip, int n_nodes, float didt, float mu0_4pi,
-                       cudaStream_t stream);
+// (n_sets, n_dip, 6), and set d of node n lands at out[n * out_stride + 3 d]. out_stride is 3 for
+// a plain (n, 3) field, 3k to write one placement's column of an interleaved (n, k, 3) block.
+void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
+                 int out_stride, int n_sets, int n_dip, int n_nodes, float didt, float mu0_4pi,
+                 cudaStream_t stream);
 
 // --- dadt_element.cu -----------------------------------------------------------------------
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
@@ -30,6 +26,7 @@ void launch_dadt_element_average_block(const float* dadt_nodes, const int* tet_n
 // a supplied handle left the in-plane axis undefined and that same fallback was used instead;
 // pass null alongside a null handles, where the flag would carry no information. The transform
 // is orthonormal either way.
+// verts is (n_tri, 3, 3) and tnorm (n_tri, 3); out is (n_pl, 4, 4).
 void launch_place(const double* centers, const double* handles, const double* dists,
-                  const double* a, const double* b, const double* c, const double* tnorm,
-                  double* out, int* degenerate, int n_pl, int n_tri, cudaStream_t stream);
+                  const double* verts, const double* tnorm, double* out, int* degenerate,
+                  int n_pl, int n_tri, cudaStream_t stream);

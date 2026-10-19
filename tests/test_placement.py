@@ -194,16 +194,14 @@ def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(
     # Both handles sit on the outward normal through proj, so neither carries an in-plane
     # direction; a caller could reasonably expect them to mean different rotations.
     handles = np.stack([proj + 10.0 * normal, proj + 250.0 * normal])
-    out = cp.empty((2, 16), dtype=cp.float64)
+    out = cp.empty((2, 4, 4), dtype=cp.float64)
     degenerate = cp.empty(2, dtype=cp.int32)
     place_transforms(
         cp.asarray(np.stack([center, center])),
         cp.asarray(handles),
         cp.asarray([4.0, 4.0]),
-        ctx.skin_a,
-        ctx.skin_b,
-        ctx.skin_c,
-        cp.ascontiguousarray(ctx.skin_tri_normals, dtype=cp.float64),
+        ctx.skin_verts,
+        ctx.skin_tri_normals,
         out,
         degenerate,
         cp.cuda.get_current_stream().ptr,
@@ -469,3 +467,16 @@ def test_dadt_matches_analytic_on_real_nodes(cp, patch_subject, patch_placement,
         d70_coil.positions_m, d70_coil.moments, tf, 1e6, cp.asnumpy(ctx.nodes_mm)
     )
     assert rel_l2(got.astype(np.float64), ref) <= 1e-5
+
+
+@pytest.mark.parametrize("bad", ["center", "handle", "distance"])
+def test_a_non_finite_placement_input_is_rejected(cube_subject, bad):
+    """A NaN centre finds no closest triangle at all, so it is refused before the kernel."""
+    from cunibs.fem.placement import compute_coil_transforms
+
+    centers = np.array([[50.0, 50.0, 120.0]])
+    handles = centers + np.array([0.0, 50.0, 0.0])
+    dists = np.array([4.0])
+    {"center": centers, "handle": handles, "distance": dists}[bad][0, ...] = np.nan
+    with pytest.raises(ValueError, match="must be finite"):
+        compute_coil_transforms(cube_subject.context, centers, handles, dists)

@@ -19,7 +19,8 @@ namespace {
 // Local block size: this kernel is register-bound and wants a narrower block than the
 // shared kBlock. Named apart from it so nothing here silently shadows the shared constant.
 constexpr int kDadtBlock = 128;
-constexpr int kDipTile = 128;
+// One dipole per thread of the block, so a tile loads in one pass.
+constexpr int kDipTile = kDadtBlock;
 // Nodes each thread carries, not a node count: the register tiling that lets one dipole
 // tile load amortize over K nodes. Measured with a 128-thread block on a head mesh: 2 / 4 / 6 / 8
 // / 12 nodes gave 831 (at 256 threads) / 836 / 853 / 807 / 880 us; 8 at 256 threads was 821.
@@ -73,7 +74,7 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
 
     for (int base = 0; base < n_dip; base += kDipTile) {
         const int tile = min(kDipTile, n_dip - base);
-        for (int i = threadIdx.x; i < tile; i += kDadtBlock) {
+        if (const int i = threadIdx.x; i < tile) {
             const int j = base + i;
             s_pos[i] = make_float4(s[j * 3 + 0], s[j * 3 + 1], s[j * 3 + 2], sn[j]);
 #pragma unroll
@@ -134,26 +135,20 @@ __global__ void dadt_kernel(const float* __restrict__ s, const float* __restrict
 }  // namespace
 
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
-                 int out_stride, int n_dip, int n_nodes, float didt, float mu0_4pi,
+                 int out_stride, int n_sets, int n_dip, int n_nodes, float didt, float mu0_4pi,
                  cudaStream_t stream) {
-    const std::int64_t threads = grid_for(n_nodes, kNodesPerThread);
-    if (const unsigned blocks = grid_for(threads, kDadtBlock)) {
-        dadt_kernel<1, kNodesPerThread><<<blocks, kDadtBlock, 0, stream>>>(
-            s, mp, sn, r, out, out_stride, n_dip, n_nodes, didt, mu0_4pi);
-    }
-}
-
-void launch_dadt_multi(const float* s, const float* mp, const float* sn, const float* r,
-                       float* out, int n_sets, int n_dip, int n_nodes, float didt, float mu0_4pi,
-                       cudaStream_t stream) {
+    const auto launch = [&](auto kernel, int nodes_per_thread) {
+        const std::int64_t threads = grid_for(n_nodes, nodes_per_thread);
+        if (const unsigned blocks = grid_for(threads, kDadtBlock)) {
+            kernel<<<blocks, kDadtBlock, 0, stream>>>(s, mp, sn, r, out, out_stride, n_dip,
+                                                      n_nodes, didt, mu0_4pi);
+        }
+    };
     if (n_sets == 1) {
-        launch_dadt(s, mp, sn, r, out, 3, n_dip, n_nodes, didt, mu0_4pi, stream);
-        return;
-    }
-    if (n_sets != 3) throw std::invalid_argument("dadt: moment sets must be 1 or 3");
-    const std::int64_t threads = grid_for(n_nodes, kNodesPerThreadMulti);
-    if (const unsigned blocks = grid_for(threads, kDadtBlock)) {
-        dadt_kernel<3, kNodesPerThreadMulti><<<blocks, kDadtBlock, 0, stream>>>(
-            s, mp, sn, r, out, 3 * n_sets, n_dip, n_nodes, didt, mu0_4pi);
+        launch(dadt_kernel<1, kNodesPerThread>, kNodesPerThread);
+    } else if (n_sets == 3) {
+        launch(dadt_kernel<3, kNodesPerThreadMulti>, kNodesPerThreadMulti);
+    } else {
+        throw std::invalid_argument("dadt: moment sets must be 1 or 3");
     }
 }
