@@ -145,15 +145,6 @@ The iterator computes results as they are requested, at most one block ahead.
 It releases each result as the loop advances unless you retain it. Use
 `list(...)` when all results are needed in memory.
 
-`block_k` controls how many placements are processed together (default `8`).
-Reduce it to lower peak memory use, or increase it when GPU memory permits. It
-does not change the field returned for a placement.
-
-```python
-for result in subject.iter_simulate(coil, placements, didt=1.0e6, block_k=4):
-    ...
-```
-
 ### Many subjects
 
 A `Subject` retains GPU resources until it is freed. Use a context manager, or
@@ -438,8 +429,8 @@ the vertex silently. Anatomical landmarks (`Nz`, `Iz`, `LPA`, `RPA`) come from `
 ## Reproducibility
 
 A placement result is determined by the mesh, coil model, placement, `didt`,
-solve tolerance, and recovery method. It is independent of `block_k`, placement
-order, and other placements in a sweep. Repeating the same calculation on the
+solve tolerance, and recovery method. It is independent of placement order and
+of the other placements in a sweep. Repeating the same calculation on the
 same software and hardware configuration reproduces the result bitwise.
 
 Results can differ across GPU architectures, CUDA versions, compiler versions,

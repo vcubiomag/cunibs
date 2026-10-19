@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import cache
@@ -32,6 +32,7 @@ from cunibs.fem import (
     validate_recovery,
 )
 from cunibs.mesh import HeadMesh, load_mesh
+from cunibs.solver import clear_cuda_error
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterator, Mapping, Sequence
@@ -69,6 +70,26 @@ _PROVENANCE_KEYS = (
 _DEFAULT_REGION: metrics.Region = "gray_matter"
 
 _NO_ROIS: Mapping[str, ResolvedTarget] = MappingProxyType({})
+
+# The widest chunk a sweep starts at. Only _block_width changes it.
+_widest_block = MAX_BLOCK
+
+
+@contextmanager
+def _block_width(k: int) -> Iterator[None]:
+    """Cap the chunk width of sweeps started inside the block, for checks that it moves nothing.
+
+    Process-wide and not thread-safe; it exists for tests and benchmarks, not for callers.
+    """
+    global _widest_block
+    if not 1 <= k <= MAX_BLOCK:
+        raise ValueError(f"block width must be in [1, {MAX_BLOCK}], got {k}")
+    previous, _widest_block = _widest_block, k
+    try:
+        yield
+    finally:
+        _widest_block = previous
+
 
 # Per-tetrahedron metric inputs on the host, shared by reference across every FieldResult.
 type _HostMetricInputs = tuple[
@@ -586,7 +607,6 @@ class Subject:
         coil: Coil,
         sites: Sequence[Placement],
         didt: float,
-        block_k: int | None,
         retain: _Retain,
         recovery: Recovery,
         record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
@@ -609,45 +629,65 @@ class Subject:
         op = self._recovery_operator(recovery, tissues)
         rois = _roi_probes(record_rois)
         provenance = self._provenance(coil)
-        # Placements share the stiffness matrix, so chunks of up to MAX_BLOCK solve as
-        # one lockstep block CG that reads the matrix/hierarchy once for the whole chunk.
-        chunk_k = MAX_BLOCK if block_k is None else max(1, min(MAX_BLOCK, block_k))
+        # Placements share the stiffness matrix, so a chunk solves as one lockstep block CG that
+        # reads the matrix and hierarchy once for all of it. A chunk starts as wide as the block
+        # kernels go and halves when the device runs out of memory for it, which never moves a
+        # result: every placement's arithmetic is the same at any width.
+        width = _widest_block
+        # An allocation that failed before this call, in CuPy or the caller's own code, leaves the
+        # thread's last CUDA error set, which the first launch check here would report as its own.
+        clear_cuda_error()
         temp_pool = self._scratch_pool()
         # With arrays to keep and more than one chunk, a chunk's copies to the host run while the
         # next chunk computes, so its results are yielded one chunk late. The pending chunk's
         # device outputs are held until its copies land.
         keeps = retain.magnitude or retain.vectors or retain.potential or retain.nodal
-        copier = self._async_copier() if keeps and len(sites) > chunk_k else None
+        copier = self._async_copier() if keeps and len(sites) > width else None
         pending: tuple[list[FieldResult], Fence] | None = None
+        start = 0
         try:
-            for start in range(0, len(sites), chunk_k):
-                chunk = sites[start : start + chunk_k]
+            while start < len(sites):
+                chunk = sites[start : start + width]
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
-                with cp.cuda.using_allocator(temp_pool.malloc):
-                    outs = solve_placements_block(
-                        ctx,
-                        dip_pos_m,
-                        dip_moment,
-                        site_args,
-                        didt,
-                        recovery=op,
-                        nodal=retain.nodal,
-                        tissues=tissues,
-                    )
-                    batch = self._reduce_chunk(
-                        chunk,
-                        outs,
-                        coil,
-                        didt,
-                        retain,
-                        region,
-                        recovery,
-                        op,
-                        rois,
-                        provenance,
-                        copier,
-                    )
-                    del outs
+                try:
+                    with cp.cuda.using_allocator(temp_pool.malloc):
+                        outs = solve_placements_block(
+                            ctx,
+                            dip_pos_m,
+                            dip_moment,
+                            site_args,
+                            didt,
+                            recovery=op,
+                            nodal=retain.nodal,
+                            tissues=tissues,
+                        )
+                        batch = self._reduce_chunk(
+                            chunk,
+                            outs,
+                            coil,
+                            didt,
+                            retain,
+                            region,
+                            recovery,
+                            op,
+                            rois,
+                            provenance,
+                            copier,
+                        )
+                        del outs
+                except MemoryError:
+                    if width == 1:
+                        raise
+                    width //= 2
+                    if copier is not None:
+                        copier.drain()
+                    # A failed allocation leaves the thread's last CUDA error set, and the next
+                    # launch check would report it as its own.
+                    clear_cuda_error()
+                    temp_pool.free_all_blocks()
+                    cp.get_default_memory_pool().free_all_blocks()
+                    continue
+                start += len(chunk)
                 if copier is None:
                     yield from batch
                     continue
@@ -655,7 +695,7 @@ class Subject:
                     copier.settle(pending[1])
                     yield from pending[0]
                 pending = (batch, copier.fence())
-            if pending is not None:
+            if pending is not None and copier is not None:
                 copier.settle(pending[1])
                 yield from pending[0]
         finally:
@@ -694,7 +734,6 @@ class Subject:
         nodal: bool = False,
         recovery: Recovery = "harmonic",
         record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
-        block_k: int | None = None,
     ) -> Iterator[FieldResult]:
         """Stream one :class:`FieldResult` per placement, in the order given.
 
@@ -724,10 +763,8 @@ class Subject:
         already holds, so a scalar per ROI needs no retained array. Same definition as the UQ
         path's ``record_rois``.
 
-        Placements are solved in blocks of ``block_k`` that share a single stiffness and
-        hierarchy read. It defaults to ``MAX_BLOCK`` and is clamped to ``[1, MAX_BLOCK]``.
-        A block is solved and reduced as a unit, so it also caps peak memory: only
-        ``block_k`` results are live at once, however long the sweep.
+        Placements are solved in blocks that share a single stiffness and hierarchy read, as
+        many at once as the device has memory for. No result depends on how they were grouped.
 
         See :meth:`iter_simulate_conductivity_uq` to stream a conductivity Monte Carlo
         instead.
@@ -744,7 +781,7 @@ class Subject:
                 "cunibs.RECOVERY_MODES."
             )
         retain = _Retain(magnitude, vectors, potential, nodal)
-        return self._iter_reduced(coil, sites, didt, block_k, retain, recovery, record_rois)
+        return self._iter_reduced(coil, sites, didt, retain, recovery, record_rois)
 
     def simulate(
         self,
@@ -758,7 +795,6 @@ class Subject:
         nodal: bool = False,
         recovery: Recovery = "harmonic",
         record_rois: Mapping[str, ResolvedTarget] = _NO_ROIS,
-        block_k: int | None = None,
     ) -> FieldResult:
         """Solve a single placement, taking the same flags as :meth:`iter_simulate`.
 
@@ -780,7 +816,6 @@ class Subject:
             nodal=nodal,
             recovery=recovery,
             record_rois=record_rois,
-            block_k=block_k,
         )
         return result
 

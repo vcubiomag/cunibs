@@ -941,7 +941,7 @@ def solve_placements_block(
     linear solve shares every stiffness/hierarchy read across the k columns.
 
     k = 1 runs the width-1 block kernels rather than routing to ``solve_placement``, so that
-    every block_k a caller can pick reaches the same arithmetic.
+    every chunk width reaches the same arithmetic.
 
     ``recovery`` is a prebuilt operator from :func:`~cunibs.fem.ensure_recovery`, or ``None``
     for the raw per-tetrahedron field; see :func:`_check_operator` for why this layer will not

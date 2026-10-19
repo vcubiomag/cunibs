@@ -40,11 +40,22 @@ inline constexpr int kNumBlockWidths = 4;
 static_assert(kBlockWidths[kNumBlockWidths - 1] <= kMaxStageBlock,
               "a solve width wider than a staging chunk could never be fed");
 
+// An allocation the device could not satisfy. Kept distinct so Python sees a MemoryError, which a
+// caller can recover from by asking for less, rather than a generic failure.
+class CudaOutOfMemory : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 inline void check_cuda(cudaError_t err, const char* origin, const char* what) {
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string(origin) + " CUDA error (" + what +
-                                 "): " + cudaGetErrorString(err));
-    }
+    if (err == cudaSuccess) return;
+    // A failed call also leaves the error as the thread's last one, which the next launch check
+    // would otherwise report as its own once the caller has recovered from this one.
+    (void)cudaGetLastError();
+    const std::string message =
+        std::string(origin) + " CUDA error (" + what + "): " + cudaGetErrorString(err);
+    if (err == cudaErrorMemoryAllocation) throw CudaOutOfMemory(message);
+    throw std::runtime_error(message);
 }
 
 // Rows times threads-per-row overflows int before gridDim.x runs out, so size the grid in

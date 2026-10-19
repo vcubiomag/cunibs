@@ -322,25 +322,25 @@ def test_nodal_field_rejects_all_for_two_valued_modes(patch_subject, d70_coil, p
 
 
 @pytest.mark.realmesh
-@pytest.mark.parametrize("block_k", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("width", [1, 2, 3, 5, 8])
 def test_recovered_field_is_block_width_invariant(
-    patch_subject, d70_coil, patch_placement, block_k
+    patch_subject, d70_coil, patch_placement, width
 ):
+    from cunibs.simulation import _block_width
+
     sites = [patch_placement] * 3
-    reference = [
-        r.magnE
-        for r in patch_subject.iter_simulate(
-            d70_coil, sites, 1e6, magnitude=True, recovery="spr_global", block_k=1
-        )
-    ]
-    got = [
-        r.magnE
-        for r in patch_subject.iter_simulate(
-            d70_coil, sites, 1e6, magnitude=True, recovery="spr_global", block_k=block_k
-        )
-    ]
-    for i, (a, b) in enumerate(zip(got, reference, strict=True)):
-        np.testing.assert_array_equal(a, b, err_msg=f"block_k={block_k}, placement {i}")
+
+    def magn(k):
+        with _block_width(k):
+            return [
+                r.magnE
+                for r in patch_subject.iter_simulate(
+                    d70_coil, sites, 1e6, magnitude=True, recovery="spr_global"
+                )
+            ]
+
+    for i, (a, b) in enumerate(zip(magn(width), magn(1), strict=True)):
+        np.testing.assert_array_equal(a, b, err_msg=f"width={width}, placement {i}")
 
 
 @pytest.mark.realmesh
@@ -847,26 +847,21 @@ def test_a_coplanar_patch_determines_no_gradient(cp):
 def test_harmonic_is_reproducible_and_block_width_invariant(
     patch_subject, d70_coil, patch_placement
 ):
-    reference = [
-        r.magnE
-        for r in patch_subject.iter_simulate(
-            d70_coil, [patch_placement] * 3, 1e6, magnitude=True, recovery="harmonic", block_k=1
-        )
-    ]
-    for block_k in (1, 2, 3, 5, 8):
-        got = [
-            r.magnE
-            for r in patch_subject.iter_simulate(
-                d70_coil,
-                [patch_placement] * 3,
-                1e6,
-                magnitude=True,
-                recovery="harmonic",
-                block_k=block_k,
-            )
-        ]
-        for i, (a, b) in enumerate(zip(got, reference, strict=True)):
-            np.testing.assert_array_equal(a, b, err_msg=f"block_k={block_k}, placement {i}")
+    from cunibs.simulation import _block_width
+
+    def magn(k):
+        with _block_width(k):
+            return [
+                r.magnE
+                for r in patch_subject.iter_simulate(
+                    d70_coil, [patch_placement] * 3, 1e6, magnitude=True, recovery="harmonic"
+                )
+            ]
+
+    reference = magn(1)
+    for width in (1, 2, 3, 5, 8):
+        for i, (a, b) in enumerate(zip(magn(width), reference, strict=True)):
+            np.testing.assert_array_equal(a, b, err_msg=f"width={width}, placement {i}")
 
 
 @pytest.mark.realmesh

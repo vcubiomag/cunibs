@@ -33,11 +33,14 @@ def test_sweep_seed_is_the_projection_and_ignores_the_block(cp):
             np.testing.assert_array_equal(cp.asnumpy(part), cp.asnumpy(got[:, c0 : c0 + k]))
 
 
-def _magn(subject, coil, placements, block_k):
-    return [
-        (r.magnE, r.iterations)
-        for r in subject.iter_simulate(coil, placements, DIDT, magnitude=True, block_k=block_k)
-    ]
+def _magn(subject, coil, placements, width):
+    from cunibs.simulation import _block_width
+
+    with _block_width(width):
+        return [
+            (r.magnE, r.iterations)
+            for r in subject.iter_simulate(coil, placements, DIDT, magnitude=True)
+        ]
 
 
 @pytest.mark.realmesh
@@ -83,7 +86,7 @@ def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
         for i, ((g, _), (r, _)) in enumerate(
             zip(_magn(seeded_subject, d70_coil, placements, k), seeded, strict=True)
         ):
-            np.testing.assert_array_equal(g, r, err_msg=f"block_k={k}, placement {i}")
+            np.testing.assert_array_equal(g, r, err_msg=f"width={k}, placement {i}")
 
     # A second prepare keeps the basis the earlier solves ran against, and refuses another.
     before = ctx.sweep_basis

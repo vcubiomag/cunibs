@@ -1,7 +1,7 @@
 """Block-CG parity: ``Subject.simulate``'s default path against the serial solve.
 
-``simulate`` batches placements through ``solve_placements_block`` at ``block_k=MAX_BLOCK``
-by default, so the lockstep k-RHS kernels and the RHS padding are what almost every caller
+``simulate`` batches placements through ``solve_placements_block`` at ``MAX_BLOCK`` wide
+unless memory runs short, so the lockstep k-RHS kernels and the RHS padding are what almost every caller
 actually runs. The oracle throughout is the one-placement-at-a-time ``solve_placement`` path,
 held to the same 2e-5 relative-L2 gate the block probe uses.
 """
@@ -154,11 +154,11 @@ def test_block_k_above_max_raises(cube_subject, synthetic_coil):
         block(cube_subject.context, synthetic_coil, cube_sites(MAX_BLOCK + 1))
 
 
-def _magn(subject, coil, placements, block_k):
-    return [
-        r.magnE
-        for r in subject.iter_simulate(coil, placements, DIDT, magnitude=True, block_k=block_k)
-    ]
+def _magn(subject, coil, placements, width):
+    from cunibs.simulation import _block_width
+
+    with _block_width(width):
+        return [r.magnE for r in subject.iter_simulate(coil, placements, DIDT, magnitude=True)]
 
 
 @pytest.mark.realmesh
@@ -167,7 +167,7 @@ def test_batch_composition_does_not_change_results(patch_subject, d70_coil, patc
     """Regrouping a sweep into different blocks must be bitwise invisible.
 
     The cuts are deliberately misaligned with the width. Splitting eight placements at four
-    with ``block_k=4`` rebuilds the same two chunks and so tests nothing; cutting at three
+    with a width of 4 rebuilds the same two chunks and so tests nothing; cutting at three
     puts placements 3..6 in a block that no chunk of the whole sweep contains, and leaves
     placement 7 alone in a block of one. This is what lets a caller batch however they like,
     or resume an interrupted sweep, without their numbers moving.
@@ -194,17 +194,17 @@ def test_sweep_position_invariance(patch_subject, d70_coil, patch_sites):
 @pytest.mark.realmesh
 @pytest.mark.parametrize("k", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_block_width_invariance(patch_subject, d70_coil, patch_sites, k):
-    """block_k is a throughput and memory knob, never an accuracy one.
+    """The chunk width is a throughput and memory choice, never an accuracy one.
 
     Every compiled width shares one fp64 summation order and every column stops on its own
-    residual, so the width cannot reach the answer at all -- not even in the last bits. A
-    researcher who retunes block_k for a different GPU gets the same numbers.
+    residual, so the width cannot reach the answer at all -- not even in the last bits. That is
+    what lets a sweep narrow its chunks on a GPU short of memory without its numbers moving.
     """
     placements = [Placement(c, h, d) for c, h, d in patch_sites]
     ref = _magn(patch_subject, d70_coil, placements, 1)
     got = _magn(patch_subject, d70_coil, placements, k)
     for i, (g, r) in enumerate(zip(got, ref, strict=True)):
-        np.testing.assert_array_equal(g, r, err_msg=f"block_k={k}, placement {i}")
+        np.testing.assert_array_equal(g, r, err_msg=f"width={k}, placement {i}")
 
 
 def _telemetry(outs):
@@ -229,7 +229,7 @@ def test_per_placement_telemetry_is_block_width_invariant(
         for i in range(0, len(patch_sites), k)
         for t in _telemetry(block(ctx, d70_coil, patch_sites[i : i + k]))
     ]
-    assert got == ref, f"block_k={k}"
+    assert got == ref, f"width={k}"
 
 
 @pytest.mark.realmesh
@@ -247,11 +247,14 @@ def test_repeated_subjects_agree_bitwise(fresh_subject, patch_mesh, d70_coil, pa
 
 
 @pytest.mark.realmesh
-def test_simulate_block_k_matches_serial(patch_subject, d70_coil, patch_sites):
-    """Through the public API: the default block path agrees with block_k=1."""
+def test_simulate_default_width_matches_serial(patch_subject, d70_coil, patch_sites):
+    """Through the public API: the default chunking agrees with one placement at a time."""
+    from cunibs.simulation import _block_width
+
     placements = [Placement(c, h, d) for c, h, d in patch_sites] * 2
     blocked = list(patch_subject.iter_simulate(d70_coil, placements, DIDT))
-    serialized = list(patch_subject.iter_simulate(d70_coil, placements, DIDT, block_k=1))
+    with _block_width(1):
+        serialized = list(patch_subject.iter_simulate(d70_coil, placements, DIDT))
     assert len(blocked) == len(serialized) == len(placements)
     for b, s in zip(blocked, serialized, strict=False):
         assert b.peak_magnE() == pytest.approx(s.peak_magnE(), rel=1e-5)
@@ -304,18 +307,74 @@ def test_a_column_stops_on_its_own_residual(cp, fresh_subject, patch_mesh):
     assert cols == [twin_iters, slow_iters]
 
 
-def test_simulate_block_k_is_clamped(cube_subject, synthetic_coil):
-    """block_k is clamped into [1, MAX_BLOCK] rather than rejected."""
+def test_a_chunk_that_runs_out_of_memory_is_retried_narrower(
+    cube_subject, synthetic_coil, monkeypatch
+):
+    """Running out of device memory halves the chunk and changes no result."""
+    from cunibs import simulation
+
     placements = [Placement(c, h, d) for c, h, d in cube_sites(8)]
-    peaks = {
-        k: [
-            r.peak_magnE()
-            for r in cube_subject.iter_simulate(synthetic_coil, placements, block_k=k)
-        ]
-        for k in (0, 1, MAX_BLOCK, 100, None)
-    }
-    assert peaks[0] == peaks[1]
-    assert peaks[100] == peaks[MAX_BLOCK] == peaks[None]
+    flags = {"magnitude": True, "vectors": True}
+    reference = list(cube_subject.iter_simulate(synthetic_coil, placements, **flags))
+
+    real = simulation.solve_placements_block
+    widths = []
+
+    def short_of_memory(ctx, pos, moment, sites, didt, **kwargs):
+        widths.append(len(sites))
+        if len(sites) > 2:
+            raise MemoryError("out of memory")
+        return real(ctx, pos, moment, sites, didt, **kwargs)
+
+    monkeypatch.setattr(simulation, "solve_placements_block", short_of_memory)
+    narrowed = list(cube_subject.iter_simulate(synthetic_coil, placements, **flags))
+    assert widths[:3] == [MAX_BLOCK, MAX_BLOCK // 2, 2]
+    assert set(widths[2:]) == {2}
+    for got, want in zip(narrowed, reference, strict=True):
+        np.testing.assert_array_equal(got.magnE, want.magnE)
+        np.testing.assert_array_equal(got.E, want.E)
+
+
+def test_running_out_of_memory_at_one_placement_still_raises(
+    cube_subject, synthetic_coil, monkeypatch
+):
+    from cunibs import simulation
+
+    def never(*_args, **_kwargs):
+        raise MemoryError("out of memory")
+
+    monkeypatch.setattr(simulation, "solve_placements_block", never)
+    with pytest.raises(MemoryError):
+        cube_subject.simulate(synthetic_coil, Placement(*cube_sites(1)[0]))
+
+
+def test_a_native_allocation_failure_is_a_memory_error(
+    cp, fresh_subject, cube_mesh, synthetic_coil
+):
+    """Out of memory is a MemoryError a caller can recover from, and leaves nothing behind."""
+    from cunibs.solver import CudaOutOfMemory, PcgAmgSolver
+
+    subject = fresh_subject(cube_mesh)
+    solver = subject.context.solver
+    cp.get_default_memory_pool().free_all_blocks()
+    # Take what the device has left, a shrinking piece at a time, straight from the driver.
+    held = []
+    piece = cp.cuda.runtime.memGetInfo()[0]
+    while piece >= 1:
+        try:
+            held.append(cp.cuda.runtime.malloc(piece))
+        except cp.cuda.runtime.CUDARuntimeError:
+            piece //= 2
+    try:
+        with pytest.raises(MemoryError) as raised:
+            PcgAmgSolver(solver.row_ptr, solver.col_idx, solver.values)
+        assert isinstance(raised.value, CudaOutOfMemory)
+        with pytest.raises(MemoryError):
+            cp.empty(1 << 30, dtype=cp.uint8)
+    finally:
+        for ptr in held:
+            cp.cuda.runtime.free(ptr)
+    assert subject.simulate(synthetic_coil, Placement(*cube_sites(1)[0])).peak_magnE() > 0
 
 
 def _force_fallback(ctx) -> None:

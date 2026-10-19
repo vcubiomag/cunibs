@@ -74,6 +74,7 @@ void CUDART_CB run_host_copy(void* arg) {
 }  // namespace
 
 NB_MODULE(_solver_ext, m) {
+    nb::exception<CudaOutOfMemory>(m, "CudaOutOfMemory", PyExc_MemoryError);
     // Compiled-in limits, exported so the Python layer never restates them.
     m.attr("MAX_STAGE_BLOCK") = kMaxStageBlock;
     nb::list widths;
@@ -993,6 +994,10 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("cell"), nb::arg("mask").noconvert(), nb::arg("stream"),
         "Marks the grid points a coil's swept (rho, h) profile reaches about any centre's axis.");
 
+    m.def(
+        "clear_cuda_error", [] { (void)cudaGetLastError(); },
+        nb::call_guard<nb::gil_scoped_release>(),
+        "Reset the calling thread's last CUDA error, which a failed allocation leaves set.");
     m.def(
         "host_copy_async",
         [](uintptr_t src, uintptr_t dst, std::size_t bytes, uintptr_t stream) {

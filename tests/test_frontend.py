@@ -59,24 +59,27 @@ def test_simulate_single_with_fields_returns_field_result(cube_subject, syntheti
 
 
 def test_iter_simulate_yields_in_submission_order(cube_subject, synthetic_coil):
-    """Order must hold across the chunk boundary, so use more placements than block_k."""
+    """Order must hold across the chunk boundary, so use more placements than a chunk holds."""
+    from cunibs.simulation import _block_width
+
     sites = [Placement(center_mm=[50, 50, 100], handle_mm=[50, 100 + i, 100]) for i in range(5)]
     expected = [cube_subject.simulate(synthetic_coil, s).peak_magnE() for s in sites]
-    for block_k in (1, 2, 8):
-        got = [
-            r.peak_magnE()
-            for r in cube_subject.iter_simulate(synthetic_coil, sites, block_k=block_k)
-        ]
+    for width in (1, 2, 8):
+        with _block_width(width):
+            got = [r.peak_magnE() for r in cube_subject.iter_simulate(synthetic_coil, sites)]
         np.testing.assert_allclose(got, expected, rtol=1e-6)
 
 
 def test_retained_results_are_independent_of_the_stream(cube_subject, synthetic_coil):
     """Each yield owns fresh arrays -- no reused buffer -- so keeping one is safe."""
+    from cunibs.simulation import _block_width
+
     sites = [Placement(center_mm=[50, 50, 100], handle_mm=[50, 100 + i, 100]) for i in range(4)]
-    stream = cube_subject.iter_simulate(synthetic_coil, sites, magnitude=True, block_k=2)
-    first = next(stream)
-    kept = first.magnE.copy()
-    rest = list(stream)
+    with _block_width(2):
+        stream = cube_subject.iter_simulate(synthetic_coil, sites, magnitude=True)
+        first = next(stream)
+        kept = first.magnE.copy()
+        rest = list(stream)
     assert len(rest) == 3
     # Exhausting the generator must not disturb the held result.
     np.testing.assert_array_equal(first.magnE, kept)
@@ -84,13 +87,16 @@ def test_retained_results_are_independent_of_the_stream(cube_subject, synthetic_
 
 
 def test_iter_simulate_survives_early_break(cube_subject, synthetic_coil):
+    from cunibs.simulation import _block_width
+
     sites = [Placement(center_mm=[50, 50, 100], handle_mm=[50, 100 + i, 100]) for i in range(6)]
-    stream = cube_subject.iter_simulate(synthetic_coil, sites, magnitude=True, block_k=2)
-    for i, r in enumerate(stream):
-        assert r.peak_magnE() > 0
-        if i == 1:
-            break
-    stream.close()
+    with _block_width(2):
+        stream = cube_subject.iter_simulate(synthetic_coil, sites, magnitude=True)
+        for i, r in enumerate(stream):
+            assert r.peak_magnE() > 0
+            if i == 1:
+                break
+        stream.close()
     # The subject stays usable after an abandoned sweep, whose copies were still in flight.
     assert cube_subject.simulate(synthetic_coil, sites[0]).peak_magnE() > 0
 

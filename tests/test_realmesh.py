@@ -323,8 +323,6 @@ def test_full_mesh_forward(cp, fresh_subject, reference_mesh_path, d70_coil):
     blocked = list(subj.iter_simulate(d70_coil, placements, 1e6, recovery="raw"))
     assert blocked[0].peak_magnE() == pytest.approx(FULL_PEAK_MAGNE, rel=5e-3)
 
-    serialized = list(
-        subj.iter_simulate(d70_coil, placements[:1], 1e6, block_k=1, recovery="raw")
-    )
+    serialized = list(subj.iter_simulate(d70_coil, placements[:1], 1e6, recovery="raw"))
     assert blocked[0].peak_magnE() == pytest.approx(serialized[0].peak_magnE(), rel=2e-5)
     assert cp.get_default_memory_pool().used_bytes() < 4e9
