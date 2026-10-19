@@ -14,12 +14,14 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
-from cunibs.head.geometry import project_to_scalp
+from cunibs.fem.solve import context_of
+from cunibs.head.geometry import _project_to_scalp
 
 if TYPE_CHECKING:
     import numpy.typing as npt
 
     from cunibs.fem.solve import SolverContext
+    from cunibs.simulation import Subject
 
 
 @dataclass(frozen=True)
@@ -33,7 +35,7 @@ class ScalpGrid:
 
     centers_mm: npt.NDArray[np.float64]
     center_mm: npt.NDArray[np.float64]
-    normal: npt.NDArray[np.float64]
+    outward_normal: npt.NDArray[np.float64]
     radius_mm: float
     requested_spacing_mm: float
     achieved_spacing_mm: float
@@ -115,7 +117,7 @@ def _median_nn(points: npt.NDArray[np.float64]) -> float:
 
 
 def scalp_grid(
-    ctx: SolverContext,
+    subject: Subject | SolverContext,
     center_mm: npt.ArrayLike,
     radius_mm: float = 20.0,
     spacing_mm: float = 2.0,
@@ -127,8 +129,9 @@ def scalp_grid(
     """
     if radius_mm <= 0.0 or spacing_mm <= 0.0:
         raise ValueError("radius_mm and spacing_mm must be positive.")
+    ctx = context_of(subject)
 
-    origin, inward = project_to_scalp(ctx, center_mm)
+    origin, inward = _project_to_scalp(ctx, center_mm)
     if origin.shape[0] != 1:
         raise ValueError("scalp_grid takes a single centre; pass one 3-vector.")
     p0, normal = origin[0], -inward[0]
@@ -156,7 +159,7 @@ def scalp_grid(
     return ScalpGrid(
         centers_mm=centers,
         center_mm=cp.asnumpy(p0),
-        normal=cp.asnumpy(normal),
+        outward_normal=cp.asnumpy(normal),
         radius_mm=float(radius_mm),
         requested_spacing_mm=float(spacing_mm),
         achieved_spacing_mm=_median_nn(centers),

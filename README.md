@@ -361,9 +361,9 @@ subject = Subject.from_mesh("subject.msh")
 coil = Coil.load(MAGSTIM_D70)
 
 target = Target(position_mm=[-45.0, -5.0, 25.0], region="gray_matter")
-centers = head.scalp_grid(subject.context, [-50.0, -10.0, 80.0], radius_mm=20.0, spacing_mm=2.0)
+centers = head.scalp_grid(subject, [-50.0, -10.0, 80.0], radius_mm=20.0, spacing_mm=2.0)
 
-result = adm.optimize(subject.context, coil, target, centers)
+result = adm.optimize(subject, coil, target, centers)
 
 result.best_objective
 result.best_center_mm
@@ -381,7 +381,7 @@ For repeated searches with the same target and candidate centres, build and
 reuse the reciprocity field:
 
 ```python
-recip = adm.build_reciprocity(subject.context, coil, target, centers)
+recip = adm.build_reciprocity(subject, coil, target, centers)
 E = adm.evaluate(recip, coil, placements, didt=1.0e6)
 ```
 
@@ -396,8 +396,8 @@ point and normal a coil placement uses:
 ```python
 from cunibs import head
 
-scd = head.scalp_to_cortex_mm(subject.context, [[-45.0, -5.0, 70.0]])
-depths = head.tissue_depths_mm(subject.context, points, ["cortical_bone", "csf", "gray_matter"])
+scd = head.scalp_to_cortex_mm(subject, [[-45.0, -5.0, 70.0]])
+depths = head.tissue_depths_mm(subject, points, ["cortical_bone", "csf", "gray_matter"])
 ```
 
 Values are `NaN` where the normal leaves the head without crossing that surface. Note that a

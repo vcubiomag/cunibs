@@ -16,6 +16,7 @@ import cupy as cp
 from cunibs.adm.evaluate import evaluate_frames
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.fem.placement import compute_coil_transforms
+from cunibs.fem.solve import context_of
 
 if TYPE_CHECKING:
     import numpy as np
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from cunibs.adm.target import ResolvedTarget, Target
     from cunibs.coil import Coil
     from cunibs.fem.solve import SolverContext
+    from cunibs.simulation import Subject
 
 
 @dataclass
@@ -131,7 +133,7 @@ def _project(
 
 
 def optimize(
-    ctx: SolverContext,
+    subject: Subject | SolverContext,
     coil: Coil,
     target: Target | ResolvedTarget,
     centers_mm: npt.ArrayLike,
@@ -148,7 +150,12 @@ def optimize(
     leaves the chosen placement unchanged.
     """
     recip = build_reciprocity(
-        ctx, coil, target, centers_mm, distance_mm=distance_mm, spacing_mm=spacing_mm
+        context_of(subject),
+        coil,
+        target,
+        centers_mm,
+        distance_mm=distance_mm,
+        spacing_mm=spacing_mm,
     )
     return optimize_placement(
         recip, coil, centers_mm, n_samples=n_samples, distance_mm=distance_mm, didt=didt

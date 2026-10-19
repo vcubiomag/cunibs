@@ -24,6 +24,7 @@ from cunibs.fem.solve import (
     SolverContext,
     _pad_block,
     _solve_grounded_block_mat,
+    context_of,
 )
 from cunibs.solver import (
     adm_reach,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
     from cunibs.coil import Coil
+    from cunibs.simulation import Subject
 
 # The adjoint RHS is a near-point source (Green's-function-like, singular at the target), so its
 # residual carries far more pointwise error in the functional than the same relative residual does
@@ -380,7 +382,7 @@ def _coverage_grid(
 
 
 def build_reciprocity(
-    ctx: SolverContext,
+    subject: Subject | SolverContext,
     coil: Coil,
     target: Target | ResolvedTarget,
     coverage_centers_mm: npt.ArrayLike,
@@ -395,6 +397,7 @@ def build_reciprocity(
     ``coverage_centers_mm`` are the scalp positions the coil may occupy; the grid is sized to contain
     every coil dipole over those positions at any rotation.
     """
+    ctx = context_of(subject)
     resolved = resolve_target(ctx, target)
     if adjoint_solver is None:
         adjoint_solver = ensure_adjoint_solver(ctx)

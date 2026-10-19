@@ -14,6 +14,7 @@ from cunibs.metrics import Region, region_mask
 
 if TYPE_CHECKING:
     from cunibs.fem.solve import SolverContext
+    from cunibs.simulation import Subject
 
 # Offset past which resolve_target warns that the point lies outside its region. A scalp
 # coordinate lands 10-20 mm from gray matter.
@@ -80,7 +81,9 @@ class ResolvedTarget:
     offset_mm: float = 0.0
 
 
-def resolve_target(ctx: SolverContext, target: Target | ResolvedTarget) -> ResolvedTarget:
+def resolve_target(
+    subject: Subject | SolverContext, target: Target | ResolvedTarget
+) -> ResolvedTarget:
     """Map a :class:`Target` to ROI elements, weights, and adjoint directions.
 
     A :class:`ResolvedTarget` is returned as it is, so anything that takes a target takes either.
@@ -90,6 +93,9 @@ def resolve_target(ctx: SolverContext, target: Target | ResolvedTarget) -> Resol
     """
     if isinstance(target, ResolvedTarget):
         return target
+    from cunibs.fem.solve import context_of
+
+    ctx = context_of(subject)
     barys = ctx.tet_barycenters_mm
     mask = region_mask(ctx.tet_tags, target.region)
     region_ids = cp.where(mask)[0].astype(cp.int32)

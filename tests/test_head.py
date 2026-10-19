@@ -207,10 +207,9 @@ def test_scalp_grid_candidates_lie_on_the_scalp_inside_the_radius(patch_subject,
     offset = np.linalg.norm(grid.centers_mm - grid.center_mm, axis=1)
     assert offset.max() <= 12.0 + 1e-9
 
-    projected, _ = project_to_scalp(ctx, grid.centers_mm)
-    import cupy as cp
-
-    assert np.abs(cp.asnumpy(projected) - grid.centers_mm).max() < 1e-6
+    projected, _ = project_to_scalp(patch_subject, grid.centers_mm)
+    assert isinstance(projected, np.ndarray)
+    assert np.abs(projected - grid.centers_mm).max() < 1e-6
 
 
 @pytest.mark.gpu
@@ -257,3 +256,19 @@ def test_scalp_grid_feeds_optimize_directly(patch_subject, patch_mesh, d70_coil,
     result = optimize(ctx, d70_coil, Target(target, region="gray_matter"), grid, spacing_mm=4.0)
     assert result.centers_mm.shape[0] == len(grid)
     assert np.isfinite(result.best_objective) and result.best_objective > 0.0
+
+
+def test_thickness_with_the_surfaces_swapped_raises(monkeypatch):
+    from cunibs.head import geometry
+
+    monkeypatch.setattr(
+        geometry,
+        "tissue_depths_mm",
+        lambda *_: {
+            "csf": np.array([9.0, np.nan]),
+            "cortical_bone": np.array([6.0, 7.0]),
+        },
+    )
+    assert geometry.tissue_thickness_mm(None, None, "cortical_bone", "csf")[0] == 3.0
+    with pytest.raises(ValueError, match="swapped"):
+        geometry.tissue_thickness_mm(None, None, "csf", "cortical_bone")

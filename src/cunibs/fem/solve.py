@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from cunibs.fem.sweep import SweepBasis
+    from cunibs.simulation import Subject
 
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
@@ -681,6 +682,15 @@ class SolverContext:
     # Set only by ensure_sweep_basis. While present, every placement block solve starts from its
     # Galerkin seed rather than from zero.
     sweep_basis: SweepBasis | None = None
+
+
+def context_of(subject: Subject | SolverContext) -> SolverContext:
+    """The solver context of ``subject``, which may also be a context already.
+
+    Lets every public function that needs the mesh's GPU state take the :class:`Subject` a user
+    holds, rather than making them reach for ``subject.context``.
+    """
+    return subject if isinstance(subject, SolverContext) else subject.context
 
 
 def _spatially_ordered(
