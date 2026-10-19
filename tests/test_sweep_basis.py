@@ -12,6 +12,20 @@ pytestmark = pytest.mark.gpu
 DIDT = 1e6
 
 
+@pytest.mark.parametrize("m", [0, 1100])
+def test_sweep_seed_handles_an_empty_or_wide_basis(cp, m):
+    """A basis past one block's threads is tiled, and an empty one seeds zero."""
+    from cunibs.fem.sweep import SweepBasis
+
+    rng = np.random.default_rng(1)
+    n = 3000
+    q = cp.asarray((rng.standard_normal((n, m)) / np.sqrt(n)).astype(np.float32))
+    b = cp.asarray(rng.standard_normal((n, 2)))
+    got = cp.asnumpy(SweepBasis(q).seed(b))
+    q64 = q.astype(cp.float64)
+    np.testing.assert_allclose(got, cp.asnumpy(q64 @ (q64.T @ b)), rtol=1e-3, atol=1e-4)
+
+
 def test_sweep_seed_is_the_projection_and_ignores_the_block(cp):
     """x0 = q (q^T b), and a column's seed is bitwise the same at every block width."""
     from cunibs.fem.sweep import SweepBasis

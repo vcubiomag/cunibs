@@ -1,6 +1,9 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
+#include <cuda/cmath>
+
+#include <algorithm>
 #include <cstdint>
 
 // Seeding a block solve from a sweep basis: x0 = Q (Q^T b) per column, with Q (n, m) fp32 and
@@ -15,10 +18,10 @@ namespace {
 // cross-tile pass is short, short enough that the grid covers the device.
 constexpr int kSeedTileRows = 1024;
 
-int seed_tiles(int n) { return (n + kSeedTileRows - 1) / kSeedTileRows; }
+int seed_tiles(int n) { return cuda::ceil_div(n, kSeedTileRows); }
 
-// b in fp32, converted once: converting inside the loops below would do it once per basis vector,
-// and fp64 conversion runs at the fp64 rate, which made both kernels four times slower.
+// b in fp32, converted once, so the loops below do not convert it once per basis vector at the
+// fp64 rate.
 __global__ void seed_narrow_kernel(const double* __restrict__ b, std::int64_t total,
                                    float* __restrict__ out) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -26,11 +29,12 @@ __global__ void seed_narrow_kernel(const double* __restrict__ b, std::int64_t to
 }
 
 // partials[tile][j][c] = sum over the tile's rows of q[r, j] b[r, c], one thread per basis
-// vector. The row's k values are a broadcast across the block, and q's row is one coalesced read.
+// vector, blockIdx.y selecting which stretch of them. The row's k values are a broadcast across
+// the block, and the block's stretch of q's row is one coalesced read.
 template <int K>
 __global__ void seed_project_kernel(const float* __restrict__ q, const float* __restrict__ b,
                                     int n, int m, double* __restrict__ partials) {
-    const int j = threadIdx.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
     if (j >= m) return;
     const int r0 = blockIdx.x * kSeedTileRows;
     const int r1 = min(n, r0 + kSeedTileRows);
@@ -84,6 +88,12 @@ std::int64_t sweep_seed_work_size(int n, int m, int k) {
 
 void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, double* work,
                        double* x0, cudaStream_t stream) {
+    if (n <= 0) return;
+    if (m <= 0) {
+        check_cuda(cudaMemsetAsync(x0, 0, static_cast<std::size_t>(n) * k * sizeof(double), stream),
+                   "seed", "zero x0");
+        return;
+    }
     const int n_tiles = seed_tiles(n);
     float* const y = reinterpret_cast<float*>(work + static_cast<std::int64_t>(n_tiles) * m * k);
     float* const b32 = y + static_cast<std::int64_t>(m) * k;
@@ -93,11 +103,12 @@ void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, dou
     }
     dispatch_k<1, 2, 4, 8>(k, "sweep_seed: k must be in {1, 2, 4, 8}", [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        const int threads = ((m + kWarp - 1) / kWarp) * kWarp;
-        seed_project_kernel<K><<<n_tiles, threads, 0, stream>>>(q, b32, n, m, work);
+        const int threads = std::min(cuda::round_up(m, kWarp), kBlock);
+        const dim3 grid(n_tiles, cuda::ceil_div(m, threads));
+        seed_project_kernel<K><<<grid, threads, 0, stream>>>(q, b32, n, m, work);
         seed_reduce_kernel<K><<<grid_for(m * K), kBlock, 0, stream>>>(work, n_tiles, m, y);
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
-            seed_expand_kernel<K><<<blocks, kBlock, 0, stream>>>(q, y, n, m, x0);
-        }
+        seed_expand_kernel<K><<<grid_for(static_cast<std::int64_t>(n) * K), kBlock, 0, stream>>>(
+            q, y, n, m, x0);
     });
+    check_cuda(cudaGetLastError(), "seed", "launch");
 }
