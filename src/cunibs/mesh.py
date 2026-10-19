@@ -253,7 +253,7 @@ def _reindex_nodes(
         raise _node_id_error(path, "a tetrahedron") from None
 
     if used.all():
-        if surf_tris.size and (surf_tris.min() < 0 or surf_tris.max() >= num_nodes):
+        if surf_tris.size and surf_tris.view(np.dtype(np.uint32)).max() >= num_nodes:
             raise _node_id_error(path, "a surface triangle")
         return np.array(nodes_xyz), tet_nodes, surf_tris
 
@@ -438,7 +438,7 @@ class HeadMesh:
         for name in ("nodes_mm", "tet_nodes", "tet_tags", "surf_tris", "surf_tags"):
             a = np.ascontiguousarray(getattr(self, name))
             h.update(f"{name}{a.shape}{a.dtype.str}".encode())
-            h.update(a.tobytes())
+            h.update(a)
         return h.hexdigest()
 
     def __repr__(self) -> str:
@@ -498,20 +498,22 @@ class MeshReport:
 def _volumes_and_flatness(
     nodes_mm: npt.NDArray[np.float64], tet_nodes: npt.NDArray[np.int32]
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Signed volumes and flatness in one pass; the ``nodes_mm[tet_nodes]`` gather dominates.
+    """Signed volumes and flatness in one pass; the four vertex gathers dominate.
 
     The volume sign convention is the one ``build_context`` checks.
     """
-    p0 = nodes_mm[tet_nodes[:, 0]]
-    e1 = nodes_mm[tet_nodes[:, 1]] - p0
-    e2 = nodes_mm[tet_nodes[:, 2]] - p0
-    e3 = nodes_mm[tet_nodes[:, 3]] - p0
+    p0, e1, e2, e3 = (nodes_mm.take(column, axis=0) for column in tet_nodes.T)
+    e1 -= p0
+    e2 -= p0
+    e3 -= p0
     vols = np.einsum("ij,ij->i", np.cross(e1, e2), e3) / 6.0
 
     def sq(d: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         return np.einsum("ij,ij->i", d, d)
 
-    edges_sq = sq(e1) + sq(e2) + sq(e3) + sq(e2 - e1) + sq(e3 - e1) + sq(e3 - e2)
+    # Over the six edges, sum |pi - pj|^2 = 4 sum |ei|^2 - |sum ei|^2 with e0 = 0, which avoids
+    # materialising the three edges that do not touch p0.
+    edges_sq = 4.0 * (sq(e1) + sq(e2) + sq(e3)) - sq(e1 + e2 + e3)
     with np.errstate(divide="ignore", invalid="ignore"):
         flatness = 12.0 * np.cbrt(3.0 * np.abs(vols)) ** 2 / edges_sq
     return vols, np.where(np.isfinite(flatness), flatness, 0.0)
