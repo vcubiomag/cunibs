@@ -54,6 +54,23 @@ _SECOND_ORDER_PAIRS = 16
 # dropped, in the nominal energy norm.
 _BASIS_RTOL = 1e-12
 
+_GRAM_CHUNKS = 64
+
+
+def _gram(v: cp.ndarray, w: cp.ndarray) -> np.ndarray:
+    """``v.T @ w`` on the host, for tall and skinny ``v`` and ``w``.
+
+    Chunked into a batched product and summed, because cuBLAS can run the direct product as a
+    single thread block over every row.
+    """
+    pad = -v.shape[0] % _GRAM_CHUNKS
+    if pad:
+        v = cp.concatenate([v, cp.zeros((pad, v.shape[1]), dtype=v.dtype)])
+        w = cp.concatenate([w, cp.zeros((pad, w.shape[1]), dtype=w.dtype)])
+    vb = v.reshape(_GRAM_CHUNKS, -1, v.shape[1])
+    wb = w.reshape(_GRAM_CHUNKS, -1, w.shape[1])
+    return cp.asnumpy(cp.matmul(vb.transpose(0, 2, 1), wb).sum(axis=0))
+
 
 def _placement_rhs(
     ctx: SolverContext, pre: ConductivityUQPrecompute, dadt_elm: cp.ndarray
@@ -204,15 +221,13 @@ class _ReducedBasis:
         e_tissue = []
         for t, op in enumerate(pre.tissue_ops):
             av = cp.concatenate([ax[:, t : t + 1], a_sens[t], csr_matmul(op, sens2)], axis=1)
-            e_tissue.append(cp.asnumpy(v.T @ av))
+            e_tissue.append(_gram(v, av))
         e_terms = np.stack(e_tissue)
         if pre.base_op is not None:
-            e_terms = np.concatenate(
-                [cp.asnumpy(v.T @ csr_matmul(pre.base_op, v))[None], e_terms]
-            )
+            e_terms = np.concatenate([_gram(v, csr_matmul(pre.base_op, v))[None], e_terms])
         e_terms = 0.5 * (e_terms + e_terms.transpose(0, 2, 1))
         b_cols = cp.concatenate([b_base[idx][:, None], b_tissue[:, idx].T], axis=1)
-        b_terms = cp.asnumpy(v.T @ b_cols.astype(cp.float64)).T  # (1 + P, m)
+        b_terms = _gram(v, b_cols.astype(cp.float64)).T  # (1 + P, m)
 
         # An A_nom-orthonormal basis, once per placement: a draw's reduced matrix is then the
         # identity plus the draw's departure from nominal, so a plain Cholesky solves it, and
