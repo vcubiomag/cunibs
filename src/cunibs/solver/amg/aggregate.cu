@@ -1,6 +1,7 @@
 #include "amg/aggregate.hpp"
 
 #include <cuda/atomic>
+#include <cuda/cmath>
 
 #include <cub/device/device_scan.cuh>
 
@@ -69,21 +70,18 @@ __device__ __forceinline__ void count_block(int predicate, int* __restrict__ cou
     }
 }
 
-__global__ __launch_bounds__(kBlock) void agg_init_round1_kernel(int n, int* __restrict__ agg,
-                                                                 int* __restrict__ partner,
-                                                                 int* __restrict__ strongest) {
+// Round 1 reads none of wsn and aggregated, so round 2's starting state is set here too.
+// `strongest` is set once only: round 2 starts from round 1's proposals.
+__global__ __launch_bounds__(kBlock) void agg_init_kernel(int n, int* __restrict__ agg,
+                                                          int* __restrict__ partner,
+                                                          int* __restrict__ strongest,
+                                                          float* __restrict__ wsn,
+                                                          int* __restrict__ aggregated) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     agg[i] = i;
     partner[i] = -1;
     strongest[i] = -1;
-}
-
-// `strongest` is deliberately not reset here: round 2 starts from round 1's proposals.
-__global__ __launch_bounds__(kBlock) void agg_init_round2_kernel(int n, float* __restrict__ wsn,
-                                                                 int* __restrict__ aggregated) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
     wsn[i] = -1.0f;
     aggregated[i] = -1;
 }
@@ -98,7 +96,7 @@ __global__ __launch_bounds__(kBlock) void agg_diag_kernel(int n, const int* __re
     const int row_e = row_ptr[i + 1];
     for (int j = row_ptr[i]; j < row_e; ++j) {
         if (col_idx[j] == i) {
-            d = values[j];
+            d = fabsf(values[j]);
             break;
         }
     }
@@ -116,7 +114,7 @@ __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
     const float* __restrict__ values, const float* __restrict__ diag, float* __restrict__ w) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float d_i = fabsf(diag[i]);
+    const float d_i = diag[i];
     const int row_e = row_ptr[i + 1];
     for (int j = row_ptr[i]; j < row_e; ++j) {
         const int jc = col_idx[j];
@@ -124,7 +122,7 @@ __global__ __launch_bounds__(kBlock) void agg_edge_weight_kernel(
             w[j] = -1.0f;
             continue;
         }
-        const float den = fmaxf(d_i, fabsf(diag[jc]));
+        const float den = fmaxf(d_i, diag[jc]);
         const float ed = fabsf(values[j]) / den;
         const unsigned int lo = static_cast<unsigned int>(min(i, jc));
         const unsigned int hi = static_cast<unsigned int>(max(i, jc));
@@ -209,7 +207,7 @@ __global__ __launch_bounds__(kBlock) void agg_agree_on_proposal_kernel(
     if (tid >= n || aggregated[tid] != -1) return;
     const int p = partner[tid];
     const float mine = wsn[tid];
-    const float theirs = (p != -1) ? wsn[p] : -1.0f;
+    const float theirs = wsn[p];
     if (mine < 0.0f && theirs < 0.0f) {
         aggregated[tid] = 1;
         strongest[tid] = -1;
@@ -263,12 +261,14 @@ __global__ __launch_bounds__(kBlock) void agg_join_existing_kernel(
     }
 }
 
-// Rows of the same aggregate race to store here, but they all store 1, and the memory model
-// guarantees one of the values written lands.
+// Rows of the same aggregate all store 1 to one flag, so the stores are atomic only to make the
+// race defined; whichever lands, the flag reads 1.
 __global__ __launch_bounds__(kBlock) void agg_mark_used_kernel(int n, const int* __restrict__ agg,
                                                                int* __restrict__ used) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < n) used[agg[tid]] = 1;
+    if (tid >= n) return;
+    cuda::atomic_ref<int, cuda::thread_scope_device> flag(used[agg[tid]]);
+    flag.store(1, cuda::std::memory_order_relaxed);
 }
 
 __global__ __launch_bounds__(kBlock) void agg_relabel_kernel(int n, int* __restrict__ agg,
@@ -279,9 +279,7 @@ __global__ __launch_bounds__(kBlock) void agg_relabel_kernel(int n, int* __restr
 
 constexpr size_t kArenaAlign = 256;
 
-constexpr size_t align_up(size_t bytes) {
-    return (bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
-}
+constexpr size_t align_up(size_t bytes) { return cuda::round_up(bytes, kArenaAlign); }
 
 // Bump allocator over one device block. Sizing runs it against a null base first, so the
 // sizing pass and the pointer pass cannot drift apart.
@@ -336,24 +334,6 @@ Scratch lay_out(Bump& bump, size_t n, size_t nnz, size_t cub_bytes) {
 
 // Every scratch buffer shares one stream-ordered allocation: on the small coarse levels a dozen
 // separate ones cost more than the aggregation itself.
-class DeviceArena {
-  public:
-    DeviceArena(size_t bytes, cudaStream_t stream) : stream_(stream) {
-        check_cuda(cudaMallocAsync(&base_, bytes, stream), "alloc aggregate scratch");
-    }
-    DeviceArena(const DeviceArena&) = delete;
-    DeviceArena& operator=(const DeviceArena&) = delete;
-    ~DeviceArena() {
-        if (base_ != nullptr) cudaFreeAsync(base_, stream_);
-    }
-
-    std::byte* get() const { return static_cast<std::byte*>(base_); }
-
-  private:
-    void* base_ = nullptr;
-    cudaStream_t stream_;
-};
-
 // The matching loops are data dependent, so each one costs a round trip per iteration.
 int read_counter(const int* counter, cudaStream_t stream) {
     int host = 0;
@@ -386,7 +366,8 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
 
     Bump sizing(nullptr);
     lay_out(sizing, n_rows, nnz, cub_bytes);
-    DeviceArena arena(sizing.bytes(), stream);
+    const ScratchBuffer<std::byte> arena =
+        scratch_alloc<std::byte>(sizing.bytes(), stream, "aggregate", "scratch");
     Bump bump(arena.get());
     const Scratch s = lay_out(bump, n_rows, nnz, cub_bytes);
 
@@ -395,9 +376,9 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
         agg_edge_weight_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, row_ptr, col_idx, values,
                                                               s.diag, s.w);
     }
-    agg_init_round1_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.partner,
-                                                          s.strongest);
-    check_cuda(cudaGetLastError(), "round 1 init launch");
+    agg_init_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.partner, s.strongest,
+                                                   s.wsn, s.aggregated);
+    check_cuda(cudaGetLastError(), "init launch");
 
     // Round 1: pairs. AMGx counts unassigned rows over a 3n-length partner array, which makes
     // its `== 0` and `< kMaxUnassignedFraction` exits unreachable here; counting over n and
@@ -417,8 +398,7 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     }
 
     agg_assign_unassigned_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, s.partner);
-    agg_init_round2_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, s.wsn, s.aggregated);
-    check_cuda(cudaGetLastError(), "round 2 init launch");
+    check_cuda(cudaGetLastError(), "assign unassigned launch");
 
     // Round 2: merge pairs into quads. Here all four AMGx exits apply, including the
     // kMaxUnassignedFraction one, because `aggregated` really is n-length upstream.

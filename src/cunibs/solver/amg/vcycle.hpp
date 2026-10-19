@@ -39,7 +39,7 @@ public:
     NativeVCycle(const NativeVCycle&) = delete;
     NativeVCycle& operator=(const NativeVCycle&) = delete;
 
-    // Chebyshev shape. Must be called before the first add_level.
+    // Chebyshev shape. Required before the first add_level.
     void set_smoother(int degree, float lower_ratio);
     // All pointers are device memory; contents are copied into solver-owned buffers on `stream`,
     // which is synchronised before return so the caller may drop its arrays.
@@ -54,8 +54,8 @@ public:
     void finalize();
 
     void apply(int n, const float* b, float* x, cudaStream_t stream);
-    // Block variant: B and X are row-major (n, k), k in {2, 4, 8}. Must be graph-capturable
-    // after a first (warm-up) call.
+    // Block variant: B and X are row-major (n, k), k in {1, 2, 4, 8}; k = 1 is apply. Must be
+    // graph-capturable after a first (warm-up) call.
     void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
     int generation() const { return generation_; }
     // Held by a solve for its whole length: a replayed graph reads the cycle's buffers without
@@ -68,7 +68,7 @@ private:
     template <typename T>
     using Buffer = DeviceBuffer<T>;
 
-    // Host-side Chebyshev coefficients. Step 0 is alpha0 * D^-1 b; step s > 0 is
+    // Host-side Chebyshev coefficients. Step 0 is alpha0 * D^-1 b from a zero guess; step s > 0 is
     //     x_out = c_cur[s-1] x_cur + c_prev[s-1] x_prev + alpha[s-1] D^-1 (b - A x_cur).
     // They depend only on the smoother interval, which the l1 diagonal fixes to
     // [1 / lower_ratio, 1] on every level, so one set serves the whole hierarchy.
@@ -123,6 +123,7 @@ private:
     std::vector<Level> levels_;
     Cheby cheby_;
     int degree_ = 1;
+    bool smoother_set_ = false;
     int coarse_n_ = 0;
     Buffer<float> coarse_ainv_;
     Buffer<float> coarse_b_;

@@ -6,6 +6,7 @@
 #include "core/device_math.cuh"
 #include "core/slot_csr.cuh"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -55,14 +56,8 @@ constexpr int kTargetBlocksPerSm = 4;
 
 // Every choice has to hold the invariant, not just the narrowest: a width that did not divide the
 // warp would put one row's lanes across two shuffle groups and silently drop part of its sum.
-constexpr bool tpr_choices_are_shuffle_widths() {
-    for (const int tpr : kTprChoices) {
-        if (kWarp % tpr != 0 || kBlock % tpr != 0) return false;
-    }
-    return true;
-}
-
-static_assert(tpr_choices_are_shuffle_widths(),
+static_assert(std::ranges::all_of(kTprChoices,
+                                  [](int tpr) { return kWarp % tpr == 0 && kBlock % tpr == 0; }),
               "every threads-per-row choice must divide both the warp and the block");
 
 // One warp fraction per row: strided partial products over the row's nonzeros, then a
@@ -102,8 +97,9 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
 template <int K>
 constexpr bool kHoistEpilogue = (K == 1);
 
-// Threads per row for one level, from that level's shape alone: deterministic, and independent of
-// k, so the same operator always gets the same split and a solve reproduces across block widths.
+// Threads per row for one level, from that level's shape and the device's SM count: independent
+// of k, so the same operator always gets the same split and a solve reproduces across block
+// widths.
 inline int choose_tpr(int n_rows, int nnz, int n_sm) {
     if (n_rows <= 0) return kTprChoices[0];
     const std::int64_t nnz_per_row = (static_cast<std::int64_t>(nnz) + n_rows - 1) / n_rows;
@@ -150,9 +146,10 @@ __global__ void __launch_bounds__(kBlock)
     row_spmv<K, TPR>(n, row_ptr, cols, vals, x, row, lane, sum);
     if (owner) {
         if (!kHoistEpilogue<K>) load_operands();
-        const WidthView<float, K> rv(r, n);
+        cuda::std::array<float, K> res;
 #pragma unroll
-        for (int c = 0; c < K; ++c) rv(row, c) = rhs[c] - s * sum[c];
+        for (int c = 0; c < K; ++c) res[c] = rhs[c] - s * sum[c];
+        store_row<K>(&WidthView<float, K>(r, n)(row, 0), res);
     }
 }
 
@@ -182,7 +179,7 @@ __global__ void __launch_bounds__(kBlock)
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
     if (row < n_coarse) {
-        const WidthView<const float, K> fine(r_fine, kUnsizedRows);
+        const auto fine = unsized<WidthView<const float, K>>(r_fine);
         const int row_e = r_row_ptr[row + 1];
         for (int j = r_row_ptr[row] + lane; j < row_e; j += kRestrictTpr) {
             const float v = r_vals[j];
@@ -213,7 +210,7 @@ __global__ void __launch_bounds__(kBlock)
     cuda::std::array<float, K> sum;
 #pragma unroll
     for (int c = 0; c < K; ++c) sum[c] = 0.0f;
-    const WidthView<const float, K> coarse(x_coarse, kUnsizedRows);
+    const auto coarse = unsized<WidthView<const float, K>>(x_coarse);
     const WidthView<float, K> fine(x_fine, n);
     for (int j = p_row_ptr[row]; j < row_e; ++j) {
         const float v = p_vals[j];
@@ -265,15 +262,9 @@ __global__ void __launch_bounds__(kBlock)
     float d = 0.0f;
     float s = 0.0f;
     const auto load_operands = [&] {
-        const WidthView<const float, K> curv(x_cur, n);
-        const WidthView<const float, K> prevv(x_prev, n);
-        const WidthView<const float, K> bv(b, n);
-#pragma unroll
-        for (int c = 0; c < K; ++c) {
-            cur[c] = curv(row, c);
-            prev[c] = prevv(row, c);
-            rhs[c] = bv(row, c);
-        }
+        load_row<K>(&WidthView<const float, K>(x_cur, n)(row, 0), cur);
+        load_row<K>(&WidthView<const float, K>(x_prev, n)(row, 0), prev);
+        load_row<K>(&WidthView<const float, K>(b, n)(row, 0), rhs);
         d = alpha * dinv[row];
         s = row_scale[row];
     };
@@ -284,11 +275,12 @@ __global__ void __launch_bounds__(kBlock)
         if (!kHoistEpilogue<K>) load_operands();
         // Plain, not __restrict__: x_out is allowed to alias x_prev, and from the second step
         // of a sweep it always does.
-        const WidthView<float, K> outv(x_out, n);
+        cuda::std::array<float, K> out;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            outv(row, c) = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
+            out[c] = c_cur * cur[c] + c_prev * prev[c] + d * (rhs[c] - s * sum[c]);
         }
+        store_row<K>(&WidthView<float, K>(x_out, n)(row, 0), out);
     }
 }
 
@@ -304,7 +296,7 @@ __global__ void __launch_bounds__(kBlock)
                           const std::int16_t* __restrict__ cols,
                           const __half* __restrict__ vals, const float* __restrict__ row_scale,
                           const float* __restrict__ dinv, const float* __restrict__ b,
-                          float alpha0, float c_cur, float c_prev, float alpha,
+                          float alpha0, float c_cur, float alpha,
                           float* __restrict__ x1_out, float* __restrict__ x_out) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / TPR;
     const int lane = static_cast<int>(threadIdx.x) % TPR;
@@ -343,9 +335,11 @@ __global__ void __launch_bounds__(kBlock)
 #pragma unroll
         for (int c = 0; c < K; ++c) x1[c] = w * rhs[c];
         const WidthView<float, K> outv(x_out, n);
+        // Spelled out so that every K contracts the same way: c_cur x1 rounds on its own.
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            outv(row, c) = c_cur * x1[c] + c_prev * x1[c] + d * (rhs[c] - s * sum[c]);
+            outv(row, c) =
+                __fmaf_rn(d, __fmaf_rn(-s, sum[c], rhs[c]), __fmul_rn(c_cur, x1[c]));
         }
         if (x1_out != nullptr) store_row<K>(&WidthView<float, K>(x1_out, n)(row, 0), x1);
     }
@@ -402,13 +396,15 @@ void launch_jacobi_zero(int n, const float* dinv, const float* b, float alpha, f
     }
 }
 
-// Turns a level's threads-per-row into the template argument the two SpMV-shaped kernels take.
-// The widths enumerated here are exactly the set choose_tpr picks from, so an unmatched value is
-// a disagreement between the two and not something a caller can provoke.
+// Turns a level's threads-per-row into the template argument the SpMV-shaped kernels take, over
+// exactly the set choose_tpr picks from, so an unmatched value is a disagreement between the two
+// and not something a caller can provoke.
 template <typename F>
 void dispatch_tpr(int tpr, F&& f) {
-    dispatch_k<2, 4, 8, 16, 32>(tpr, "V-cycle threads-per-row must be one of {2, 4, 8, 16, 32}",
-                             std::forward<F>(f));
+    [&]<std::size_t... I>(std::index_sequence<I...>) {
+        dispatch_k<kTprChoices[I]...>(tpr, "V-cycle threads-per-row outside kTprChoices",
+                                      std::forward<F>(f));
+    }(std::make_index_sequence<std::size(kTprChoices)>{});
 }
 
 template <int K>
@@ -462,13 +458,13 @@ void launch_cheby_step(int n, int tpr, const int* row_ptr, const std::int16_t* c
 template <int K>
 void launch_cheby_first(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
                         const __half* values, const float* row_scale, const float* dinv,
-                        const float* b, float alpha0, float c_cur, float c_prev, float alpha,
+                        const float* b, float alpha0, float c_cur, float alpha,
                         float* x1_out, float* x_out, cudaStream_t stream) {
     dispatch_tpr(tpr, [&](auto tc) {
         constexpr int TPR = decltype(tc)::value;
         if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
             vc_cheby_first_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                n, row_ptr, cols, values, row_scale, dinv, b, alpha0, c_cur, c_prev, alpha,
+                n, row_ptr, cols, values, row_scale, dinv, b, alpha0, c_cur, alpha,
                 x1_out, x_out);
         }
     });
@@ -505,19 +501,13 @@ __global__ void __launch_bounds__(kBlock)
     }
 }
 
-constexpr const char* kBadK = "V-cycle block apply supports k in {2, 4, 8}";
-
-// Smoother shape before any set_smoother call: a single relaxed Jacobi sweep.
-constexpr int kDefaultDegree = 1;
-constexpr float kDefaultLowerRatio = 4.0f;
+constexpr const char* kBadK = "V-cycle block apply supports k in {1, 2, 4, 8}";
 
 std::atomic<int> g_vcycle_generation{0};
 
 }  // namespace
 
-NativeVCycle::NativeVCycle() : generation_(++g_vcycle_generation) {
-    set_smoother(kDefaultDegree, kDefaultLowerRatio);
-}
+NativeVCycle::NativeVCycle() : generation_(++g_vcycle_generation) {}
 
 // Chebyshev over [1 / lower_ratio, 1], rewritten from the usual d-recurrence into the
 // x-recurrence the step kernel takes:
@@ -558,6 +548,7 @@ void NativeVCycle::set_smoother(int degree, float lower_ratio) {
         rho = rho_next;
     }
     degree_ = degree;
+    smoother_set_ = true;
 }
 
 void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const int* row_ptr,
@@ -566,6 +557,7 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
                              const int* r_row_ptr, const int* r_col_idx,
                              const float* r_values, cudaStream_t stream) {
     if (finalized_) throw std::runtime_error("NativeVCycle: add_level after finalize");
+    if (!smoother_set_) throw std::runtime_error("NativeVCycle: add_level before set_smoother");
     if (n_rows <= 0 || n_coarse <= 0 || nnz < 0 || p_nnz < 0) {
         throw std::invalid_argument("NativeVCycle: level dimensions must be positive");
     }
@@ -697,11 +689,10 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         float* prev = other;
         if (x0 == nullptr && degree_ > 1) {
             // Steps 0 and 1 fused; x1 is only materialised when step 2 will read it as x_prev.
-            // Step 1's c_prev is 0 because there is no x_{-1}, and the kernel multiplies it by
-            // x1 rather than by any buffer, so no unwritten memory reaches it.
+            // Step 1's x_prev term drops out because x0 is zero.
             launch_cheby_first<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
                                   lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi,
-                                  cheby_.alpha0, cheby_.c_cur[0], 0.0f, cheby_.alpha[0],
+                                  cheby_.alpha0, cheby_.c_cur[0], cheby_.alpha[0],
                                   degree_ > 2 ? target(0) : nullptr, target(1), stream);
             prev = target(0);
             cur = target(1);
@@ -766,7 +757,7 @@ void NativeVCycle::apply_block(int n, int k, const float* B, float* X, cudaStrea
     // Dispatch before allocating so an unsupported k costs nothing.
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        ensure_block_buffers(K);
+        if constexpr (K > 1) ensure_block_buffers(K);
         run_cycle<K>(B, X, stream);
     });
 }

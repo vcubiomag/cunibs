@@ -1,7 +1,6 @@
 #include "amg/slot_csr.hpp"
+#include "core/scan.cuh"
 #include "core/slot_csr.cuh"
-
-#include <cub/device/device_scan.cuh>
 
 #include <algorithm>
 #include <numeric>
@@ -144,24 +143,12 @@ SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, cudaStream
     }
     SlotCsr out;
     out.ptr = device_alloc<int>(static_cast<std::size_t>(n) + 1, origin, "slot ptr");
-    DeviceBuffer<int> counts =
-        device_alloc<int>(static_cast<std::size_t>(n) + 1, origin, "slot counts");
-    check_cuda(cudaMemsetAsync(counts.get() + n, 0, sizeof(int), stream), origin, "slot counts");
+    const ScratchBuffer<int> counts =
+        scratch_alloc<int>(static_cast<std::size_t>(n) + 1, stream, origin, "slot counts");
     if (const unsigned blocks = grid_for(n)) {
         slot_count_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, counts.get());
     }
-    std::size_t bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts.get(), out.ptr.get(), n + 1,
-                                             stream),
-               origin, "slot scan size");
-    DeviceBuffer<unsigned char> temp = device_alloc<unsigned char>(bytes, origin, "slot scan");
-    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts.get(), out.ptr.get(),
-                                             n + 1, stream),
-               origin, "slot scan");
-    check_cuda(cudaMemcpyAsync(&out.n_slots, out.ptr.get() + n, sizeof(int),
-                               cudaMemcpyDeviceToHost, stream),
-               origin, "slot count");
-    check_cuda(cudaStreamSynchronize(stream), origin, "slot count");
+    out.n_slots = scan_counts(n, counts.get(), out.ptr.get(), stream, origin);
     out.cols = device_alloc<std::int16_t>(static_cast<std::size_t>(out.n_slots), origin,
                                           "slot cols");
     if (const unsigned blocks = grid_for(n)) {
@@ -181,25 +168,6 @@ void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
     }
 }
 
-namespace {
-
-// Exclusive scan of n per-row counts into an (n + 1) pointer; returns the total.
-int scan_counts(int n, const int* counts, int* ptr, cudaStream_t stream, const char* origin) {
-    std::size_t bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, bytes, counts, ptr, n + 1, stream), origin,
-               "scan size");
-    DeviceBuffer<unsigned char> temp = device_alloc<unsigned char>(bytes, origin, "scan");
-    check_cuda(cub::DeviceScan::ExclusiveSum(temp.get(), bytes, counts, ptr, n + 1, stream),
-               origin, "scan");
-    int total = 0;
-    check_cuda(cudaMemcpyAsync(&total, ptr + n, sizeof(int), cudaMemcpyDeviceToHost, stream),
-               origin, "total");
-    check_cuda(cudaStreamSynchronize(stream), origin, "total");
-    return total;
-}
-
-}  // namespace
-
 AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* slot_ptr,
                                const std::int16_t* slot_cols, const double* term_vals,
                                int n_terms, cudaStream_t stream, const char* origin) {
@@ -209,17 +177,16 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
     AffineSlots out;
     out.n_terms = n_terms;
     const std::size_t rows1 = static_cast<std::size_t>(n) + 1;
-    DeviceBuffer<int> segs = device_alloc<int>(rows1, origin, "affine segs");
-    DeviceBuffer<int> slots = device_alloc<int>(rows1, origin, "affine slots");
-    check_cuda(cudaMemsetAsync(segs.get() + n, 0, sizeof(int), stream), origin, "affine segs");
-    check_cuda(cudaMemsetAsync(slots.get() + n, 0, sizeof(int), stream), origin, "affine slots");
+    const ScratchBuffer<int> segs = scratch_alloc<int>(rows1, stream, origin, "affine segs");
+    const ScratchBuffer<int> slots = scratch_alloc<int>(rows1, stream, origin, "affine slots");
     if (const unsigned blocks = grid_for(n)) {
         affine_count_kernel<<<blocks, kBlock, 0, stream>>>(n, nnz, row_ptr, slot_ptr, slot_cols,
                                                            term_vals, n_terms, segs.get(),
                                                            slots.get());
     }
     out.seg_ptr = device_alloc<int>(rows1, origin, "affine seg_ptr");
-    DeviceBuffer<int> slot_base = device_alloc<int>(rows1, origin, "affine slot base");
+    const ScratchBuffer<int> slot_base =
+        scratch_alloc<int>(rows1, stream, origin, "affine slot base");
     out.n_segs = scan_counts(n, segs.get(), out.seg_ptr.get(), stream, origin);
     out.n_slots = scan_counts(n, slots.get(), slot_base.get(), stream, origin);
     out.seg_start =
