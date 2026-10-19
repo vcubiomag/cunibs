@@ -106,6 +106,28 @@ def test_transform_columns_follow_the_documented_convention(
     np.testing.assert_allclose(x, np.cross(y, z), atol=1e-12)
 
 
+@pytest.mark.parametrize(
+    ("centers", "handles", "dists"),
+    [
+        ([50.0, 50.0, 120.0], None, [4.0]),
+        ([[50.0, 50.0, 120.0]] * 2, [[50.0, 150.0, 100.0]], [4.0, 4.0]),
+        ([[50.0, 50.0, 120.0]] * 2, None, [4.0]),
+    ],
+)
+def test_transforms_reject_mismatched_shapes(cube_subject, centers, handles, dists):
+    """The kernel reads one handle and distance per centre, so a short array must not reach it."""
+    with pytest.raises(ValueError, match="must"):
+        compute_coil_transforms(cube_subject.context, centers, handles, dists)
+
+
+def test_transforms_broadcast_one_distance(cp, cube_subject):
+    ctx = cube_subject.context
+    centers = np.array([[50.0, 50.0, 120.0], [40.0, 60.0, 120.0]])
+    one = cp.asnumpy(compute_coil_transforms(ctx, centers, None, 4.0))
+    each = cp.asnumpy(compute_coil_transforms(ctx, centers, None, [4.0, 4.0]))
+    np.testing.assert_array_equal(one, each)
+
+
 def test_transform_orthogonalizes_the_handle(cube_subject):
     """A handle far out of the tangent plane is projected onto it, keeping its in-plane sign."""
     tf = compute_coil_transform(cube_subject.context, [50, 50, 120], [50, 150, 900], 4.0)

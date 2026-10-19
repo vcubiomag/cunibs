@@ -56,23 +56,36 @@ def _require_defined_handle_axis(
 def compute_coil_transforms(
     ctx: SolverContext,
     centers_mm: npt.ArrayLike,
-    pos_ydir_mm: npt.ArrayLike | None,
+    handles_mm: npt.ArrayLike | None,
     distances_mm: npt.ArrayLike,
 ) -> cp.ndarray:
-    """Compute batched 4x4 coil-to-head affines in millimetres.
+    """Compute batched 4x4 coil-to-head affines in millimetres, ``(P, 4, 4)``.
 
-    ``pos_ydir_mm`` may be ``None`` for callers that only want the scalp projection and
-    normal; the in-plane axes are then arbitrary but orthonormal and deterministic. When it is
+    ``centers_mm`` and ``handles_mm`` are ``(P, 3)`` points; ``distances_mm`` is ``(P,)`` or one
+    value for all. ``handles_mm`` may be ``None`` for callers that only want the scalp projection
+    and normal; the in-plane axes are then arbitrary but orthonormal and deterministic. When it is
     given, a handle that leaves the in-plane axis undefined raises ``ValueError``.
     """
     centers = cp.ascontiguousarray(cp.asarray(centers_mm, dtype=cp.float64))
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError(f"centers_mm must be (P, 3), got shape {centers.shape}.")
+    n_pl = centers.shape[0]
     handles = (
         None
-        if pos_ydir_mm is None
-        else cp.ascontiguousarray(cp.asarray(pos_ydir_mm, dtype=cp.float64))
+        if handles_mm is None
+        else cp.ascontiguousarray(cp.asarray(handles_mm, dtype=cp.float64))
     )
-    dists = cp.ascontiguousarray(cp.asarray(distances_mm, dtype=cp.float64))
-    n_pl = centers.shape[0]
+    if handles is not None and handles.shape != centers.shape:
+        raise ValueError(
+            f"handles_mm must match centers_mm's shape {centers.shape}, got {handles.shape}."
+        )
+    dists = cp.asarray(distances_mm, dtype=cp.float64)
+    # The kernel reads one distance per placement, so a short array is an out-of-bounds read.
+    if dists.ndim == 0:
+        dists = cp.full(n_pl, float(dists), dtype=cp.float64)
+    if dists.shape != (n_pl,):
+        raise ValueError(f"distances_mm must be one value or ({n_pl},), got {dists.shape}.")
+    dists = cp.ascontiguousarray(dists)
     out = cp.empty((n_pl, 16), dtype=cp.float64)
     degenerate = None if handles is None else cp.empty(n_pl, dtype=cp.int32)
     place_transforms(
@@ -96,7 +109,7 @@ def compute_coil_transforms(
 def compute_coil_transform(
     ctx: SolverContext,
     center_mm: npt.ArrayLike,
-    pos_ydir_mm: npt.ArrayLike,
+    handle_mm: npt.ArrayLike,
     distance_mm: float,
 ) -> npt.NDArray[np.float64]:
     """Compute the 4x4 coil-to-head affine in millimetres.
@@ -108,7 +121,7 @@ def compute_coil_transform(
     transform = compute_coil_transforms(
         ctx,
         np.asarray(center_mm, dtype=np.float64).reshape(1, 3),
-        np.asarray(pos_ydir_mm, dtype=np.float64).reshape(1, 3),
+        np.asarray(handle_mm, dtype=np.float64).reshape(1, 3),
         np.asarray([distance_mm], dtype=np.float64),
     )
     return cp.asnumpy(transform[0])

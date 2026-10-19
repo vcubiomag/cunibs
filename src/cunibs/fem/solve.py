@@ -862,7 +862,7 @@ def solve_placement(
     dip_pos_m: npt.ArrayLike,
     dip_moment: npt.ArrayLike,
     center_mm: npt.ArrayLike,
-    pos_ydir_mm: npt.ArrayLike,
+    handle_mm: npt.ArrayLike,
     distance_mm: float,
     didt: float,
     *,
@@ -877,7 +877,7 @@ def solve_placement(
     """
     _check_operator(ctx, recovery, nodal, "solve_placement")
 
-    transform = compute_coil_transform(ctx, center_mm, pos_ydir_mm, distance_mm)
+    transform = compute_coil_transform(ctx, center_mm, handle_mm, distance_mm)
     dadt_nodes = coil_dadt_at_nodes(dip_pos_m, dip_moment, transform, didt, ctx.nodes_mm)
     dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
 
@@ -933,7 +933,7 @@ def solve_placements_block(
 ) -> list[PlacementResult]:
     """Solve up to MAX_BLOCK placements with block kernels end to end.
 
-    ``sites`` are (center_mm, pos_ydir_mm, distance_mm) triples. All stages that read
+    ``sites`` are (center_mm, handle_mm, distance_mm) triples. All stages that read
     large placement-independent arrays (scalp projection, tet connectivity, weighted
     gradients, node2corner, g) run once per chunk rather than once per placement, and the
     linear solve shares every stiffness/hierarchy read across the k columns.
