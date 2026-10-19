@@ -2,6 +2,7 @@
 #include "core/common.hpp"
 
 #include <cuda/std/array>
+#include <cuda/std/limits>
 #include <cuda/std/mdspan>
 
 // __device__ helpers shared across kernels. .cu only. Keep this out of dadt.cu: that
@@ -25,6 +26,10 @@ using Tet4View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynam
 // entries are node ids rather than components of one vector.
 template <typename T, typename Index = int>
 using Tri3View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3>>;
+// (n_tri, 3, 3): the three corner coordinates of each triangle of a surface.
+template <typename T, typename Index = int>
+using TriVertView =
+    cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3, 3>>;
 // (n_tet, 4, 3): the P1 basis gradient of corner i of tetrahedron e. Also addressable per
 // corner c = 4e + i through a Vec3View, which is how the corner-centric kernels read it.
 template <typename T, typename Index = int>
@@ -38,16 +43,20 @@ template <typename T, int K>
 using WidthView =
     cuda::std::mdspan<T, cuda::std::extents<std::int64_t, cuda::std::dynamic_extent, K>>;
 
-// Leading extent for a kernel that was never handed its row count: it reaches rows through an
-// incidence list that only names valid ones, and a row-major mapping never reads the extent.
-constexpr int kUnsizedRows = 0;
+// A view for a kernel that was never handed its row count: it reaches rows through an incidence
+// list that only names valid ones. The leading extent is the largest the index type can describe
+// beside the trailing extents, so every row such a list can name is in range.
+template <typename View>
+__host__ __device__ constexpr View unsized(typename View::data_handle_type p) {
+    using Index = typename View::index_type;
+    using Extents = typename View::extents_type;
+    Index inner = 1;
+    for (cuda::std::size_t r = 1; r < Extents::rank(); ++r) inner *= Extents::static_extent(r);
+    return View(p, cuda::std::numeric_limits<Index>::max() / inner);
+}
 
-struct Vec3d {
-    double x, y, z;
-};
-
-// The same three components where a caller wants to pass them around by value rather than reach
-// them by name; the geometry kernels build and fold these, the ones below take plain pointers.
+// Three components passed around by value; the geometry kernels build and fold these, the helpers
+// below take plain pointers.
 using Vec3 = cuda::std::array<double, 3>;
 
 __device__ __forceinline__ double dot3(const double* u, const double* v) {
@@ -62,40 +71,15 @@ __device__ __forceinline__ void cross3(const double* u, const double* v, double*
     out[2] = u[0] * v[1] - u[1] * v[0];
 }
 
-// grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron, taken as
-// Σ_{i≥1} (v_i − v_0) g[e,i,:] since P1 gradients sum to zero over the corners. The direct sum
-// carries v's common level through fp32 g that do not sum to zero to the last bit, which leaks
-// |v| |g| ε into a gradient that is small beside it. Accumulated in fp64 because callers subtract
-// a comparable term from it and lose the leading digits. g[e,0,:] is never read.
-__device__ __forceinline__ Vec3d tet_grad4(const double* __restrict__ v,
-                                           Tet4View<const int> tet_nodes,
-                                           TetGradView<const float> g, int e) {
-    const double v0 = v[tet_nodes(e, 0)];
-    double gx = 0.0, gy = 0.0, gz = 0.0;
-#pragma unroll
-    for (int i = 1; i < 4; ++i) {
-        const double di = v[tet_nodes(e, i)] - v0;
-        gx += di * static_cast<double>(g(e, i, 0));
-        gy += di * static_cast<double>(g(e, i, 1));
-        gz += di * static_cast<double>(g(e, i, 2));
-    }
-    return {gx, gy, gz};
-}
-
 // Per-placement pointers for the block stages, passed by value as a kernel argument.
 using ConstPtrPack = cuda::std::array<const float*, kMaxStageBlock>;
 using PtrPack = cuda::std::array<float*, kMaxStageBlock>;
 
 // Host side of the same: a launcher fills the first k slots from its caller's array and leaves the
 // rest null, since a kernel only ever reads the columns it was given a k for.
-inline ConstPtrPack const_ptr_pack(const float* const* src, int k) {
-    ConstPtrPack out{};
-    for (int c = 0; c < k; ++c) out[c] = src[c];
-    return out;
-}
-
-inline PtrPack ptr_pack(float* const* src, int k) {
-    PtrPack out{};
+template <typename T>
+cuda::std::array<T*, kMaxStageBlock> ptr_pack(T* const* src, int k) {
+    cuda::std::array<T*, kMaxStageBlock> out{};
     for (int c = 0; c < k; ++c) out[c] = src[c];
     return out;
 }
@@ -137,11 +121,7 @@ __device__ __forceinline__ void warp_reduce_sum(cuda::std::array<T, K>& sum) {
 template <int K>
 __device__ __forceinline__ void load_row(const float* __restrict__ p,
                                          cuda::std::array<float, K>& v) {
-    if constexpr (K == 2) {
-        const float2 t = *reinterpret_cast<const float2*>(p);
-        v[0] = t.x;
-        v[1] = t.y;
-    } else if constexpr (K % 4 == 0) {
+    if constexpr (K % 4 == 0) {
 #pragma unroll
         for (int b = 0; b < K / 4; ++b) {
             const float4 t = *reinterpret_cast<const float4*>(p + b * 4);
@@ -149,6 +129,13 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p,
             v[b * 4 + 1] = t.y;
             v[b * 4 + 2] = t.z;
             v[b * 4 + 3] = t.w;
+        }
+    } else if constexpr (K % 2 == 0) {
+#pragma unroll
+        for (int b = 0; b < K / 2; ++b) {
+            const float2 t = *reinterpret_cast<const float2*>(p + b * 2);
+            v[b * 2 + 0] = t.x;
+            v[b * 2 + 1] = t.y;
         }
     } else {
 #pragma unroll
@@ -174,13 +161,16 @@ __device__ __forceinline__ void load_row(const double* __restrict__ p,
 
 template <int K>
 __device__ __forceinline__ void store_row(float* p, const cuda::std::array<float, K>& v) {
-    if constexpr (K == 2) {
-        *reinterpret_cast<float2*>(p) = make_float2(v[0], v[1]);
-    } else if constexpr (K % 4 == 0) {
+    if constexpr (K % 4 == 0) {
 #pragma unroll
         for (int b = 0; b < K / 4; ++b) {
             *reinterpret_cast<float4*>(p + b * 4) =
                 make_float4(v[b * 4 + 0], v[b * 4 + 1], v[b * 4 + 2], v[b * 4 + 3]);
+        }
+    } else if constexpr (K % 2 == 0) {
+#pragma unroll
+        for (int b = 0; b < K / 2; ++b) {
+            *reinterpret_cast<float2*>(p + b * 2) = make_float2(v[b * 2 + 0], v[b * 2 + 1]);
         }
     } else {
 #pragma unroll
@@ -199,4 +189,17 @@ __device__ __forceinline__ void store_row(double* p, const cuda::std::array<doub
 #pragma unroll
         for (int c = 0; c < K; ++c) p[c] = v[c];
     }
+}
+
+// A fixed-order tree over one value per thread, returned to every thread of the block. Every
+// thread must reach it. A kernel that sums twice passes each call its own array, or synchronises
+// in between, since the first total is still being read when the second tree starts writing.
+__device__ __forceinline__ double block_tree_sum(double v, double (&sh)[kBlock]) {
+    sh[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = kBlock / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    return sh[0];
 }

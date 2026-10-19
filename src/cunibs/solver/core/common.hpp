@@ -3,18 +3,19 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <utility>
 
 // Host-side pieces every translation unit in this directory needs. Safe to include from
 // .cpp as well as .cu; anything with __device__ code belongs in device_math.cuh instead.
 
 // A reduction whose association order is unspecified cannot stand in for one of these kernels:
-// results are required to be bit-reproducible, so every summation tree is written out here.
-// Library calls are confined to setup (cub::DeviceScan, cub::DeviceSegmentedSort) and to
-// place.cu's minimum over a total order, which no order of combination can change.
+// results are required to be bit-reproducible, so every floating-point summation tree is written
+// out here. Library calls are confined to integer work (scans, sorts, compaction) and to minima
+// over a total order, which no order of combination can change.
 
 constexpr int kBlock = 256;
 constexpr int kWarp = 32;
@@ -25,19 +26,21 @@ constexpr unsigned kFullWarp = 0xffffffffu;
 
 static_assert(kBlock % kWarp == 0, "a block must be a whole number of warps");
 
-// Block (k <= 8 placements per chunk) variants of the per-placement stages: the shared
-// mesh arrays (tet_nodes, wg, node2corner, g) are read once per chunk rather than once
-// per placement. Per-placement arrays stay separate contiguous buffers, passed as
-// pointer packs, so the per-placement result layout is the same as the serial path's.
+// Widest block of the per-placement stages: the shared mesh arrays are read once per block of up
+// to this many placements. Per-placement arrays stay separate contiguous buffers, passed as
+// pointer packs, so a placement's result layout does not depend on its block.
 constexpr int kMaxStageBlock = 8;
 
 // Compiled widths of the k-RHS CG and V-cycle kernels, increasing. The dispatch_k call sites
 // in block_cg.cu and vcycle.cu enumerate the same set as template arguments; this is what the
 // bindings export, so the Python layer derives its BLOCK_SIZES rather than restating it.
 inline constexpr int kBlockWidths[] = {1, 2, 4, 8};
-inline constexpr int kNumBlockWidths = 4;
 
-static_assert(kBlockWidths[kNumBlockWidths - 1] <= kMaxStageBlock,
+inline bool is_block_width(int k) {
+    return std::find(std::begin(kBlockWidths), std::end(kBlockWidths), k) != std::end(kBlockWidths);
+}
+
+static_assert(kBlockWidths[std::size(kBlockWidths) - 1] <= kMaxStageBlock,
               "a solve width wider than a staging chunk could never be fed");
 
 // An allocation the device could not satisfy. Kept distinct so Python sees a MemoryError, which a
@@ -66,9 +69,10 @@ inline unsigned grid_for(std::int64_t total, int per = kBlock) {
     return static_cast<unsigned>((total + per - 1) / per);
 }
 
-// Multiprocessor count of the current device, cached because nothing here changes it. Callers use
-// it only to decide how far to split work for occupancy, so a failed query falls back to one SM
-// and costs throughput, nothing more.
+// Multiprocessor count of the current device, cached because nothing here changes it. It decides
+// how far work is split for occupancy, and through choose_tpr a V-cycle level's threads per row,
+// which fixes that level's summation tree: a result reproduces on one GPU model, not necessarily
+// across models with different SM counts. A failed query falls back to one SM.
 inline int sm_count() {
     static const int count = [] {
         int device = 0, sms = 0;
@@ -108,40 +112,12 @@ void dispatch_k(int k, const char* what, F&& f) {
     if (!matched) throw std::invalid_argument(what);
 }
 
-// Move-only owners for the four CUDA resources this directory allocates. Setup takes a dozen
-// of them in a row, so wrapping them keeps a failure part way through from leaking the
-// earlier ones and keeps every destructor implicit.
+// Owners for the four CUDA resources this directory allocates. Setup takes a dozen of them in a
+// row, so wrapping them keeps a failure part way through from leaking the earlier ones and keeps
+// every destructor implicit.
 //
 // All four release without checking: a free during interpreter teardown, after the context is
 // gone, reports an error there is nothing useful to do with.
-template <typename T, typename Deleter>
-class Owner {
-public:
-    Owner() = default;
-    explicit Owner(T handle) noexcept : handle_(handle) {}
-    ~Owner() { reset(); }
-
-    Owner(const Owner&) = delete;
-    Owner& operator=(const Owner&) = delete;
-    Owner(Owner&& other) noexcept : handle_(other.release()) {}
-    Owner& operator=(Owner&& other) noexcept {
-        if (this != &other) reset(other.release());
-        return *this;
-    }
-
-    T get() const noexcept { return handle_; }
-    explicit operator bool() const noexcept { return handle_ != T{}; }
-    T release() noexcept { return std::exchange(handle_, T{}); }
-
-    void reset(T handle = T{}) noexcept {
-        if (handle_ != T{}) Deleter{}(handle_);
-        handle_ = handle;
-    }
-
-private:
-    T handle_{};
-};
-
 namespace detail {
 struct FreeDevice {
     void operator()(void* p) const noexcept { cudaFree(p); }
@@ -155,14 +131,23 @@ struct DestroyStream {
 struct DestroyEvent {
     void operator()(cudaEvent_t e) const noexcept { cudaEventDestroy(e); }
 };
+struct FreeAsync {
+    cudaStream_t stream = nullptr;
+    void operator()(void* p) const noexcept { cudaFreeAsync(p, stream); }
+};
 }  // namespace detail
 
 template <typename T>
-using DeviceBuffer = Owner<T*, detail::FreeDevice>;
+using DeviceBuffer = std::unique_ptr<T, detail::FreeDevice>;
 template <typename T>
-using PinnedBuffer = Owner<T*, detail::FreeHost>;
-using CudaStream = Owner<cudaStream_t, detail::DestroyStream>;
-using CudaEvent = Owner<cudaEvent_t, detail::DestroyEvent>;
+using PinnedBuffer = std::unique_ptr<T, detail::FreeHost>;
+using CudaStream = std::unique_ptr<std::remove_pointer_t<cudaStream_t>, detail::DestroyStream>;
+using CudaEvent = std::unique_ptr<std::remove_pointer_t<cudaEvent_t>, detail::DestroyEvent>;
+// Scratch for one launcher's work, allocated and freed in order on its stream: neither waits for
+// the device, and the launcher need not synchronise before it goes out of scope. Stream-ordered
+// allocation is illegal inside a graph capture, so these are for setup and per-call stages only.
+template <typename T>
+using ScratchBuffer = std::unique_ptr<T, detail::FreeAsync>;
 
 template <typename T>
 DeviceBuffer<T> device_alloc(std::size_t count, const char* origin, const char* what) {
@@ -180,6 +165,14 @@ DeviceBuffer<T> device_clone(const T* src, std::size_t count, cudaStream_t strea
                                stream),
                origin, what);
     return buf;
+}
+
+template <typename T>
+ScratchBuffer<T> scratch_alloc(std::size_t count, cudaStream_t stream, const char* origin,
+                               const char* what) {
+    T* ptr = nullptr;
+    check_cuda(cudaMallocAsync(&ptr, count * sizeof(T), stream), origin, what);
+    return ScratchBuffer<T>(ptr, detail::FreeAsync{stream});
 }
 
 template <typename T>
