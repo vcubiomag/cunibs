@@ -245,14 +245,17 @@ def _cortex_under(subject, placement) -> np.ndarray:
 
 
 @pytest.mark.realmesh
-def test_record_rois_matches_a_host_reduction_of_the_retained_field(
+def test_record_rois_matches_a_reduction_of_the_retained_field(
     cp, patch_subject, d70_coil, patch_placement
 ):
     """An ROI scalar must be the same number a retained array would have given.
 
     Recording ROIs on the forward path avoids keeping a per-tetrahedron array to extract a few
-    numbers from; it does not approximate the reduction, so the two must agree exactly.
+    numbers from; it does not approximate the reduction, so the two must agree exactly. A host
+    sum associates differently, so it can only agree to rounding.
     """
+    from cunibs import metrics
+
     cortex = _cortex_under(patch_subject, patch_placement)
     rois = {
         "near": patch_subject.roi(cortex, radius_mm=5.0, region="gray_matter"),
@@ -262,10 +265,12 @@ def test_record_rois_matches_a_host_reduction_of_the_retained_field(
 
     assert set(result.roi_means) == {"near", "point"}
     for name, target in rois.items():
+        retained = metrics.roi_mean(cp.asarray(result.magnE), target.elem_idx, target.weights)
+        assert result.roi_means[name] == float(retained)
         idx = cp.asnumpy(target.elem_idx)
         w = cp.asnumpy(target.weights)
-        want = float((result.magnE[idx].astype(np.float64) * w).sum())
-        assert result.roi_means[name] == want
+        host = float((result.magnE[idx].astype(np.float64) * w).sum())
+        assert result.roi_means[name] == pytest.approx(host, rel=1e-14)
 
     # Recording an ROI must not require retaining anything.
     lean = patch_subject.simulate(d70_coil, patch_placement, record_rois=rois)
