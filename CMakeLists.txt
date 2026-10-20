@@ -96,6 +96,10 @@ target_include_directories(_solver_ext PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src/cu
 
 set_source_files_properties(src/cunibs/solver/coil/dadt.cu
   PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+# Left to itself, nvcc fuses the frame's fp64 products into FMAs differently per architecture, so
+# a placement's frame would differ by an ulp between GPU models. The kernel runs once per placement.
+set_source_files_properties(src/cunibs/solver/coil/place.cu
+  PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
 if(MSVC)
   # solver.hpp and several kernels carry UTF-8 bytes; MSVC otherwise decodes the sources
