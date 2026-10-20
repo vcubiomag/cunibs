@@ -53,6 +53,11 @@ constexpr int kMinRowIters = 4;
 // either side of that trade. Past this, latency hiding stops improving on this shape of kernel.
 constexpr int kTargetBlocksPerSm = 4;
 
+// The SM count a level has to fill. It is a constant so that tpr, which sets the level's summation
+// tree, is the same on every GPU. Only levels too small to fill a GPU depend on it, and those cost
+// little.
+constexpr int kFillSms = 128;
+
 // Every choice has to hold the invariant, not just the narrowest: a width that did not divide the
 // warp would put one row's lanes across two shuffle groups and silently drop part of its sum.
 static_assert(std::ranges::all_of(kTprChoices,
@@ -96,13 +101,13 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
 template <int K>
 constexpr bool kHoistEpilogue = (K == 1);
 
-// Threads per row for one level, from that level's shape and the device's SM count: independent
-// of k, so the same operator always gets the same split and a solve reproduces across block
-// widths.
-inline int choose_tpr(int n_rows, int nnz, int n_sm) {
+// Threads per row for one level, from that level's shape alone: independent of k and of the GPU,
+// so the same operator always gets the same split and a solve reproduces across block widths and
+// GPU models.
+inline int choose_tpr(int n_rows, int nnz) {
     if (n_rows <= 0) return kTprChoices[0];
     const std::int64_t nnz_per_row = (static_cast<std::int64_t>(nnz) + n_rows - 1) / n_rows;
-    const std::int64_t to_fill = static_cast<std::int64_t>(n_sm) * kTargetBlocksPerSm * kBlock;
+    const std::int64_t to_fill = static_cast<std::int64_t>(kFillSms) * kTargetBlocksPerSm * kBlock;
     int tpr = kTprChoices[0];
     for (std::size_t i = 1; i < std::size(kTprChoices); ++i) {
         // Widen while the matrix half still has enough work per thread to pay for what the
@@ -565,7 +570,7 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     Level lvl;
     lvl.n = n_rows;
     lvl.n_coarse = n_coarse;
-    lvl.tpr = choose_tpr(n_rows, nnz, sm_count());
+    lvl.tpr = choose_tpr(n_rows, nnz);
     SlotCsr slots = build_slot_csr(n_rows, row_ptr, col_idx, stream, "vcycle");
     lvl.row_ptr = std::move(slots.ptr);
     lvl.cols = std::move(slots.cols);

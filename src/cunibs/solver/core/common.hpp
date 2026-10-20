@@ -70,9 +70,9 @@ inline unsigned grid_for(std::int64_t total, int per = kBlock) {
 }
 
 // Multiprocessor count of the current device, cached because nothing here changes it. It decides
-// how far work is split for occupancy, and through choose_tpr a V-cycle level's threads per row,
-// which fixes that level's summation tree: a result reproduces on one GPU model, not necessarily
-// across models with different SM counts. A failed query falls back to one SM.
+// how far work is split for occupancy, so it must never decide an order of floating-point
+// operations: anything that did would give different bits on GPU models with different SM counts.
+// A failed query falls back to one SM.
 inline int sm_count() {
     static const int count = [] {
         int device = 0, sms = 0;
