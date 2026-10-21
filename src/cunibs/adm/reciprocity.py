@@ -29,8 +29,11 @@ from cunibs.fem.solve import (
     context_of,
 )
 from cunibs.solver import (
+    adm_entry_floats,
     adm_reach,
-    dadt_nbody,
+    adm_sample,
+    adm_sample_tile,
+    adm_slot_corners,
     element_weight,
     node_gather,
     node_gather3,
@@ -199,6 +202,15 @@ class ReciprocityField:
     of any placement is ``E_d = didt · Σ_j m_j · Q_d(s_j)`` (``s_j``, ``m_j`` = placed coil dipoles).
     It is laid out ``(nx, ny, nz, D, 3)`` so that one grid point's every direction is one read.
 
+    Q is singular at every mesh node and the grid's cells straddle the scalp, so ``q`` leaves out,
+    at each point, the nodes in the eight cells around it, and no near-node term is ever
+    interpolated. A sampled cell whose 27 neighbours hold a node (``cell_near``) gets a slot: its
+    own eight corners ``q_near`` without those nodes, and the nodes themselves, which the evaluator
+    sums at the dipole directly. ``src`` and ``src_w`` are the nodes in grid index units and their
+    weights, sorted by extended cell (-1 .. n-1 per axis, so every grid point has all eight of its
+    cells), and ``cell_ptr`` is their CSR. A slot's nodes are ``entries[list_ptr[i]:list_ptr[i+1]]``,
+    each its position then its weights, packed so one is a few vector loads.
+
     Only the points a coil can reach are sampled when the grid carries a coverage; ``sampled``
     marks them, and ``cell_ok`` marks the cells whose eight corners all are, which is the only
     place interpolation is allowed to read. A frame that lands elsewhere has its points sampled on
@@ -213,10 +225,16 @@ class ReciprocityField:
     magnitude: bool
     sampled: cp.ndarray  # (nx * ny * nz,) uint8
     cell_ok: cp.ndarray  # ((nx-1) * (ny-1) * (nz-1),) uint8
-    # The N-body sources, centred on the grid, for sampling further points on demand.
-    src: cp.ndarray  # (n_nodes, 3) float32
-    src_sq: cp.ndarray  # (n_nodes,) float32
-    moments: cp.ndarray  # (D, n_nodes, 6) float32: W_d and W_d x s
+    cell_near: cp.ndarray  # ((nx-1) * (ny-1) * (nz-1),) uint8
+    src: cp.ndarray  # (n_nodes, 3) float32, grid index units
+    src_w: cp.ndarray  # (D, n_nodes, 3) float32
+    cell_ptr: cp.ndarray  # ((nx+1) * (ny+1) * (nz+1) + 1,) int32
+    tile_box: cp.ndarray  # (ceil(n_nodes / adm_sample_tile()), 6) int32
+    cell_slot: cp.ndarray  # ((nx-1) * (ny-1) * (nz-1),) int32, -1 for none
+    slot_cells: cp.ndarray  # (n_slots,) int64 flat cell index
+    list_ptr: cp.ndarray  # (n_slots + 1,) int32
+    entries: cp.ndarray  # (n_entries, adm_entry_floats(D)) float32
+    q_near: cp.ndarray  # (n_slots, 8, D, 3) float32
     # The coil's offset from the scalp and the candidate centres the coverage was built for, or
     # None for a field not built by build_reciprocity. optimize_placement defaults to both.
     distance_mm: float | None = None
@@ -231,32 +249,82 @@ class ReciprocityField:
         if points.size == 0:
             return
         grid = self.grid
-        flat = grid_points_m(grid, points) - grid.center_m[None, :]
-        r = flat.astype(cp.float32)
-        out = cp.empty((int(points.size), self.n_directions, 3), dtype=cp.float32)
-        dadt_nbody(
+        adm_sample(
             self.src,
-            self.moments,
-            self.src_sq,
-            r,
-            out.reshape(int(points.size), -1),
-            1.0,
+            self.src_w,
+            self.tile_box,
+            cp.ascontiguousarray(cp.sort(points), dtype=cp.int64),
             MU0_OVER_4PI,
+            *_grid_args(grid),
+            self.q.reshape(-1),
             cp.cuda.get_current_stream().ptr,
         )
-        self.q.reshape(-1, self.n_directions, 3)[points] = out
         self.sampled[points] = 1
         self.cell_ok = _cells_ok(self.sampled, grid.shape)
+        fresh = (self.cell_ok & self.cell_near).astype(cp.bool_) & (self.cell_slot < 0)
+        self._add_slots(cp.flatnonzero(fresh))
+
+    def _add_slots(self, cells: cp.ndarray) -> None:
+        """Give each of the sampled near cells ``cells`` a slot: its node list and corners."""
+        if cells.size == 0:
+            return
+        grid = self.grid
+        _, ny, nz = grid.shape
+        ix = cells // ((ny - 1) * (nz - 1))
+        iy = (cells // (nz - 1)) % (ny - 1)
+        iz = cells % (nz - 1)
+        # Cell i's neighbours are extended cells i .. i + 2; each (x, y) row's three are adjacent.
+        rows = cp.stack(
+            [
+                ((ix + a) * (ny + 1) + (iy + b)) * (nz + 1) + iz
+                for a in range(3)
+                for b in range(3)
+            ],
+            axis=1,
+        )
+        lo = self.cell_ptr[rows].ravel()
+        seg = self.cell_ptr[rows + 3].ravel() - lo
+        ends = cp.cumsum(seg)
+        entry = cp.arange(int(ends[-1]), dtype=cp.int64)
+        owner = cp.searchsorted(ends, entry, side="right")
+        idx = lo[owner] + (entry - (ends - seg)[owner])
+
+        first = int(self.slot_cells.size)
+        counts = seg.reshape(-1, 9).sum(axis=1)
+        self.list_ptr = cp.concatenate(
+            [self.list_ptr, self.list_ptr[-1] + cp.cumsum(counts).astype(cp.int32)]
+        )
+        packed = cp.zeros((int(idx.size), self.entries.shape[1]), dtype=cp.float32)
+        packed[:, :3] = self.src[idx]
+        packed[:, 3 : 3 + 3 * self.n_directions] = (
+            self.src_w[:, idx].transpose(1, 0, 2).reshape(int(idx.size), -1)
+        )
+        self.entries = cp.concatenate([self.entries, packed])
+        self.slot_cells = cp.concatenate([self.slot_cells, cells.astype(cp.int64)])
+        self.cell_slot[cells] = cp.arange(first, first + int(cells.size), dtype=cp.int32)
+        self.q_near = cp.concatenate(
+            [self.q_near, cp.empty((int(cells.size), *self.q_near.shape[1:]), cp.float32)]
+        )
+        adm_slot_corners(
+            self.slot_cells,
+            first,
+            self.list_ptr,
+            self.entries.reshape(-1),
+            self.n_directions,
+            self.q.reshape(-1),
+            MU0_OVER_4PI,
+            *_grid_args(grid),
+            self.q_near.reshape(-1),
+            cp.cuda.get_current_stream().ptr,
+        )
 
 
-def grid_points_m(grid: Grid, points: cp.ndarray) -> cp.ndarray:
-    """Coordinates ``(K, 3)`` of the flat C-order grid indices ``points``."""
-    _, ny, nz = grid.shape
-    ix = points // (ny * nz)
-    iy = (points // nz) % ny
-    iz = points % nz
-    idx = cp.stack([ix, iy, iz], axis=1).astype(cp.float64)
-    return grid.origin_m[None, :] + grid.spacing_m[None, :] * idx
+def _grid_args(grid: Grid) -> tuple[list[float], list[float], list[int]]:
+    return (
+        [float(x) for x in cp.asnumpy(grid.origin_m)],
+        [float(x) for x in cp.asnumpy(grid.spacing_m)],
+        list(grid.shape),
+    )
 
 
 def _cells_ok(sampled: cp.ndarray, shape: tuple[int, int, int]) -> cp.ndarray:
@@ -315,35 +383,78 @@ def _reachable(grid: Grid, coverage: SweptCoverage) -> cp.ndarray:
     return mask
 
 
-def sample_qfield(adjoint: AdjointField, grid: Grid) -> ReciprocityField:
-    """Evaluate the reciprocity Q-field on ``grid`` via the node-sourced dA/dt N-body kernel.
+def _binned_sources(
+    adjoint: AdjointField, grid: Grid
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+    """The nodes in grid index units sorted by extended cell, their weights, CSR, tile boxes and
+    ``cell_near``.
 
-    ``Q_d = dadt_nbody(sources=mesh nodes, moments=W_{d,n}, targets=grid, didt=1)`` uses the same
-    kernel and formula as the forward coil field, with the roles of coil and mesh swapped, and all
-    directions in one pass over the sources. With a coverage on the grid only the reachable points
-    are sampled; without one, all of them.
+    Nodes outside the extended cells are never near a grid point, so they follow the binned ones
+    and only enter the far field.
     """
-    ctx = adjoint.ctx
-    center = grid.center_m
-    s = cp.ascontiguousarray(
-        ((cp.asarray(ctx.nodes_mm) * 1e-3) - center[None, :]).astype(cp.float32)
-    )
-    sn = cp.ascontiguousarray((s * s).sum(1))
-    n_dir = int(adjoint.node_weights.shape[0])
-    w = adjoint.node_weights.astype(cp.float32)  # (D, n_nodes, 3)
-    moments = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, s[None])], axis=2))
+    idx = (cp.asarray(adjoint.ctx.nodes_mm) * 1e-3 - grid.origin_m[None, :]) / grid.spacing_m
+    src = idx.astype(cp.float32)
+    # Binned from the float32 coordinates the kernels read, so both sides agree on every cell.
+    ext = cp.floor(src).astype(cp.int64) + 1
+    n_ext = cp.asarray(grid.shape, dtype=cp.int64) + 1
+    inside = ((ext >= 0) & (ext < n_ext[None, :])).all(axis=1)
+    flat = (ext[:, 0] * n_ext[1] + ext[:, 1]) * n_ext[2] + ext[:, 2]
+    n_cells = int(cp.prod(n_ext))
+    flat = cp.where(inside, flat, n_cells)
+    order = cp.argsort(flat, kind="stable")
+    # cp.bincount is unsafe here: CuPy runs it through CUB's histogram, which keeps blocks * cells
+    # counters and offsets into them in 32 bits, so a fine grid writes out of bounds.
+    cell_ptr = cp.searchsorted(flat[order], cp.arange(n_cells + 1)).astype(cp.int32)
 
+    occupied = (cell_ptr[1:] > cell_ptr[:-1]).reshape(tuple(int(n) for n in n_ext))
+    # Cell i's 27 neighbours are extended cells i .. i + 2 on each axis.
+    near = occupied[:-2] | occupied[1:-1] | occupied[2:]
+    near = near[:, :-2] | near[:, 1:-1] | near[:, 2:]
+    near = near[:, :, :-2] | near[:, :, 1:-1] | near[:, :, 2:]
+
+    src = cp.ascontiguousarray(src[order])
+    tile = adm_sample_tile()
+    cells = cp.floor(src).astype(cp.int32)
+    pad = (-int(src.shape[0])) % tile
+    lo = cp.pad(cells, ((0, pad), (0, 0)), mode="edge").reshape(-1, tile, 3).min(axis=1)
+    hi = cp.pad(cells, ((0, pad), (0, 0)), mode="edge").reshape(-1, tile, 3).max(axis=1)
+    tile_box = cp.ascontiguousarray(cp.concatenate([lo, hi], axis=1))
+    w = adjoint.node_weights.astype(cp.float32)[:, order]
+    return (
+        src,
+        cp.ascontiguousarray(w),
+        cell_ptr,
+        tile_box,
+        cp.ascontiguousarray(near.astype(cp.uint8).ravel()),
+    )
+
+
+def sample_qfield(adjoint: AdjointField, grid: Grid) -> ReciprocityField:
+    """Evaluate the reciprocity Q-field's far part on ``grid`` (see :class:`ReciprocityField`).
+
+    All directions go in one pass over the sources. With a coverage on the grid only the reachable
+    points are sampled; without one, all of them.
+    """
+    src, src_w, cell_ptr, tile_box, cell_near = _binned_sources(adjoint, grid)
+    n_dir = int(adjoint.node_weights.shape[0])
     field = ReciprocityField(
-        ctx=ctx,
+        ctx=adjoint.ctx,
         target=adjoint.target,
         grid=grid,
         q=cp.zeros((*grid.shape, n_dir, 3), dtype=cp.float32),
         magnitude=adjoint.target.magnitude,
         sampled=cp.zeros(grid.n_points, dtype=cp.uint8),
         cell_ok=cp.zeros(0, dtype=cp.uint8),
-        src=s,
-        src_sq=sn,
-        moments=moments,
+        cell_near=cell_near,
+        src=src,
+        src_w=src_w,
+        cell_ptr=cell_ptr,
+        tile_box=tile_box,
+        cell_slot=cp.full(cell_near.size, -1, dtype=cp.int32),
+        slot_cells=cp.zeros(0, dtype=cp.int64),
+        list_ptr=cp.zeros(1, dtype=cp.int32),
+        entries=cp.zeros((0, adm_entry_floats(n_dir)), dtype=cp.float32),
+        q_near=cp.zeros((0, 8, n_dir, 3), dtype=cp.float32),
     )
     if grid.coverage is None:
         points = cp.arange(grid.n_points, dtype=cp.int64)

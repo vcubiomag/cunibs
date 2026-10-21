@@ -1,6 +1,7 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
+#include <climits>
 #include <cstdint>
 #include <stdexcept>
 
@@ -144,17 +145,73 @@ __device__ __forceinline__ void report_fault(int* fault, AdmFault kind, int cand
     atomicMin(&fault[kind], candidate);
 }
 
+// out += g W x d for every moment set, g = |d|^-3. Coordinates are grid index units, so the
+// caller scales by mu0_4pi / spacing^2. d = target - source is formed directly, since a node a
+// fraction of a millimetre from the target leaves no digits in |r|^2 + |s|^2 - 2 r.s.
+template <int D>
+__device__ __forceinline__ void add_source(float (&out)[D * 3], float dx, float dy, float dz,
+                                           const float* __restrict__ w) {
+    const float d2 = fmaf(dx, dx, fmaf(dy, dy, dz * dz));
+    const float inv = rsqrtf(d2);
+    const float g = inv * inv * inv;
+#pragma unroll
+    for (int d = 0; d < D; ++d) {
+        const float wx = w[3 * d], wy = w[3 * d + 1], wz = w[3 * d + 2];
+        out[3 * d + 0] = fmaf(g, wy * dz - wz * dy, out[3 * d + 0]);
+        out[3 * d + 1] = fmaf(g, wz * dx - wx * dz, out[3 * d + 1]);
+        out[3 * d + 2] = fmaf(g, wx * dy - wy * dx, out[3 * d + 2]);
+    }
+}
+
+// The reciprocity field is singular at every mesh node, and a 3 mm cell can straddle the scalp,
+// so trilinear interpolation alone smears a corner's near-node spike into a dipole a millimetre
+// away. The grid therefore stores, at each point, the field of every source outside the eight
+// cells around it. A cell whose 27 neighbours hold a source gets a slot: its own eight corner
+// values with all of those sources removed, and the list of them, which the evaluator sums at the
+// dipole directly. Adjacency is decided by the source's cell, floor(s), so every side agrees on
+// every source. Extended cells -1 .. n-1 per axis give each grid point all eight of its cells.
+__device__ __forceinline__ bool adjacent(float p, float s) {
+    const float o = p - floorf(s);
+    return o >= 0.0f && o <= 1.0f;
+}
+
+// A slot's sources are packed one entry each: the position, then the D weight vectors, padded to
+// whole float4s so an entry is a few vector loads.
+template <int D>
+__host__ __device__ constexpr int entry_floats() {
+    return (3 + 3 * D + 3) / 4 * 4;
+}
+
+template <int D>
+__device__ __forceinline__ void load_entry(float (&e)[entry_floats<D>()],
+                                           const float* __restrict__ entries, int k) {
+    const float4* v = reinterpret_cast<const float4*>(entries) +
+                      static_cast<std::int64_t>(k) * (entry_floats<D>() / 4);
+#pragma unroll
+    for (int i = 0; i < entry_floats<D>() / 4; ++i) {
+        const float4 x = __ldg(v + i);
+        e[4 * i] = x.x;
+        e[4 * i + 1] = x.y;
+        e[4 * i + 2] = x.z;
+        e[4 * i + 3] = x.w;
+    }
+}
+
 // E_{p,d} = didt * sum_j m_{p,j} . Q_d(s_{p,j}), one warp per candidate. Q is trilinearly
 // interpolated from the grid's (nx, ny, nz, D, 3) samples, so a corner is one contiguous read of
-// every direction. The per-dipole products are fp32, like the samples they read; the sum over the
-// coil is fp64, because a figure-of-eight coil's two wings cancel in it.
+// every direction, or from the cell's slot, whose sources are then added directly. The per-dipole
+// products are fp32, like the samples they read; the sum over the coil is fp64, because a
+// figure-of-eight coil's two wings cancel in it.
 template <int D>
 __global__ void __launch_bounds__(kBlock)
     adm_evaluate_kernel(const double* __restrict__ frames, int n_frames,
                         const float* __restrict__ coil_pos, const float* __restrict__ coil_mom,
                         int n_dip, const float* __restrict__ q,
-                        const unsigned char* __restrict__ cell_ok, GridGeom g, double didt,
-                        double* __restrict__ out, int* __restrict__ fault) {
+                        const unsigned char* __restrict__ cell_ok,
+                        const int* __restrict__ cell_slot, const float* __restrict__ q_near,
+                        const int* __restrict__ list_ptr, const float* __restrict__ entries,
+                        float near_scale, GridGeom g, double didt, double* __restrict__ out,
+                        int* __restrict__ fault) {
     const int cand = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / kWarp);
     const int lane = static_cast<int>(threadIdx.x % kWarp);
     cuda::std::array<double, D> e;
@@ -181,16 +238,37 @@ __global__ void __launch_bounds__(kBlock)
             float qv[D * 3];
 #pragma unroll
             for (int t = 0; t < D * 3; ++t) qv[t] = 0.0f;
+            const int slot = __ldg(cell_slot + cell);
+            // A slot's eight corners are contiguous, (x, y, z) bit order.
             const float* base =
-                q + i0[0] * sx + i0[1] * sy + static_cast<std::int64_t>(i0[2]) * (3 * D);
+                slot < 0 ? q + i0[0] * sx + i0[1] * sy + static_cast<std::int64_t>(i0[2]) * (3 * D)
+                         : q_near + static_cast<std::int64_t>(slot) * (8 * 3 * D);
+            const std::int64_t cx = slot < 0 ? sx : 4 * 3 * D;
+            const std::int64_t cy = slot < 0 ? sy : 2 * 3 * D;
 #pragma unroll
             for (int corner = 0; corner < 8; ++corner) {
                 const int bx = corner >> 2, by = (corner >> 1) & 1, bz = corner & 1;
                 const float w = (bx ? f[0] : 1.0f - f[0]) * (by ? f[1] : 1.0f - f[1]) *
                                 (bz ? f[2] : 1.0f - f[2]);
-                const float* v = base + bx * sx + by * sy + bz * (3 * D);
+                const float* v = base + bx * cx + by * cy + bz * (3 * D);
 #pragma unroll
                 for (int t = 0; t < D * 3; ++t) qv[t] = fmaf(w, __ldg(v + t), qv[t]);
+            }
+            if (slot >= 0) {
+                const float x = static_cast<float>(i0[0]) + f[0];
+                const float y = static_cast<float>(i0[1]) + f[1];
+                const float z = static_cast<float>(i0[2]) + f[2];
+                float near[D * 3];
+#pragma unroll
+                for (int t = 0; t < D * 3; ++t) near[t] = 0.0f;
+                const int end = __ldg(list_ptr + slot + 1);
+                for (int k = __ldg(list_ptr + slot); k < end; ++k) {
+                    float entry[entry_floats<D>()];
+                    load_entry<D>(entry, entries, k);
+                    add_source<D>(near, x - entry[0], y - entry[1], z - entry[2], entry + 3);
+                }
+#pragma unroll
+                for (int t = 0; t < D * 3; ++t) qv[t] = fmaf(near_scale, near[t], qv[t]);
             }
             const float mx = coil_mom[3 * j], my = coil_mom[3 * j + 1], mz = coil_mom[3 * j + 2];
             float m[3];
@@ -210,6 +288,43 @@ __global__ void __launch_bounds__(kBlock)
 #pragma unroll
         for (int d = 0; d < D; ++d) out[static_cast<std::int64_t>(cand) * D + d] = didt * e[d];
     }
+}
+
+// q_near[slot, corner] = q at the corner minus every source in the slot's entries that the
+// corner's own sample kept, one thread per (slot, corner) from first_slot on. What is left is the
+// field of the sources outside the cell's 27 neighbours.
+template <int D>
+__global__ void __launch_bounds__(kBlock)
+    adm_slot_corners_kernel(const std::int64_t* __restrict__ slot_cells, int first_slot,
+                            int n_slots, const int* __restrict__ list_ptr,
+                            const float* __restrict__ entries, const float* __restrict__ q,
+                            GridGeom g, float scale, float* __restrict__ q_near) {
+    const std::int64_t t = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t n = static_cast<std::int64_t>(n_slots - first_slot) * 8;
+    if (t >= n) return;
+    const int slot = first_slot + static_cast<int>(t / 8);
+    const int corner = static_cast<int>(t % 8);
+    const std::int64_t cell = slot_cells[slot];
+    const std::int64_t ncz = g.n[2] - 1, ncy = g.n[1] - 1;
+    const int ix = static_cast<int>(cell / (ncy * ncz)) + (corner >> 2);
+    const int iy = static_cast<int>((cell / ncz) % ncy) + ((corner >> 1) & 1);
+    const int iz = static_cast<int>(cell % ncz) + (corner & 1);
+    const float px = static_cast<float>(ix), py = static_cast<float>(iy),
+                pz = static_cast<float>(iz);
+    float acc[D * 3];
+#pragma unroll
+    for (int c = 0; c < D * 3; ++c) acc[c] = 0.0f;
+    const int end = list_ptr[slot + 1];
+    for (int k = list_ptr[slot]; k < end; ++k) {
+        float entry[entry_floats<D>()];
+        load_entry<D>(entry, entries, k);
+        if (adjacent(px, entry[0]) && adjacent(py, entry[1]) && adjacent(pz, entry[2])) continue;
+        add_source<D>(acc, px - entry[0], py - entry[1], pz - entry[2], entry + 3);
+    }
+    const float* v = q + ((static_cast<std::int64_t>(ix) * g.n[1] + iy) * g.n[2] + iz) * (3 * D);
+    float* dst = q_near + (static_cast<std::int64_t>(slot) * 8 + corner) * (3 * D);
+#pragma unroll
+    for (int c = 0; c < D * 3; ++c) dst[c] = fmaf(-scale, acc[c], v[c]);
 }
 
 // Marks every grid point some dipole's interpolation would read, for the points a frame needs
@@ -269,6 +384,261 @@ __global__ void __launch_bounds__(kBlock)
     mask[p] = hit;
 }
 
+constexpr int kSampleBlock = 128;
+// Tiles summed in fp32 before each fp64 flush. The field sums every mesh node, and a single fp32
+// running sum over ~10^6 terms carries ~1e-3 of rounding.
+constexpr int kSampleFlush = 16;
+// Grid points each thread carries, which amortises one source tile over K points.
+constexpr int kSamplePoints = 2;
+
+// One block's sampled points: kSampleBlock * K consecutive entries of points, which lie close
+// together, and their bounding box in absolute indices.
+struct SampleBlock {
+    int lo[3];
+    int hi[3];
+};
+
+__device__ __forceinline__ void decode_point(std::int64_t p, const GridGeom& g, int (&i)[3]) {
+    i[2] = static_cast<int>(p % g.n[2]);
+    i[1] = static_cast<int>((p / g.n[2]) % g.n[1]);
+    i[0] = static_cast<int>(p / (static_cast<std::int64_t>(g.n[1]) * g.n[2]));
+}
+
+// A tile source's W then W x (s - o), padded to whole float4s so it is a few vector loads.
+template <int D>
+__host__ __device__ constexpr int wm_vectors() {
+    return (6 * D + 3) / 4;
+}
+
+// The cross product is accumulated as (sum g W) x (p - o) - sum g W x (s - o): six FMAs per set
+// where W x (p - s) takes nine. o is the grid's middle index, so the two terms cancel only by
+// |p - o| / |p - s|, under half the grid in cells since every source within a cell of p is
+// excluded, and a point's value does not depend on which other points share its block. CHECK
+// tests that exclusion, which only tiles near the block need.
+template <int D, int K, bool CHECK>
+__device__ __forceinline__ void sample_tile(int tile, const float4* s_pos, const float4* s_cell,
+                                            const float4 (*s_wm)[wm_vectors<D>()],
+                                            const float (&px)[K], const float (&py)[K],
+                                            const float (&pz)[K], float (&aw)[K][D * 3],
+                                            float (&am)[K][D * 3]) {
+#pragma unroll 2
+    for (int j = 0; j < tile; ++j) {
+        const float4 sp = s_pos[j];
+        float4 sc;
+        if constexpr (CHECK) sc = s_cell[j];
+        float wm[4 * wm_vectors<D>()];
+#pragma unroll
+        for (int v = 0; v < wm_vectors<D>(); ++v) {
+            const float4 x = s_wm[j][v];
+            wm[4 * v] = x.x;
+            wm[4 * v + 1] = x.y;
+            wm[4 * v + 2] = x.z;
+            wm[4 * v + 3] = x.w;
+        }
+#pragma unroll
+        for (int k = 0; k < K; ++k) {
+            const float dx = px[k] - sp.x, dy = py[k] - sp.y, dz = pz[k] - sp.z;
+            const float d2 = fmaf(dx, dx, fmaf(dy, dy, dz * dz));
+            const float inv = rsqrtf(d2);
+            float gw = inv * inv * inv;
+            if constexpr (CHECK) {
+                // An excluded source can sit on the point, where gw is infinite: a select.
+                const bool near = fmaxf(fabsf(px[k] - sc.x),
+                                        fmaxf(fabsf(py[k] - sc.y), fabsf(pz[k] - sc.z))) <= 0.5f;
+                gw = near ? 0.0f : gw;
+            }
+#pragma unroll
+            for (int c = 0; c < D * 3; ++c) {
+                aw[k][c] = fmaf(gw, wm[c], aw[k][c]);
+                am[k][c] = fmaf(gw, wm[3 * D + c], am[k][c]);
+            }
+        }
+    }
+}
+
+// q[point] = scale * sum over sources not in the point's eight cells of W x d / |d|^3. src and w
+// are the sources in grid index units sorted by cell, and tile_box each kSampleBlock-source tile's
+// cell bounding box (lo xyz, hi xyz), so a tile that cannot reach any of the block's points skips
+// the exclusion test. points are flat C-order grid indices.
+template <int D, int K>
+__global__ void __launch_bounds__(kSampleBlock)
+    adm_sample_kernel(const float* __restrict__ src, const float* __restrict__ w, int n_src,
+                      const int* __restrict__ tile_box, const std::int64_t* __restrict__ points,
+                      int n_points, GridGeom g, double scale, float* __restrict__ q) {
+    __shared__ float4 s_pos[kSampleBlock];   // s - o
+    __shared__ float4 s_cell[kSampleBlock];  // floor(s) + 0.5 - o
+    __shared__ float4 s_wm[kSampleBlock][wm_vectors<D>()];
+    __shared__ SampleBlock blk;
+
+    const float o[3] = {static_cast<float>((g.n[0] - 1) / 2), static_cast<float>((g.n[1] - 1) / 2),
+                        static_cast<float>((g.n[2] - 1) / 2)};
+    const int first = blockIdx.x * (kSampleBlock * K);
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < 3; ++i) {
+            blk.lo[i] = INT_MAX;
+            blk.hi[i] = INT_MIN;
+        }
+    }
+    __syncthreads();
+
+    float px[K], py[K], pz[K];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = first + k * kSampleBlock + threadIdx.x;
+        int ip[3];
+        decode_point(points[min(i, n_points - 1)], g, ip);
+        if (i < n_points) {
+            for (int a = 0; a < 3; ++a) {
+                atomicMin(&blk.lo[a], ip[a]);
+                atomicMax(&blk.hi[a], ip[a]);
+            }
+        }
+        px[k] = static_cast<float>(ip[0]) - o[0];
+        py[k] = static_cast<float>(ip[1]) - o[1];
+        pz[k] = static_cast<float>(ip[2]) - o[2];
+    }
+    __syncthreads();
+
+    float aw[K][D * 3], am[K][D * 3];
+    double sum[K][D * 3];
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+#pragma unroll
+        for (int c = 0; c < D * 3; ++c) {
+            aw[k][c] = am[k][c] = 0.0f;
+            sum[k][c] = 0.0;
+        }
+    }
+
+    int tiles = 0;
+    for (int base = 0; base < n_src; base += kSampleBlock) {
+        const int tile = min(kSampleBlock, n_src - base);
+        if (const int i = threadIdx.x; i < tile) {
+            const int j = base + i;
+            const float sx = src[3 * j], sy = src[3 * j + 1], sz = src[3 * j + 2];
+            const float rx = sx - o[0], ry = sy - o[1], rz = sz - o[2];
+            s_pos[i] = make_float4(rx, ry, rz, 0.0f);
+            s_cell[i] = make_float4(floorf(sx) - o[0] + 0.5f, floorf(sy) - o[1] + 0.5f,
+                                    floorf(sz) - o[2] + 0.5f, 0.0f);
+            float wm[4 * wm_vectors<D>()] = {};
+#pragma unroll
+            for (int d = 0; d < D; ++d) {
+                const float* wd = w + (static_cast<std::int64_t>(d) * n_src + j) * 3;
+                const float wx = wd[0], wy = wd[1], wz = wd[2];
+                wm[3 * d] = wx;
+                wm[3 * d + 1] = wy;
+                wm[3 * d + 2] = wz;
+                wm[3 * D + 3 * d] = wy * rz - wz * ry;
+                wm[3 * D + 3 * d + 1] = wz * rx - wx * rz;
+                wm[3 * D + 3 * d + 2] = wx * ry - wy * rx;
+            }
+#pragma unroll
+            for (int v = 0; v < wm_vectors<D>(); ++v) {
+                s_wm[i][v] = make_float4(wm[4 * v], wm[4 * v + 1], wm[4 * v + 2], wm[4 * v + 3]);
+            }
+        }
+        __syncthreads();
+
+        // A source is in one of p's eight cells when floor(s) is p - 1 or p on every axis.
+        const int* box = tile_box + 6 * (base / kSampleBlock);
+        const bool check = box[0] <= blk.hi[0] && box[3] >= blk.lo[0] - 1 &&
+                           box[1] <= blk.hi[1] && box[4] >= blk.lo[1] - 1 &&
+                           box[2] <= blk.hi[2] && box[5] >= blk.lo[2] - 1;
+        if (check) {
+            sample_tile<D, K, true>(tile, s_pos, s_cell, s_wm, px, py, pz, aw, am);
+        } else {
+            sample_tile<D, K, false>(tile, s_pos, s_cell, s_wm, px, py, pz, aw, am);
+        }
+        __syncthreads();
+
+        if (++tiles == kSampleFlush || base + kSampleBlock >= n_src) {
+            tiles = 0;
+#pragma unroll
+            for (int k = 0; k < K; ++k) {
+#pragma unroll
+                for (int d = 0; d < D; ++d) {
+                    const float* a = aw[k] + 3 * d;
+                    const float* m = am[k] + 3 * d;
+                    sum[k][3 * d] += static_cast<double>(a[1] * pz[k] - a[2] * py[k] - m[0]);
+                    sum[k][3 * d + 1] += static_cast<double>(a[2] * px[k] - a[0] * pz[k] - m[1]);
+                    sum[k][3 * d + 2] += static_cast<double>(a[0] * py[k] - a[1] * px[k] - m[2]);
+                }
+#pragma unroll
+                for (int c = 0; c < D * 3; ++c) aw[k][c] = am[k][c] = 0.0f;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int k = 0; k < K; ++k) {
+        const int i = first + k * kSampleBlock + threadIdx.x;
+        if (i < n_points) {
+            float* const dst = q + points[i] * (D * 3);
+#pragma unroll
+            for (int c = 0; c < D * 3; ++c) dst[c] = static_cast<float>(scale * sum[k][c]);
+        }
+    }
+}
+
+// out[i] = scale * sum over every source of W x (p_i - s) / |p_i - s|^3 at arbitrary points, the
+// unapproximated field the grid stands in for. One point per thread against shared source tiles,
+// summed in fp32 per tile run and fp64 across runs, as adm_sample_kernel does.
+template <int D>
+__global__ void __launch_bounds__(kSampleBlock)
+    adm_q_points_kernel(const float* __restrict__ src, const float* __restrict__ w, int n_src,
+                        const float* __restrict__ points, int n_points, double scale,
+                        float* __restrict__ out) {
+    __shared__ float4 s_pos[kSampleBlock];
+    __shared__ float s_w[kSampleBlock][D * 3];
+
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int p = min(i, n_points - 1);
+    const float px = points[3 * p], py = points[3 * p + 1], pz = points[3 * p + 2];
+    float acc[D * 3];
+    double sum[D * 3];
+#pragma unroll
+    for (int c = 0; c < D * 3; ++c) {
+        acc[c] = 0.0f;
+        sum[c] = 0.0;
+    }
+
+    int tiles = 0;
+    for (int base = 0; base < n_src; base += kSampleBlock) {
+        const int tile = min(kSampleBlock, n_src - base);
+        if (const int t = threadIdx.x; t < tile) {
+            const int j = base + t;
+            s_pos[t] = make_float4(src[3 * j], src[3 * j + 1], src[3 * j + 2], 0.0f);
+#pragma unroll
+            for (int d = 0; d < D; ++d) {
+#pragma unroll
+                for (int c = 0; c < 3; ++c) {
+                    s_w[t][3 * d + c] = w[(static_cast<std::int64_t>(d) * n_src + j) * 3 + c];
+                }
+            }
+        }
+        __syncthreads();
+        for (int j = 0; j < tile; ++j) {
+            const float4 sp = s_pos[j];
+            add_source<D>(acc, px - sp.x, py - sp.y, pz - sp.z, s_w[j]);
+        }
+        __syncthreads();
+        if (++tiles == kSampleFlush || base + kSampleBlock >= n_src) {
+            tiles = 0;
+#pragma unroll
+            for (int c = 0; c < D * 3; ++c) {
+                sum[c] += static_cast<double>(acc[c]);
+                acc[c] = 0.0f;
+            }
+        }
+    }
+    if (i < n_points) {
+#pragma unroll
+        for (int c = 0; c < D * 3; ++c) {
+            out[static_cast<std::int64_t>(i) * (D * 3) + c] = static_cast<float>(scale * sum[c]);
+        }
+    }
+}
+
 }  // namespace
 
 void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
@@ -309,20 +679,87 @@ GridGeom grid_geom(const double* origin, const double* spacing, const int* shape
 
 void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_pos,
                          const float* coil_mom, int n_dip, const float* q,
-                         const unsigned char* cell_ok, const double* origin,
-                         const double* spacing, const int* shape, int n_dir, double didt,
-                         double* out, int* fault, cudaStream_t stream) {
+                         const unsigned char* cell_ok, const int* cell_slot, const float* q_near,
+                         const int* list_ptr, const float* entries, double mu0_4pi,
+                         const double* origin, const double* spacing, const int* shape, int n_dir,
+                         double didt, double* out, int* fault, cudaStream_t stream) {
     const GridGeom g = grid_geom(origin, spacing, shape);
     const unsigned blocks = grid_for(static_cast<std::int64_t>(n_frames) * kWarp);
     if (blocks == 0) return;
+    const auto near_scale = static_cast<float>(mu0_4pi / (spacing[0] * spacing[0]));
     if (n_dir == 1) {
         adm_evaluate_kernel<1><<<blocks, kBlock, 0, stream>>>(
-            frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, g, didt, out, fault);
+            frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, cell_slot, q_near, list_ptr,
+            entries, near_scale, g, didt, out, fault);
     } else if (n_dir == 3) {
         adm_evaluate_kernel<3><<<blocks, kBlock, 0, stream>>>(
-            frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, g, didt, out, fault);
+            frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, cell_slot, q_near, list_ptr,
+            entries, near_scale, g, didt, out, fault);
     } else {
         throw std::invalid_argument("adm_evaluate: directions must be 1 or 3");
+    }
+}
+
+void launch_adm_slot_corners(const std::int64_t* slot_cells, int first_slot, int n_slots,
+                             const int* list_ptr, const float* entries, int n_dir, const float* q,
+                             double mu0_4pi, const double* origin, const double* spacing,
+                             const int* shape, float* q_near, cudaStream_t stream) {
+    const GridGeom g = grid_geom(origin, spacing, shape);
+    const auto scale = static_cast<float>(mu0_4pi / (spacing[0] * spacing[0]));
+    const unsigned blocks = grid_for(static_cast<std::int64_t>(n_slots - first_slot) * 8);
+    if (blocks == 0) return;
+    if (n_dir == 1) {
+        adm_slot_corners_kernel<1><<<blocks, kBlock, 0, stream>>>(
+            slot_cells, first_slot, n_slots, list_ptr, entries, q, g, scale, q_near);
+    } else if (n_dir == 3) {
+        adm_slot_corners_kernel<3><<<blocks, kBlock, 0, stream>>>(
+            slot_cells, first_slot, n_slots, list_ptr, entries, q, g, scale, q_near);
+    } else {
+        throw std::invalid_argument("adm_slot_corners: directions must be 1 or 3");
+    }
+}
+
+int adm_sample_tile() { return kSampleBlock; }
+
+void launch_adm_q_points(const float* src, const float* src_w, int n_src, int n_dir,
+                         const float* points, int n_points, double scale, float* out,
+                         cudaStream_t stream) {
+    const unsigned blocks = grid_for(n_points, kSampleBlock);
+    if (blocks == 0) return;
+    if (n_dir == 1) {
+        adm_q_points_kernel<1><<<blocks, kSampleBlock, 0, stream>>>(src, src_w, n_src, points,
+                                                                     n_points, scale, out);
+    } else if (n_dir == 3) {
+        adm_q_points_kernel<3><<<blocks, kSampleBlock, 0, stream>>>(src, src_w, n_src, points,
+                                                                     n_points, scale, out);
+    } else {
+        throw std::invalid_argument("adm_q_points: directions must be 1 or 3");
+    }
+}
+
+int adm_entry_floats(int n_dir) {
+    if (n_dir == 1) return entry_floats<1>();
+    if (n_dir == 3) return entry_floats<3>();
+    throw std::invalid_argument("adm: directions must be 1 or 3");
+}
+
+void launch_adm_sample(const float* src, const float* src_w, int n_src, int n_dir,
+                       const int* tile_box, const std::int64_t* points, int n_points,
+                       double mu0_4pi,
+                       const double* origin, const double* spacing, const int* shape, float* q,
+                       cudaStream_t stream) {
+    const GridGeom g = grid_geom(origin, spacing, shape);
+    const double scale = mu0_4pi / (spacing[0] * spacing[0]);
+    const unsigned blocks = grid_for(n_points, kSampleBlock * kSamplePoints);
+    if (blocks == 0) return;
+    if (n_dir == 1) {
+        adm_sample_kernel<1, kSamplePoints><<<blocks, kSampleBlock, 0, stream>>>(
+            src, src_w, n_src, tile_box, points, n_points, g, scale, q);
+    } else if (n_dir == 3) {
+        adm_sample_kernel<3, kSamplePoints><<<blocks, kSampleBlock, 0, stream>>>(
+            src, src_w, n_src, tile_box, points, n_points, g, scale, q);
+    } else {
+        throw std::invalid_argument("adm_sample: directions must be 1 or 3");
     }
 }
 

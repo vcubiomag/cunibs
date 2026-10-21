@@ -450,7 +450,7 @@ def test_dadt_nbody_matches_analytic_dipoles(cp, stream):
     out = cp.empty((40, 3), dtype=cp.float32)
     dadt_nbody(
         cp.ascontiguousarray(cp.asarray(s.astype(np.float32))),
-        cp.ascontiguousarray(cp.asarray(mp[None])),
+        cp.ascontiguousarray(cp.asarray(mp)),
         cp.ascontiguousarray(cp.asarray((s.astype(np.float32) ** 2).sum(1))),
         cp.ascontiguousarray(cp.asarray(r.astype(np.float32))),
         out,

@@ -141,17 +141,45 @@ void launch_node_gather(const double* corner, const int* ptr, const int* idx, do
 void launch_node_gather3(const double* w_e, const int* ptr, const int* idx, double* node_w,
                           int n_nodes, cudaStream_t stream);
 
-// Candidate evaluation against a sampled reciprocity field. The grid is origin/spacing (metres)
-// and shape (3 ints, host arrays); q is (nx, ny, nz, n_dir, 3) and cell_ok one byte per cell, set
-// when all eight of its corners were sampled. frames are (n_frames, 4, 4) coil-to-head affines
-// with the translation in mm; coil_pos/coil_mom are the coil-frame dipoles in metres. out is
-// (n_frames, n_dir). fault is two device ints the caller sets to n_frames: they receive the lowest
-// candidate with a dipole off the grid, and the lowest with one in an unsampled cell.
+// Candidate evaluation against a sampled reciprocity field. The grid is origin/spacing (metres,
+// equal on every axis) and shape (3 ints, host arrays); q is (nx, ny, nz, n_dir, 3) and cell_ok
+// one byte per cell, set when all eight of its corners were sampled. cell_slot is -1 or the cell's
+// slot: q_near (n_slots, 8, n_dir, 3) holds its corners without the sources in its 27 neighbours,
+// and list_ptr delimits those sources in entries, adm_entry_floats(n_dir) floats each: the
+// position in grid index units, then the n_dir weight vectors. frames are (n_frames, 4, 4)
+// coil-to-head affines with the translation in mm; coil_pos/coil_mom are the coil-frame dipoles in
+// metres. out is (n_frames, n_dir). fault is two device ints the caller sets to n_frames: they
+// receive the lowest candidate with a dipole off the grid, and the lowest with one in an unsampled
+// cell.
 void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_pos,
                          const float* coil_mom, int n_dip, const float* q,
-                         const unsigned char* cell_ok, const double* origin,
-                         const double* spacing, const int* shape, int n_dir, double didt,
-                         double* out, int* fault, cudaStream_t stream);
+                         const unsigned char* cell_ok, const int* cell_slot, const float* q_near,
+                         const int* list_ptr, const float* entries, double mu0_4pi,
+                         const double* origin, const double* spacing, const int* shape, int n_dir,
+                         double didt, double* out, int* fault, cudaStream_t stream);
+// Floats per packed slot entry.
+int adm_entry_floats(int n_dir);
+// Sources per adm_sample tile.
+int adm_sample_tile();
+// Samples the reciprocity field at the flat grid indices points, each from every source outside
+// its eight cells, into q (nx, ny, nz, n_dir, 3). src is (n_src, 3) in grid index units, sorted by
+// cell, and src_w (n_dir, n_src, 3); tile_box is (ceil(n_src / adm_sample_tile()), 6), each tile's
+// floor(src) bounding box as lo xyz then hi xyz. points must be sorted.
+void launch_adm_sample(const float* src, const float* src_w, int n_src, int n_dir,
+                       const int* tile_box, const std::int64_t* points, int n_points,
+                       double mu0_4pi, const double* origin, const double* spacing,
+                       const int* shape, float* q, cudaStream_t stream);
+// out (n_points, n_dir, 3) = scale * sum over every source of W x (p - s) / |p - s|^3, with src
+// (n_src, 3), src_w (n_dir, n_src, 3) and points (n_points, 3) in one frame and unit.
+void launch_adm_q_points(const float* src, const float* src_w, int n_src, int n_dir,
+                         const float* points, int n_points, double scale, float* out,
+                         cudaStream_t stream);
+// Fills q_near for slots first_slot .. n_slots - 1, whose flat cell indices are slot_cells, from
+// q and each slot's entries. The slots' corners must already be sampled.
+void launch_adm_slot_corners(const std::int64_t* slot_cells, int first_slot, int n_slots,
+                             const int* list_ptr, const float* entries, int n_dir, const float* q,
+                             double mu0_4pi, const double* origin, const double* spacing,
+                             const int* shape, float* q_near, cudaStream_t stream);
 // Sets need[p] = 1 for every grid point some dipole's interpolation reads.
 void launch_adm_mark(const double* frames, int n_frames, const float* coil_pos, int n_dip,
                      const double* origin, const double* spacing, const int* shape,

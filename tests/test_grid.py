@@ -51,16 +51,6 @@ def test_points_m_matches_c_order_reshape(cp, dipole_cloud):
         np.testing.assert_allclose(pts[k], origin + spacing * np.asarray(ijk), atol=1e-15)
 
 
-def test_center_m_is_the_geometric_center(cp, dipole_cloud):
-    grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
-    pts = grid.points_m()
-    np.testing.assert_allclose(
-        cp.asnumpy(grid.center_m),
-        0.5 * (cp.asnumpy(pts[0]) + cp.asnumpy(pts[-1])),
-        atol=1e-15,
-    )
-
-
 def test_world_to_index_roundtrip_is_integral(cp, dipole_cloud):
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
     idx = cp.asnumpy(grid.world_to_index(grid.points_m()))

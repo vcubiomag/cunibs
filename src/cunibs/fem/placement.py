@@ -185,7 +185,7 @@ def coil_dadt_at_nodes(
     # inside float32 range.
     s = s.astype(DADT_COMPUTE_DTYPE)
     r = _centred_m(target_nodes_mm, o)
-    mp = mp.astype(DADT_COMPUTE_DTYPE)[None]
+    mp = cp.ascontiguousarray(mp.astype(DADT_COMPUTE_DTYPE))
     sn = cp.ascontiguousarray((s * s).sum(1))
 
     stream = cp.cuda.get_current_stream().ptr

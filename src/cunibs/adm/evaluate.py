@@ -11,7 +11,7 @@ from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.place import place_coil_dipoles_batch
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.simulation import Placement
-from cunibs.solver import adm_evaluate, adm_mark, dadt_nbody
+from cunibs.solver import adm_evaluate, adm_mark, adm_q_points
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -108,10 +108,11 @@ def _evaluate_native(
 ) -> cp.ndarray:
     """Target E-vectors ``(P, D)`` for ``frames``, sampling any cell a frame needs that is not yet.
 
-    One warp per candidate transforms the coil, interpolates every direction at each dipole and
-    reduces the dot products, all on chip. A dipole in a cell the coverage did not sample is
-    reported rather than read; its frame's points are then sampled and the call re-run, so a frame
-    outside the coverage costs its own sampling once and is never answered from zeros.
+    One warp per candidate transforms the coil, interpolates every direction at each dipole, adds
+    the mesh nodes near it directly and reduces the dot products, all on chip. A dipole in a cell
+    the coverage did not sample is reported rather than read; its frame's points are then sampled
+    and the call re-run, so a frame outside the coverage costs its own sampling once and is never
+    answered from zeros.
     """
     grid = recip.grid
     frames = cp.ascontiguousarray(frames, dtype=cp.float64).reshape(-1, 4, 4)
@@ -134,6 +135,11 @@ def _evaluate_native(
             mom,
             q,
             recip.cell_ok,
+            recip.cell_slot,
+            recip.q_near.reshape(-1),
+            recip.list_ptr,
+            recip.entries.reshape(-1),
+            MU0_OVER_4PI,
             origin,
             spacing,
             shape,
@@ -200,13 +206,13 @@ def evaluate_exact(
     coil: Coil,
     placements: Placement | Sequence[Placement],
     didt: float = 1e6,
-    center_m: cp.ndarray | None = None,
 ) -> cp.ndarray:
     """Same functional as :func:`evaluate` but with ``Q`` evaluated exactly at each dipole (no grid).
 
     Isolates the grid-interpolation error: this is the auxiliary-dipole method *without* the
     auxiliary grid, so it must agree with the exact reciprocity functional to float32 precision.
-    ``Q(s_j) = dadt_nbody(sources=mesh nodes, moments=W_n, targets=s_j)``.
+    ``Q(s_j)`` sums every mesh node at the placed dipole, with coordinates centred on the dipoles
+    so the short distances keep their digits.
 
     ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
     """
@@ -216,25 +222,19 @@ def evaluate_exact(
     s, m = _placed_dipoles(ctx, coil, pls)  # (P,N,3)
     p, n, _ = s.shape
 
-    center = cp.zeros(3) if center_m is None else cp.asarray(center_m, dtype=cp.float64)
+    center = s.reshape(-1, 3).mean(axis=0)
     src = cp.ascontiguousarray(
         ((cp.asarray(ctx.nodes_mm) * 1e-3) - center[None, :]).astype(cp.float32)
     )
-    sn = cp.ascontiguousarray((src * src).sum(1))
     tgt = cp.ascontiguousarray((s.reshape(-1, 3) - center[None, :]).astype(cp.float32))
-
     n_dir = int(adjoint.node_weights.shape[0])
-    w = adjoint.node_weights.astype(cp.float32)
-    mp = cp.ascontiguousarray(cp.concatenate([w, cp.cross(w, src[None])], axis=2))
     out = cp.empty((p * n, n_dir, 3), dtype=cp.float32)
-    dadt_nbody(
+    adm_q_points(
         src,
-        mp,
-        sn,
+        cp.ascontiguousarray(adjoint.node_weights.astype(cp.float32)),
         tgt,
-        out.reshape(p * n, -1),
-        1.0,
         MU0_OVER_4PI,
+        out.reshape(p * n, -1),
         cp.cuda.get_current_stream().ptr,
     )
     dipole_q = out.transpose(1, 0, 2).astype(cp.float64)

@@ -28,8 +28,7 @@ class Grid:
     """Axis-aligned regular grid in metres.
 
     ``origin_m`` is the coordinate of index ``(0,0,0)``, ``spacing_m`` the per-axis step, and
-    ``shape`` the number of samples per axis. Coordinates are stored absolute (uncentred); callers
-    that run the N-body in float32 should subtract :attr:`center_m` from both sources and samples.
+    ``shape`` the number of samples per axis.
     """
 
     origin_m: cp.ndarray  # (3,) float64
@@ -51,10 +50,6 @@ class Grid:
     def upper_m(self) -> cp.ndarray:
         """Coordinate of the last sample on each axis (the inclusive upper corner)."""
         return self.origin_m + self.spacing_m * self.max_index
-
-    @property
-    def center_m(self) -> cp.ndarray:
-        return 0.5 * (self.origin_m + self.upper_m)
 
     def points_m(self) -> cp.ndarray:
         """All grid points as ``(n_points, 3)`` in C order (matches ``reshape(shape+(3,))``)."""

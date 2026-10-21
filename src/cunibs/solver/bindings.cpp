@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 
 #include "amg/aggregate.hpp"
@@ -31,6 +32,7 @@ using f64_2d = Dev<double, -1, -1>;
 using f32_1d = Dev<float, -1>;
 using f32_2d = Dev<float, -1, -1>;
 using i32_1d = Dev<int32_t, -1>;
+using i64_1d = Dev<int64_t, -1>;
 using u8_1d = Dev<uint8_t, -1>;
 using u8_2d = Dev<uint8_t, -1, -1>;
 // Per-row 3-vectors: node coordinates, fields, triangle corners.
@@ -44,6 +46,8 @@ using TriVerts = Dev<double, -1, 3, 3>;
 using Frames = Dev<double, -1, 4, 4>;
 // An interleaved (n_nodes, k, 3) nodal block.
 using Interleaved = Dev<float, -1, -1, 3>;
+// Per-set source weights (n_sets, n_src, 3).
+using SetRows3f = Dev<float, -1, -1, 3>;
 
 namespace {
 
@@ -100,6 +104,30 @@ GridArgs grid_args(const std::vector<double>& origin, const std::vector<double>&
         g.shape[i] = shape[i];
     }
     return g;
+}
+
+// The ADM sampling and near-source kernels work in grid index units and scale by 1 / spacing^2,
+// which needs the same spacing on every axis.
+GridArgs isotropic_grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
+                             const std::vector<int>& shape, const char* what) {
+    const GridArgs g = grid_args(origin, spacing, shape);
+    require(g.spacing[1] == g.spacing[0] && g.spacing[2] == g.spacing[0],
+            (std::string(what) + ": the grid spacing must be equal on every axis").c_str());
+    return g;
+}
+
+void require_sources(const Rows3f& src, const SetRows3f& src_w, int n_dir, const char* what) {
+    require(static_cast<int>(src_w.shape(0)) == n_dir && src_w.shape(1) == src.shape(0),
+            (std::string(what) + ": src_w must be (n_dir, n_src, 3)").c_str());
+}
+
+void require_slots(const i32_1d& list_ptr, std::size_t n_slots, const f32_1d& q_near,
+                   const f32_1d& entries, int n_dir, const char* what) {
+    const std::size_t width = static_cast<std::size_t>(adm_entry_floats(n_dir));
+    require(list_ptr.shape(0) == n_slots + 1 && q_near.shape(0) == n_slots * 8 * n_dir * 3 &&
+                entries.shape(0) % width == 0 &&
+                reinterpret_cast<std::uintptr_t>(entries.data()) % 16 == 0,
+            (std::string(what) + ": list_ptr, q_near and entries must match the slots").c_str());
 }
 
 // A host-to-host copy run in stream order by the CUDA driver's own callback thread, which is what
@@ -310,28 +338,27 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "dadt_nbody",
-        [](const Rows3f& s, const Dev<float, -1, -1, 6>& mp, const f32_1d& sn, const Rows3f& r,
+        [](const Rows3f& s, const Dev<float, -1, 6>& mp, const f32_1d& sn, const Rows3f& r,
            const f32_2d& out, float didt, float mu0_4pi, uintptr_t stream, int column) {
-            const std::size_t n_sets = mp.shape(0);
             const std::size_t n_dip = s.shape(0);
             const std::size_t n_nodes = r.shape(0);
             const int stride = static_cast<int>(out.shape(1));
-            require(mp.shape(1) == n_dip && sn.shape(0) == n_dip,
+            require(mp.shape(0) == n_dip && sn.shape(0) == n_dip,
                     "dadt_nbody: s, mp and sn must have one entry per dipole");
             require(out.shape(0) == n_nodes && stride % 3 == 0 && column >= 0 &&
-                        3 * (column + static_cast<int>(n_sets)) <= stride,
-                    "dadt_nbody: out must be (n_nodes, 3k) with room for n_sets sets at column");
+                        3 * (column + 1) <= stride,
+                    "dadt_nbody: out must be (n_nodes, 3k) with room for column");
             launch_dadt(s.data(), mp.data(), sn.data(), r.data(), out.data() + 3 * column, stride,
-                        static_cast<int>(n_sets), static_cast<int>(n_dip),
-                        static_cast<int>(n_nodes), didt, mu0_4pi, as_stream(stream));
+                        static_cast<int>(n_dip), static_cast<int>(n_nodes), didt, mu0_4pi,
+                        as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
         nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
         nb::arg("stream"), nb::arg("column") = 0,
-        "Fused dA/dt at nodes from placed magnetic dipoles, for 1 or 3 moment sets over shared "
-        "positions: mp is (n_sets, n_dip, 6). out is (n_nodes, 3k), an interleaved (n_nodes, k, 3) "
-        "block, and the sets fill columns column .. column + n_sets - 1.");
+        "Fused dA/dt at nodes from placed magnetic dipoles: mp is (n_dip, 6), each moment then its "
+        "cross product with the position. out is (n_nodes, 3k), an interleaved (n_nodes, k, 3) "
+        "block, and the field fills column column.");
 
     m.def(
         "dadt_node_to_element_block",
@@ -794,33 +821,120 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "adm_evaluate",
         [](const Frames& frames, const Rows3f& coil_pos, const Rows3f& coil_mom, const f32_1d& q,
-           const u8_1d& cell_ok, const std::vector<double>& origin,
-           const std::vector<double>& spacing, const std::vector<int>& shape, int n_dir,
-           double didt, const f64_2d& out, const i32_1d& fault, uintptr_t stream) {
-            const GridArgs g = grid_args(origin, spacing, shape);
+           const u8_1d& cell_ok, const i32_1d& cell_slot, const f32_1d& q_near,
+           const i32_1d& list_ptr, const f32_1d& entries, double mu0_4pi,
+           const std::vector<double>& origin, const std::vector<double>& spacing,
+           const std::vector<int>& shape, int n_dir, double didt, const f64_2d& out,
+           const i32_1d& fault, uintptr_t stream) {
+            const GridArgs g = isotropic_grid_args(origin, spacing, shape, "adm_evaluate");
             const std::size_t n_frames = frames.shape(0);
             const std::int64_t n_cells =
                 static_cast<std::int64_t>(shape[0] - 1) * (shape[1] - 1) * (shape[2] - 1);
             require(coil_mom.shape(0) == coil_pos.shape(0) &&
                         static_cast<std::int64_t>(q.shape(0)) == g.points() * n_dir * 3 &&
                         static_cast<std::int64_t>(cell_ok.shape(0)) == n_cells &&
+                        static_cast<std::int64_t>(cell_slot.shape(0)) == n_cells &&
                         out.shape(0) == n_frames && static_cast<int>(out.shape(1)) == n_dir &&
                         fault.shape(0) == 2,
                     "adm_evaluate: shape mismatch");
+            require_slots(list_ptr, list_ptr.shape(0) - 1, q_near, entries, n_dir,
+                          "adm_evaluate");
             launch_adm_evaluate(frames.data(), static_cast<int>(n_frames), coil_pos.data(),
                                 coil_mom.data(), static_cast<int>(coil_pos.shape(0)), q.data(),
-                                cell_ok.data(), g.origin, g.spacing, g.shape, n_dir, didt,
-                                out.data(), fault.data(), as_stream(stream));
+                                cell_ok.data(), cell_slot.data(), q_near.data(), list_ptr.data(),
+                                entries.data(), mu0_4pi, g.origin, g.spacing, g.shape, n_dir,
+                                didt, out.data(), fault.data(), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(),
         nb::arg("coil_mom").noconvert(), nb::arg("q").noconvert(), nb::arg("cell_ok").noconvert(),
+        nb::arg("cell_slot").noconvert(), nb::arg("q_near").noconvert(),
+        nb::arg("list_ptr").noconvert(), nb::arg("entries").noconvert(), nb::arg("mu0_4pi"),
         nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("n_dir"),
         nb::arg("didt"), nb::arg("out").noconvert(), nb::arg("fault").noconvert(),
         nb::arg("stream"),
         "Target E-vectors (n_frames, n_dir) of coil frames against a sampled reciprocity field. "
-        "fault (2 ints the caller sets to n_frames) receives the lowest candidate off the grid "
-        "and the lowest reading an unsampled cell.");
+        "A cell with a slot (cell_slot >= 0) interpolates its own corners q_near and adds the "
+        "sources list_ptr delimits in entries (adm_entry_floats(n_dir) floats each: position in "
+        "grid index units, then the weights) directly. fault (2 ints the caller sets to "
+        "n_frames) receives the lowest candidate off the grid and the lowest reading an "
+        "unsampled cell.");
+
+    m.def(
+        "adm_sample",
+        [](const Rows3f& src, const SetRows3f& src_w, const Dev<int32_t, -1, 6>& tile_box,
+           const i64_1d& points, double mu0_4pi, const std::vector<double>& origin,
+           const std::vector<double>& spacing, const std::vector<int>& shape, const f32_1d& q,
+           uintptr_t stream) {
+            const GridArgs g = isotropic_grid_args(origin, spacing, shape, "adm_sample");
+            const int n_dir = static_cast<int>(src_w.shape(0));
+            require(static_cast<std::int64_t>(q.shape(0)) == g.points() * n_dir * 3,
+                    "adm_sample: q must be (nx * ny * nz * n_dir * 3,)");
+            require_sources(src, src_w, n_dir, "adm_sample");
+            const std::size_t tile = static_cast<std::size_t>(adm_sample_tile());
+            require(tile_box.shape(0) == (src.shape(0) + tile - 1) / tile,
+                    "adm_sample: tile_box must have one row per source tile");
+            launch_adm_sample(src.data(), src_w.data(), static_cast<int>(src.shape(0)), n_dir,
+                              tile_box.data(), points.data(), static_cast<int>(points.shape(0)),
+                              mu0_4pi, g.origin, g.spacing, g.shape, q.data(), as_stream(stream));
+        },
+        nb::call_guard<nb::gil_scoped_release>(),
+        nb::arg("src").noconvert(), nb::arg("src_w").noconvert(),
+        nb::arg("tile_box").noconvert(), nb::arg("points").noconvert(), nb::arg("mu0_4pi"),
+        nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("q").noconvert(),
+        nb::arg("stream"),
+        "Samples the reciprocity field at the sorted flat grid indices points into q, each point "
+        "from every source (grid index units, sorted by cell) outside its eight cells. tile_box "
+        "holds each adm_sample_tile()-source tile's floor(src) box, lo xyz then hi xyz.");
+
+    m.def("adm_sample_tile", &adm_sample_tile, "Sources per adm_sample tile.");
+
+    m.def(
+        "adm_q_points",
+        [](const Rows3f& src, const SetRows3f& src_w, const Rows3f& points, double scale,
+           const f32_2d& out, uintptr_t stream) {
+            const int n_dir = static_cast<int>(src_w.shape(0));
+            require_sources(src, src_w, n_dir, "adm_q_points");
+            require(out.shape(0) == points.shape(0) &&
+                        static_cast<int>(out.shape(1)) == 3 * n_dir,
+                    "adm_q_points: out must be (n_points, 3 * n_dir)");
+            launch_adm_q_points(src.data(), src_w.data(), static_cast<int>(src.shape(0)), n_dir,
+                                points.data(), static_cast<int>(points.shape(0)), scale,
+                                out.data(), as_stream(stream));
+        },
+        nb::call_guard<nb::gil_scoped_release>(),
+        nb::arg("src").noconvert(), nb::arg("src_w").noconvert(), nb::arg("points").noconvert(),
+        nb::arg("scale"), nb::arg("out").noconvert(), nb::arg("stream"),
+        "out (n_points, 3 * n_dir) = scale * sum over every source of W x (p - s) / |p - s|^3, "
+        "with src, src_w (n_dir, n_src, 3) and points in one frame and unit.");
+
+    m.def(
+        "adm_slot_corners",
+        [](const i64_1d& slot_cells, int first_slot, const i32_1d& list_ptr,
+           const f32_1d& entries, int n_dir, const f32_1d& q, double mu0_4pi,
+           const std::vector<double>& origin, const std::vector<double>& spacing,
+           const std::vector<int>& shape, const f32_1d& q_near, uintptr_t stream) {
+            const GridArgs g = isotropic_grid_args(origin, spacing, shape, "adm_slot_corners");
+            const std::size_t n_slots = slot_cells.shape(0);
+            require(static_cast<std::int64_t>(q.shape(0)) == g.points() * n_dir * 3 &&
+                        first_slot >= 0 && static_cast<std::size_t>(first_slot) <= n_slots,
+                    "adm_slot_corners: shape mismatch");
+            require_slots(list_ptr, n_slots, q_near, entries, n_dir, "adm_slot_corners");
+            launch_adm_slot_corners(slot_cells.data(), first_slot, static_cast<int>(n_slots),
+                                    list_ptr.data(), entries.data(), n_dir, q.data(), mu0_4pi,
+                                    g.origin, g.spacing, g.shape, q_near.data(),
+                                    as_stream(stream));
+        },
+        nb::call_guard<nb::gil_scoped_release>(),
+        nb::arg("slot_cells").noconvert(), nb::arg("first_slot"), nb::arg("list_ptr").noconvert(),
+        nb::arg("entries").noconvert(), nb::arg("n_dir"), nb::arg("q").noconvert(),
+        nb::arg("mu0_4pi"), nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"),
+        nb::arg("q_near").noconvert(), nb::arg("stream"),
+        "Fills q_near (n_slots, 8, n_dir, 3) from first_slot on: each slot cell's sampled corners "
+        "less its entries' sources that the corner's own sample kept.");
+
+    m.def("adm_entry_floats", &adm_entry_floats, nb::arg("n_dir"),
+          "Floats per packed ADM slot entry for n_dir weight sets.");
 
     m.def(
         "adm_mark",

@@ -87,7 +87,7 @@ def test_qfield_reformulation_and_grid_interp(cp, cube_mesh, coil):
     pl = Placement(CENTER, HANDLE, DIST)
 
     grid = grid_for_placements(ctx, coil, [pl], spacing_mm=2.0, margin_mm=8.0)
-    e_exact = cp.asnumpy(evaluate_exact(adj, coil, pl, DIDT, center_m=grid.center_m))
+    e_exact = cp.asnumpy(evaluate_exact(adj, coil, pl, DIDT))
     np.testing.assert_allclose(e_exact, j, rtol=1e-3, atol=1e-3)
 
     recip = sample_qfield(adj, grid)
@@ -544,14 +544,67 @@ def test_grid_interpolation_error_converges(
         grid = grid_for_placements(
             ctx, d70_coil, [patch_placement], spacing_mm=spacing, margin_mm=8.0
         )
-        exact = cp.asnumpy(
-            evaluate_exact(adj, d70_coil, patch_placement, DIDT, center_m=grid.center_m)
-        )
+        exact = cp.asnumpy(evaluate_exact(adj, d70_coil, patch_placement, DIDT))
         approx = cp.asnumpy(evaluate(sample_qfield(adj, grid), d70_coil, patch_placement, DIDT))
         errors.append(float(np.linalg.norm(approx - exact) / np.linalg.norm(exact)))
 
     assert errors[0] > errors[1] > errors[2], errors
     assert errors[-1] <= 3e-3, errors
+
+
+@pytest.mark.realmesh
+def test_dipoles_beside_the_scalp_with_a_grid_point_on_a_node(
+    cp, patch_subject, patch_target, patch_top_mm
+):
+    """A grid point 10 nm from a scalp node and a dipole pair 1 mm above it, against exact.
+
+    The field is singular at every node, so that point's full sample would be ~1e10 times the
+    field at the dipoles, and 3 mm cells interpolate a 1 mm neighbourhood badly even without it.
+    The pair's opposed moments cancel the smooth far field, as an auxiliary-dipole coil's do, so
+    what is left is mostly the near field; the error is taken against one dipole's own.
+    """
+    from cunibs.adm.evaluate import evaluate_frames
+    from cunibs.adm.grid import build_grid
+    from cunibs.adm.reciprocity import exact_functional, sample_qfield, solve_adjoint
+    from cunibs.adm.target import Target, resolve_target
+    from cunibs.coil import Coil
+    from cunibs.fem.placement import coil_dadt_at_nodes
+
+    ctx = patch_subject.context
+    adj = solve_adjoint(ctx, resolve_target(ctx, Target(patch_target, region="gray_matter")))
+    node_m = cp.asarray(patch_top_mm * 1e-3)
+    grid = build_grid(node_m[None], spacing_mm=3.0, margin_mm=8.0)
+    nearest = (
+        grid.origin_m + cp.rint((node_m - grid.origin_m) / grid.spacing_m) * grid.spacing_m
+    )
+    grid.origin_m = grid.origin_m + (node_m - nearest) + 1e-8
+    recip = sample_qfield(adj, grid)
+
+    coil = Coil(
+        np.array([[-1e-3, 0.0, 0.0], [1e-3, 0.0, 0.0]]),
+        np.array([[0.6, -0.3, 0.74], [-0.6, 0.3, -0.74]]),
+    )
+    offsets = [(dx, dy, h) for dx in (-0.7, 0.0, 0.9) for dy in (-0.4, 0.5) for h in (0.6, 1.0)]
+    frames = np.repeat(np.eye(4)[None], len(offsets), axis=0)
+    frames[:, :3, 3] = patch_top_mm + np.asarray(offsets)
+
+    def exact(c):
+        return np.stack(
+            [
+                cp.asnumpy(
+                    exact_functional(
+                        adj.node_weights,
+                        coil_dadt_at_nodes(c.positions_m, c.moments, f, DIDT, ctx.nodes_mm),
+                    )
+                )
+                for f in frames
+            ]
+        )
+
+    approx = evaluate_frames(recip, coil, frames, DIDT)
+    one = Coil(coil.positions_m[:1], coil.moments[:1])
+    err = np.linalg.norm(approx - exact(coil), axis=1) / np.linalg.norm(exact(one), axis=1)
+    assert err.max() <= 1.5e-2, err
 
 
 @pytest.mark.realmesh
@@ -667,3 +720,50 @@ def test_masked_sampling_matches_the_full_box_and_fills_off_coverage_frames(
     assert int(masked.sampled.sum()) > before, (
         "the tilted frames needed points the coverage skipped"
     )
+
+
+def test_binned_sources_on_a_fine_grid_match_numpy(cp):
+    """The node CSR and near-cell mask over 12M extended cells at 1.5 mm, against numpy.
+
+    That is the cell count of a 1.5 mm grid over a head, enough for the CUB histogram behind
+    cp.bincount to write out of bounds on an A100. Some of the nodes fall outside the extended
+    cells.
+    """
+    from types import SimpleNamespace
+
+    from cunibs.adm.grid import Grid
+    from cunibs.adm.reciprocity import _binned_sources
+
+    rng = np.random.default_rng(3)
+    shape = (226, 231, 228)
+    spacing_m = 1.5e-3
+    origin = np.array([-0.171, -0.118, -0.093])
+    span = (np.array(shape) - 1) * spacing_m
+    nodes_mm = (origin + rng.uniform(-0.03, 1.03, size=(900_000, 3)) * span) * 1e3
+    weights = rng.standard_normal((3, nodes_mm.shape[0], 3))
+    adjoint = SimpleNamespace(
+        ctx=SimpleNamespace(nodes_mm=nodes_mm), node_weights=cp.asarray(weights)
+    )
+    grid = Grid(origin_m=cp.asarray(origin), spacing_m=cp.full(3, spacing_m), shape=shape)
+    src, src_w, cell_ptr, _, cell_near = _binned_sources(adjoint, grid)
+
+    idx = ((nodes_mm * 1e-3 - origin) / spacing_m).astype(np.float32)
+    ext = np.floor(idx).astype(np.int64) + 1
+    n_ext = np.array(shape) + 1
+    inside = ((ext >= 0) & (ext < n_ext)).all(axis=1)
+    assert 0.05 < 1.0 - inside.mean() < 0.2
+    n_cells = int(np.prod(n_ext))
+    flat = np.where(inside, (ext[:, 0] * n_ext[1] + ext[:, 1]) * n_ext[2] + ext[:, 2], n_cells)
+    order = np.argsort(flat, kind="stable")
+    counts = np.bincount(flat, minlength=n_cells + 1)[:n_cells]
+    np.testing.assert_array_equal(
+        cp.asnumpy(cell_ptr), np.concatenate([[0], np.cumsum(counts)])
+    )
+    np.testing.assert_array_equal(cp.asnumpy(src), idx[order])
+    np.testing.assert_array_equal(cp.asnumpy(src_w), weights.astype(np.float32)[:, order])
+
+    occupied = (counts > 0).reshape(tuple(n_ext))
+    near = occupied[:-2] | occupied[1:-1] | occupied[2:]
+    near = near[:, :-2] | near[:, 1:-1] | near[:, 2:]
+    near = near[:, :, :-2] | near[:, :, 1:-1] | near[:, :, 2:]
+    np.testing.assert_array_equal(cp.asnumpy(cell_near), near.astype(np.uint8).ravel())

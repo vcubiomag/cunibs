@@ -8,7 +8,7 @@
 // (n_sets, n_dip, 6), and set d of node n lands at out[n * out_stride + 3 d]. out_stride is 3 for
 // a plain (n, 3) field, 3k to write one placement's column of an interleaved (n, k, 3) block.
 void launch_dadt(const float* s, const float* mp, const float* sn, const float* r, float* out,
-                 int out_stride, int n_sets, int n_dip, int n_nodes, float didt, float mu0_4pi,
+                 int out_stride, int n_dip, int n_nodes, float didt, float mu0_4pi,
                  cudaStream_t stream);
 
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
