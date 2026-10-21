@@ -162,11 +162,8 @@ def _stiffness(ctx: SolverContext):
     """The reduced stiffness as an fp32 CSR, for the basis's energy inner products."""
     import cupyx.scipy.sparse as csp
 
-    solver = ctx.solver
-    n = int(solver.idx.shape[0])
-    return csp.csr_matrix(
-        (solver.values.astype(cp.float32), solver.col_idx, solver.row_ptr), shape=(n, n)
-    )
+    a = ctx.solver.matrix()
+    return csp.csr_matrix((a.data.astype(cp.float32), a.indices, a.indptr), shape=a.shape)
 
 
 def ensure_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepBasis:

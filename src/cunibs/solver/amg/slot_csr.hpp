@@ -20,6 +20,11 @@ void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
                          const std::int16_t* cols, const double* src, double* dst,
                          cudaStream_t stream);
 
+// col_idx and values (row_ptr's entries) from the slot form, either of which may be null: the
+// inverse of the fill and of launch_slot_scatter.
+void launch_slot_gather(int n, const int* row_ptr, const int* slot_ptr, const std::int16_t* cols,
+                        const double* src, int* col_idx, double* values, cudaStream_t stream);
+
 // An operator affine in per-column coefficients, laid out for the affine SpMV (cg_kernels.hpp):
 // every row's entries regrouped into one segment per part that has a nonzero there, each in
 // column order and in slots.
@@ -48,3 +53,12 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
 // aw_t[t * n_s + s] = the sum of part t's entries in row rows[s], in entry order.
 void launch_term_row_sums(int n_s, const int* rows, const int* row_ptr, const double* term_vals,
                           int nnz, int n_terms, double* aw_t, cudaStream_t stream);
+
+// out (row_ptr's entries) = sum_t sigma[t] A_t, sigma a device array of terms.n_terms.
+void launch_affine_values(int n, const int* row_ptr, const int* slot_ptr,
+                          const std::int16_t* slot_cols, const AffineSlots& terms,
+                          const double* sigma, double* out, cudaStream_t stream);
+
+// y (n, m) = A_t x for one part t and row-major (n, m) x.
+void launch_affine_term_matmul(int n, const AffineSlots& terms, int term, const double* x,
+                               double* y, int m, cudaStream_t stream);

@@ -94,29 +94,68 @@ void PcgAmgSolver::update_values(const double* values, cudaStream_t stream) {
     deflation_from_values(stream);
 }
 
-void PcgAmgSolver::set_affine_terms(int n_terms, const double* term_values,
-                                    cudaStream_t stream) {
-    const std::lock_guard lock(mutex_);
-    affine_ = build_affine_slots(n_, nnz_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(),
-                                 term_values, n_terms, stream, "solver");
-    affine_aw_t_ =
-        alloc<double>(static_cast<size_t>(n_terms) * std::max(defl_n_, 1), "affine aw_t");
-    launch_term_row_sums(defl_n_, defl_rows_.get(), row_ptr_.get(), term_values, nnz_, n_terms,
-                         affine_aw_t_.get(), stream);
-    affine_sigma_ = alloc<double>(static_cast<size_t>(kMaxStageBlock) * n_terms, "affine sigma");
-    affine_graph_.clear();
+// The solver's pattern and deflation rows are fixed at construction, so the parts built here stay
+// valid against it for both objects' lifetimes.
+AffineTerms::AffineTerms(const PcgAmgSolver& solver, int n_terms, const double* term_values,
+                         cudaStream_t stream)
+    : solver_(&solver),
+      n_(solver.n_),
+      slots_(build_affine_slots(solver.n_, solver.nnz_, solver.row_ptr_.get(),
+                                solver.slots_.ptr.get(), solver.slots_.cols.get(), term_values,
+                                n_terms, stream, "affine terms")) {
+    aw_t_ = alloc<double>(static_cast<size_t>(n_terms) * std::max(solver.defl_n_, 1),
+                          "affine aw_t");
+    launch_term_row_sums(solver.defl_n_, solver.defl_rows_.get(), solver.row_ptr_.get(),
+                         term_values, solver.nnz_, n_terms, aw_t_.get(), stream);
+    sigma_ = alloc<double>(static_cast<size_t>(kMaxStageBlock) * n_terms, "affine sigma");
     check_cuda(cudaGetLastError(), "affine terms");
     check_cuda(cudaStreamSynchronize(stream), "sync(affine terms)");
 }
 
-void PcgAmgSolver::apply_operator(int k, bool affine, const double* x, double* y,
+void AffineTerms::values(const double* sigma, double* out, cudaStream_t stream) const {
+    const int t = slots_.n_terms;
+    // A copy from pageable memory has read sigma by the time it returns, so the caller's array
+    // need not outlive the call.
+    const ScratchBuffer<double> d_sigma =
+        scratch_alloc<double>(static_cast<size_t>(t), stream, "affine terms", "sigma");
+    check_cuda(cudaMemcpyAsync(d_sigma.get(), sigma, t * sizeof(double), cudaMemcpyHostToDevice,
+                               stream),
+               "copy(values sigma)");
+    const PcgAmgSolver& s = *solver_;
+    launch_affine_values(s.n_, s.row_ptr_.get(), s.slots_.ptr.get(), s.slots_.cols.get(), slots_,
+                         d_sigma.get(), out, stream);
+    check_cuda(cudaGetLastError(), "affine values");
+}
+
+void AffineTerms::matmul(int term, const double* x, double* y, int m, cudaStream_t stream) const {
+    if (term < 0 || term >= slots_.n_terms) {
+        throw std::invalid_argument("AffineTerms::matmul: no such term");
+    }
+    launch_affine_term_matmul(n_, slots_, term, x, y, m, stream);
+    check_cuda(cudaGetLastError(), "affine term matmul");
+}
+
+void PcgAmgSolver::export_csr(int* row_ptr, int* col_idx, double* values, cudaStream_t stream) {
+    const std::lock_guard lock(mutex_);
+    check_cuda(cudaMemcpyAsync(row_ptr, row_ptr_.get(),
+                               (static_cast<size_t>(n_) + 1) * sizeof(int),
+                               cudaMemcpyDeviceToDevice, stream),
+               "copy(export row_ptr)");
+    if (col_idx != nullptr || values != nullptr) {
+        launch_slot_gather(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values_.get(),
+                           col_idx, values, stream);
+    }
+    check_cuda(cudaGetLastError(), "export csr");
+}
+
+void PcgAmgSolver::apply_operator(int k, const AffineTerms* terms, const double* x, double* y,
                                   cudaStream_t stream) {
-    if (affine) {
-        const AffineOperator op{affine_.n_terms,         affine_.order.get(),
-                                affine_.seg_ptr.get(),   affine_.seg_start.get(),
-                                affine_.seg_term.get(),  affine_.cols.get(),
-                                affine_.vals.get()};
-        launch_affine_spmv_block(n_, k, op, affine_sigma_.get(), x, y, stream);
+    if (terms != nullptr) {
+        const AffineSlots& a = terms->slots_;
+        const AffineOperator op{a.n_terms,          a.order.get(),     a.seg_ptr.get(),
+                                a.seg_start.get(),  a.seg_term.get(),  a.cols.get(),
+                                a.vals.get()};
+        launch_affine_spmv_block(n_, k, op, terms->sigma_.get(), x, y, stream);
     } else {
         launch_bcsrmv_f64_block(n_, k, slots_.ptr.get(), slots_.cols.get(), values_.get(), x, y,
                                 stream);
@@ -151,37 +190,40 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
     return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kBlock);
 }
 
-PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, const double* B,
-                                                double* X, int k, const double* sigma,
-                                                double tolerance, int max_iters,
-                                                cudaStream_t stream, const double* X0) {
+PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, AffineTerms& terms,
+                                                const double* B, double* X, int k,
+                                                const double* sigma, double tolerance,
+                                                int max_iters, cudaStream_t stream,
+                                                const double* X0) {
     const std::scoped_lock lock(mutex_, preconditioner.mutex());
-    if (affine_.n_terms == 0) {
-        throw std::runtime_error("solve_affine_block: no affine terms set");
+    if (terms.solver_ != this) {
+        throw std::invalid_argument("solve_affine_block: the terms were built for another solver");
     }
     if (!is_block_width(k)) {
         throw std::invalid_argument("solve_affine_block supports k in {1, 2, 4, 8}");
     }
     // Columns past k repeat the last, so the deflation state for every held column is defined.
-    const int t = affine_.n_terms;
+    const int t = terms.n_terms();
     std::vector<double> padded(static_cast<size_t>(kMaxStageBlock) * t);
     for (int c = 0; c < kMaxStageBlock; ++c) {
         const int from = std::min(c, k - 1);
         for (int j = 0; j < t; ++j) padded[c * t + j] = sigma[from * t + j];
     }
-    check_cuda(cudaMemcpyAsync(affine_sigma_.get(), padded.data(), padded.size() * sizeof(double),
+    check_cuda(cudaMemcpyAsync(terms.sigma_.get(), padded.data(), padded.size() * sizeof(double),
                                cudaMemcpyHostToDevice, stream),
                "copy(sigma)");
-    launch_bcg_defl_affine(defl_n_, t, affine_aw_t_.get(), affine_sigma_.get(), defl_aw_.get(),
+    launch_bcg_defl_affine(defl_n_, t, terms.aw_t_.get(), terms.sigma_.get(), defl_aw_.get(),
                            defl_inv_e_.get(), stream);
     check_cuda(cudaGetLastError(), "affine deflation");
     defl_affine_ = true;
-    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kAffine);
+    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kAffine,
+                       &terms);
 }
 
 PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const double* B,
                                          double* X, int k, double tolerance, int max_iters,
-                                         cudaStream_t stream, const double* X0, Path path) {
+                                         cudaStream_t stream, const double* X0, Path path,
+                                         AffineTerms* terms) {
     if (max_iters <= 0) throw std::invalid_argument("solve_mixed_block: max_iters must be > 0");
     if (!is_block_width(k)) {
         throw std::invalid_argument("solve_mixed_block supports k in {1, 2, 4, 8}");
@@ -265,7 +307,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
             check_cuda(cudaMemset2DAsync(X_int + c, k * sizeof(double), 0, sizeof(double), n_, s),
                        "block:zero(X0 column)");
         }
-        apply_operator(k, affine, X_int, AP, s);
+        apply_operator(k, terms, X_int, AP, s);
         launch_bcg_residual(nk_signed, B, AP, R, s);
         if (single) {
             launch_bcg_norm2(n_, 1, R, partials, d_norm, s);
@@ -292,7 +334,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     launch_bcg_cast_dot_init(n_, k, ZF, R, defl, d_rsum, partials, d_rz, d_shift, P, s);
 
     auto run_body = [&]() {
-        apply_operator(k, affine, P, AP, s);
+        apply_operator(k, terms, P, AP, s);
         launch_bcg_dot(n_, k, P, AP, partials, d_pap, s);
         launch_bcg_alpha(k, d_rz, d_pap, d_converged, d_alpha, d_neg_alpha, s);
         launch_bcg_update_r_norm(n_, k, d_neg_alpha, AP, R, RF, partials, d_norm, s);
@@ -316,7 +358,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     }
     int result_iters = max_iters;
     for (int it = 1; it <= max_iters; ++it) {
-        GraphCache& graph = affine ? affine_graph_ : single ? single_graph_ : block_graph_;
+        GraphCache& graph = affine ? terms->graph_ : single ? single_graph_ : block_graph_;
         graph.run(s, key, it, run_body);
         check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
         double worst = 0.0;

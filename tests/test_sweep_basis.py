@@ -67,7 +67,6 @@ def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
     placement is bitwise the same at every block width, and the basis is A-orthonormal, which is
     what makes q q^T b the Galerkin start rather than merely a projection.
     """
-    import cupyx.scipy.sparse as csp
 
     centroids = patch_mesh.nodes_mm[patch_mesh.skin_tris].mean(axis=1)
     top = centroids[np.argsort(centroids[:, 2])[-400:]]
@@ -84,9 +83,7 @@ def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
     seeded_subject.prepare_sweep(d70_coil, size=16)
     ctx = seeded_subject.context
     q = ctx.sweep_basis.q.astype(cp.float64)
-    solver = ctx.solver
-    n = int(solver.idx.shape[0])
-    a = csp.csr_matrix((solver.values, solver.col_idx, solver.row_ptr), shape=(n, n))
+    a = ctx.solver.matrix()
     gram = cp.asnumpy(q.T @ (a @ q))
     np.testing.assert_allclose(gram, np.eye(gram.shape[0]), atol=1e-3)
 

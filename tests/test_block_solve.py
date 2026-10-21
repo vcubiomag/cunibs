@@ -398,7 +398,7 @@ def test_a_native_allocation_failure_is_a_memory_error(
     from cunibs.solver import CudaOutOfMemory, PcgAmgSolver
 
     subject = fresh_subject(cube_mesh)
-    solver = subject.context.solver
+    a = subject.context.solver.matrix()
     cp.get_default_memory_pool().free_all_blocks()
     # Take what the device has left, a shrinking piece at a time, straight from the driver.
     held = []
@@ -410,9 +410,7 @@ def test_a_native_allocation_failure_is_a_memory_error(
             piece //= 2
     try:
         with pytest.raises(MemoryError) as raised:
-            PcgAmgSolver(
-                solver.row_ptr, solver.col_idx, solver.values, cp.cuda.get_current_stream().ptr
-            )
+            PcgAmgSolver(a.indptr, a.indices, a.data, cp.cuda.get_current_stream().ptr)
         assert isinstance(raised.value, CudaOutOfMemory)
         with pytest.raises(MemoryError):
             cp.empty(1 << 30, dtype=cp.uint8)
@@ -506,11 +504,9 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     good_levels = ctx.solver.precond.n_levels()
     assert good_levels >= 1
 
+    a = ctx.solver.matrix()
     other = build_native_vcycle(
-        ctx.solver.row_ptr,
-        ctx.solver.col_idx,
-        cp.ascontiguousarray(ctx.solver.values.astype(cp.float32)),
-        AggregationParams(rounds=1),
+        a.indptr, a.indices, a.data.astype(cp.float32), AggregationParams(rounds=1)
     )
     assert other.n_levels() > good_levels, "the substitute must be a different hierarchy"
     ctx.solver.precond = other

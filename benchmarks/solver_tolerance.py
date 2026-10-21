@@ -23,7 +23,6 @@ GRAY_MATTER = 2
 
 def run(ctx: _run.Context) -> dict:
     import cupy as cp
-    import cupyx.scipy.sparse as csp
 
     from cunibs import Coil, Subject
     from cunibs.fem import coil_dadt_at_nodes, solve_placement
@@ -64,9 +63,7 @@ def run(ctx: _run.Context) -> dict:
     # The right-hand side the solve consumed is not returned, and only the solver assembles it.
     b = _assemble_rhs(subject.context, dadt.reshape(-1, 1, 3)).ravel()[solver.idx]
     b = b.astype(cp.float64)
-    stiffness = csp.csr_matrix(
-        (solver.values, solver.col_idx, solver.row_ptr), shape=(len(b), len(b))
-    )
+    stiffness = solver.matrix()
     true = float(cp.linalg.norm(b - stiffness @ result["v"][solver.idx]) / cp.linalg.norm(b))
     recurrence = result["relative_residual"]
     residual = {

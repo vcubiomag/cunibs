@@ -37,10 +37,11 @@ def _install(solver, **aggregation) -> None:
     from cunibs.fem.solve import AggregationParams, SmootherParams, build_native_vcycle
 
     degree = aggregation.pop("degree", 2)
+    a = solver.matrix()
     solver.precond = build_native_vcycle(
-        solver.row_ptr,
-        solver.col_idx,
-        solver.values.astype(cp.float32),
+        a.indptr,
+        a.indices,
+        a.data.astype(cp.float32),
         AggregationParams(**aggregation),
         SmootherParams(degree=degree),
     )
@@ -80,8 +81,7 @@ def _ds_cg(subject, coil, placement, gm, w) -> dict:
         coil.positions_m, coil.moments, shipped["transform"], _data.DIDT, context.nodes_mm
     )
     b = _assemble_rhs(context, dadt.reshape(-1, 1, 3))[solver.idx, 0].astype(cp.float64)
-    n = int(solver.row_ptr.shape[0]) - 1
-    a = csp.csr_matrix((solver.values, solver.col_idx, solver.row_ptr), shape=(n, n))
+    a = solver.matrix()
     iterations = 0
 
     def count(_) -> None:
@@ -188,10 +188,11 @@ def run(ctx: _run.Context) -> dict:
             }
     solver.rebuild_preconditioner()
 
+    a = solver.matrix()
     levels, coarse = aggregation_levels(
-        solver.row_ptr,
-        solver.col_idx,
-        solver.values.astype(cp.float32),
+        a.indptr,
+        a.indices,
+        a.data.astype(cp.float32),
         AggregationParams(max_levels=1),
     )
     two_level = {

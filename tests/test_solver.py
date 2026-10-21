@@ -149,11 +149,8 @@ def test_l1_dinv_matches_dense_reference(cp, cube_subject):
 
     from cunibs.fem.solve import _l1_dinv
 
-    solver = cube_subject.context.solver
-    n = int(solver.idx.shape[0])
-    a32 = csp.csr_matrix(
-        (solver.values.astype(cp.float32), solver.col_idx, solver.row_ptr), shape=(n, n)
-    )
+    a = cube_subject.context.solver.matrix()
+    a32 = csp.csr_matrix((a.data.astype(cp.float32), a.indices, a.indptr), shape=a.shape)
     dense = cp.asnumpy(a32.toarray()).astype(np.float64)
     d = np.abs(dense).sum(axis=1) * np.sign(np.diag(dense))
     np.testing.assert_allclose(cp.asnumpy(_l1_dinv(a32)), 1.0 / d, rtol=1e-6)
@@ -165,15 +162,11 @@ def test_l1_dinv_matches_dense_reference(cp, cube_subject):
 
 def test_solve_grounded_matches_dense_solve(cp, cube_subject):
     """The mixed-precision PCG must reproduce a dense fp64 solve of the reduced system."""
-    import cupyx.scipy.sparse as csp
 
     from cunibs.fem.solve import solve_grounded
 
     solver = cube_subject.context.solver
-    n_red = int(solver.idx.shape[0])
-    a_red = csp.csr_matrix(
-        (solver.values, solver.col_idx, solver.row_ptr), shape=(n_red, n_red)
-    )
+    a_red = solver.matrix()
     rng = np.random.default_rng(0)
     b = cp.asarray(rng.standard_normal(solver.n))
 
@@ -202,7 +195,6 @@ def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degre
     cycle silently returns a corrupted correction, which shows up here as a wrong answer or a
     blown iteration count rather than as a crash.
     """
-    import cupyx.scipy.sparse as csp
 
     from cunibs.fem.solve import (
         BLOCK_SIZES,
@@ -213,10 +205,7 @@ def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degre
     )
 
     solver = cube_subject.context.solver
-    n_red = int(solver.idx.shape[0])
-    a_red = csp.csr_matrix(
-        (solver.values, solver.col_idx, solver.row_ptr), shape=(n_red, n_red)
-    )
+    a_red = solver.matrix()
     rng = np.random.default_rng(0)
     b = cp.asarray(rng.standard_normal(solver.n))
     x_ref = np.linalg.solve(
@@ -224,9 +213,9 @@ def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degre
     )
 
     solver.precond = build_native_vcycle(
-        solver.row_ptr,
-        solver.col_idx,
-        cp.ascontiguousarray(solver.values.astype(cp.float32)),
+        a_red.indptr,
+        a_red.indices,
+        a_red.data.astype(cp.float32),
         smoother=SmootherParams(degree=degree),
     )
     got = cp.asnumpy(solve_grounded(solver, b)[solver.idx])

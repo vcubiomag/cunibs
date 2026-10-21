@@ -48,7 +48,8 @@ def test_uq_precompute_matches_direct_nominal_assembly(cp, two_tissue_subject):
 
     The library's own gate (assembly.py's ``rel > 1e-10`` RuntimeError) compares the
     decomposition against the same ``k_ref`` it was built from, so it cannot catch a shared
-    error; this rebuilds the reference from ``gradient_operator``/``assemble_stiffness``.
+    error; this rebuilds the reference from ``gradient_operator``/``assemble_stiffness``. The
+    forward solver the draws run on must hold that same matrix exactly.
     """
     from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
     from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
@@ -57,37 +58,39 @@ def test_uq_precompute_matches_direct_nominal_assembly(cp, two_tissue_subject):
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
     ref = _direct_reduced_stiffness(ctx, {t: TISSUE_CONDUCTIVITY[t] for t in (2, 3)})
 
-    np.testing.assert_array_equal(cp.asnumpy(pre.indptr), cp.asnumpy(ref.indptr))
-    np.testing.assert_array_equal(cp.asnumpy(pre.indices), cp.asnumpy(ref.indices))
-    recon = pre.base_data + pre.nominal_sigma @ pre.tissue_data
+    forward = pre.solver.matrix()
+    np.testing.assert_array_equal(cp.asnumpy(forward.indptr), cp.asnumpy(ref.indptr))
+    np.testing.assert_array_equal(cp.asnumpy(forward.indices), cp.asnumpy(ref.indices))
+    np.testing.assert_array_equal(cp.asnumpy(forward.data), cp.asnumpy(ref.data))
+    recon = pre.values(pre.nominal_sigma)
     rel = float(cp.linalg.norm(recon - ref.data) / cp.linalg.norm(ref.data))
     assert rel <= 1e-12
-    assert float(cp.abs(pre.tissue_data).sum()) > 0.0
+    assert pre.terms.n_terms == 2
 
 
 @pytest.mark.parametrize("sigma", [(0.4, 2.1), (1e-3, 5.0), (1.0, 1.0)])
 def test_uq_combine_matches_direct_assembly_at_nonnominal_sigma(cp, two_tissue_subject, sigma):
-    """``combine`` away from nominal — the point the library's internal gate never checks."""
+    """``values`` away from nominal — the point the library's internal gate never checks."""
     from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
 
     ctx = two_tissue_subject.context
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
-    got = pre.combine(cp.asarray(sigma, dtype=cp.float64))
+    got = pre.values(np.asarray(sigma, dtype=np.float64))
     ref = _direct_reduced_stiffness(ctx, {2: sigma[0], 3: sigma[1]})
     rel = float(cp.linalg.norm(got - ref.data) / cp.linalg.norm(ref.data))
     assert rel <= 1e-12
 
 
-def test_uq_combine_is_affine_in_sigma(cp, two_tissue_subject):
-    """K(σ) is affine, so combine must satisfy K(a+b) - K(a) = K(b) - K(0) exactly."""
+def test_uq_values_are_affine_in_sigma(cp, two_tissue_subject):
+    """K(σ) is affine, so values must satisfy K(a+b) - K(a) = K(b) - K(0)."""
     from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
 
     pre = build_conductivity_uq_precompute(two_tissue_subject.context, (2, 3))
-    a = cp.asarray([0.3, 1.7])
-    b = cp.asarray([1.1, 0.2])
-    zero = cp.zeros(2)
-    lhs = pre.combine(a + b) - pre.combine(a)
-    rhs = pre.combine(b) - pre.combine(zero)
+    a = np.asarray([0.3, 1.7])
+    b = np.asarray([1.1, 0.2])
+    zero = np.zeros(2)
+    lhs = pre.values(a + b) - pre.values(a)
+    rhs = pre.values(b) - pre.values(zero)
     np.testing.assert_allclose(cp.asnumpy(lhs), cp.asnumpy(rhs), rtol=1e-12, atol=1e-18)
 
 
@@ -450,12 +453,20 @@ def test_uq_reduced_basis_guess_tracks_the_solution(cp, two_tissue_subject):
 
     def solve_at(sigma):
         b = cp.ascontiguousarray(
-            (b_base + sigma.astype(cp.float32) @ b_tissue)[pre.idx], dtype=cp.float64
+            (b_base + sigma.astype(cp.float32) @ b_tissue)[pre.idx][:, None], dtype=cp.float64
         )
-        pre.pcg.update_values(cp.ascontiguousarray(pre.combine(sigma)), stream)
-        x = cp.empty(n_red, dtype=cp.float64)
-        pre.pcg.solve_mixed(pre.precond, b, x, 1e-11, pre.max_iters, stream)
-        return x
+        x = cp.empty((n_red, 1), dtype=cp.float64)
+        pre.solver.pcg.solve_affine_block(
+            pre.solver.precond,
+            pre.terms,
+            b,
+            x,
+            pre.affine_coefficients(sigma[None]),
+            1e-11,
+            pre.max_iters,
+            stream,
+        )
+        return x[:, 0]
 
     def guess_at(basis, sigma):
         y = basis.coefficients(cp.asnumpy(sigma)[None])
@@ -529,19 +540,24 @@ def test_uq_draw_preconditioner_solves_its_own_sample(cp, fresh_subject, two_tis
     subj.simulate_conductivity_uq(_coil(), _placement(), config=cfg, moments=True)
     pre = subj._conductivity_uq_precompute(cfg)
 
-    extreme = cp.ascontiguousarray(pre.nominal_sigma * 5.0)
-    sample_data = cp.ascontiguousarray(pre.combine(extreme))
-    precond = pre.preconditioner_for(sample_data)
+    extreme = pre.nominal_sigma.get() * 5.0
+    precond = pre.preconditioner_for(extreme)
 
     n_red = int(pre.idx.shape[0])
     rng = cp.random.default_rng(0)
-    b = cp.ascontiguousarray(rng.standard_normal(n_red, dtype=cp.float64))
-    x = cp.empty(n_red, dtype=cp.float64)
-    pre.pcg.update_values(sample_data, cp.cuda.get_current_stream().ptr)
-    _, rel = pre.pcg.solve_mixed(
-        precond, b, x, pre.tolerance, pre.max_iters, cp.cuda.get_current_stream().ptr
+    b = cp.ascontiguousarray(rng.standard_normal((n_red, 1), dtype=cp.float64))
+    x = cp.empty((n_red, 1), dtype=cp.float64)
+    _, rels, _ = pre.solver.pcg.solve_affine_block(
+        precond,
+        pre.terms,
+        b,
+        x,
+        pre.affine_coefficients(extreme[None]),
+        pre.tolerance,
+        pre.max_iters,
+        cp.cuda.get_current_stream().ptr,
     )
-    assert rel <= pre.tolerance
+    assert rels[0] <= pre.tolerance
 
 
 def test_uq_result_save_load(tmp_path, two_tissue_cube):
@@ -571,6 +587,7 @@ def test_affine_block_solves_each_draw_against_its_own_matrix(cp, two_tissue_sub
     has to land where an ordinary solve of that column's assembled matrix does. And a column
     solved alone must come back bit for bit as it did inside a block: the draws only share reads.
     """
+    from cunibs.solver import PcgAmgSolver
     from cunibs.uq import build_conductivity_uq_precompute
 
     ctx = two_tissue_subject.context
@@ -578,26 +595,29 @@ def test_affine_block_solves_each_draw_against_its_own_matrix(cp, two_tissue_sub
     n_red = int(pre.idx.shape[0])
     stream = cp.cuda.get_current_stream().ptr
     rng = np.random.default_rng(3)
-    sigmas = cp.asarray(pre.nominal_sigma.get() * rng.lognormal(0.0, 0.3, size=(4, 2)))
+    sigmas = pre.nominal_sigma.get() * rng.lognormal(0.0, 0.3, size=(4, 2))
     b = cp.asarray(rng.standard_normal((n_red, 4)))
 
+    pcg, precond = pre.solver.pcg, pre.solver.precond
     x = cp.empty_like(b)
-    _, rels, _ = pre.pcg.solve_affine_block(
-        pre.precond, b, x, pre.affine_coefficients(sigmas), 1e-10, pre.max_iters, stream
+    _, rels, _ = pcg.solve_affine_block(
+        precond, pre.terms, b, x, pre.affine_coefficients(sigmas), 1e-10, pre.max_iters, stream
     )
     assert max(rels) <= 1e-10
 
+    pattern = pre.solver.matrix(values=False)
     for c in range(4):
-        pre.pcg.update_values(cp.ascontiguousarray(pre.combine(sigmas[c])), stream)
+        assembled = PcgAmgSolver(pattern.indptr, pattern.indices, pre.values(sigmas[c]), stream)
         ref = cp.empty(n_red, dtype=cp.float64)
-        pre.pcg.solve_mixed(
-            pre.precond, cp.ascontiguousarray(b[:, c]), ref, 1e-12, pre.max_iters, stream
+        assembled.solve_mixed(
+            precond, cp.ascontiguousarray(b[:, c]), ref, 1e-12, pre.max_iters, stream
         )
         np.testing.assert_allclose(cp.asnumpy(x[:, c]), cp.asnumpy(ref), rtol=1e-7, atol=1e-12)
 
         alone = cp.empty((n_red, 1), dtype=cp.float64)
-        pre.pcg.solve_affine_block(
-            pre.precond,
+        pcg.solve_affine_block(
+            precond,
+            pre.terms,
             cp.ascontiguousarray(b[:, c : c + 1]),
             alone,
             pre.affine_coefficients(sigmas[c : c + 1]),
@@ -611,25 +631,28 @@ def test_affine_block_solves_each_draw_against_its_own_matrix(cp, two_tissue_sub
 @pytest.mark.parametrize("k", [1, 2])
 def test_a_block_solve_after_a_wider_one_reads_the_current_buffers(cp, two_tissue_subject, k):
     """A wider solve reallocates the block buffers that a narrower solve's captured graph reads."""
+    from cunibs.solver import PcgAmgSolver
     from cunibs.uq import build_conductivity_uq_precompute
 
     ctx = two_tissue_subject.context
     stream = cp.cuda.get_current_stream().ptr
     rng = np.random.default_rng(5)
-
-    def solve_narrow(pre):
-        b = cp.asarray(np.random.default_rng(6).standard_normal((int(pre.idx.shape[0]), k)))
-        x = cp.empty_like(b)
-        pre.pcg.solve_mixed_block(pre.precond, b, x, 1e-10, pre.max_iters, stream)
-        return cp.asnumpy(x)
-
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
     n_red = int(pre.idx.shape[0])
-    solve_narrow(pre)
-    sigmas = cp.asarray(pre.nominal_sigma.get() * rng.lognormal(0.0, 0.3, size=(8, 2)))
+    precond = pre.solver.precond
+
+    def solve_narrow(pcg):
+        b = cp.asarray(np.random.default_rng(6).standard_normal((n_red, k)))
+        x = cp.empty_like(b)
+        pcg.solve_mixed_block(precond, b, x, 1e-10, pre.max_iters, stream)
+        return cp.asnumpy(x)
+
+    solve_narrow(pre.solver.pcg)
+    sigmas = pre.nominal_sigma.get() * rng.lognormal(0.0, 0.3, size=(8, 2))
     wide = cp.asarray(rng.standard_normal((n_red, 8)))
-    pre.pcg.solve_affine_block(
-        pre.precond,
+    pre.solver.pcg.solve_affine_block(
+        precond,
+        pre.terms,
         wide,
         cp.empty_like(wide),
         pre.affine_coefficients(sigmas),
@@ -637,10 +660,33 @@ def test_a_block_solve_after_a_wider_one_reads_the_current_buffers(cp, two_tissu
         pre.max_iters,
         stream,
     )
-    after = solve_narrow(pre)
+    after = solve_narrow(pre.solver.pcg)
+    a = pre.solver.matrix()
     np.testing.assert_array_equal(
-        after, solve_narrow(build_conductivity_uq_precompute(ctx, (2, 3)))
+        after, solve_narrow(PcgAmgSolver(a.indptr, a.indices, a.data, stream))
     )
+
+
+def test_affine_terms_only_solve_on_their_own_solver(cp, two_tissue_subject):
+    from cunibs.solver import PcgAmgSolver
+    from cunibs.uq import build_conductivity_uq_precompute
+
+    pre = build_conductivity_uq_precompute(two_tissue_subject.context, (2, 3))
+    stream = cp.cuda.get_current_stream().ptr
+    a = pre.solver.matrix()
+    other = PcgAmgSolver(a.indptr, a.indices, a.data, stream)
+    b = cp.ones((a.shape[0], 1))
+    with pytest.raises(ValueError, match="built for another solver"):
+        other.solve_affine_block(
+            pre.solver.precond,
+            pre.terms,
+            b,
+            cp.empty_like(b),
+            pre.affine_coefficients(pre.nominal_sigma.get()[None]),
+            1e-10,
+            pre.max_iters,
+            stream,
+        )
 
 
 def test_block_moments_and_row_dot_match_their_serial_forms(cp):

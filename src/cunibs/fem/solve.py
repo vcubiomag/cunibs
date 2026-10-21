@@ -429,6 +429,9 @@ class GroundedSolver:
 
     Grounding removes the free additive constant in ``v``. It does not change
     ``E = -grad(v) - dA/dt``.
+
+    The reduced matrix lives in ``pcg`` alone; :meth:`matrix` exports it for a caller that needs
+    it as a CSR.
     """
 
     n: int
@@ -439,11 +442,21 @@ class GroundedSolver:
     pcg: PcgAmgSolver
     tolerance: float
     max_iters: int
-    row_ptr: cp.ndarray
-    col_idx: cp.ndarray
-    values: cp.ndarray
     last_iterations: int = 0
     last_relative_residual: float = 0.0
+
+    def matrix(self, values: bool = True) -> csp.csr_matrix:
+        """The reduced matrix as an fp64 CSR with int32 indices, a fresh copy on every call.
+
+        ``values=False`` exports the pattern alone, with uninitialised data.
+        """
+        pcg = self.pcg
+        stream = cp.cuda.get_current_stream().ptr
+        indptr = cp.empty(pcg.n + 1, dtype=cp.int32)
+        indices = cp.empty(pcg.nnz, dtype=cp.int32)
+        data = cp.empty(pcg.nnz, dtype=cp.float64)
+        pcg.export_csr(indptr, indices, data if values else None, stream)
+        return csp.csr_matrix((data, indices, indptr), shape=(pcg.n, pcg.n))
 
     def rebuild_preconditioner(self) -> None:
         """Rebuild the fp32 V-cycle from the solver's current fp64 values.
@@ -454,11 +467,9 @@ class GroundedSolver:
         accurate solver to fall back to. Installing a new NativeVCycle bumps its generation
         and so invalidates PcgAmgSolver's captured CG graph.
         """
-        self.precond = build_native_vcycle(
-            self.row_ptr,
-            self.col_idx,
-            self.values.astype(cp.float32),
-        )
+        with build_arena():
+            a = self.matrix()
+            self.precond = build_native_vcycle(a.indptr, a.indices, a.data.astype(cp.float32))
 
 
 def prepare_grounded_solver(
@@ -474,10 +485,9 @@ def prepare_grounded_solver(
         with arena.resident():
             idx = solve_ordering(nodes_mm, ground_node)
         a_red = reduce_matrix(a, idx)
-        row_ptr = arena.keep(a_red.indptr.astype(cp.int32, copy=False))
-        col_idx = arena.keep(a_red.indices.astype(cp.int32, copy=False))
-        values = arena.keep(a_red.data.astype(cp.float64, copy=False))
-        del a_red
+        row_ptr = a_red.indptr.astype(cp.int32, copy=False)
+        col_idx = a_red.indices.astype(cp.int32, copy=False)
+        values = a_red.data.astype(cp.float64, copy=False)
         precond = build_native_vcycle(row_ptr, col_idx, values.astype(cp.float32))
         pcg = PcgAmgSolver(row_ptr, col_idx, values, cp.cuda.get_current_stream().ptr)
     return GroundedSolver(
@@ -487,9 +497,6 @@ def prepare_grounded_solver(
         pcg=pcg,
         tolerance=tolerance,
         max_iters=max_iters,
-        row_ptr=row_ptr,
-        col_idx=col_idx,
-        values=values,
     )
 
 

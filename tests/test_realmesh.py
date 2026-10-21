@@ -95,11 +95,10 @@ def test_patch_no_degenerate_tets(cp, patch_subject):
 @pytest.mark.realmesh
 def test_patch_stiffness_is_spd_after_grounding(cp, patch_subject):
     """Grounding one DOF must leave the reduced stiffness positive definite."""
-    import cupyx.scipy.sparse as csp
 
     solver = patch_subject.context.solver
-    n = int(solver.idx.shape[0])
-    a = csp.csr_matrix((solver.values, solver.col_idx, solver.row_ptr), shape=(n, n))
+    a = solver.matrix()
+    n = a.shape[0]
 
     rng = np.random.default_rng(0)
     for _ in range(20):
@@ -171,7 +170,6 @@ def test_patch_multilevel_solve_true_residual(
     enough that the hierarchy has no coarse levels at all; this is the same guarantee at a
     size where the V-cycle actually runs.
     """
-    import cupyx.scipy.sparse as csp
 
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
     from cunibs.fem.solve import _assemble_rhs, solve_grounded
@@ -188,10 +186,7 @@ def test_patch_multilevel_solve_true_residual(
     solver = ctx.solver
     v = solve_grounded(solver, b)
 
-    n_red = int(solver.idx.shape[0])
-    a_red = csp.csr_matrix(
-        (solver.values, solver.col_idx, solver.row_ptr), shape=(n_red, n_red)
-    )
+    a_red = solver.matrix()
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
     x_red = cp.ascontiguousarray(v[solver.idx])
     true_residual = float(cp.linalg.norm(b_red - a_red @ x_red) / cp.linalg.norm(b_red))

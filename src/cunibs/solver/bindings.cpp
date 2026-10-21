@@ -246,6 +246,23 @@ NB_MODULE(_solver_ext, m) {
             nb::call_guard<nb::gil_scoped_release>(),
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
             nb::arg("values").noconvert(), nb::arg("stream"))
+        .def_prop_ro("n", &PcgAmgSolver::n, "Rows of the matrix.")
+        .def_prop_ro("nnz", &PcgAmgSolver::nnz, "Nonzeros of the matrix's entry CSR.")
+        .def(
+            "export_csr",
+            [](PcgAmgSolver& self, const i32_1d& row_ptr, const std::optional<i32_1d>& col_idx,
+               const std::optional<f64_1d>& values, uintptr_t stream) {
+                require(static_cast<int>(row_ptr.shape(0)) == self.n() + 1 &&
+                            (!col_idx || static_cast<int>(col_idx->shape(0)) == self.nnz()) &&
+                            (!values || static_cast<int>(values->shape(0)) == self.nnz()),
+                        "export_csr: row_ptr must be (n + 1), col_idx and values (nnz)");
+                self.export_csr(row_ptr.data(), data_or_null(col_idx), data_or_null(values),
+                                as_stream(stream));
+            },
+            nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert().none(),
+            nb::arg("values").noconvert().none(), nb::arg("stream"),
+            "Write the matrix's entry CSR into caller arrays; col_idx or values may be None.")
         .def(
             "update_values",
             [](PcgAmgSolver& self, const f64_1d& values, uintptr_t stream) {
@@ -293,40 +310,73 @@ NB_MODULE(_solver_ext, m) {
             "column freezes once its own residual meets tolerance, so it stops where it would "
             "have solved alone. k in {1, 2, 4, 8}.")
         .def(
-            "set_affine_terms",
-            [](PcgAmgSolver& self, const f64_2d& terms, uintptr_t stream) {
-                require(static_cast<int>(terms.shape(1)) == self.nnz(),
-                        "affine terms must be (n_terms, nnz)");
-                self.set_affine_terms(static_cast<int>(terms.shape(0)), terms.data(),
-                                      as_stream(stream));
-            },
-            nb::call_guard<nb::gil_scoped_release>(),
-            nb::arg("terms").noconvert(), nb::arg("stream"),
-            "Set an operator affine in per-column coefficients, A(sigma) = sum_t sigma_t A_t, "
-            "from its parts' values in entry order (n_terms, nnz).")
-        .def(
             "solve_affine_block",
-            [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_2d& B, const f64_2d& X,
+            [](PcgAmgSolver& self, NativeVCycle& preconditioner, AffineTerms& terms,
+               const f64_2d& B, const f64_2d& X,
                const nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>& sigma,
                double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_2d>& X0) {
                 const std::size_t n = self.n();
                 const std::size_t k = B.shape(1);
                 require(B.shape(0) == n && X.shape(0) == n && X.shape(1) == k &&
                             sigma.shape(0) == k &&
-                            static_cast<int>(sigma.shape(1)) == self.affine_terms() &&
+                            static_cast<int>(sigma.shape(1)) == terms.n_terms() &&
                             (!X0 || (X0->shape(0) == n && X0->shape(1) == k)),
                         "B, X and X0 must be (n, k) and sigma (k, n_terms)");
                 return as_tuple(self.solve_affine_block(
-                    preconditioner, B.data(), X.data(), static_cast<int>(k), sigma.data(),
+                    preconditioner, terms, B.data(), X.data(), static_cast<int>(k), sigma.data(),
                     tolerance, max_iters, as_stream(stream), data_or_null(X0)));
             },
             nb::call_guard<nb::gil_scoped_release>(),
-            nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
-            nb::arg("sigma").noconvert(), nb::arg("tolerance"), nb::arg("max_iters"),
-            nb::arg("stream"), nb::arg("X0").noconvert() = nb::none(),
-            "The block solve with column c's operator A(sigma[c]) from set_affine_terms: every "
-            "column its own matrix, sharing the parts' reads and the preconditioner. sigma is a "
-            "host (k, n_terms) float64 array. Returns what solve_mixed_block does.");
+            nb::arg("preconditioner"), nb::arg("terms"), nb::arg("B").noconvert(),
+            nb::arg("X").noconvert(), nb::arg("sigma").noconvert(), nb::arg("tolerance"),
+            nb::arg("max_iters"), nb::arg("stream"), nb::arg("X0").noconvert() = nb::none(),
+            "The block solve with column c's operator A(sigma[c]) from `terms`: every column its "
+            "own matrix, sharing the parts' reads and the preconditioner. sigma is a host "
+            "(k, n_terms) float64 array. X0 may be X itself. Returns what solve_mixed_block "
+            "does.");
+
+    nb::class_<AffineTerms>(m, "AffineTerms")
+        .def(
+            "__init__",
+            [](AffineTerms* self, const PcgAmgSolver& solver, const f64_2d& terms,
+               uintptr_t stream) {
+                require(static_cast<int>(terms.shape(1)) == solver.nnz(),
+                        "affine terms must be (n_terms, nnz)");
+                new (self) AffineTerms(solver, static_cast<int>(terms.shape(0)), terms.data(),
+                                       as_stream(stream));
+            },
+            nb::call_guard<nb::gil_scoped_release>(), nb::keep_alive<1, 2>(),
+            nb::arg("solver"), nb::arg("terms").noconvert(), nb::arg("stream"),
+            "An operator affine in per-column coefficients over solver's pattern, "
+            "A(sigma) = sum_t sigma_t A_t, from its parts' values in entry order (n_terms, nnz). "
+            "Keeps solver alive.")
+        .def_prop_ro("n_terms", &AffineTerms::n_terms)
+        .def(
+            "values",
+            [](const AffineTerms& self,
+               const nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu>& sigma,
+               const f64_1d& out, uintptr_t stream) {
+                require(static_cast<int>(sigma.shape(0)) == self.n_terms(),
+                        "values: sigma must have one entry per term");
+                self.values(sigma.data(), out.data(), as_stream(stream));
+            },
+            nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("sigma").noconvert(), nb::arg("out").noconvert(), nb::arg("stream"),
+            "out = sum_t sigma[t] A_t in the solver's entry order, for host sigma (n_terms,).")
+        .def(
+            "matmul",
+            [](const AffineTerms& self, int term, const f64_2d& x, const f64_2d& y,
+               uintptr_t stream) {
+                require(static_cast<int>(x.shape(0)) == self.n() && y.shape(0) == x.shape(0) &&
+                            y.shape(1) == x.shape(1),
+                        "matmul: x and y must both be (n, m)");
+                self.matmul(term, x.data(), y.data(), static_cast<int>(x.shape(1)),
+                            as_stream(stream));
+            },
+            nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("term"), nb::arg("x").noconvert(), nb::arg("y").noconvert(), nb::arg("stream"),
+            "y = A_term x for row-major (n, m) float64 x, each row summed over the part's own "
+            "nonzeros in column order with one fused multiply-add per entry.");
 
     m.def(
         "p1_gradients",

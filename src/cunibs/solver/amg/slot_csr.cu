@@ -68,6 +68,79 @@ __device__ __forceinline__ void for_each_entry(int row, const int* __restrict__ 
     }
 }
 
+// The inverse of the fill and the scatter: a row's entries back in entry order, its columns
+// decoded and its values copied, either of which may be skipped with a null output.
+__global__ void slot_gather_kernel(int n, const int* __restrict__ row_ptr,
+                                   const int* __restrict__ slot_ptr,
+                                   const std::int16_t* __restrict__ cols,
+                                   const double* __restrict__ src, int* __restrict__ col_idx,
+                                   double* __restrict__ values) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+    for_each_entry(row, row_ptr, slot_ptr, cols, [&](int p, int s, bool) {
+        if (col_idx != nullptr) col_idx[p] = slot_column(cols, s, row);
+        if (values != nullptr) values[p] = src[s];
+    });
+}
+
+// out[p] = sum_t sigma[t] A_t[p] over a row's entries. A segment's entries are a subset of the
+// row's, in the same column order, so one forward walk over the row's slots places each of them.
+__global__ void affine_values_kernel(int n, const int* __restrict__ row_ptr,
+                                     const int* __restrict__ slot_ptr,
+                                     const std::int16_t* __restrict__ slot_cols,
+                                     const int* __restrict__ seg_ptr,
+                                     const int* __restrict__ seg_start,
+                                     const std::uint8_t* __restrict__ seg_term,
+                                     const std::int16_t* __restrict__ cols,
+                                     const double* __restrict__ vals,
+                                     const double* __restrict__ sigma, double* __restrict__ out) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+    for (int p = row_ptr[row]; p < row_ptr[row + 1]; ++p) out[p] = 0.0;
+    for (int g = seg_ptr[row]; g < seg_ptr[row + 1]; ++g) {
+        const double coef = sigma[seg_term[g]];
+        int s = slot_ptr[row];
+        int p = row_ptr[row];
+        for (int j = seg_start[g]; j < seg_start[g + 1]; ++j) {
+            if (cols[j] > kSlotNearMax) continue;
+            const int col = slot_column(cols, j, row);
+            while (slot_cols[s] > kSlotNearMax || slot_column(slot_cols, s, row) != col) {
+                if (slot_cols[s] <= kSlotNearMax) ++p;
+                ++s;
+            }
+            out[p] += coef * vals[j];
+            ++s;
+            ++p;
+        }
+    }
+}
+
+// y (n, m) = A_t x for row-major x, one thread per output entry. A row's entries of part t are
+// summed in column order with one fused multiply-add each, skipping the zero low halves of far
+// columns, which is the CSR product over the part's own nonzeros.
+__global__ void affine_term_matmul_kernel(int n, int m, int term, const int* __restrict__ seg_ptr,
+                                          const int* __restrict__ seg_start,
+                                          const std::uint8_t* __restrict__ seg_term,
+                                          const std::int16_t* __restrict__ cols,
+                                          const double* __restrict__ vals,
+                                          const double* __restrict__ x, double* __restrict__ y) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<std::int64_t>(n) * m) return;
+    const int row = static_cast<int>(i / m);
+    const int c = static_cast<int>(i % m);
+    double acc = 0.0;
+    for (int g = seg_ptr[row]; g < seg_ptr[row + 1]; ++g) {
+        if (seg_term[g] != term) continue;
+        for (int j = seg_start[g]; j < seg_start[g + 1]; ++j) {
+            if (cols[j] > kSlotNearMax) continue;
+            const std::int64_t col = slot_column(cols, j, row);
+            acc = fma(vals[j], x[col * m + c], acc);
+        }
+        break;
+    }
+    y[i] = acc;
+}
+
 __global__ void affine_count_kernel(int n, int nnz, const int* __restrict__ row_ptr,
                                     const int* __restrict__ slot_ptr,
                                     const std::int16_t* __restrict__ slot_cols,
@@ -230,6 +303,33 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
     check_cuda(cudaGetLastError(), origin, "affine fill");
     check_cuda(cudaStreamSynchronize(stream), origin, "affine fill");
     return out;
+}
+
+void launch_slot_gather(int n, const int* row_ptr, const int* slot_ptr, const std::int16_t* cols,
+                        const double* src, int* col_idx, double* values, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(n)) {
+        slot_gather_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, slot_ptr, cols, src,
+                                                          col_idx, values);
+    }
+}
+
+void launch_affine_values(int n, const int* row_ptr, const int* slot_ptr,
+                          const std::int16_t* slot_cols, const AffineSlots& terms,
+                          const double* sigma, double* out, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(n)) {
+        affine_values_kernel<<<blocks, kBlock, 0, stream>>>(
+            n, row_ptr, slot_ptr, slot_cols, terms.seg_ptr.get(), terms.seg_start.get(),
+            terms.seg_term.get(), terms.cols.get(), terms.vals.get(), sigma, out);
+    }
+}
+
+void launch_affine_term_matmul(int n, const AffineSlots& terms, int term, const double* x,
+                               double* y, int m, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * m)) {
+        affine_term_matmul_kernel<<<blocks, kBlock, 0, stream>>>(
+            n, m, term, terms.seg_ptr.get(), terms.seg_start.get(), terms.seg_term.get(),
+            terms.cols.get(), terms.vals.get(), x, y);
+    }
 }
 
 void launch_term_row_sums(int n_s, const int* rows, const int* row_ptr, const double* term_vals,

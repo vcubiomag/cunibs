@@ -513,10 +513,8 @@ def test_native_aggregation_is_a_valid_partition(cp, patch_subject):
     """
     from cunibs.fem.solve import aggregation_levels
 
-    solver = patch_subject.context.solver
-    values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
-
-    levels, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    a = patch_subject.context.solver.matrix()
+    levels, _ = aggregation_levels(a.indptr, a.indices, a.data.astype(cp.float32))
     assert levels, "the patch should coarsen at least once"
 
     for i, level in enumerate(levels):
@@ -638,11 +636,11 @@ def test_native_aggregation_is_deterministic(cp, patch_subject):
     """
     from cunibs.fem.solve import aggregation_levels
 
-    solver = patch_subject.context.solver
-    values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
+    a = patch_subject.context.solver.matrix()
+    values_f32 = a.data.astype(cp.float32)
 
-    first, first_coarse = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
-    second, second_coarse = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    first, first_coarse = aggregation_levels(a.indptr, a.indices, values_f32)
+    second, second_coarse = aggregation_levels(a.indptr, a.indices, values_f32)
 
     assert len(first) == len(second)
     for i, (a, b) in enumerate(zip(first, second, strict=True)):
@@ -679,9 +677,8 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
     from cunibs.fem.solve import aggregation_levels
 
     solver = patch_subject.context.solver
-    values_f32 = cp.ascontiguousarray(solver.values.astype(cp.float32))
-
-    levels, _ = aggregation_levels(solver.row_ptr, solver.col_idx, values_f32)
+    a = solver.matrix()
+    levels, _ = aggregation_levels(a.indptr, a.indices, a.data.astype(cp.float32))
     sizes = [int(solver.idx.shape[0])] + [level.n_coarse for level in levels]
     assert sizes == [8403, 465], f"hierarchy shape changed: {sizes}"
 
@@ -696,14 +693,14 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
 def test_update_values_rejects_a_wrong_nonzero_count(cp, cube_subject):
     """A short ``values`` would otherwise be read past its end on the device."""
     pcg = cube_subject.context.solver.pcg
-    short = cp.ascontiguousarray(cube_subject.context.solver.values[:-1])
+    short = cp.ascontiguousarray(cube_subject.context.solver.matrix().data[:-1])
     with pytest.raises(ValueError, match="one entry per nonzero"):
         pcg.update_values(short, cp.cuda.get_current_stream().ptr)
 
 
 def test_solve_mixed_rejects_a_wrong_row_count(cp, cube_subject):
     solver = cube_subject.context.solver
-    n = int(solver.row_ptr.shape[0]) - 1
+    n = solver.pcg.n
     stream = cp.cuda.get_current_stream().ptr
     b = cp.zeros(n - 1, dtype=cp.float64)
     x = cp.empty(n - 1, dtype=cp.float64)
@@ -714,7 +711,7 @@ def test_solve_mixed_rejects_a_wrong_row_count(cp, cube_subject):
 def test_solve_mixed_block_rejects_mismatched_operands(cp, cube_subject):
     """``k`` is taken from ``B``, so an ``X`` of a different width has to be rejected."""
     solver = cube_subject.context.solver
-    n = int(solver.row_ptr.shape[0]) - 1
+    n = solver.pcg.n
     stream = cp.cuda.get_current_stream().ptr
     B = cp.ascontiguousarray(cp.zeros((n, 4), dtype=cp.float64))
     X = cp.ascontiguousarray(cp.empty((n, 2), dtype=cp.float64))
@@ -732,7 +729,7 @@ def test_exported_block_widths_are_the_ones_the_solver_accepts(cp, cube_subject)
     from cunibs.solver import BLOCK_SIZES, MAX_STAGE_BLOCK
 
     solver = cube_subject.context.solver
-    n = int(solver.row_ptr.shape[0]) - 1
+    n = solver.pcg.n
     stream = cp.cuda.get_current_stream().ptr
     accepted = []
     for k in range(1, MAX_STAGE_BLOCK + 1):

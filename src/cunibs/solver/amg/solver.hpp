@@ -120,6 +120,43 @@ void GraphCache::run(cudaStream_t stream, const Key& key, int iteration, Body&& 
     check_cuda(cudaGraphLaunch(exec_, stream), "solver", "graph_launch_first");
 }
 
+class PcgAmgSolver;
+
+// An operator affine in per-column coefficients over one solver's pattern,
+// A(sigma) = sum_t sigma_t A_t, for PcgAmgSolver::solve_affine_block. A solver can serve any
+// number of them; each holds its own parts, the coefficients a block runs with, and its captured
+// CG graph, and only the solver it was built on can solve with it.
+class AffineTerms {
+public:
+    // term_values is (n_terms, nnz) in the solver's entry order. Runs on `stream` and
+    // synchronises it, so the caller may drop term_values on return.
+    AffineTerms(const PcgAmgSolver& solver, int n_terms, const double* term_values,
+                cudaStream_t stream);
+
+    AffineTerms(const AffineTerms&) = delete;
+    AffineTerms& operator=(const AffineTerms&) = delete;
+
+    int n_terms() const { return slots_.n_terms; }
+    // Rows of the solver's matrix.
+    int n() const { return n_; }
+    // out (nnz, entry order) = sum_t sigma[t] A_t, for host sigma (n_terms).
+    void values(const double* sigma, double* out, cudaStream_t stream) const;
+    // y (n, m) = A_term x for row-major (n, m) x, each row summed over the part's own nonzeros in
+    // column order.
+    void matmul(int term, const double* x, double* y, int m, cudaStream_t stream) const;
+
+private:
+    friend class PcgAmgSolver;
+    const PcgAmgSolver* solver_;
+    int n_;
+    AffineSlots slots_;
+    // Each part's Aw on the solver's deflation rows (n_terms, defl_n_).
+    DeviceBuffer<double> aw_t_;
+    // The per-column coefficients a block runs with, [column][term].
+    DeviceBuffer<double> sigma_;
+    GraphCache graph_;
+};
+
 class PcgAmgSolver {
 public:
     // Setup runs on `stream` and synchronises it, so the caller may drop its arrays on return.
@@ -148,27 +185,31 @@ public:
                                      int k, double tolerance, int max_iters,
                                      cudaStream_t stream, const double* X0 = nullptr);
 
-    // An operator affine in per-column coefficients over this solver's pattern,
-    // A(sigma) = sum_t sigma_t A_t, given as n_terms value arrays in entry order (n_terms, nnz).
-    // Kept beside the values update_values sets, which the other solves go on using.
-    void set_affine_terms(int n_terms, const double* term_values, cudaStream_t stream);
-    int affine_terms() const { return affine_.n_terms; }
-    // A block solve in which column c's operator is A(sigma[c]), sigma host (k, n_terms): every
-    // column a different matrix, sharing each part's reads and the preconditioner.
-    PcgBlockResult solve_affine_block(NativeVCycle& preconditioner, const double* B, double* X,
-                                      int k, const double* sigma, double tolerance, int max_iters,
-                                      cudaStream_t stream, const double* X0 = nullptr);
+    // A block solve in which column c's operator is A(sigma[c]) from `terms`, sigma host
+    // (k, n_terms): every column a different matrix, sharing each part's reads and the
+    // preconditioner. The values update_values sets are left as they are.
+    PcgBlockResult solve_affine_block(NativeVCycle& preconditioner, AffineTerms& terms,
+                                      const double* B, double* X, int k, const double* sigma,
+                                      double tolerance, int max_iters, cudaStream_t stream,
+                                      const double* X0 = nullptr);
+
+    // The matrix as the entry CSR it was built from: row_ptr (n + 1), and col_idx and values
+    // (nnz each), either of which may be null. Runs on `stream`.
+    void export_csr(int* row_ptr, int* col_idx, double* values, cudaStream_t stream);
 
 private:
+    friend class AffineTerms;
     void ensure_block_buffers(int k);
     Deflation deflation() const;
     // Sets the deflation state from values_, unless it already holds it.
     void deflation_from_values(cudaStream_t stream);
-    void apply_operator(int k, bool affine, const double* x, double* y, cudaStream_t stream);
+    // `terms` is the affine operator to apply, or null for values_.
+    void apply_operator(int k, const AffineTerms* terms, const double* x, double* y,
+                        cudaStream_t stream);
     enum class Path { kSingle, kBlock, kAffine };
     PcgBlockResult solve_block(NativeVCycle& preconditioner, const double* B, double* X, int k,
                                double tolerance, int max_iters, cudaStream_t stream,
-                               const double* X0, Path path);
+                               const double* X0, Path path, AffineTerms* terms = nullptr);
 
     // Serialises every call that touches the solver's buffers, since the bindings release the GIL.
     std::mutex mutex_;
@@ -212,11 +253,4 @@ private:
     DeviceBuffer<double> partials_blk_;
     PinnedBuffer<double> h_norms_blk_;  // pinned, k residual norms + k reference norms
     GraphCache block_graph_;
-    // The affine operator, its parts' Aw on the deflation rows (n_terms, defl_n_), and the
-    // per-column coefficients a block runs with, [column][term]. The graph is its own: the body
-    // reads different arrays, and a new set of parts replaces it.
-    AffineSlots affine_;
-    DeviceBuffer<double> affine_aw_t_;
-    DeviceBuffer<double> affine_sigma_;
-    GraphCache affine_graph_;
 };

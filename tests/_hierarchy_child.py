@@ -48,11 +48,11 @@ def save_operator(mesh_path: Path, out_dir: Path) -> None:
 
     subject = Subject(load_mesh(mesh_path))
     try:
-        solver = subject.context.solver
+        a = subject.context.solver.matrix()
         out_dir.mkdir(parents=True, exist_ok=True)
-        np.save(out_dir / "indptr.npy", cp.asnumpy(solver.row_ptr))
-        np.save(out_dir / "indices.npy", cp.asnumpy(solver.col_idx))
-        np.save(out_dir / "data.npy", cp.asnumpy(solver.values.astype(cp.float32)))
+        np.save(out_dir / "indptr.npy", cp.asnumpy(a.indptr))
+        np.save(out_dir / "indices.npy", cp.asnumpy(a.indices))
+        np.save(out_dir / "data.npy", cp.asnumpy(a.data.astype(cp.float32)))
     finally:
         subject.free()
 

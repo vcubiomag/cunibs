@@ -9,7 +9,7 @@ import numpy as np
 
 from cunibs import metrics
 from cunibs._common import NO_ROIS
-from cunibs.fem.assembly import conductivity_per_tet, csr_matmul
+from cunibs.fem.assembly import conductivity_per_tet
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 from cunibs.fem.recovery import RecoveredField, RecoveryOperator, apply_recovery_into
 from cunibs.fem.solve import (
@@ -56,17 +56,39 @@ _BASIS_RTOL = 1e-12
 
 _GRAM_CHUNKS = 64
 
+# The per-tetrahedron moments of |E| from the running sums, in one pass and straight to float32.
+# Each step is the float64 array expression it replaces, rounded where that rounded, so the
+# outputs are its bits: (q - s^2/n) / dof clipped at zero keeps a negative zero, as clip does.
+_moments = cp.ElementwiseKernel(
+    "float64 s, float64 q, float64 n, float64 dof, float64 floor",
+    "float32 mean_out, float32 std_out, float32 cov_out",
+    """
+    const double mean = __ddiv_rn(s, n);
+    const double var = __ddiv_rn(__dsub_rn(q, __ddiv_rn(__dmul_rn(s, s), n)), dof);
+    const double sd = sqrt(var < 0.0 ? 0.0 : var);
+    mean_out = (float)mean;
+    std_out = (float)sd;
+    cov_out = (float)(mean > floor ? __ddiv_rn(sd, mean) : 0.0);
+    """,
+    "cunibs_uq_moments",
+)
+
+
+def _padded(n: int, m: int) -> cp.ndarray:
+    """A zeroed ``(n, m)`` float64 operand for :func:`_gram`, with rows padded to its chunking.
+
+    The padding rows stay zero, so filling the first ``n`` rows and handing the whole array to
+    ``_gram`` gives the product of the unpadded operands without copying them.
+    """
+    return cp.zeros((n + (-n % _GRAM_CHUNKS), m), dtype=cp.float64)
+
 
 def _gram(v: cp.ndarray, w: cp.ndarray) -> np.ndarray:
-    """``v.T @ w`` on the host, for tall and skinny ``v`` and ``w``.
+    """``v.T @ w`` on the host, for tall and skinny operands from :func:`_padded`.
 
     Chunked into a batched product and summed, because cuBLAS can run the direct product as a
     single thread block over every row.
     """
-    pad = -v.shape[0] % _GRAM_CHUNKS
-    if pad:
-        v = cp.concatenate([v, cp.zeros((pad, v.shape[1]), dtype=v.dtype)])
-        w = cp.concatenate([w, cp.zeros((pad, w.shape[1]), dtype=w.dtype)])
     vb = v.reshape(_GRAM_CHUNKS, -1, v.shape[1])
     wb = w.reshape(_GRAM_CHUNKS, -1, w.shape[1])
     return cp.asnumpy(cp.matmul(vb.transpose(0, 2, 1), wb).sum(axis=0))
@@ -111,7 +133,8 @@ def _solve_columns(
         width = min(MAX_BLOCK, k - start)
         b = _pad_block(cp.ascontiguousarray(rhs[:, start : start + width]), width)
         x = cp.empty_like(b)
-        pre.pcg.solve_mixed_block(pre.precond, b, x, tolerance, pre.max_iters, stream)
+        solver = pre.solver
+        solver.pcg.solve_mixed_block(solver.precond, b, x, tolerance, pre.max_iters, stream)
         out[:, start : start + width] = x[:, :width]
     return out
 
@@ -183,13 +206,11 @@ class _ReducedBasis:
         stream: int,
     ) -> None:
         idx = pre.idx
-        p = len(pre.tissue_ops)
-        ax = cp.stack(
-            [csr_matmul(op, x_nominal) for op in pre.tissue_ops], axis=1
-        )  # (n_red, P)
+        p = len(pre.perturbed_tags)
+        ax = cp.stack([pre.apply_part(x_nominal, t) for t in range(p)], axis=1)  # (n_red, P)
         rhs1 = cp.ascontiguousarray(b_tissue[:, idx].astype(cp.float64).T - ax)
         sens = _solve_columns(pre, rhs1, _SENSITIVITY_TOL, stream)
-        a_sens = [csr_matmul(op, sens) for op in pre.tissue_ops]
+        a_sens = [pre.apply_part(sens, t) for t in range(p)]
 
         pairs = [(s, t) for s in range(p) for t in range(s, p)]
         std = cp.asnumpy(pre.nominal_sigma) * spreads
@@ -213,27 +234,44 @@ class _ReducedBasis:
             )
         )
         sens2 = _solve_columns(pre, rhs2, _SENSITIVITY_TOL, stream)
-        v = cp.ascontiguousarray(cp.concatenate([x_nominal[:, None], sens, sens2], axis=1))
         del rhs1, rhs2
+        n, p2 = int(sens.shape[0]), int(sens2.shape[1])
+        m = 1 + p + p2
+        v = _padded(n, m)
+        v[:n, 0] = x_nominal
+        v[:n, 1 : 1 + p] = sens
+        v[:n, 1 + p :] = sens2
+        del sens
 
         # V^T A_t V per tissue. A_t x_nom and A_t dx/ds are already to hand from the right-hand
-        # sides; only the second-order columns need a product of their own.
+        # sides; only the second-order columns need a product of their own. Each tissue's A dx/ds
+        # is dropped once its product is formed.
+        av = _padded(n, m)
         e_tissue = []
-        for t, op in enumerate(pre.tissue_ops):
-            av = cp.concatenate([ax[:, t : t + 1], a_sens[t], csr_matmul(op, sens2)], axis=1)
+        for t in range(p):
+            av[:n, 0] = ax[:, t]
+            av[:n, 1 : 1 + p] = a_sens[t]
+            av[:n, 1 + p :] = pre.apply_part(sens2, t)
+            a_sens[t] = None
             e_tissue.append(_gram(v, av))
+        del ax, sens2
         e_terms = np.stack(e_tissue)
-        if pre.base_op is not None:
-            e_terms = np.concatenate([_gram(v, csr_matmul(pre.base_op, v))[None], e_terms])
+        if pre.affine_has_base:
+            av[:n] = pre.apply_part(v[:n], None)
+            e_terms = np.concatenate([_gram(v, av)[None], e_terms])
+        del av
         e_terms = 0.5 * (e_terms + e_terms.transpose(0, 2, 1))
-        b_cols = cp.concatenate([b_base[idx][:, None], b_tissue[:, idx].T], axis=1)
-        b_terms = _gram(v, b_cols.astype(cp.float64)).T  # (1 + P, m)
+        b_cols = _padded(n, 1 + p)
+        b_cols[:n, 0] = b_base[idx]
+        b_cols[:n, 1:] = b_tissue[:, idx].T
+        b_terms = _gram(v, b_cols).T  # (1 + P, m)
+        del b_cols
 
         # An A_nom-orthonormal basis, once per placement: a draw's reduced matrix is then the
         # identity plus the draw's departure from nominal, so a plain Cholesky solves it, and
         # directions the others already span are dropped here rather than per draw.
         nominal = np.concatenate([[1.0], cp.asnumpy(pre.nominal_sigma)])
-        coef_nom = nominal if pre.base_op is not None else nominal[1:]
+        coef_nom = nominal if pre.affine_has_base else nominal[1:]
         # The columns differ in scale by orders of magnitude, so they are equilibrated first and
         # the cutoff only sees dependence, not size.
         g = np.tensordot(coef_nom, e_terms, axes=1)
@@ -243,8 +281,8 @@ class _ReducedBasis:
         tr = d[:, None] * u[:, live] / np.sqrt(w[live])
         self._e_terms = np.einsum("ji,tjk,kl->til", tr, e_terms, tr)
         self._b_terms = b_terms @ tr
-        self._v = cp.ascontiguousarray(v @ cp.asarray(tr))
-        self._has_base = pre.base_op is not None
+        self._v = cp.ascontiguousarray(v[:n] @ cp.asarray(tr))
+        self._has_base = pre.affine_has_base
 
     @property
     def width(self) -> int:
@@ -287,12 +325,12 @@ def run_conductivity_uq(
 
     ``didt`` is the coil current's rate of change in A/s; the field is linear in it.
 
-    The coil field (``dadt_elm``) and the per-tissue RHS/stiffness components are σ-independent and
-    built once. Each sample re-weights the matrix and RHS by the sampled conductivities (two small
-    GEMVs), then solves against a preconditioner built once at the nominal (ensemble-centre) σ,
-    which the i.i.d. samples stay clustered around. A draw that misses tolerance falls back to a
-    per-draw preconditioner rebuild, so accuracy never depends on the preconditioner tracking the
-    sample.
+    The coil field and the per-tissue RHS/stiffness components are σ-independent and built once.
+    Each draw's operator is applied from the stiffness components with its own conductivities and
+    its RHS is a small GEMV, solved against a preconditioner built once at the nominal
+    (ensemble-centre) σ, which the i.i.d. samples stay clustered around. A draw that misses
+    tolerance falls back to a per-draw preconditioner rebuild, so accuracy never depends on the
+    preconditioner tracking the sample.
 
     Every draw's gray-matter peak ``|E|``, focality, and peak location are recorded — the
     distributional quantities a metric of the mean field cannot provide. ``record_rois``, a
@@ -309,36 +347,6 @@ def run_conductivity_uq(
     ``region`` is the gray-matter slice the per-draw scalars are taken over, built here when not
     given.
     """
-    with pre.lock:
-        return _run_locked(
-            ctx,
-            pre,
-            coil,
-            placement,
-            config,
-            didt=didt,
-            record_rois=record_rois,
-            focality_frac=focality_frac,
-            recovery=recovery,
-            tissues=tissues,
-            region=region,
-        )
-
-
-def _run_locked(
-    ctx: SolverContext,
-    pre: ConductivityUQPrecompute,
-    coil: Coil,
-    placement: Placement,
-    config: ConductivityUQConfig,
-    *,
-    didt: float,
-    record_rois: Mapping[str, ResolvedTarget],
-    focality_frac: float,
-    recovery: RecoveryOperator | None,
-    tissues: Collection[int] | None,
-    region: metrics.RegionSlice | None,
-) -> ConductivityUQResult:
     _check_operator(ctx, recovery, False, "run_conductivity_uq")
     wanted = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
     if wanted != tuple(sorted(pre.perturbed_tags)):
@@ -350,6 +358,7 @@ def _run_locked(
         )
     sigmas = sample_conductivities(config, pre.perturbed_tags)  # (N, P) f64
     sig_f32 = sigmas.astype(cp.float32)
+    sigmas_host = cp.asnumpy(sigmas)
 
     transform = compute_coil_transform(
         ctx, placement.center_mm, placement.handle_mm, placement.distance_mm
@@ -364,29 +373,45 @@ def _run_locked(
 
     # The preconditioner stays frozen at nominal σ for every draw; a draw that misses tolerance
     # builds a matched one for itself (``pre.preconditioner_for``) and throws it away.
-    pcg = pre.pcg
-    precond = pre.precond
+    solver = pre.solver
+    pcg = solver.pcg
+    precond = solver.precond
 
     n_tet = int(ctx.tet_nodes.shape[0])
     n_red = int(pre.idx.shape[0])
     stream = cp.cuda.get_current_stream().ptr
+
+    # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
+    # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
+    # initial residual, so a warm-started draw still reaches the same accuracy criterion. The
+    # nominal operator is the forward one, whose values the solver holds.
+    x_nominal = cp.empty(n_red, dtype=cp.float64)
+    b_nom = cp.ascontiguousarray(
+        (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx], dtype=cp.float64
+    )
+    pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
+    del b_nom
+
+    spreads = np.array([config.cov_for(t) for t in pre.perturbed_tags], dtype=np.float64)
+    basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream)
+    del x_nominal
+
     # Draws are solved MAX_BLOCK at a time as columns of one affine block solve: column c's matrix
     # is A(sigma_c), applied from the per-tissue parts without ever being assembled, and every
     # part's read is shared across the block. A short last block repeats its final draw, which
     # costs a column and changes nothing, since columns are independent and the repeat is never
-    # read back.
+    # read back. The loop's buffers are allocated after the basis, whose build is the larger
+    # peak, and rewritten in place per block. Each block's guess goes into x_blk, which the solve
+    # takes as its start before it writes the answer there.
     width = MAX_BLOCK
     b_blk = cp.empty((n_red, width), dtype=cp.float64)
     x_blk = cp.empty((n_red, width), dtype=cp.float64)
-    x0_blk = cp.empty((n_red, width), dtype=cp.float64)
     v_blk = cp.zeros((ctx.n_nodes, width), dtype=cp.float64)
     sum_e = cp.zeros(n_tet, dtype=cp.float64)
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
-    # Every buffer below is allocated once and rewritten in place per block, like everything else
-    # in the loop, so the recovery call's arguments are loop-invariant too. Only magnitudes reach
-    # a statistic: with no recovery the reconstruct writes them alone, and an element-consuming
-    # recovery reads the raw E and writes its own magnitudes.
+    # Only magnitudes reach a statistic. With no recovery the reconstruct writes them alone; an
+    # element-consuming recovery reads the raw E and writes its own magnitudes.
     on_potential = recovery is not None and recovery.on_potential
     e_bufs: list[cp.ndarray] = []
     magns: list[cp.ndarray] = []
@@ -402,24 +427,6 @@ def _run_locked(
     # magn_stat is what every statistic below reads: binding it once is what keeps the moments
     # and the per-draw scalars describing the same field.
     magn_stat = magns if rec is None else rec.magnE
-
-    # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
-    # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
-    # initial residual, so a warm-started draw still reaches the same accuracy criterion.
-    # pcg is cached on `pre` and reused across placements, so its values may hold a previous
-    # placement's last fallback draw — reset the matrix to nominal before seeding (the
-    # preconditioner affects only iteration count, not the solution, so it needs no reset).
-    x_nominal = cp.empty(n_red, dtype=cp.float64)
-    pcg.update_values(cp.ascontiguousarray(pre.nominal_data), stream)
-    b_nom = cp.ascontiguousarray(
-        (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx], dtype=cp.float64
-    )
-    pcg.solve_mixed(precond, b_nom, x_nominal, pre.tolerance, pre.max_iters, stream)
-
-    spreads = np.array([config.cov_for(t) for t in pre.perturbed_tags], dtype=np.float64)
-    basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream)
-    sigmas_host = cp.asnumpy(sigmas)
-    y_all = basis.coefficients(sigmas_host)
 
     gm = region or metrics.region_slice(
         ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, "gray_matter"
@@ -440,9 +447,10 @@ def _run_locked(
     # projected out of the distance. A draw's own result does not depend on the block it lands
     # in, so the order changes no draw; the moments are summed in it.
     log_ratio = cp.log(sigmas / pre.nominal_sigma[None, :])
-    if pre.base_op is None:
+    if not pre.affine_has_base:
         log_ratio = log_ratio - log_ratio.mean(axis=1, keepdims=True)
     log_dist = cp.asnumpy(cp.sqrt((log_ratio**2).sum(axis=1)))
+    del log_ratio
     schedule = [int(k) for k in np.argsort(log_dist, kind="stable")]
     schedule_dev = cp.asarray(schedule)
     for start in range(0, config.n_samples, width):
@@ -452,34 +460,41 @@ def _run_locked(
         # column by column, so neither depends on which block the draw landed in.
         for c, k in enumerate(cols):
             b_blk[:, c] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        basis.guess_into(cp.asarray(y_all[cols]), x0_blk, stream)
+        basis.guess_into(cp.asarray(basis.coefficients(sigmas_host[cols])), x_blk, stream)
         _, rels, _ = pcg.solve_affine_block(
             precond,
+            pre.terms,
             b_blk,
             x_blk,
             pre.affine_coefficients(sigmas_host[cols]),
             pre.tolerance,
             pre.max_iters,
             stream,
-            x0_blk,
+            x_blk,
         )
         for c, k in enumerate(draws):
             if rels[c] <= pre.tolerance:
                 continue
             # Rare extreme draw: the nominal-σ preconditioner missed tolerance, so build one
-            # matched to this sample, restart from the failed iterate, and discard it.
-            # pre.precond stays at nominal for the following draws.
-            sample_data = cp.ascontiguousarray(pre.combine(sigmas[k]))
-            pcg.update_values(sample_data, stream)
-            draw_precond = pre.preconditioner_for(sample_data)
-            b_red = cp.ascontiguousarray(b_blk[:, c])
-            x_red = cp.ascontiguousarray(x_blk[:, c])
-            retry_iters, rel = pcg.solve_mixed(
-                draw_precond, b_red, x_red, pre.tolerance, pre.max_iters, stream, x_red
+            # matched to this sample and restart from the failed iterate against the draw's own
+            # operator, discarding the hierarchy afterwards.
+            draw_precond = pre.preconditioner_for(sigmas_host[k])
+            b_red = cp.ascontiguousarray(b_blk[:, c : c + 1])
+            x_red = cp.ascontiguousarray(x_blk[:, c : c + 1])
+            retry_iters, retry_rels, _ = pcg.solve_affine_block(
+                draw_precond,
+                pre.terms,
+                b_red,
+                x_red,
+                pre.affine_coefficients(sigmas_host[k : k + 1]),
+                pre.tolerance,
+                pre.max_iters,
+                stream,
+                x_red,
             )
-            if rel > pre.tolerance:
-                raise SolverConvergenceError(int(retry_iters), float(rel), pre.tolerance)
-            x_blk[:, c] = x_red
+            if retry_rels[0] > pre.tolerance:
+                raise SolverConvergenceError(int(retry_iters), retry_rels[0], pre.tolerance)
+            x_blk[:, c] = x_red[:, 0]
 
         v_blk[pre.idx] = x_blk
         if not on_potential:
@@ -509,16 +524,19 @@ def _run_locked(
                 roi = record_rois[name]
                 roi_s[k, j] = metrics.roi_mean(magn_stat[c], roi.elem_idx, roi.weights)
 
+    del b_blk, x_blk, v_blk, e_bufs, magns, rec, magn_stat, table
     n = config.n_samples
-    mean = sum_e / n
-    var = (sumsq_e - sum_e * sum_e / n) / max(n - 1, 1)
-    std = cp.sqrt(cp.clip(var, 0.0, None))
-    cov = cp.where(mean > 1e-12 * float(mean.max()), std / mean, 0.0)
+    # max(sum_e / n) is max(sum_e) / n exactly: dividing by a positive n rounds monotonically.
+    floor = 1e-12 * (float(sum_e.max()) / n)
+    mean = cp.empty(n_tet, dtype=cp.float32)
+    std = cp.empty(n_tet, dtype=cp.float32)
+    cov = cp.empty(n_tet, dtype=cp.float32)
+    _moments(sum_e, sumsq_e, float(n), float(max(n - 1, 1)), floor, mean, std, cov)
 
     return ConductivityUQResult(
-        mean_magnE=mean.astype(cp.float32),
-        std_magnE=std.astype(cp.float32),
-        cov_magnE=cov.astype(cp.float32),
+        mean_magnE=mean,
+        std_magnE=std,
+        cov_magnE=cov,
         n_samples=n,
         perturbed_tags=pre.perturbed_tags,
         sigma_samples=sigmas_host,
