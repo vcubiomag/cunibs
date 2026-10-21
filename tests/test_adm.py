@@ -767,3 +767,29 @@ def test_binned_sources_on_a_fine_grid_match_numpy(cp):
     near = near[:, :-2] | near[:, 1:-1] | near[:, 2:]
     near = near[:, :, :-2] | near[:, :, 1:-1] | near[:, :, 2:]
     np.testing.assert_array_equal(cp.asnumpy(cell_near), near.astype(np.uint8).ravel())
+
+
+def test_reach_profile_matches_the_broadcast_distance(cp):
+    """The raster kernel against the (rho, h, dipole) distance block it stands in for.
+
+    Every cell's verdict has to agree with the array form exactly, including cells whose centre
+    sits on the margin.
+    """
+    from cunibs.adm.reciprocity import _reach_profile
+
+    rng = np.random.default_rng(5)
+    base = np.stack([rng.uniform(0.0, 0.05, 300), rng.uniform(-0.01, 0.01, 300)], axis=1)
+    prof = cp.asarray(np.concatenate([base, base[::3]]))
+    cell = 0.75e-3
+    rc = (cp.arange(90, dtype=cp.float64) + 0.5) * cell
+    hc = -0.02 + (cp.arange(60, dtype=cp.float64) + 0.5) * cell
+    for margin in (0.0, 2e-3, 8e-3):
+        reach_sq = (margin + cell * 0.5 * 2.0**0.5) ** 2
+        d2 = (rc[:, None, None] - prof[None, None, :, 0]) ** 2 + (
+            hc[None, :, None] - prof[None, None, :, 1]
+        ) ** 2
+        expected = (d2.min(axis=2) <= reach_sq).astype(cp.uint8)
+        got = cp.empty((rc.size, hc.size), dtype=cp.uint8)
+        _reach_profile(rc, hc, prof, int(prof.shape[0]), int(hc.size), reach_sq, got)
+        assert 0 < int(expected.sum()) < expected.size
+        np.testing.assert_array_equal(cp.asnumpy(got), cp.asnumpy(expected))

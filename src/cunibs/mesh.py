@@ -553,13 +553,17 @@ class HeadMesh:
         """Surface tags this mesh carries, in ascending order."""
         return tuple(int(t) for t in np.unique(self.surf_tags))
 
-    def surface(self, tag: int) -> npt.NDArray[np.int32]:
+    def surface(self, tag: int, *, host: bool = True) -> Any:
         """The triangles of one surface tag, on the host.
 
         ``tag`` is a surface tag (1001-1010, 1099), not a volume tag; see
         :data:`SURFACE_KEY_TO_LABEL`. Raises when the mesh carries no such surface.
+
+        ``host=False`` returns them wherever the mesh holds its surfaces instead, so a
+        device-backed mesh, such as ``Subject.mesh``, splits them out on the device without
+        copying every surface to the host. That form is not cached.
         """
-        tris = self._tagged(tag)
+        tris = self._tagged(tag) if host else self._surf_tris[self._surf_tags == tag]
         if tris.shape[0] == 0:
             known = ", ".join(str(t) for t in self.surface_tags) or "none"
             raise KeyError(f"this mesh carries no surface with tag {tag} (has: {known})")

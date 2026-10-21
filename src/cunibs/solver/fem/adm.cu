@@ -20,28 +20,11 @@ __device__ __forceinline__ Vec3 tet_grad4(const double* __restrict__ v,
 #pragma unroll
     for (int i = 1; i < 4; ++i) {
         const double di = v[tet_nodes(e, i)] - v0;
-        gx += di * static_cast<double>(g(e, i, 0));
-        gy += di * static_cast<double>(g(e, i, 1));
-        gz += di * static_cast<double>(g(e, i, 2));
+        gx = fma(di, static_cast<double>(g(e, i, 0)), gx);
+        gy = fma(di, static_cast<double>(g(e, i, 1)), gy);
+        gz = fma(di, static_cast<double>(g(e, i, 2)), gz);
     }
     return {gx, gy, gz};
-}
-
-//   w_e[e,k] = (−neg_vc[e]) · Σ_i values[tet_nodes[e,i]] · g[e,i,k]   (= vol_e·σ_e·(G_e λ))
-// Accumulate in float64: the weight feeds a difference against the direct ROI term.
-__global__ void element_weight_kernel(const double* __restrict__ values,
-                                      const int* __restrict__ tet_nodes,
-                                      const float* __restrict__ g,
-                                      const float* __restrict__ neg_vc,
-                                      double* __restrict__ w_e, int n_tet) {
-    const int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= n_tet) return;
-
-    const Vec3 grad = tet_grad4(values, Tet4View<const int>(tet_nodes, n_tet),
-                                TetGradView<const float>(g, n_tet), e);
-    const Vec3View<double> w(w_e, n_tet);
-    const double s = -static_cast<double>(neg_vc[e]);
-    for (int k = 0; k < 3; ++k) w(e, k) = s * grad[k];
 }
 
 //   out[n] = Σ_{c ∋ n} corner[c]   (node2corner stores corner ids c = 4e + i)
@@ -60,14 +43,39 @@ __global__ void node_gather_kernel(const double* __restrict__ corner, const int*
     out[node] = acc;
 }
 
-//   node_w[n,k] = ¼ Σ_{c ∋ n} w_e[c>>2, k]
-__global__ void node_gather3_kernel(const double* __restrict__ w_e, const int* __restrict__ ptr,
-                                     const int* __restrict__ idx, double* __restrict__ node_w,
-                                     int n_nodes) {
+// The position of e in the ascending roi_elems, or -1.
+__device__ __forceinline__ int roi_find(const int* __restrict__ roi_elems, int n_roi, int e) {
+    if (n_roi == 0 || e < __ldg(roi_elems) || e > __ldg(roi_elems + n_roi - 1)) return -1;
+    int lo = 0, hi = n_roi - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (__ldg(roi_elems + mid) < e) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return __ldg(roi_elems + lo) == e ? lo : -1;
+}
+
+//   node_w[n,k] = ¼ Σ_{c ∋ n} w_e[c>>2, k],   w_e = (−neg_vc[e]) · (G_e λ) − α_e ê
+// with α_e the ROI weight of e, or no term outside the ROI. Each corner recomputes its element's
+// weight, so no per-element array is stored. Every product and sum is rounded on its own: the
+// weight is a difference of comparable terms, and the result must not depend on what the compiler
+// chooses to fuse.
+__global__ void node_weight_kernel(const double* __restrict__ lam,
+                                   const int* __restrict__ tet_nodes, const float* __restrict__ g,
+                                   const float* __restrict__ neg_vc, int n_tet,
+                                   const int* __restrict__ ptr, const int* __restrict__ idx,
+                                   const int* __restrict__ roi_elems,
+                                   const double* __restrict__ roi_alpha, int n_roi, double dir_x,
+                                   double dir_y, double dir_z, double* __restrict__ node_w,
+                                   int n_nodes) {
     const int node = blockIdx.x * blockDim.x + threadIdx.x;
     if (node >= n_nodes) return;
 
-    const auto w = unsized<Vec3View<const double>>(w_e);
+    const Tet4View<const int> tets(tet_nodes, n_tet);
+    const TetGradView<const float> grads(g, n_tet);
     const Vec3View<double> out(node_w, n_nodes);
 
     const int begin = ptr[node];
@@ -75,13 +83,24 @@ __global__ void node_gather3_kernel(const double* __restrict__ w_e, const int* _
     double ax = 0.0, ay = 0.0, az = 0.0;
     for (int p = begin; p < end; ++p) {
         const int e = idx[p] >> 2;
-        ax += w(e, 0);
-        ay += w(e, 1);
-        az += w(e, 2);
+        const Vec3 grad = tet_grad4(lam, tets, grads, e);
+        const double s = -static_cast<double>(neg_vc[e]);
+        double wx = __dmul_rn(s, grad[0]);
+        double wy = __dmul_rn(s, grad[1]);
+        double wz = __dmul_rn(s, grad[2]);
+        if (const int r = roi_find(roi_elems, n_roi, e); r >= 0) {
+            const double a = roi_alpha[r];
+            wx = __dsub_rn(wx, __dmul_rn(a, dir_x));
+            wy = __dsub_rn(wy, __dmul_rn(a, dir_y));
+            wz = __dsub_rn(wz, __dmul_rn(a, dir_z));
+        }
+        ax = __dadd_rn(ax, wx);
+        ay = __dadd_rn(ay, wy);
+        az = __dadd_rn(az, wz);
     }
-    out(node, 0) = 0.25 * ax;
-    out(node, 1) = 0.25 * ay;
-    out(node, 2) = 0.25 * az;
+    out(node, 0) = __dmul_rn(0.25, ax);
+    out(node, 1) = __dmul_rn(0.25, ay);
+    out(node, 2) = __dmul_rn(0.25, az);
 }
 
 // A regular grid, as the ADM kernels see it: index (i, j, k) sits at origin + (i, j, k) * spacing,
@@ -641,14 +660,6 @@ __global__ void __launch_bounds__(kSampleBlock)
 
 }  // namespace
 
-void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
-                           const float* neg_vc, double* w_e, int n_tet, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_tet)) {
-        element_weight_kernel<<<blocks, kBlock, 0, stream>>>(values, tet_nodes, g, neg_vc, w_e,
-                                                             n_tet);
-    }
-}
-
 void launch_node_gather(const double* corner, const int* ptr, const int* idx, double* out,
                         int n_nodes, cudaStream_t stream) {
     if (const unsigned blocks = grid_for(n_nodes)) {
@@ -656,10 +667,15 @@ void launch_node_gather(const double* corner, const int* ptr, const int* idx, do
     }
 }
 
-void launch_node_gather3(const double* w_e, const int* ptr, const int* idx, double* node_w,
-                          int n_nodes, cudaStream_t stream) {
+void launch_node_weight(const double* lam, const int* tet_nodes, const float* g,
+                        const float* neg_vc, int n_tet, const int* ptr, const int* idx,
+                        const int* roi_elems, const double* roi_alpha, int n_roi,
+                        const double* direction, double* node_w, int n_nodes,
+                        cudaStream_t stream) {
     if (const unsigned blocks = grid_for(n_nodes)) {
-        node_gather3_kernel<<<blocks, kBlock, 0, stream>>>(w_e, ptr, idx, node_w, n_nodes);
+        node_weight_kernel<<<blocks, kBlock, 0, stream>>>(
+            lam, tet_nodes, g, neg_vc, n_tet, ptr, idx, roi_elems, roi_alpha, n_roi, direction[0],
+            direction[1], direction[2], node_w, n_nodes);
     }
 }
 

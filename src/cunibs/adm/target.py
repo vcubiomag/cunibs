@@ -40,6 +40,20 @@ _outside_reach = cp.ElementwiseKernel(
     "cunibs_outside_reach",
 )
 
+# Squared distance from element e's barycentre to pos. The squares go through pow, as CuPy's
+# ``** 2`` does, and pow(x, 2.0) is not always x * x to the last bit.
+_distance_sq = cp.ElementwiseKernel(
+    "raw float64 barys, int32 e, raw float64 pos",
+    "float64 d2",
+    """
+    const double dx = barys[3LL * e] - pos[0];
+    const double dy = barys[3LL * e + 1] - pos[1];
+    const double dz = barys[3LL * e + 2] - pos[2];
+    d2 = __dadd_rn(__dadd_rn(pow(dx, 2.0), pow(dy, 2.0)), pow(dz, 2.0));
+    """,
+    "cunibs_distance_sq",
+)
+
 
 @dataclass(frozen=True, init=False)
 class Target:
@@ -110,14 +124,11 @@ def resolve_target(
 
     ctx = context_of(subject)
     barys = ctx.tet_barycenters_mm
-    mask = region_mask(ctx.tet_tags, target.region)
-    region_ids = cp.where(mask)[0].astype(cp.int32)
+    region_ids = cp.flatnonzero(region_mask(ctx.tet_tags, target.region)).astype(cp.int32)
     if region_ids.shape[0] == 0:
         raise ValueError(f"Region {target.region!r} contains no elements.")
 
-    pos = cp.asarray(target.position_mm)
-    region_barys = barys[region_ids]
-    d2 = ((region_barys - pos) ** 2).sum(1)
+    d2 = _distance_sq(barys, region_ids, cp.asarray(target.position_mm, dtype=cp.float64))
 
     if target.radius_mm <= 0.0:
         sel = region_ids[cp.argmin(d2)][None]

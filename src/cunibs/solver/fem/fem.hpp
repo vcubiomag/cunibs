@@ -144,15 +144,18 @@ void launch_ray_first_hit(const double* origins, const double* directions, const
                           double* out_t, int n_rays, int n_tri, double min_t,
                           cudaStream_t stream);
 
-void launch_element_weight(const double* values, const int* tet_nodes, const float* g,
-                           const float* neg_vc, double* w_e, int n_tet, cudaStream_t stream);
-
 // corner is indexed by corner id c = 4e + i, not by element.
 void launch_node_gather(const double* corner, const int* ptr, const int* idx, double* out,
                         int n_nodes, cudaStream_t stream);
 
-void launch_node_gather3(const double* w_e, const int* ptr, const int* idx, double* node_w,
-                          int n_nodes, cudaStream_t stream);
+// node_w (n_nodes, 3) = 1/4 sum over each node's corners of its element's reciprocity weight
+// vol*sigma*(G_e lam) - alpha_e * direction. roi_elems (n_roi,) are the ROI elements in ascending
+// order and roi_alpha their weights; direction is 3 host doubles.
+void launch_node_weight(const double* lam, const int* tet_nodes, const float* g,
+                        const float* neg_vc, int n_tet, const int* ptr, const int* idx,
+                        const int* roi_elems, const double* roi_alpha, int n_roi,
+                        const double* direction, double* node_w, int n_nodes,
+                        cudaStream_t stream);
 
 // Candidate evaluation against a sampled reciprocity field. The grid is origin/spacing (metres,
 // equal on every axis) and shape (3 ints, host arrays); q is (nx, ny, nz, n_dir, 3) and cell_ok

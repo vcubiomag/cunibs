@@ -828,21 +828,6 @@ NB_MODULE(_solver_ext, m) {
         "e_out or magn_out is not written.");
 
     m.def(
-        "element_weight",
-        [](const f64_1d& values, const Tets& tet_nodes, const TetGradf& g, const f32_1d& neg_vc,
-           const Rows3d& w_e, uintptr_t stream) {
-            require(w_e.shape(0) == tet_nodes.shape(0),
-                    "element_weight: w_e must have one row per tet");
-            launch_element_weight(values.data(), tet_nodes.data(), g.data(), neg_vc.data(),
-                                  w_e.data(), static_cast<int>(tet_nodes.shape(0)),
-                                  as_stream(stream));
-        },
-        nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("values").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
-        nb::arg("neg_vc").noconvert(), nb::arg("w_e").noconvert(), nb::arg("stream"),
-        "Per-element reciprocity weight w_e = vol*sigma*(G_e values); into caller-allocated w_e.");
-
-    m.def(
         "node_gather",
         [](const f64_1d& corner, const i32_1d& ptr, const i32_1d& idx, const f64_1d& out,
            uintptr_t stream) {
@@ -857,19 +842,33 @@ NB_MODULE(_solver_ext, m) {
         "Node-centric scalar corner gather over the node2corner CSR; into caller-allocated out.");
 
     m.def(
-        "node_gather3",
-        [](const Rows3d& w_e, const i32_1d& ptr, const i32_1d& idx, const Rows3d& node_w,
+        "node_weight",
+        [](const f64_1d& lam, const Tets& tet_nodes, const TetGradf& g, const f32_1d& neg_vc,
+           const i32_1d& ptr, const i32_1d& idx, const i32_1d& roi_elems,
+           const f64_1d& roi_alpha, const std::vector<double>& direction, const Rows3d& node_w,
            uintptr_t stream) {
             const std::size_t n_nodes = ptr.shape(0) - 1;
-            require(node_w.shape(0) == n_nodes,
-                    "node_gather3: node_w must have one row per node");
-            launch_node_gather3(w_e.data(), ptr.data(), idx.data(), node_w.data(),
-                                 static_cast<int>(n_nodes), as_stream(stream));
+            require(node_w.shape(0) == n_nodes && lam.shape(0) == n_nodes,
+                    "node_weight: lam and node_w must have one row per node");
+            require(g.shape(0) == tet_nodes.shape(0) && neg_vc.shape(0) == tet_nodes.shape(0),
+                    "node_weight: g and neg_vc must have one row per tet");
+            require(roi_alpha.shape(0) == roi_elems.shape(0),
+                    "node_weight: roi_alpha must have one entry per ROI element");
+            require(direction.size() == 3, "node_weight: direction must have 3 components");
+            launch_node_weight(lam.data(), tet_nodes.data(), g.data(), neg_vc.data(),
+                               static_cast<int>(tet_nodes.shape(0)), ptr.data(), idx.data(),
+                               roi_elems.data(), roi_alpha.data(),
+                               static_cast<int>(roi_elems.shape(0)), direction.data(),
+                               node_w.data(), static_cast<int>(n_nodes), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("w_e").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("lam").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
+        nb::arg("neg_vc").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
+        nb::arg("roi_elems").noconvert(), nb::arg("roi_alpha").noconvert(), nb::arg("direction"),
         nb::arg("node_w").noconvert(), nb::arg("stream"),
-        "Node-centric 3-vector corner gather with 1/4 weight; into caller-allocated node_w.");
+        "Nodal reciprocity weights, 1/4 the sum over each node's corners of "
+        "vol*sigma*(G_e lam) - alpha_e direction; roi_elems ascending; into caller-allocated "
+        "node_w.");
 
     m.def(
         "adm_evaluate",

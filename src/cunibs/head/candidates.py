@@ -146,7 +146,7 @@ def scalp_grid(
         raise ValueError("scalp_grid takes a single centre; pass one 3-vector.")
     p0, normal = origin[0], -inward[0]
 
-    verts = ctx.nodes_mm[ctx.skin_tris]
+    verts = ctx.skin_verts
     near = cp.linalg.norm(verts.mean(axis=1) - p0, axis=1) <= radius_mm
     n_source = int(near.sum())
     if n_source == 0:

@@ -308,85 +308,78 @@ def _p1_grad_reference(v, tet_nodes, g):
     return np.einsum("ei,eik->ek", vt[:, 1:] - vt[:, :1], g[:, 1:].astype(np.float64))
 
 
-def test_element_weight_matches_numpy(cp, dev, mesh_arrays, stream):
-    """w_e[e,k] = (−neg_vc[e]) · Σᵢ values[tet_nodes[e,i]]·g[e,i,k] — i.e. vol·σ·(Gλ)."""
-    from cunibs.solver import element_weight
+def _node_weight(cp, dev, stream, values, roi, alpha, direction):
+    from cunibs.solver import node_weight
 
-    w_e = cp.empty((N_TET, 3), dtype=cp.float64)
-    element_weight(dev["v"], dev["tet_nodes"], dev["g"], dev["neg_vc"], w_e, stream)
-
-    grad = _p1_grad_reference(mesh_arrays["v"], mesh_arrays["tet_nodes"], mesh_arrays["g"])
-    expected = -mesh_arrays["neg_vc"].astype(np.float64)[:, None] * grad
-    np.testing.assert_allclose(cp.asnumpy(w_e), expected, rtol=1e-9)
-
-
-def test_element_weight_sign_is_positive_for_positive_conductivity(
-    cp, dev, mesh_arrays, stream
-):
-    """neg_vc is −vol·σ, so the kernel's leading −neg_vc must come out positive."""
-    from cunibs.solver import element_weight
-
-    w_e = cp.empty((N_TET, 3), dtype=cp.float64)
-    element_weight(dev["v"], dev["tet_nodes"], dev["g"], dev["neg_vc"], w_e, stream)
-    grad = _p1_grad_reference(mesh_arrays["v"], mesh_arrays["tet_nodes"], mesh_arrays["g"])
-    scale = -cp.asnumpy(dev["neg_vc"]).astype(np.float64)
-    assert np.all(scale > 0)
-    np.testing.assert_allclose(cp.asnumpy(w_e), scale[:, None] * grad, rtol=1e-9)
-
-
-def test_element_weight_of_a_constant_is_exactly_zero(cp, dev, stream):
-    """A constant potential has no gradient, and the differenced form returns exactly that."""
-    from cunibs.solver import element_weight
-
-    w_e = cp.empty((N_TET, 3), dtype=cp.float64)
-    element_weight(
-        cp.full(N_NODES, 3.25, dtype=cp.float64),
+    node_w = cp.empty((N_NODES, 3), dtype=cp.float64)
+    node_weight(
+        values,
         dev["tet_nodes"],
         dev["g"],
         dev["neg_vc"],
-        w_e,
+        dev["ptr"],
+        dev["idx"],
+        cp.asarray(roi, dtype=cp.int32),
+        cp.asarray(alpha, dtype=cp.float64),
+        list(direction),
+        node_w,
         stream,
     )
-    assert not cp.any(w_e)
+    return cp.asnumpy(node_w)
 
 
-def test_element_weight_is_linear_in_values(cp, dev, stream):
-    from cunibs.solver import element_weight
-
-    def run(values):
-        out = cp.empty((N_TET, 3), dtype=cp.float64)
-        element_weight(values, dev["tet_nodes"], dev["g"], dev["neg_vc"], out, stream)
-        return cp.asnumpy(out)
-
-    a = run(dev["v"])
-    b = run(cp.ascontiguousarray(dev["v"] * 3.0))
-    np.testing.assert_allclose(b, 3.0 * a, rtol=1e-12)
+ROI = np.array([2, 5, 6, 11, 30], dtype=np.int32)
 
 
-def test_node_gather3_matches_numpy(cp, dev, mesh_arrays, stream):
-    """node_w[n,k] = ¼ Σ_{corners c of n} w_e[c>>2, k]."""
-    from cunibs.solver import node_gather3
-
-    rng = np.random.default_rng(4)
-    w_e = rng.standard_normal((N_TET, 3))
-    node_w = cp.empty((N_NODES, 3), dtype=cp.float64)
-    node_gather3(cp.asarray(w_e), dev["ptr"], dev["idx"], node_w, stream)
-
+def _node_weight_reference(mesh_arrays, values, roi, alpha, direction):
+    """¼ Σ_{e∋n} w_e with w_e = (−neg_vc[e]) · Σᵢ values[tet_nodes[e,i]]·g[e,i,:] − α_e ê."""
+    grad = _p1_grad_reference(values, mesh_arrays["tet_nodes"], mesh_arrays["g"])
+    w_e = -mesh_arrays["neg_vc"].astype(np.float64)[:, None] * grad
+    w_e[roi] -= np.asarray(alpha)[:, None] * np.asarray(direction)[None, :]
     expected = np.zeros((N_NODES, 3))
     np.add.at(expected, mesh_arrays["tet_nodes"].ravel(), np.repeat(w_e, 4, axis=0))
-    np.testing.assert_allclose(cp.asnumpy(node_w), 0.25 * expected, rtol=1e-12)
+    return 0.25 * expected
 
 
-def test_node_gather3_counts_each_incident_corner(cp, dev, mesh_arrays, stream):
-    """With w_e ≡ 1 each node gets ¼ × (number of corners it owns)."""
-    from cunibs.solver import node_gather3
+def test_node_weight_matches_numpy(cp, dev, mesh_arrays, stream):
+    alpha = np.linspace(0.1, 0.5, ROI.size)
+    direction = (0.6, -0.8, 0.0)
+    got = _node_weight(cp, dev, stream, dev["v"], ROI, alpha, direction)
+    expected = _node_weight_reference(mesh_arrays, mesh_arrays["v"], ROI, alpha, direction)
+    np.testing.assert_allclose(got, expected, rtol=1e-9, atol=1e-12)
 
-    node_w = cp.empty((N_NODES, 3), dtype=cp.float64)
-    node_gather3(cp.ones((N_TET, 3), dtype=cp.float64), dev["ptr"], dev["idx"], node_w, stream)
-    counts = np.bincount(mesh_arrays["tet_nodes"].ravel(), minlength=N_NODES)
-    np.testing.assert_allclose(
-        cp.asnumpy(node_w), 0.25 * np.tile(counts[:, None], 3), rtol=1e-12
+
+def test_node_weight_without_an_roi_is_the_gathered_element_weight(
+    cp, dev, mesh_arrays, stream
+):
+    got = _node_weight(cp, dev, stream, dev["v"], [], [], (1.0, 0.0, 0.0))
+    expected = _node_weight_reference(mesh_arrays, mesh_arrays["v"], [], [], (1.0, 0.0, 0.0))
+    np.testing.assert_allclose(got, expected, rtol=1e-9)
+
+
+def test_node_weight_of_a_constant_is_exactly_zero(cp, dev, stream):
+    """A constant potential has no gradient, and the differenced form returns exactly that."""
+    values = cp.full(N_NODES, 3.25, dtype=cp.float64)
+    assert not np.any(_node_weight(cp, dev, stream, values, [], [], (0.0, 0.0, 1.0)))
+
+
+def test_node_weight_counts_each_incident_roi_corner(cp, dev, mesh_arrays, stream):
+    """With λ ≡ 0 and every element in the ROI at α = 1, each node gets −¼ ê per corner."""
+    values = cp.zeros(N_NODES, dtype=cp.float64)
+    got = _node_weight(
+        cp, dev, stream, values, np.arange(N_TET), np.ones(N_TET), (0.0, 2.0, 0.0)
     )
+    counts = np.bincount(mesh_arrays["tet_nodes"].ravel(), minlength=N_NODES)
+    np.testing.assert_array_equal(got[:, 1], -0.5 * counts)
+    assert not np.any(got[:, [0, 2]])
+
+
+def test_node_weight_is_linear_in_values(cp, dev, stream):
+    a = _node_weight(cp, dev, stream, dev["v"], [], [], (1.0, 0.0, 0.0))
+    b = _node_weight(
+        cp, dev, stream, cp.ascontiguousarray(dev["v"] * 3.0), [], [], (1.0, 0.0, 0.0)
+    )
+    np.testing.assert_allclose(b, 3.0 * a, rtol=1e-12)
 
 
 # --- streaming moments -------------------------------------------------------------------

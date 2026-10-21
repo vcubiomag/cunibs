@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
+from cunibs._memory import build_arena
 from cunibs.adm.evaluate import _evaluate_native
 from cunibs.adm.reciprocity import ReciprocityField, build_reciprocity
 from cunibs.fem.placement import compute_coil_transforms
@@ -31,6 +32,25 @@ if TYPE_CHECKING:
 
 # Distance from the centre to each reported handle point, along the handle direction.
 _HANDLE_MM = 50.0
+
+# e_f[c, d, f] = sum_k e_s[c, k, d] * kernel[f, k] for e_f (C, D, F), e_s (C, K, D) and kernel
+# (F, K). Summed over the samples in order, each product and sum rounded on its own, rather than
+# through a GEMM, whose algorithm, and so whose bits, can change with the number of candidates.
+_interpolate = cp.ElementwiseKernel(
+    "raw float64 e_s, raw float64 kernel, int32 n_k, int32 n_d, int32 n_f",
+    "float64 e_f",
+    """
+    const long long f = i % n_f;
+    const long long d = (i / n_f) % n_d;
+    const long long c = i / n_f / n_d;
+    double acc = 0.0;
+    for (int k = 0; k < n_k; ++k) {
+        acc = __dadd_rn(acc, __dmul_rn(e_s[(c * n_k + k) * n_d + d], kernel[f * n_k + k]));
+    }
+    e_f = acc;
+    """,
+    "cunibs_interpolate_angles",
+)
 
 
 @dataclass
@@ -174,18 +194,20 @@ def optimize(
     :func:`optimize_placement` on it.
     """
     _check_angle_sampling(n_samples, resolution)
-    recip = build_reciprocity(
-        context_of(subject),
-        coil,
-        target,
-        centers_mm,
-        distance_mm=distance_mm,
-        spacing_mm=spacing_mm,
-        margin_mm=margin_mm,
-    )
-    return optimize_placement(
-        recip, coil, n_samples=n_samples, resolution=resolution, didt=didt
-    )
+    # The field never leaves this call, so all of it is a temporary of the call's arena.
+    with build_arena():
+        recip = build_reciprocity(
+            context_of(subject),
+            coil,
+            target,
+            centers_mm,
+            distance_mm=distance_mm,
+            spacing_mm=spacing_mm,
+            margin_mm=margin_mm,
+        )
+        return optimize_placement(
+            recip, coil, n_samples=n_samples, resolution=resolution, didt=didt
+        )
 
 
 def _check_angle_sampling(n_samples: int, resolution: int) -> None:
@@ -249,11 +271,16 @@ def optimize_placement(
         kernel += 2.0 * cp.cos(h * d)
     kernel /= n_samples  # interpolating Dirichlet kernel (exact for band limit ``order``)
 
-    # Summed over the samples in order rather than through a GEMM, whose algorithm, and so whose
-    # bits, can change with the number of candidates.
-    e_f = sum(
-        e_s[:, k, :, None] * kernel[None, None, :, k] for k in range(n_samples)
-    )  # (C,D,F)
+    n_dir = int(e_s.shape[2])
+    e_f = cp.empty((int(e_s.shape[0]), n_dir, resolution), dtype=cp.float64)  # (C,D,F)
+    _interpolate(
+        cp.ascontiguousarray(e_s),
+        cp.ascontiguousarray(kernel),
+        n_samples,
+        n_dir,
+        resolution,
+        e_f,
+    )
     obj_f = _objective(cp.moveaxis(e_f, 1, 2), recip.magnitude)  # (C,F)
     theta = _parabolic_refine(obj_f, cp.argmax(obj_f, axis=1), theta_f)
 

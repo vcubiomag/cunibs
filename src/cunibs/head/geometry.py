@@ -38,7 +38,7 @@ def _depth_to_tag(
     ctx: SolverContext, origins: cp.ndarray, inward: cp.ndarray, tag: int
 ) -> npt.NDArray[np.float64]:
     """Distance from each origin along its inward normal to surface ``tag``, ``NaN`` on a miss."""
-    verts = cp.ascontiguousarray(ctx.nodes_mm[cp.asarray(ctx.mesh.surface(tag))])
+    verts = ctx.nodes_mm[ctx.mesh.surface(tag, host=False)]
     t = cp.empty(origins.shape[0], dtype=cp.float64)
     ray_first_hit(
         origins,
