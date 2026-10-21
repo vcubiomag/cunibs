@@ -258,17 +258,17 @@ __global__ void __launch_bounds__(kBlock)
                 const float x = static_cast<float>(i0[0]) + f[0];
                 const float y = static_cast<float>(i0[1]) + f[1];
                 const float z = static_cast<float>(i0[2]) + f[2];
-                float near[D * 3];
+                float near_q[D * 3];
 #pragma unroll
-                for (int t = 0; t < D * 3; ++t) near[t] = 0.0f;
+                for (int t = 0; t < D * 3; ++t) near_q[t] = 0.0f;
                 const int end = __ldg(list_ptr + slot + 1);
                 for (int k = __ldg(list_ptr + slot); k < end; ++k) {
                     float entry[entry_floats<D>()];
                     load_entry<D>(entry, entries, k);
-                    add_source<D>(near, x - entry[0], y - entry[1], z - entry[2], entry + 3);
+                    add_source<D>(near_q, x - entry[0], y - entry[1], z - entry[2], entry + 3);
                 }
 #pragma unroll
-                for (int t = 0; t < D * 3; ++t) qv[t] = fmaf(near_scale, near[t], qv[t]);
+                for (int t = 0; t < D * 3; ++t) qv[t] = fmaf(near_scale, near_q[t], qv[t]);
             }
             const float mx = coil_mom[3 * j], my = coil_mom[3 * j + 1], mz = coil_mom[3 * j + 2];
             float m[3];
@@ -443,9 +443,9 @@ __device__ __forceinline__ void sample_tile(int tile, const float4* s_pos, const
             float gw = inv * inv * inv;
             if constexpr (CHECK) {
                 // An excluded source can sit on the point, where gw is infinite: a select.
-                const bool near = fmaxf(fabsf(px[k] - sc.x),
+                const bool skip = fmaxf(fabsf(px[k] - sc.x),
                                         fmaxf(fabsf(py[k] - sc.y), fabsf(pz[k] - sc.z))) <= 0.5f;
-                gw = near ? 0.0f : gw;
+                gw = skip ? 0.0f : gw;
             }
 #pragma unroll
             for (int c = 0; c < D * 3; ++c) {

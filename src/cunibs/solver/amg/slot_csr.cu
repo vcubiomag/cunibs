@@ -79,8 +79,8 @@ __global__ void affine_count_kernel(int n, int nnz, const int* __restrict__ row_
     for (int t = 0; t < n_terms; ++t) {
         const double* v = term_vals + static_cast<std::int64_t>(t) * nnz;
         int cnt = 0;
-        for_each_entry(row, row_ptr, slot_ptr, slot_cols, [&](int p, int, bool far) {
-            if (v[p] != 0.0) cnt += far ? 2 : 1;
+        for_each_entry(row, row_ptr, slot_ptr, slot_cols, [&](int p, int, bool is_far) {
+            if (v[p] != 0.0) cnt += is_far ? 2 : 1;
         });
         n_seg += cnt > 0;
         n_slot += cnt;
@@ -104,11 +104,11 @@ __global__ void affine_fill_kernel(int n, int nnz, const int* __restrict__ row_p
     for (int t = 0; t < n_terms; ++t) {
         const double* v = term_vals + static_cast<std::int64_t>(t) * nnz;
         const int begin = o;
-        for_each_entry(row, row_ptr, slot_ptr, slot_cols, [&](int p, int s, bool far) {
+        for_each_entry(row, row_ptr, slot_ptr, slot_cols, [&](int p, int s, bool is_far) {
             if (v[p] == 0.0) return;
             cols[o] = slot_cols[s];
             vals[o++] = v[p];
-            if (far) {
+            if (is_far) {
                 cols[o] = slot_cols[s + 1];
                 vals[o++] = 0.0;
             }
