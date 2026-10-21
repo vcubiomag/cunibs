@@ -98,6 +98,7 @@ def assemble_stiffness(
     cond: cp.ndarray,
     n_nodes: int,
     tet_nodes: cp.ndarray,
+    node2corner: tuple[cp.ndarray, cp.ndarray] | None = None,
 ) -> csp.csr_matrix:
     """Assemble the symmetric P1 conductivity stiffness matrix.
 
@@ -105,10 +106,11 @@ def assemble_stiffness(
 
     Two passes: ``stiffness_pattern`` derives row and column indices from the connectivity alone,
     then ``fill_stiffness_values`` writes the values one thread per row over the node2corner map,
-    which is what fixes the summation order.
+    which is what fixes the summation order. ``node2corner`` is that map, ``build_node2corner``'s
+    result; pass it when the caller already holds one, otherwise it is built here.
     """
     tets = as_int32_tets(tet_nodes)
-    ptr, idx = build_node2corner(tets, n_nodes)
+    ptr, idx = node2corner if node2corner is not None else build_node2corner(tets, n_nodes)
     a = stiffness_pattern(tets, n_nodes, ptr, idx)
     fill_stiffness_values(a, g, vols, cond, tets, ptr, idx)
     return a
@@ -177,11 +179,11 @@ def build_node2corner(tet_nodes: cp.ndarray, n_nodes: int) -> tuple[cp.ndarray, 
         # A tet subset is empty whenever a UQ per-tissue component covers a tag the mesh does not
         # use.
         return cp.zeros(n_nodes + 1, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
-    corners = cp.arange(n_corner, dtype=cp.int32)
     keys = tet_nodes.ravel()
+    # Corner c sits at keys[c], so the sorting permutation is the corner list itself.
     order = cp.argsort(keys, kind="stable")
-    idx = cp.ascontiguousarray(corners[order])
-    return csr_offsets(keys[order], n_nodes), idx
+    ptr = csr_offsets(keys[order], n_nodes)
+    return ptr, order.astype(cp.int32)
 
 
 def csr_offsets(sorted_keys: cp.ndarray, n: int) -> cp.ndarray:

@@ -46,7 +46,7 @@ from cunibs.mesh import HeadMesh, load_mesh
 from cunibs.solver import clear_cuda_error
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
     from typing import Self
 
     from cunibs.adm.target import ResolvedTarget
@@ -222,6 +222,7 @@ class Subject:
         ] = {}
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
+        self._resident: cp.cuda.MemoryPool | None = None
         self._scratch: cp.cuda.MemoryPool | None = None
         self._copier: AsyncCopier | None = None
         # Guards every lazy field above: under the free-threaded build two threads sharing a
@@ -237,9 +238,11 @@ class Subject:
     def free(self) -> None:
         """Release cached GPU state: solver context, AMG hierarchies, UQ precompute and scratch.
 
-        Dropping the cached solver objects triggers their teardown, so a loop over many subjects
-        can reclaim device memory as it goes. The subject stays usable afterwards; cached state is
-        rebuilt lazily on the next call. Also available via the context manager:
+        The subject keeps its device memory in pools of its own, which this returns to the device,
+        so a loop over many subjects can reclaim memory as it goes. Arrays a caller still holds
+        from the cached state, such as ``subject.context``'s, stay valid and are released when
+        dropped. The subject stays usable afterwards; cached state is rebuilt lazily on the next
+        call. Also available via the context manager:
         ``with Subject.from_mesh(path) as subject: ...``.
         """
         with self._lock:
@@ -250,13 +253,14 @@ class Subject:
             self._host_tets = None
             self._host_slots.clear()
             self._region_slices.clear()
-            if self._scratch is not None:
-                self._scratch.free_all_blocks()
-                self._scratch = None
             if self._copier is not None:
                 self._copier.drain()
                 self._copier = None
-        cp.get_default_memory_pool().free_all_blocks()
+            for pool in (self._scratch, self._resident):
+                if pool is not None:
+                    pool.free_all_blocks()
+            self._scratch = None
+            self._resident = None
 
     def __enter__(self) -> Self:
         return self
@@ -272,17 +276,45 @@ class Subject:
             return self._copier
 
     def _scratch_pool(self) -> cp.cuda.MemoryPool:
-        """The pool a call's chunk-scoped temporaries come from, kept until :meth:`free`.
+        """The pool a call's temporaries come from, kept until :meth:`free`.
 
         Keeping it lets repeated calls reuse its blocks rather than allocate and release them each
-        time. It is created with the default pool's free blocks handed back, since a separate pool
-        cannot draw on them and whatever setup churned through would stay stranded beside it.
+        time.
         """
         with self._lock:
             if self._scratch is None:
-                cp.get_default_memory_pool().free_all_blocks()
                 self._scratch = cp.cuda.MemoryPool()
             return self._scratch
+
+    def _release_free_blocks(self) -> None:
+        """Return every free block a pool holds to the device, after an allocation failed.
+
+        Each pool only reclaims its own blocks when it runs out, so memory cached by one is out of
+        reach of the others until handed back. The default pool is the caller's, but its free
+        blocks are unused memory, and a failed allocation is the moment they are needed.
+        """
+        # A failed allocation leaves the thread's last CUDA error set, and the next launch check
+        # would report it as its own.
+        clear_cuda_error()
+        for pool in (self._scratch, self._resident, cp.get_default_memory_pool()):
+            if pool is not None:
+                pool.free_all_blocks()
+
+    def _build[T](self, build: Callable[[], T]) -> T:
+        """Run a build of cached state, allocating what it keeps from the subject's resident pool.
+
+        Its temporaries come from the build's own arena (see :mod:`cunibs._memory`), so the
+        resident pool holds nothing but cached state. A build that runs out of memory is retried
+        once after :meth:`_release_free_blocks`. Callers hold the subject's lock.
+        """
+        if self._resident is None:
+            self._resident = cp.cuda.MemoryPool()
+        with cp.cuda.using_allocator(self._resident.malloc):
+            try:
+                return _published(build())
+            except MemoryError:
+                self._release_free_blocks()
+                return _published(build())
 
     @property
     def mesh(self) -> HeadMesh:
@@ -298,7 +330,7 @@ class Subject:
     def context(self) -> SolverContext:
         with self._lock:
             if self._ctx is None:
-                self._ctx = _published(build_context(self._mesh))
+                self._ctx = self._build(lambda: build_context(self._mesh))
             return self._ctx
 
     def roi(
@@ -348,11 +380,12 @@ class Subject:
         from cunibs.uq import build_conductivity_uq_precompute
 
         ctx = self.context
-        tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
+        with cp.cuda.using_allocator(self._scratch_pool().malloc):
+            tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
         with self._lock:
             if tags not in self._conductivity_uq_pre:
-                self._conductivity_uq_pre[tags] = _published(
-                    build_conductivity_uq_precompute(ctx, tags)
+                self._conductivity_uq_pre[tags] = self._build(
+                    lambda: build_conductivity_uq_precompute(ctx, tags)
                 )
             return self._conductivity_uq_pre[tags]
 
@@ -380,17 +413,15 @@ class Subject:
         }
 
     def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
-        """The field-independent half of a summary, gathered once per region.
-
-        Call it first outside any scratch allocator: filling the cache inside one would tie it to
-        that pool's lifetime.
-        """
+        """The field-independent half of a summary, gathered once per region."""
         with self._lock:
             cached = self._region_slices.get(region)
             if cached is None:
                 ctx = self.context
-                cached = _published(
-                    metrics.region_slice(ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, region)
+                cached = self._build(
+                    lambda: metrics.region_slice(
+                        ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, region
+                    )
                 )
                 self._region_slices[region] = cached
             return cached
@@ -414,14 +445,15 @@ class Subject:
         """Build (and cache on the context) the patch weights for ``recovery``.
 
         Held here rather than reached from inside a solve so the build is serialised against
-        other threads sharing this subject, and so it lands outside the caller's scratch
-        allocator, since the operator outlives the chunk that first asked for it. ``tissues`` is
-        what the call reads; see :meth:`_needed_tissues`.
+        other threads sharing this subject, and so it lands in the resident pool, since the
+        operator outlives the chunk that first asked for it. ``tissues`` is what the call reads;
+        see :meth:`_needed_tissues`.
         """
         if recovery == "raw":
             return None
         with self._lock:
-            return _published(ensure_recovery(self.context, recovery, tissues))
+            ctx = self.context
+            return self._build(lambda: ensure_recovery(ctx, recovery, tissues))
 
     def _needed_tissues(
         self, full_volume: bool, record_rois: Mapping[str, ResolvedTarget]
@@ -555,26 +587,26 @@ class Subject:
         if not sites:
             return
         ctx = self.context
-        # Held across chunks, so these are allocated outside the scratch pool.
-        dip_pos_m = cp.asarray(coil.positions_m)
-        dip_moment = cp.asarray(coil.moments)
         region = self._region_slice(DEFAULT_REGION)
-        # Same reason: the patch weights outlive the chunk that first needs them.
-        tissues = self._needed_tissues(
-            retain.magnitude or retain.vectors or retain.nodal, record_rois
-        )
+        temp_pool = self._scratch_pool()
+        with cp.cuda.using_allocator(temp_pool.malloc):
+            dip_pos_m = cp.asarray(coil.positions_m)
+            dip_moment = cp.asarray(coil.moments)
+            tissues = self._needed_tissues(
+                retain.magnitude or retain.vectors or retain.nodal, record_rois
+            )
+            # Every site's frame in one launch, which also rejects a degenerate handle before any
+            # result is yielded.
+            transforms = cp.asnumpy(
+                compute_coil_transforms(
+                    ctx,
+                    np.stack([s.center_mm for s in sites]),
+                    np.stack([s.handle_mm for s in sites]),
+                    np.array([s.distance_mm for s in sites]),
+                )
+            )
         op = self._recovery_operator(recovery, tissues)
         provenance = self._provenance(coil)
-        # Every site's frame in one launch, which also rejects a degenerate handle before any
-        # result is yielded.
-        transforms = cp.asnumpy(
-            compute_coil_transforms(
-                ctx,
-                np.stack([s.center_mm for s in sites]),
-                np.stack([s.handle_mm for s in sites]),
-                np.array([s.distance_mm for s in sites]),
-            )
-        )
         # Placements share the stiffness matrix, so a chunk solves as one lockstep block CG that
         # reads the matrix and hierarchy once for all of it. A chunk starts as wide as the block
         # kernels go and halves when the device runs out of memory for it, which never moves a
@@ -583,7 +615,6 @@ class Subject:
         # An allocation that failed before this call, in CuPy or the caller's own code, leaves the
         # thread's last CUDA error set, which the first launch check here would report as its own.
         clear_cuda_error()
-        temp_pool = self._scratch_pool()
         # With arrays to keep and more than one chunk, a chunk's copies to the host run while the
         # next chunk computes, so its results are yielded one chunk late. The pending chunk's
         # device outputs are held until its copies land.
@@ -628,11 +659,7 @@ class Subject:
                     width //= 2
                     if copier is not None:
                         copier.drain()
-                    # A failed allocation leaves the thread's last CUDA error set, and the next
-                    # launch check would report it as its own.
-                    clear_cuda_error()
-                    temp_pool.free_all_blocks()
-                    cp.get_default_memory_pool().free_all_blocks()
+                    self._release_free_blocks()
                     continue
                 start += len(chunk)
                 if copier is None:
@@ -667,7 +694,8 @@ class Subject:
         any other raises until :meth:`free` discards it.
         """
         with self._lock:
-            _published(ensure_sweep_basis(self.context, coil, size))
+            ctx = self.context
+            self._build(lambda: ensure_sweep_basis(ctx, coil, size))
 
     def iter_simulate(
         self,
@@ -785,14 +813,15 @@ class Subject:
 
         ctx = self.context
         pre = self._conductivity_uq_precompute(config)
-        # Outside the pool below, for the same reason the precompute is: the patch weights are
-        # cached on the context and outlive the placement that first asked for them.
-        tissues = self._needed_tissues(moments, record_rois)
+        temp_pool = self._scratch_pool()
+        with cp.cuda.using_allocator(temp_pool.malloc):
+            tissues = self._needed_tissues(moments, record_rois)
         op = self._recovery_operator(recovery, tissues)
         gray_matter = self._region_slice(DEFAULT_REGION)
         provenance = self._provenance(coil, seeded=False)
-        temp_pool = self._scratch_pool()
-        for site in sites:
+        host = self._host_metric_inputs if moments else None
+
+        def reduce(site: Placement) -> ConductivityUQResult:
             with cp.cuda.using_allocator(temp_pool.malloc):
                 result = run_conductivity_uq(
                     ctx,
@@ -807,8 +836,7 @@ class Subject:
                     region=gray_matter,
                 )
                 # Summarised on the device before anything is copied back.
-                host = self._host_metric_inputs if moments else None
-                reduced = replace(
+                return replace(
                     result,
                     summary=result.compute_summary(region_slice=gray_matter),
                     mean_magnE=cp.asnumpy(result.mean_magnE) if moments else None,
@@ -819,7 +847,15 @@ class Subject:
                     barycenters_mm=host[2] if host else None,
                     provenance=provenance,
                 )
-                del result
+
+        for site in sites:
+            # A placement's draws do not depend on anything a failed attempt left behind, so a
+            # rerun after the pools hand back their free blocks gives the same result.
+            try:
+                reduced = reduce(site)
+            except MemoryError:
+                self._release_free_blocks()
+                reduced = reduce(site)
             yield reduced
 
     def iter_simulate_conductivity_uq(

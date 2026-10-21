@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 import cupy as cp
 
+from cunibs._memory import build_arena
 from cunibs.fem.assembly import build_node2corner
 from cunibs.solver import (
     count_incident_node_csr,
@@ -367,11 +368,12 @@ class RecoveryOperator:
         cached = self.active.get(key)
         if cached is None:
             assert self.slot_tag is not None
-            wanted = cp.asarray(sorted(key), dtype=self.slot_tag.dtype)
-            slots = cp.flatnonzero(cp.isin(self.slot_tag, wanted)).astype(cp.int32)
-            element_tag = self.slot_tag[self.slot_of_corner[::4]]
-            elements = cp.flatnonzero(cp.isin(element_tag, wanted)).astype(cp.int32)
-            cached = (cp.ascontiguousarray(slots), cp.ascontiguousarray(elements))
+            with build_arena() as arena:
+                wanted = cp.asarray(sorted(key), dtype=self.slot_tag.dtype)
+                slots = cp.flatnonzero(cp.isin(self.slot_tag, wanted)).astype(cp.int32)
+                element_tag = self.slot_tag[self.slot_of_corner[::4]]
+                elements = cp.flatnonzero(cp.isin(element_tag, wanted)).astype(cp.int32)
+                cached = (arena.keep(slots), arena.keep(elements))
             self.active[key] = cached
         return cached
 
@@ -388,22 +390,26 @@ def _build_harmonic_operator(
 
     Only the slots of ``tissues`` are fitted, or every slot when it is ``None``.
     """
-    slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
-    pptr, pidx = node_patches(ctx, slots)
-    n_slots = int(slots.slot_node.shape[0])
-    op = RecoveryOperator(
-        mode="harmonic",
-        ptr=pptr,
-        idx=pidx,
-        w=cp.empty((int(pidx.shape[0]), 3), dtype=cp.float32),
-        slot_of_corner=slots.slot_of_corner,
-        slot_node=slots.slot_node,
-        slot_tag=slots.slot_tag,
-        n_slots=n_slots,
-        status=cp.full(n_slots, -1, dtype=cp.int32),
-        fitted=set(),
-        tags=frozenset(int(t) for t in cp.asnumpy(cp.unique(slots.slot_tag))),
-    )
+    with build_arena() as arena:
+        slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
+        pptr, pidx = node_patches(ctx, slots)
+        n_slots = int(slots.slot_node.shape[0])
+        with arena.resident():
+            w = cp.empty((int(pidx.shape[0]), 3), dtype=cp.float32)
+            status = cp.full(n_slots, -1, dtype=cp.int32)
+        op = RecoveryOperator(
+            mode="harmonic",
+            ptr=arena.keep(pptr),
+            idx=arena.keep(pidx),
+            w=w,
+            slot_of_corner=arena.keep(slots.slot_of_corner),
+            slot_node=arena.keep(slots.slot_node),
+            slot_tag=arena.keep(slots.slot_tag),
+            n_slots=n_slots,
+            status=status,
+            fitted=set(),
+            tags=frozenset(int(t) for t in cp.asnumpy(cp.unique(slots.slot_tag))),
+        )
     fit_harmonic(ctx, op, op.tags if tissues is None else tissues)
     return op
 
@@ -414,61 +420,69 @@ def fit_harmonic(ctx: SolverContext, op: RecoveryOperator, tissues: Collection[i
     missing = sorted(({int(t) for t in tissues} & op.tags) - op.fitted)
     if not missing:
         return
-    active = cp.flatnonzero(cp.isin(op.slot_tag, cp.asarray(missing, dtype=op.slot_tag.dtype)))
-    # In metres, not millimetres. These weights differentiate, so unlike the SPR ones they carry
-    # a length unit: v is in volts and E has to come out in V/m. The scaling cancels in any check
-    # whose reference gradient is also per millimetre, so it stays invisible until dA/dt is added.
-    nodes_m = cp.ascontiguousarray(ctx.nodes_mm * 1e-3)
-    hpr_weights(
-        nodes_m,
-        op.ptr,
-        op.idx,
-        op.slot_node,
-        op.w,
-        op.status,
-        cp.cuda.get_current_stream().ptr,
-        cp.ascontiguousarray(active.astype(cp.int32)),
-    )
+    # The fit writes into op's own arrays, so nothing allocated here outlives it.
+    with build_arena():
+        wanted = cp.asarray(missing, dtype=op.slot_tag.dtype)
+        active = cp.flatnonzero(cp.isin(op.slot_tag, wanted)).astype(cp.int32)
+        # In metres, not millimetres. These weights differentiate, so unlike the SPR ones they
+        # carry a length unit: v is in volts and E has to come out in V/m. The scaling cancels in
+        # any check whose reference gradient is also per millimetre, so it stays invisible until
+        # dA/dt is added.
+        nodes_m = cp.ascontiguousarray(ctx.nodes_mm * 1e-3)
+        hpr_weights(
+            nodes_m,
+            op.ptr,
+            op.idx,
+            op.slot_node,
+            op.w,
+            op.status,
+            cp.cuda.get_current_stream().ptr,
+            active,
+        )
     op.fitted.update(missing)
 
 
 def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
     """Fit the per-element field over each slot's incident tetrahedra, linearly."""
     n_nodes = int(ctx.n_nodes)
-    if mode in TISSUE_SLOT_MODES:
-        slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
-        ptr, idx, slot_of_corner = slots.ptr, slots.idx, slots.slot_of_corner
-        slot_node, slot_tag = slots.slot_node, slots.slot_tag
-        slot_arg = slot_node
-    else:
-        # A slot is a node, so the corner CSR is the one the RHS assembly already carries and a
-        # corner reads back from its own node, so no index arrays are built.
-        ptr, idx = ctx.node2corner_ptr, ctx.node2corner_idx
-        slot_of_corner = cp.ascontiguousarray(ctx.tet_nodes.reshape(-1))
-        slot_node = cp.arange(n_nodes, dtype=cp.int32)
-        slot_tag = None
-        slot_arg = None
+    with build_arena() as arena:
+        if mode in TISSUE_SLOT_MODES:
+            slots = tissue_slots(ctx.tet_nodes, ctx.tet_tags)
+            ptr, idx, slot_of_corner, slot_node, slot_tag = (arena.keep(a) for a in slots)
+            slot_arg = slot_node
+            del slots
+        else:
+            # A slot is a node, so the corner CSR is the one the RHS assembly already carries and
+            # a corner reads back from its own node, a view of the connectivity.
+            ptr, idx = ctx.node2corner_ptr, ctx.node2corner_idx
+            slot_of_corner = ctx.tet_nodes.reshape(-1)
+            with arena.resident():
+                slot_node = cp.arange(n_nodes, dtype=cp.int32)
+            slot_tag = None
+            slot_arg = None
 
-    node2corner = (ctx.node2corner_ptr, ctx.node2corner_idx)
-    is_boundary = (
-        tissue_boundary_nodes(ctx.tet_nodes, n_nodes, slot_node, node2corner=node2corner)
-        if mode in TISSUE_SLOT_MODES
-        else outer_boundary_nodes(ctx.tet_nodes, n_nodes, node2corner=node2corner)
-    )
-    w = cp.empty(int(idx.shape[0]), dtype=cp.float32)
-    counter = cp.zeros(1, dtype=cp.int32)
-    spr_weights(
-        ctx.nodes_mm,
-        ctx.tet_nodes,
-        ctx.vols,
-        ptr,
-        idx,
-        slot_arg,
-        is_boundary,
-        w,
-        counter,
-        cp.cuda.get_current_stream().ptr,
-    )
+        node2corner = (ctx.node2corner_ptr, ctx.node2corner_idx)
+        is_boundary = (
+            tissue_boundary_nodes(ctx.tet_nodes, n_nodes, slot_node, node2corner=node2corner)
+            if mode in TISSUE_SLOT_MODES
+            else outer_boundary_nodes(ctx.tet_nodes, n_nodes, node2corner=node2corner)
+        )
+        with arena.resident():
+            w = cp.empty(int(idx.shape[0]), dtype=cp.float32)
+        counter = cp.zeros(1, dtype=cp.int32)
+        spr_weights(
+            ctx.nodes_mm,
+            ctx.tet_nodes,
+            ctx.vols,
+            ptr,
+            idx,
+            slot_arg,
+            is_boundary,
+            w,
+            counter,
+            cp.cuda.get_current_stream().ptr,
+        )
+        n_fallback = int(counter[0])
     return RecoveryOperator(
         mode=mode,
         ptr=ptr,
@@ -478,7 +492,7 @@ def _build_spr_operator(ctx: SolverContext, mode: Recovery) -> RecoveryOperator:
         slot_node=slot_node,
         slot_tag=slot_tag,
         n_slots=int(slot_node.shape[0]),
-        spr_fallbacks=int(counter[0]),
+        spr_fallbacks=n_fallback,
     )
 
 
@@ -504,7 +518,8 @@ def ensure_recovery(
     """Return ``mode``'s operator for ``ctx``, building and caching it on first use.
 
     The operator returned is fitted at least for ``tissues``, or for every tissue when it is
-    ``None``.
+    ``None``, and holds the slot and element lists an apply restricted to ``tissues`` reads, so
+    building those never lands in a later call's allocator.
 
     Callers that hold a :class:`~cunibs.simulation.Subject` should go through it instead, so the
     build is serialised by its lock and lands outside any scratch allocator.
@@ -516,6 +531,8 @@ def ensure_recovery(
         ctx.recovery[mode] = cached
     elif cached.fitted is not None:
         fit_harmonic(ctx, cached, cached.tags if tissues is None else tissues)
+    if tissues is not None and cached.fitted is not None:
+        cached.restricted_to(frozenset(int(t) for t in tissues) & cached.tags)
     return cached
 
 

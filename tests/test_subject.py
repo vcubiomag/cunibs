@@ -92,20 +92,28 @@ def test_mesh_property_is_the_context_mesh(cube_mesh):
         subj.free()
 
 
+def _held(cp, subj) -> int:
+    """Bytes in use across every pool device arrays can come from: the subject's and the caller's."""
+    pools = [subj._resident, subj._scratch, cp.get_default_memory_pool()]
+    return sum(pool.used_bytes() for pool in pools if pool is not None)
+
+
 @pytest.mark.realmesh
 def test_free_releases_device_memory(cp, patch_mesh):
-    """Dropping the cached context must return the pool to roughly its starting size."""
-    pool = cp.get_default_memory_pool()
-    pool.free_all_blocks()
-    baseline = pool.used_bytes()
+    """The cached state lives in the subject's own pool, and free() hands all of it back."""
+    caller = cp.get_default_memory_pool()
+    caller.free_all_blocks()
+    baseline = caller.used_bytes()
 
     subj = Subject(patch_mesh)
     assert subj.context is not None
-    grown = pool.used_bytes()
-    assert grown - baseline > 1_000_000  # the patch's resident arrays are several MB
+    resident = subj._resident
+    assert resident.used_bytes() > 1_000_000  # the patch's resident arrays are several MB
+    assert caller.used_bytes() - baseline < 1_000_000
 
     subj.free()
-    assert pool.used_bytes() - baseline < 1_000_000
+    assert resident.total_bytes() == 0
+    assert caller.used_bytes() - baseline < 1_000_000
 
 
 @pytest.mark.realmesh
@@ -114,14 +122,13 @@ def test_summary_sweep_does_not_grow_pool(
 ):
     """The documented scratch-pool contract: a long sweep must not accumulate device memory."""
     subj = fresh_subject(patch_mesh)
-    pool = cp.get_default_memory_pool()
 
     subj.simulate(d70_coil, patch_placement)
     subj.simulate(d70_coil, patch_placement)
-    settled = pool.used_bytes()
+    settled = _held(cp, subj)
     for _ in range(8):
         subj.simulate(d70_coil, patch_placement)
-    assert pool.used_bytes() - settled < 1_000_000
+    assert _held(cp, subj) - settled < 1_000_000
 
 
 @pytest.mark.realmesh
@@ -130,10 +137,9 @@ def test_retained_fields_are_host_backed_and_leave_the_pool_flat(
 ):
     """The counterpart: retaining fields moves them to the host, off the scarcer resource."""
     subj = fresh_subject(patch_mesh)
-    pool = cp.get_default_memory_pool()
 
     subj.simulate(d70_coil, patch_placement)  # warm the context and its caches
-    settled = pool.used_bytes()
+    settled = _held(cp, subj)
     results = list(subj.iter_simulate(d70_coil, [patch_placement] * 4, magnitude=True))
 
     for r in results:
@@ -141,8 +147,8 @@ def test_retained_fields_are_host_backed_and_leave_the_pool_flat(
         assert r.magnE.shape == (patch_mesh.tet_nodes.shape[0],)
     # Retained results share the metric inputs rather than copying them per result.
     assert results[0].vols is results[1].vols
-    # Holding every result on the host must not have grown the device pool.
-    assert pool.used_bytes() - settled < 1_000_000
+    # Holding every result on the host must not have grown the device pools.
+    assert _held(cp, subj) - settled < 1_000_000
 
 
 def test_roi_radius_zero_is_nearest_gm_element(cp, cube_subject, cube_mesh):

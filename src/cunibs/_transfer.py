@@ -36,7 +36,12 @@ class AsyncCopier:
     """
 
     def __init__(self) -> None:
-        self._slots = [cp.cuda.alloc_pinned_memory(_SLOT_BYTES) for _ in range(_SLOTS)]
+        # Each slot is an allocation of its own, released with the copier. CuPy's pinned pool
+        # would keep the page-locked memory for the life of the process.
+        self._slots = [
+            cp.cuda.PinnedMemoryPointer(cp.cuda.PinnedMemory(_SLOT_BYTES), 0)
+            for _ in range(_SLOTS)
+        ]
         self._streams = [cp.cuda.Stream(non_blocking=True) for _ in range(_SLOTS)]
         self._turn = 0
         self._lock = threading.Lock()

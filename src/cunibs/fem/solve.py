@@ -10,6 +10,7 @@ import cupyx.scipy.sparse as csp
 import numpy as np
 import numpy.typing as npt
 
+from cunibs._memory import Arena, build_arena
 from cunibs.fem.assembly import (
     assemble_stiffness,
     build_node2corner,
@@ -212,11 +213,12 @@ def _aggregate(
 
 
 class AggregationLevel(NamedTuple):
-    """One coarsening step of the hierarchy."""
+    """One coarsening step of the hierarchy, with its smoother's l1 diagonal."""
 
     a: csp.csr_matrix
     aggregates: cp.ndarray
     p: csp.csr_matrix
+    dinv: cp.ndarray
 
     @property
     def n_coarse(self) -> int:
@@ -238,6 +240,9 @@ def aggregation_levels(
     Each level's prolongator is built here rather than by the caller because the next level's
     operator is the Galerkin product over it, so the transfer and the coarse operator have to
     agree.
+
+    Each level is built in an arena of its own, since the Galerkin product's SpGEMM workspace is
+    many times the operator it produces, and only the level's results are kept.
     """
     if params is None:
         params = AggregationParams()
@@ -249,12 +254,15 @@ def aggregation_levels(
         n_rows = a.shape[0]
         if n_rows <= params.min_coarse_rows:
             break
-        agg, n_coarse = _aggregate(a, params, stream)
-        if agg is None or n_coarse == n_rows or n_coarse < params.min_coarse_rows:
-            break
-        p = _smooth_prolongator(a, _tentative_prolongator(agg, n_coarse), _l1_dinv(a))
-        levels.append(AggregationLevel(a, agg, p))
-        a = _galerkin(a, p)
+        with build_arena() as arena:
+            agg, n_coarse = _aggregate(a, params, stream)
+            if agg is None or n_coarse == n_rows or n_coarse < params.min_coarse_rows:
+                break
+            dinv = _l1_dinv(a)
+            p = _smooth_prolongator(a, _tentative_prolongator(agg, n_coarse), dinv)
+            level = AggregationLevel(a, arena.keep(agg), arena.keep(p), arena.keep(dinv))
+            a = arena.keep(_galerkin(a, p))
+        levels.append(level)
     return levels, a
 
 
@@ -269,21 +277,25 @@ def build_native_vcycle(
 
     P and R = P^T both go up as CSR. ``sort_indices`` on each is what fixes the summation order
     inside the prolongate and restrict kernels, which walk their rows in index order.
+
+    The V-cycle copies every level into memory of its own, so no CuPy array outlives the build and
+    all of it runs in an arena: a rebuild inside a caller's scratch allocator leaves nothing there.
     """
     if smoother is None:
         smoother = SmootherParams()
-    levels, coarse = aggregation_levels(row_ptr, col_idx, values_f32, params)
-    stream = cp.cuda.get_current_stream().ptr
-    vc = NativeVCycle()
-    vc.set_smoother(smoother.degree, smoother.lower_ratio)
-    for level in levels:
-        a, p = level.a, level.p
-        r = p.T.tocsr()
-        r.sort_indices()
-        vc.add_level(*_csr_f32(a), _l1_dinv(a), *_csr_f32(p), *_csr_f32(r), stream)
-    ainv = cp.linalg.inv(coarse.todense().astype(cp.float32))
-    vc.set_coarse(cp.ascontiguousarray(ainv), stream)
-    vc.finalize()
+    with build_arena():
+        levels, coarse = aggregation_levels(row_ptr, col_idx, values_f32, params)
+        stream = cp.cuda.get_current_stream().ptr
+        vc = NativeVCycle()
+        vc.set_smoother(smoother.degree, smoother.lower_ratio)
+        for level in levels:
+            a, p = level.a, level.p
+            r = p.T.tocsr()
+            r.sort_indices()
+            vc.add_level(*_csr_f32(a), level.dinv, *_csr_f32(p), *_csr_f32(r), stream)
+        ainv = cp.linalg.inv(coarse.todense().astype(cp.float32))
+        vc.set_coarse(cp.ascontiguousarray(ainv), stream)
+        vc.finalize()
     return vc
 
 
@@ -459,14 +471,16 @@ def prepare_grounded_solver(
 ) -> GroundedSolver:
     """Remove the ground DOF and build the mixed-precision solver."""
     n = a.shape[0]
-    idx = solve_ordering(nodes_mm, ground_node)
-    a_red = reduce_matrix(a, idx)
-    row_ptr = a_red.indptr.astype(cp.int32, copy=False)
-    col_idx = a_red.indices.astype(cp.int32, copy=False)
-    values = a_red.data.astype(cp.float64, copy=False)
-    values_f32 = values.astype(cp.float32)
-    precond = build_native_vcycle(row_ptr, col_idx, values_f32)
-    pcg = PcgAmgSolver(row_ptr, col_idx, values, cp.cuda.get_current_stream().ptr)
+    with build_arena() as arena:
+        with arena.resident():
+            idx = solve_ordering(nodes_mm, ground_node)
+        a_red = reduce_matrix(a, idx)
+        row_ptr = arena.keep(a_red.indptr.astype(cp.int32, copy=False))
+        col_idx = arena.keep(a_red.indices.astype(cp.int32, copy=False))
+        values = arena.keep(a_red.data.astype(cp.float64, copy=False))
+        del a_red
+        precond = build_native_vcycle(row_ptr, col_idx, values.astype(cp.float32))
+        pcg = PcgAmgSolver(row_ptr, col_idx, values, cp.cuda.get_current_stream().ptr)
     return GroundedSolver(
         n=n,
         idx=idx,
@@ -697,24 +711,27 @@ def context_of(subject: Subject | SolverContext) -> SolverContext:
 
 
 def _spatially_ordered(
-    mesh: HeadMesh,
+    mesh: HeadMesh, arena: Arena
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
-    """Reorder a mesh along a Morton curve, as device arrays.
+    """Reorder a mesh along a Morton curve, as device arrays the arena keeps.
 
     This order is the one every array in the context carries, and so the one a caller reads
     results against. Surface rows keep their file order; only the node ids they name move, so the
     surface tags do not move at all.
     """
-    nodes_mm = cp.asarray(mesh.nodes_mm)
-    tet_nodes = cp.asarray(mesh.tet_nodes)
-    node_perm, inverse, tet_perm = spatial_order(nodes_mm, tet_nodes)
-
-    nodes_mm = cp.ascontiguousarray(nodes_mm[node_perm])
-    tet_nodes = cp.ascontiguousarray(inverse[tet_nodes[tet_perm]])
-    tet_tags = cp.ascontiguousarray(cp.asarray(mesh.tet_tags)[tet_perm])
+    nodes_in = cp.asarray(mesh.nodes_mm)
+    tets_in = cp.asarray(mesh.tet_nodes)
+    node_perm, inverse, tet_perm = spatial_order(nodes_in, tets_in)
+    tets_permuted = tets_in[tet_perm]
+    tags_in = cp.asarray(mesh.tet_tags)
     surf = cp.asarray(mesh.surf_tris)
-    surf_tris = cp.ascontiguousarray(inverse[surf]) if surf.shape[0] else surf
-    return nodes_mm, tet_nodes, tet_tags, surf_tris, cp.asarray(mesh.surf_tags)
+    with arena.resident():
+        nodes_mm = cp.ascontiguousarray(nodes_in[node_perm])
+        tet_nodes = cp.ascontiguousarray(inverse[tets_permuted])
+        tet_tags = cp.ascontiguousarray(tags_in[tet_perm])
+        surf_tris = cp.ascontiguousarray(inverse[surf]) if surf.shape[0] else surf
+        surf_tags = cp.asarray(mesh.surf_tags)
+    return nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags
 
 
 def skin_triangle_normals(nodes_mm: cp.ndarray, skin_tris: cp.ndarray) -> cp.ndarray:
@@ -765,45 +782,56 @@ def build_context(mesh: HeadMesh) -> SolverContext:
 
     Assemble ``g``, volumes, and stiffness in float64. Store ``g``, volumes, and
     ``-volume * conductivity`` in float32 for placement kernels.
+
+    The context's arrays come from the caller's allocator; everything else is a temporary of the
+    build's arena.
     """
-    nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags = _spatially_ordered(mesh)
-    skin_tris = cp.ascontiguousarray(surf_tris[surf_tags == SKIN_SURFACE_TAG])
-    n_nodes = int(nodes_mm.shape[0])
+    with build_arena() as arena:
+        nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags = _spatially_ordered(mesh, arena)
+        with arena.resident():
+            skin_tris = cp.ascontiguousarray(surf_tris[surf_tags == SKIN_SURFACE_TAG])
+        n_nodes = int(nodes_mm.shape[0])
 
-    g, vols = gradient_operator(nodes_mm, tet_nodes)
-    n_invalid = int(cp.count_nonzero((vols <= 0.0) | ~cp.isfinite(vols)))
-    if n_invalid:
-        subject = "tetrahedron has" if n_invalid == 1 else "tetrahedra have"
-        raise ValueError(f"{n_invalid} {subject} zero or non-finite volume")
-    cond = conductivity_per_tet(tet_tags)
-    stiffness = assemble_stiffness(g, vols, cond, n_nodes, tet_nodes)
-    ground_node = ground_node_of(nodes_mm)
-    solver = prepare_grounded_solver(stiffness, nodes_mm, ground_node)
-    ptr, idx = build_node2corner(tet_nodes, n_nodes)
-    rhs_op = build_rhs_operator(stiffness, g, -(vols * cond), tet_nodes, ptr, idx)
-    rhs_indptr = stiffness.indptr
-    del stiffness
+        g, vols = gradient_operator(nodes_mm, tet_nodes)
+        n_invalid = int(cp.count_nonzero((vols <= 0.0) | ~cp.isfinite(vols)))
+        if n_invalid:
+            subject = "tetrahedron has" if n_invalid == 1 else "tetrahedra have"
+            raise ValueError(f"{n_invalid} {subject} zero or non-finite volume")
+        cond = conductivity_per_tet(tet_tags)
+        ptr, idx = (arena.keep(a) for a in build_node2corner(tet_nodes, n_nodes))
+        stiffness = assemble_stiffness(
+            g, vols, cond, n_nodes, tet_nodes, node2corner=(ptr, idx)
+        )
+        # The solver build below is the peak of the whole context, so everything it does not read
+        # is finished and dropped first: the RHS operator is the last reader of the float64 g.
+        rhs_op = arena.keep(
+            build_rhs_operator(stiffness, g, -(vols * cond), tet_nodes, ptr, idx)
+        )
+        rhs_indptr = arena.keep(stiffness.indptr)
+        with arena.resident():
+            g32 = g.astype(RESIDENT_G_DTYPE)
+            vols32 = vols.astype(cp.float32)
+        neg_vc = arena.keep(-(vols32 * cond.astype(cp.float32)))
+        del g, vols, cond
+        with arena.resident():
+            solver = prepare_grounded_solver(stiffness, nodes_mm, ground_node_of(nodes_mm))
+        del stiffness
 
-    g = g.astype(RESIDENT_G_DTYPE)
-    neg_vc = cp.ascontiguousarray(-(vols.astype(cp.float32) * cond.astype(cp.float32)))
-    vols = vols.astype(cp.float32)
-    del cond
-    barycenters = cp.empty((int(tet_nodes.shape[0]), 3), dtype=cp.float64)
-    _barycentres(nodes_mm, tet_nodes, barycenters)
-
-    skin_verts = nodes_mm[skin_tris]
-    skin_tri_normals = skin_triangle_normals(nodes_mm, skin_tris)
+        with arena.resident():
+            barycenters = cp.empty((int(tet_nodes.shape[0]), 3), dtype=cp.float64)
+            _barycentres(nodes_mm, tet_nodes, barycenters)
+            skin_verts = nodes_mm[skin_tris]
+        skin_tri_normals = arena.keep(skin_triangle_normals(nodes_mm, skin_tris))
     # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
     # rather than a cost of building the context.
-    mesh = HeadMesh(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags)
-    ctx = SolverContext(
-        mesh,
+    return SolverContext(
+        HeadMesh(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags),
         nodes_mm,
         tet_nodes,
         tet_tags,
         n_nodes,
-        g,
-        vols,
+        g32,
+        vols32,
         barycenters,
         neg_vc,
         solver,
@@ -815,8 +843,6 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         skin_tri_normals,
         skin_tris,
     )
-    cp.get_default_memory_pool().free_all_blocks()
-    return ctx
 
 
 class PlacementResult(TypedDict):
