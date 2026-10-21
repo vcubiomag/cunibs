@@ -424,6 +424,13 @@ class ColumnTelemetry(NamedTuple):
 
 
 @dataclass
+class PreconditionerSlot:
+    """The V-cycle every solver over one matrix applies, held where all of them read it."""
+
+    vcycle: NativeVCycle
+
+
+@dataclass
 class GroundedSolver:
     """Reduced SPD system with one grounded potential.
 
@@ -431,19 +438,29 @@ class GroundedSolver:
     ``E = -grad(v) - dA/dt``.
 
     The reduced matrix lives in ``pcg`` alone; :meth:`matrix` exports it for a caller that needs
-    it as a CSR.
+    it as a CSR. A copy made with :func:`dataclasses.replace` to change the stopping rule shares
+    the matrix, the solver and ``slot``, so a preconditioner rebuilt through either copy is the
+    one both use.
     """
 
     n: int
     idx: cp.ndarray
     # The fp32 apply inside solve_mixed. Mutable: a solve that misses tolerance rebuilds it
     # from the current values (see rebuild_preconditioner).
-    precond: NativeVCycle
+    slot: PreconditionerSlot
     pcg: PcgAmgSolver
     tolerance: float
     max_iters: int
     last_iterations: int = 0
     last_relative_residual: float = 0.0
+
+    @property
+    def precond(self) -> NativeVCycle:
+        return self.slot.vcycle
+
+    @precond.setter
+    def precond(self, vcycle: NativeVCycle) -> None:
+        self.slot.vcycle = vcycle
 
     def matrix(self, values: bool = True) -> csp.csr_matrix:
         """The reduced matrix as an fp64 CSR with int32 indices, a fresh copy on every call.
@@ -493,7 +510,7 @@ def prepare_grounded_solver(
     return GroundedSolver(
         n=n,
         idx=idx,
-        precond=precond,
+        slot=PreconditionerSlot(precond),
         pcg=pcg,
         tolerance=tolerance,
         max_iters=max_iters,
