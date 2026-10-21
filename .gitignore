@@ -18,6 +18,6 @@ src/cunibs/solver/_solver_ext.pyi
 compile_commands.json
 
 # Evaluation
-metrics
+benchmarks/results
 reference_data
 manuscripts
