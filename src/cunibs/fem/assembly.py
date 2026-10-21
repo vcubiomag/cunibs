@@ -173,15 +173,23 @@ def build_node2corner(tet_nodes: cp.ndarray, n_nodes: int) -> tuple[cp.ndarray, 
     reduce over.
     """
     n_corner = int(tet_nodes.shape[0]) * int(tet_nodes.shape[1])
-    ptr = cp.zeros(n_nodes + 1, dtype=cp.int32)
     if n_corner == 0:
-        # cupy's bincount reduces over the keys to size its output rather than trusting
-        # minlength, so it cannot take an empty array. A tet subset is empty whenever a UQ
-        # per-tissue component covers a tag the mesh does not use.
-        return ptr, cp.empty(0, dtype=cp.int32)
+        # A tet subset is empty whenever a UQ per-tissue component covers a tag the mesh does not
+        # use.
+        return cp.zeros(n_nodes + 1, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
     corners = cp.arange(n_corner, dtype=cp.int32)
     keys = tet_nodes.ravel()
     order = cp.argsort(keys, kind="stable")
     idx = cp.ascontiguousarray(corners[order])
-    ptr[1:] = cp.cumsum(cp.bincount(keys, minlength=n_nodes)).astype(cp.int32)
-    return ptr, idx
+    return csr_offsets(keys[order], n_nodes), idx
+
+
+def csr_offsets(sorted_keys: cp.ndarray, n: int) -> cp.ndarray:
+    """CSR row offsets ``(n + 1,)`` int32 of sorted keys; a key of ``n`` or more is in no row.
+
+    ``cp.bincount`` is unsafe for this: CuPy runs it through CUB's histogram, which keeps
+    ``blocks * n`` counters (2 GB at 860k nodes on an A100) and offsets into them in 32 bits, so
+    it writes out of bounds once that product passes 2^31.
+    """
+    offsets = cp.searchsorted(sorted_keys, cp.arange(n + 1, dtype=sorted_keys.dtype))
+    return offsets.astype(cp.int32)

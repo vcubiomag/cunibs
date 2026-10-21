@@ -20,6 +20,7 @@ import numpy as np
 
 from cunibs.adm.grid import Grid, SweptCoverage, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
+from cunibs.fem.assembly import csr_offsets
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.fem.solve import (
     GroundedSolver,
@@ -402,9 +403,7 @@ def _binned_sources(
     n_cells = int(cp.prod(n_ext))
     flat = cp.where(inside, flat, n_cells)
     order = cp.argsort(flat, kind="stable")
-    # cp.bincount is unsafe here: CuPy runs it through CUB's histogram, which keeps blocks * cells
-    # counters and offsets into them in 32 bits, so a fine grid writes out of bounds.
-    cell_ptr = cp.searchsorted(flat[order], cp.arange(n_cells + 1)).astype(cp.int32)
+    cell_ptr = csr_offsets(flat[order], n_cells)
 
     occupied = (cell_ptr[1:] > cell_ptr[:-1]).reshape(tuple(int(n) for n in n_ext))
     # Cell i's 27 neighbours are extended cells i .. i + 2 on each axis.

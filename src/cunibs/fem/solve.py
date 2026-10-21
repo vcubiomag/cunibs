@@ -99,7 +99,10 @@ def _tentative_prolongator(agg: cp.ndarray, n_coarse: int) -> csp.csr_matrix:
     rows on one scale when aggregates differ in size.
     """
     n = int(agg.shape[0])
-    counts = cp.bincount(agg, minlength=n_coarse).astype(cp.float32)
+    # cp.bincount is unsafe here, as csr_offsets says; integer atomics count exactly in any order.
+    counts = cp.zeros(n_coarse, dtype=cp.int32)
+    cp.add.at(counts, agg, 1)
+    counts = counts.astype(cp.float32)
     scale = cp.reciprocal(cp.sqrt(counts))
     return csp.csr_matrix(
         (scale[agg], agg, cp.arange(n + 1, dtype=cp.int32)), shape=(n, n_coarse)

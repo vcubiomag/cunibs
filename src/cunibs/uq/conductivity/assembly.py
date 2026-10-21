@@ -20,6 +20,7 @@ from cunibs.fem.assembly import (
     TISSUE_CONDUCTIVITY,
     as_int32_tets,
     conductivity_per_tet,
+    csr_offsets,
     fill_stiffness_values,
     gradient_operator,
     stiffness_pattern,
@@ -159,8 +160,7 @@ def build_conductivity_uq_precompute(
 
     def compressed(data: cp.ndarray) -> csp.csr_matrix:
         keep = data != 0.0
-        counts = cp.bincount(rows[keep], minlength=shape[0])
-        ptr = cp.concatenate([cp.zeros(1, dtype=cp.int32), cp.cumsum(counts).astype(cp.int32)])
+        ptr = csr_offsets(rows[keep], shape[0])
         return csp.csr_matrix((data[keep], col_idx[keep], ptr), shape=shape)
 
     tissue_ops = [compressed(tissue_data[i]) for i in range(len(perturbed_tags))]
