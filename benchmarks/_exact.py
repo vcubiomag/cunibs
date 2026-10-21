@@ -397,7 +397,7 @@ class Solved:
 
         op = ensure_recovery(self.ctx, mode)
         if op.on_potential:
-            zero = [cp.zeros((len(self.nodes), 3), cp.float32)]
+            zero = cp.zeros((len(self.nodes), 3), cp.float32)
             v = cp.ascontiguousarray(cp.asarray(self.v).reshape(-1, 1))
             out = apply_recovery(op, len(self.tets), potential=v, dadt_nodes=zero)
         else:

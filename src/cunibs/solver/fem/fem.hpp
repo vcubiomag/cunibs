@@ -63,10 +63,19 @@ void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,
                         cudaStream_t stream);
 
-// v_block is row-major (n_nodes, k) float64.
+// v_block is row-major (n_nodes, k) float64. A null e_out[c] or magn_out[c] is not written.
 void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const float* g,
                               const float* const* dadt_elm, float* const* e_out,
                               float* const* magn_out, int n_tet, int k, cudaStream_t stream);
+
+// The same from nodal dA/dt, averaged onto each element in the kernel: placement c's value at node
+// n starts at dadt_nodes[n * row_stride + c * column_stride], so an interleaved (n_nodes, k, 3)
+// block has strides (3k, 3) and one field shared by every placement has (3, 0).
+void launch_reconstruct_nodal_block(const double* v_block, const int* tet_nodes, const float* g,
+                                    const float* dadt_nodes, std::int64_t row_stride,
+                                    int column_stride, float* const* e_out,
+                                    float* const* magn_out, int n_tet, int k,
+                                    cudaStream_t stream);
 
 // A "slot" is what a patch is fitted around: a node in the global mode, a (node, tissue) pair in
 // the tissue-restricted ones. The SPR entry points take a corner CSR over slots, in the same
@@ -110,15 +119,19 @@ void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx
                         const int* slot_node, float* w, int* status, const int* active, int n,
                         cudaStream_t stream);
 
-// v_block is row-major (n_nodes, stride) float64; column c of each slot uses dadt_nodes[c].
-// stride is the width of v_block, which exceeds k when the block was padded.
+// v_block is row-major (n_nodes, stride) float64; stride is the width of v_block, which exceeds k
+// when the block was padded. Column c's dA/dt at node n starts at
+// dadt_nodes[n * dadt_row + c * dadt_column], so an interleaved (n_nodes, k, 3) block has strides
+// (3k, 3) and one field shared by every column has (3, 0). work holds hpr_grad_work_floats.
 // Only the slots active[0, n) are written, or all n_slots when active is null.
+std::size_t hpr_grad_work_floats(int n_nodes, int k);
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
-                     const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
-                     int n_slots, const int* active, int n, int k, int stride, int n_nodes,
-                     cudaStream_t stream);
+                     const int* slot_node, const float* dadt_nodes, std::int64_t dadt_row,
+                     int dadt_column, float* const* e_slots, int n_slots, const int* active,
+                     int n, int k, int stride, int n_nodes, float* work, cudaStream_t stream);
 
-// slot_of_corner is (4 * n_tet,): the slot each corner reads back from.
+// slot_of_corner is (4 * n_tet,): the slot each corner reads back from. A null e_out[c] or
+// magn_out[c] is not written.
 // Only the elements active[0, n) are written, or all n_tet when active is null.
 void launch_recover_elements(const float* const* e_slots, const int* slot_of_corner,
                              float* const* e_out, float* const* magn_out, int n_tet,

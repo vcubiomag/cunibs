@@ -388,6 +388,7 @@ def test_build_node2corner_on_patch(cp, patch_mesh):
 
 def test_reconstruct_matches_numpy_reference(cp, cube_mesh):
     from cunibs.fem import build_context, solve_placement
+    from cunibs.fem.placement import coil_dadt_at_nodes
 
     ctx = build_context(cube_mesh)
     coil_pos = np.array([[-0.02, 0, 0], [0.02, 0, 0]])
@@ -396,7 +397,8 @@ def test_reconstruct_matches_numpy_reference(cp, cube_mesh):
     v = cp.asnumpy(out["v"])
     g = cp.asnumpy(ctx.g).astype(np.float64)
     tet_nodes = cp.asnumpy(ctx.tet_nodes)
-    dadt = cp.asnumpy(out["dadt_elm"]).astype(np.float64)
+    dadt_nodes = coil_dadt_at_nodes(coil_pos, coil_mom, out["transform"], 1e6, ctx.nodes_mm)
+    dadt = cp.asnumpy(dadt_nodes).astype(np.float64)[tet_nodes].mean(axis=1)
     grad_v = np.einsum("ei,eik->ek", v[tet_nodes], g)
     e_ref = -grad_v - dadt
     np.testing.assert_allclose(

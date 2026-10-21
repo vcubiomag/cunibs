@@ -648,7 +648,7 @@ def _harmonic_grads(op, v, dadt, n_tet, cp):
         op,
         n_tet,
         potential=cp.ascontiguousarray(cp.asarray(v, dtype=cp.float64).reshape(-1, 1)),
-        dadt_nodes=[cp.ascontiguousarray(cp.asarray(dadt, dtype=cp.float32))],
+        dadt_nodes=cp.ascontiguousarray(cp.asarray(dadt, dtype=cp.float32)),
     )
     return cp.asnumpy(rec.E_slots[0]), cp.asnumpy(rec.E[0])
 
@@ -1101,7 +1101,7 @@ def test_a_partly_fitted_operator_refuses_a_full_apply(cp, fresh_subject, patch_
     op = ensure_recovery(ctx, "harmonic", {2})
     out = RecoveredField.allocate(op, int(ctx.tet_nodes.shape[0]))
     potential = cp.zeros((ctx.n_nodes, 1))
-    dadt = [cp.zeros((ctx.n_nodes, 3), dtype=cp.float32)]
+    dadt = cp.zeros((ctx.n_nodes, 3), dtype=cp.float32)
     with pytest.raises(ValueError, match="fitted for tissues"):
         apply_recovery_into(op, out, potential=potential, dadt_nodes=dadt)
     apply_recovery_into(op, out, potential=potential, dadt_nodes=dadt, tissues={2})

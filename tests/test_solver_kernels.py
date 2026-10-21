@@ -168,24 +168,6 @@ def test_rhs_operator_block_matches_single(cp, dev, mesh_arrays, stream, k):
         )
 
 
-@pytest.mark.parametrize("k", [1, 3, 8])
-def test_dadt_node_to_element_block_matches_single(cp, dev, stream, k):
-    from cunibs.solver import dadt_node_to_element, dadt_node_to_element_block
-
-    rng = np.random.default_rng(6)
-    block = cp.asarray(rng.standard_normal((N_NODES, k, 3)).astype(np.float32))
-    outs = [cp.empty((N_TET, 3), dtype=cp.float32) for _ in range(k)]
-    dadt_node_to_element_block(block, dev["tet_nodes"], outs, stream)
-    for c in range(k):
-        single = cp.empty((N_TET, 3), dtype=cp.float32)
-        dadt_node_to_element(
-            cp.ascontiguousarray(block[:, c, :]), dev["tet_nodes"], single, stream
-        )
-        np.testing.assert_array_equal(
-            cp.asnumpy(outs[c]), cp.asnumpy(single), err_msg=f"col {c}"
-        )
-
-
 def test_rhs_assembly_is_bit_reproducible(cp, dev, stream):
     """Node-centric, atomic-free, fixed summation order — repeated calls must be identical."""
     from cunibs.solver import rhs_assemble
@@ -258,27 +240,31 @@ def test_reconstruct_e_zero_potential_is_minus_dadt(cp, dev, mesh_arrays, stream
 
 
 @pytest.mark.parametrize("k", [1, 2, 3, 8])
-def test_reconstruct_e_block_matches_single(cp, dev, stream, k):
-    from cunibs.solver import reconstruct_e, reconstruct_e_block
+@pytest.mark.parametrize("shared", [False, True])
+def test_reconstruct_e_nodal_block_matches_averaging_first(cp, dev, stream, k, shared):
+    """Averaging the nodal dA/dt in the kernel gives the bits of averaging it onto the elements
+    first, column by column, for an interleaved block and for one field every column shares."""
+    from cunibs.solver import dadt_node_to_element, reconstruct_e, reconstruct_e_nodal_block
 
     rng = np.random.default_rng(3)
     v_block = cp.ascontiguousarray(cp.asarray(rng.standard_normal((N_NODES, k))))
-    dadts = [
-        cp.ascontiguousarray(cp.asarray(rng.standard_normal((N_TET, 3)).astype(np.float32)))
-        for _ in range(k)
-    ]
+    width = 1 if shared else k
+    nodal = cp.asarray(rng.standard_normal((N_NODES, width, 3)).astype(np.float32))
     es = [cp.empty((N_TET, 3), dtype=cp.float32) for _ in range(k)]
     magns = [cp.empty(N_TET, dtype=cp.float32) for _ in range(k)]
-    reconstruct_e_block(v_block, dev["tet_nodes"], dev["g"], dadts, es, magns, stream)
+    reconstruct_e_nodal_block(v_block, dev["tet_nodes"], dev["g"], nodal, es, magns, stream)
 
     for c in range(k):
+        dadt_elm = cp.empty((N_TET, 3), dtype=cp.float32)
+        column = cp.ascontiguousarray(nodal[:, 0 if shared else c, :])
+        dadt_node_to_element(column, dev["tet_nodes"], dadt_elm, stream)
         e_ref = cp.empty((N_TET, 3), dtype=cp.float32)
         magn_ref = cp.empty(N_TET, dtype=cp.float32)
         reconstruct_e(
             cp.ascontiguousarray(v_block[:, c]),
             dev["tet_nodes"],
             dev["g"],
-            dadts[c],
+            dadt_elm,
             e_ref,
             magn_ref,
             stream,
@@ -287,6 +273,26 @@ def test_reconstruct_e_block_matches_single(cp, dev, stream, k):
         np.testing.assert_array_equal(
             cp.asnumpy(magns[c]), cp.asnumpy(magn_ref), err_msg=f"col {c}"
         )
+
+
+def test_reconstruct_e_nodal_block_skips_an_output_without_moving_the_other(cp, dev, stream):
+    from cunibs.solver import reconstruct_e_nodal_block
+
+    k = 4
+    rng = np.random.default_rng(4)
+    v_block = cp.ascontiguousarray(cp.asarray(rng.standard_normal((N_NODES, k))))
+    nodal = cp.asarray(rng.standard_normal((N_NODES, k, 3)).astype(np.float32))
+    es = [cp.empty((N_TET, 3), dtype=cp.float32) for _ in range(k)]
+    magns = [cp.empty(N_TET, dtype=cp.float32) for _ in range(k)]
+    reconstruct_e_nodal_block(v_block, dev["tet_nodes"], dev["g"], nodal, es, magns, stream)
+
+    magn_only = [cp.full(N_TET, cp.nan, dtype=cp.float32) for _ in range(k)]
+    reconstruct_e_nodal_block(v_block, dev["tet_nodes"], dev["g"], nodal, [], magn_only, stream)
+    e_only = [cp.full((N_TET, 3), cp.nan, dtype=cp.float32) for _ in range(k)]
+    reconstruct_e_nodal_block(v_block, dev["tet_nodes"], dev["g"], nodal, e_only, [], stream)
+    for c in range(k):
+        np.testing.assert_array_equal(cp.asnumpy(magn_only[c]), cp.asnumpy(magns[c]))
+        np.testing.assert_array_equal(cp.asnumpy(e_only[c]), cp.asnumpy(es[c]))
 
 
 # --- ADM reciprocity weights -------------------------------------------------------------

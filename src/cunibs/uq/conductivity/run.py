@@ -22,7 +22,7 @@ from cunibs.fem.solve import (
 from cunibs.solver import (
     SUMMARY_LAYOUT,
     accumulate_moments_block,
-    reconstruct_e_block,
+    reconstruct_e_nodal_block,
     rhs_assemble,
     row_dot,
 )
@@ -357,8 +357,10 @@ def _run_locked(
     dadt_nodes = coil_dadt_at_nodes(
         coil.positions_m, coil.moments, transform, didt, ctx.nodes_mm
     )
-    dadt_elm = _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes)
-    b_base, b_tissue = _placement_rhs(ctx, pre, dadt_elm)
+    # One field shared by every draw, read nodally by the reconstruct and the harmonic recovery,
+    # which average it onto the elements themselves where they need it.
+    dadt_shared = dadt_nodes.reshape(-1, 1, 3)
+    b_base, b_tissue = _placement_rhs(ctx, pre, _dadt_node_to_elm(dadt_nodes, ctx.tet_nodes))
 
     # The preconditioner stays frozen at nominal σ for every draw; a draw that misses tolerance
     # builds a matched one for itself (``pre.preconditioner_for``) and throws it away.
@@ -382,23 +384,24 @@ def _run_locked(
     sumsq_e = cp.zeros(n_tet, dtype=cp.float64)
 
     # Every buffer below is allocated once and rewritten in place per block, like everything else
-    # in the loop, so the recovery call's arguments are loop-invariant too.
+    # in the loop, so the recovery call's arguments are loop-invariant too. Only magnitudes reach
+    # a statistic: with no recovery the reconstruct writes them alone, and an element-consuming
+    # recovery reads the raw E and writes its own magnitudes.
+    on_potential = recovery is not None and recovery.on_potential
     e_bufs: list[cp.ndarray] = []
     magns: list[cp.ndarray] = []
-    dadt_elms = [dadt_elm] * width
     rec = None
-    if recovery is None or not recovery.on_potential:
-        e_bufs = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(width)]
+    if recovery is None:
         magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(width)]
-    if recovery is not None:
-        rec = RecoveredField.allocate(recovery, n_tet, width, zeroed=tissues is not None)
+    else:
+        if not on_potential:
+            e_bufs = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(width)]
+        rec = RecoveredField.allocate(
+            recovery, n_tet, width, zeroed=tissues is not None, vectors=False
+        )
     # magn_stat is what every statistic below reads: binding it once is what keeps the moments
     # and the per-draw scalars describing the same field.
     magn_stat = magns if rec is None else rec.magnE
-    # A potential-consuming operator reads the nodal potential and the exact nodal dA/dt rather
-    # than the per-element field, so the reconstruct is skipped on every draw.
-    dadt_nodal = [cp.ascontiguousarray(dadt_nodes)] * width
-    on_potential = recovery is not None and recovery.on_potential
 
     # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
     # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
@@ -480,14 +483,16 @@ def _run_locked(
 
         v_blk[pre.idx] = x_blk
         if not on_potential:
-            reconstruct_e_block(v_blk, ctx.tet_nodes, ctx.g, dadt_elms, e_bufs, magns, stream)
+            reconstruct_e_nodal_block(
+                v_blk, ctx.tet_nodes, ctx.g, dadt_shared, e_bufs, magns, stream
+            )
         if recovery is not None and rec is not None:
             apply_recovery_into(
                 recovery,
                 rec,
                 elements=None if on_potential else e_bufs,
                 potential=v_blk,
-                dadt_nodes=dadt_nodal if on_potential else None,
+                dadt_nodes=dadt_shared if on_potential else None,
                 tissues=tissues,
             )
 

@@ -32,10 +32,9 @@ from cunibs.solver import (
     NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
-    dadt_node_to_element_block,
     l1_dinv,
     reconstruct_e,
-    reconstruct_e_block,
+    reconstruct_e_nodal_block,
     rhs_operator_apply,
     rhs_operator_fill,
     select_size4,
@@ -848,20 +847,18 @@ def build_context(mesh: HeadMesh) -> SolverContext:
 class PlacementResult(TypedDict):
     """Arrays produced for one placement, plus how its linear solve went.
 
-    ``E``/``magnE`` are whichever field the run's ``recovery`` mode asked for. ``E_slots`` is
-    present only when a recovery mode ran and the caller asked for it. ``dadt_elm``, the
-    element-averaged dA/dt, is present only when the field was reconstructed per element, which
-    a potential-consuming recovery skips.
+    ``E``/``magnE`` are whichever field the run's ``recovery`` mode asked for. ``E`` and ``v`` are
+    present only when the caller asked for them, and ``E_slots`` only when a recovery mode ran and
+    the caller asked for it.
 
     ``iterations``/``relative_residual`` are this placement's own, not its block's: in a k-RHS
     solve every column freezes at its own residual.
     """
 
     transform: npt.NDArray[np.float64]
-    dadt_elm: NotRequired[cp.ndarray]
-    E: cp.ndarray
+    E: NotRequired[cp.ndarray]
     magnE: cp.ndarray
-    v: cp.ndarray
+    v: NotRequired[cp.ndarray]
     iterations: int
     relative_residual: float
     E_slots: NotRequired[cp.ndarray]
@@ -910,6 +907,8 @@ def solve_placement(
     *,
     recovery: RecoveryOperator | None = None,
     nodal: bool = False,
+    vectors: bool = True,
+    potential: bool = True,
 ) -> PlacementResult:
     """Solve one placement and return device arrays plus the host transform.
 
@@ -917,11 +916,19 @@ def solve_placement(
     whichever of the two solved it. ``recovery`` is a prebuilt operator from
     :func:`~cunibs.fem.ensure_recovery`, or ``None`` for the raw per-tetrahedron field; see
     :func:`_check_operator` for why this layer will not build one. ``nodal`` additionally keeps
-    the recovered field on its slots.
+    the recovered field on its slots, and ``vectors``/``potential`` keep ``E`` and ``v``.
     """
     site = (np.asarray(center_mm), np.asarray(handle_mm), float(distance_mm))
     (result,) = solve_placements_block(
-        ctx, dip_pos_m, dip_moment, [site], didt, recovery=recovery, nodal=nodal
+        ctx,
+        dip_pos_m,
+        dip_moment,
+        [site],
+        didt,
+        recovery=recovery,
+        nodal=nodal,
+        vectors=vectors,
+        potential=potential,
     )
     return result
 
@@ -937,6 +944,8 @@ def solve_placements_block(
     nodal: bool = False,
     tissues: Collection[int] | None = None,
     transforms: npt.NDArray[np.float64] | None = None,
+    vectors: bool = True,
+    potential: bool = True,
 ) -> list[PlacementResult]:
     """Solve up to MAX_BLOCK placements with block kernels end to end.
 
@@ -953,6 +962,10 @@ def solve_placements_block(
     reduction order does not depend on k, so a placement's recovered field is the same at every
     block width. ``tissues`` limits the recovered field to those tissues' elements, leaving the
     rest of ``E`` and ``magnE`` unwritten; see :func:`~cunibs.fem.apply_recovery_into`.
+
+    ``vectors`` and ``potential`` say whether each result carries ``E`` and ``v``. ``magnE`` is
+    always computed; ``E`` is otherwise neither stored nor, where the field is reconstructed per
+    element and nothing else reads it, written.
 
     ``transforms``, when given, are the sites' ``(k, 4, 4)`` coil transforms from
     :func:`~cunibs.fem.compute_coil_transforms`, which a sweep computes for all of its sites at
@@ -978,8 +991,8 @@ def solve_placements_block(
         )
     device_transforms = cp.asarray(transforms)
 
-    # Staged interleaved, so that a node's k values are one contiguous gather for both the
-    # element average and the RHS operator.
+    # Staged interleaved, so that a node's k values are one contiguous gather for the RHS operator
+    # and for the per-element field, which averages them onto each element as it reconstructs.
     dadt_block = cp.empty((ctx.n_nodes, k, 3), dtype=cp.float32)
     for i in range(k):
         coil_dadt_at_nodes(
@@ -991,61 +1004,58 @@ def solve_placements_block(
             out=dadt_block,
             column=i,
         )
-    # A potential-consuming operator adds dA/dt back at the nodes, where it is exact, so that
-    # path keeps the nodal field the others average onto the elements.
-    dadt_elms: list[cp.ndarray] = []
-    dadt_nodal: list[cp.ndarray] = []
-    if on_potential:
-        dadt_nodal = [cp.ascontiguousarray(dadt_block[:, i, :]) for i in range(k)]
-    else:
-        dadt_elms = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
-        dadt_node_to_element_block(dadt_block, ctx.tet_nodes, dadt_elms, stream)
 
     b_block = _assemble_rhs(ctx, dadt_block)
-    del dadt_block
-
     B_pad = _pad_block(b_block[solver.idx, :].astype(cp.float64), k)
+    del b_block
     X0 = None if ctx.sweep_basis is None else ctx.sweep_basis.seed(B_pad)
     X, telemetry = _solve_grounded_block_mat(solver, B_pad, k, X0)
+    del B_pad, X0
 
     v_block = cp.zeros((solver.n, k), dtype=cp.float64)
     v_block[solver.idx, :] = X[:, :k]
+    del X
 
     # The potential path never reads the raw field, so it neither reconstructs nor allocates one.
+    # An element-consuming recovery reads the raw E and replaces its magnitude, and with no
+    # recovery the raw field is the result.
     es: list[cp.ndarray] = []
     magns: list[cp.ndarray] = []
     if not on_potential:
-        es = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
-        magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(k)]
-        reconstruct_e_block(v_block, ctx.tet_nodes, ctx.g, dadt_elms, es, magns, stream)
+        if vectors or recovery is not None:
+            es = [cp.empty((n_tet, 3), dtype=cp.float32) for _ in range(k)]
+        if recovery is None:
+            magns = [cp.empty(n_tet, dtype=cp.float32) for _ in range(k)]
+        reconstruct_e_nodal_block(v_block, ctx.tet_nodes, ctx.g, dadt_block, es, magns, stream)
 
     slots: list[cp.ndarray] = []
     if recovery is not None:
-        rec = RecoveredField.allocate(recovery, n_tet, k)
+        rec = RecoveredField.allocate(recovery, n_tet, k, vectors=vectors)
         apply_recovery_into(
             recovery,
             rec,
             elements=None if on_potential else es,
             potential=v_block,
-            dadt_nodes=dadt_nodal if on_potential else None,
+            dadt_nodes=dadt_block if on_potential else None,
             tissues=tissues,
         )
         slots, es, magns = rec.E_slots, rec.E, rec.magnE
+    del dadt_block
 
     results: list[PlacementResult] = [
         {
             "transform": transforms[i],
-            "E": es[i],
             "magnE": magns[i],
-            "v": cp.ascontiguousarray(v_block[:, i]),
             "iterations": telemetry[i].iterations,
             "relative_residual": telemetry[i].relative_residual,
         }
         for i in range(k)
     ]
     for i, result in enumerate(results):
-        if dadt_elms:
-            result["dadt_elm"] = dadt_elms[i]
+        if vectors:
+            result["E"] = es[i]
+        if potential:
+            result["v"] = cp.ascontiguousarray(v_block[:, i])
         if nodal:
             result["E_slots"] = slots[i]
     return results

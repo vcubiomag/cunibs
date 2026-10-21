@@ -63,7 +63,7 @@ def _ds_cg(subject, coil, placement, gm, w) -> dict:
     from cunibs.fem import coil_dadt_at_nodes, solve_placement
 
     # The RHS has no public form, and the baseline has to solve the system the shipped solver did.
-    from cunibs.fem.solve import _assemble_rhs
+    from cunibs.fem.solve import _assemble_rhs, _dadt_node_to_elm
 
     context = subject.context
     solver = context.solver
@@ -101,7 +101,8 @@ def _ds_cg(subject, coil, placement, gm, w) -> dict:
     )
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x
-    fields = [_field_from_potential(context, u, shipped["dadt_elm"]) for u in (v, shipped["v"])]
+    dadt_elm = _dadt_node_to_elm(dadt, context.tet_nodes)
+    fields = [_field_from_potential(context, u, dadt_elm) for u in (v, shipped["v"])]
     return {
         "iterations": iterations,
         "relative_residual": float(cp.linalg.norm(a @ x - b) / cp.linalg.norm(b)),

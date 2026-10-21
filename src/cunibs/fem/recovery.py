@@ -63,6 +63,7 @@ from cunibs.solver import (
     fill_incident_node_csr,
     fill_patch_csr,
     hpr_grad,
+    hpr_grad_work_size,
     hpr_weights,
     mark_outer_boundary,
     recover_elements,
@@ -541,7 +542,8 @@ class RecoveredField(NamedTuple):
 
     The names match what these arrays become downstream (``PlacementResult["E_slots"]`` and
     :attr:`~cunibs.FieldResult.E_slots`, and likewise for ``E`` and ``magnE``), so nothing has
-    to be renamed as a field flows out of the solver.
+    to be renamed as a field flows out of the solver. ``E`` is empty when the caller reads only
+    the magnitude.
     """
 
     E_slots: list[cp.ndarray]
@@ -550,17 +552,25 @@ class RecoveredField(NamedTuple):
 
     @classmethod
     def allocate(
-        cls, op: RecoveryOperator, n_tet: int, k: int = 1, *, zeroed: bool = False
+        cls,
+        op: RecoveryOperator,
+        n_tet: int,
+        k: int = 1,
+        *,
+        zeroed: bool = False,
+        vectors: bool = True,
     ) -> RecoveredField:
         """Buffers for ``k`` placements against ``op``.
 
         A recovery limited to some tissues leaves the other elements unwritten; ``zeroed`` makes
-        those read as zero for a caller that reduces over every element.
+        those read as zero for a caller that reduces over every element. ``vectors=False`` leaves
+        out the per-element field, which is the largest of the three, for a caller that reads only
+        ``magnE``.
         """
         new = cp.zeros if zeroed else cp.empty
         return cls(
             E_slots=[cp.empty((op.n_slots, 3), dtype=cp.float32) for _ in range(k)],
-            E=[new((n_tet, 3), dtype=cp.float32) for _ in range(k)],
+            E=[new((n_tet, 3), dtype=cp.float32) for _ in range(k)] if vectors else [],
             magnE=[new(n_tet, dtype=cp.float32) for _ in range(k)],
         )
 
@@ -571,7 +581,7 @@ def apply_recovery_into(
     *,
     elements: Sequence[cp.ndarray] | None = None,
     potential: cp.ndarray | None = None,
-    dadt_nodes: Sequence[cp.ndarray] | None = None,
+    dadt_nodes: cp.ndarray | None = None,
     tissues: Collection[int] | None = None,
 ) -> None:
     """Recover a block of placements into caller-allocated buffers.
@@ -579,8 +589,9 @@ def apply_recovery_into(
     The operator decides which inputs it reads, so a caller never branches on the mode. An
     element-consuming operator needs ``elements``, the per-tetrahedron field; a
     potential-consuming one needs ``potential``, the row-major ``(n_nodes, stride)`` float64
-    block the solve already produces, together with ``dadt_nodes``, the exact nodal dA/dt each
-    placement was built from. Passing all three is fine.
+    block the solve already produces, together with ``dadt_nodes``, the exact nodal dA/dt the
+    placements were built from: float32, interleaved ``(n_nodes, k, 3)``, or ``(n_nodes, 3)``
+    for one field every placement shares. Passing all three is fine.
 
     Both kernels read the shared operator once for the whole block, and each column's reduction
     order is the one the width-1 path would use, so a placement's recovered field does not
@@ -610,15 +621,20 @@ def apply_recovery_into(
                 f"recovery={op.mode!r} reads the nodal potential, so apply_recovery needs "
                 f"{missing}=. Pass the solve's v block and the nodal dA/dt it was built from."
             )
-        _check_width(len(dadt_nodes), out, op.mode)
+        dadt = dadt_nodes.reshape(dadt_nodes.shape[0], -1, 3)
+        if dadt.shape[1] != 1:
+            _check_width(int(dadt.shape[1]), out, op.mode)
+        n_nodes, k = int(potential.shape[0]), len(out.E_slots)
+        work = cp.empty(hpr_grad_work_size(n_nodes, k), dtype=cp.float32)
         hpr_grad(
             potential,
             op.w,
             op.ptr,
             op.idx,
             op.slot_node,
-            list(dadt_nodes),
+            dadt,
             out.E_slots,
+            work,
             stream,
             slots,
         )
@@ -647,14 +663,17 @@ def apply_recovery(
     *,
     elements: Sequence[cp.ndarray] | None = None,
     potential: cp.ndarray | None = None,
-    dadt_nodes: Sequence[cp.ndarray] | None = None,
+    dadt_nodes: cp.ndarray | None = None,
 ) -> RecoveredField:
     """Recover a block of placements, allocating the outputs.
 
     The allocating form of :func:`apply_recovery_into`; see it for which inputs an operator
-    reads.
+    reads. A potential-consuming operator recovers one placement per column of ``potential``.
     """
-    k = len(dadt_nodes or ()) if op.on_potential else len(elements or ())
+    if op.on_potential:
+        k = 0 if potential is None else int(potential.reshape(potential.shape[0], -1).shape[1])
+    else:
+        k = len(elements or ())
     out = RecoveredField.allocate(op, n_tet, k)
     apply_recovery_into(op, out, elements=elements, potential=potential, dadt_nodes=dadt_nodes)
     return out

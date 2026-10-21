@@ -638,6 +638,8 @@ class Subject:
                             nodal=retain.nodal,
                             tissues=tissues,
                             transforms=transforms[start : start + len(chunk)],
+                            vectors=retain.vectors,
+                            potential=retain.potential,
                         )
                         batch = self._reduce_chunk(
                             chunk,

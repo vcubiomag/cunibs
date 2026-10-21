@@ -80,6 +80,14 @@ std::array<Ptr, kMaxStageBlock> pack(const std::vector<Array>& arrays, int k, st
     return out;
 }
 
+// The same for an output a caller may skip: an empty list leaves every pointer null.
+template <typename Array>
+std::array<float*, kMaxStageBlock> optional_pack(const std::vector<Array>& arrays, int k,
+                                                 std::size_t rows, const char* what) {
+    if (arrays.empty()) return {};
+    return pack<float*>(arrays, k, rows, what);
+}
+
 // A grid's origin and spacing (metres) and shape, as the ADM kernels take them.
 struct GridArgs {
     double origin[3];
@@ -361,26 +369,6 @@ NB_MODULE(_solver_ext, m) {
         "block, and the field fills column column.");
 
     m.def(
-        "dadt_node_to_element_block",
-        [](const Interleaved& dadt_nodes, const Tets& tet_nodes, const std::vector<Rows3f>& out,
-           uintptr_t stream) {
-            const int k = block_width(out.size(), "dadt_node_to_element_block: bad block size");
-            require(static_cast<int>(dadt_nodes.shape(1)) == k,
-                    "dadt_node_to_element_block: dadt_nodes must be (n_nodes, k, 3)");
-            const std::size_t n_tet = tet_nodes.shape(0);
-            const auto out_ptrs =
-                pack<float*>(out, k, n_tet, "dadt_node_to_element_block: bad output shape");
-            launch_dadt_element_average_block(dadt_nodes.data(), tet_nodes.data(),
-                                              out_ptrs.data(), static_cast<int>(n_tet), k,
-                                              as_stream(stream));
-        },
-        nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("dadt_nodes").noconvert(), nb::arg("tet_nodes").noconvert(),
-        nb::arg("out").noconvert(), nb::arg("stream"),
-        "Average an interleaved (n_nodes, k, 3) nodal dA/dt onto tetrahedra, one (n_tet, 3) "
-        "output per placement; tet_nodes is read once for the block.");
-
-    m.def(
         "rhs_operator_fill",
         [](const TetGradd& g, const f64_1d& scale, const Tets& tet_nodes, const i32_1d& ptr,
            const i32_1d& idx, const i32_1d& indptr, const i32_1d& indices,
@@ -560,28 +548,31 @@ NB_MODULE(_solver_ext, m) {
         "l1-Jacobi smoother scaling 1 / (sign(a_ii) * sum_j |a_ij|), one thread per row.");
 
     m.def(
-        "reconstruct_e_block",
+        "reconstruct_e_nodal_block",
         [](const f64_2d& v_block, const Tets& tet_nodes, const TetGradf& g,
-           const std::vector<Rows3f>& dadt_elm, const std::vector<Rows3f>& e_out,
+           const Interleaved& dadt_nodes, const std::vector<Rows3f>& e_out,
            const std::vector<f32_1d>& magn_out, uintptr_t stream) {
-            const int k = block_width(dadt_elm.size(), "reconstruct_e_block: bad list sizes");
-            require(static_cast<int>(v_block.shape(1)) == k,
-                    "reconstruct_e_block: v_block must be (n_nodes, k)");
+            const int k = block_width(v_block.shape(1), "reconstruct_e_nodal_block: bad width");
+            const std::size_t kd = dadt_nodes.shape(1);
+            require(dadt_nodes.shape(0) == v_block.shape(0) &&
+                        (kd == static_cast<std::size_t>(k) || kd == 1),
+                    "reconstruct_e_nodal_block: dadt_nodes must be (n_nodes, k or 1, 3)");
             const std::size_t n_tet = tet_nodes.shape(0);
-            const char* bad = "reconstruct_e_block: every list must hold k (n_tet, ...) arrays";
-            const auto de = pack<const float*>(dadt_elm, k, n_tet, bad);
-            const auto eo = pack<float*>(e_out, k, n_tet, bad);
-            const auto mo = pack<float*>(magn_out, k, n_tet, bad);
-            launch_reconstruct_block(v_block.data(), tet_nodes.data(), g.data(), de.data(),
-                                     eo.data(), mo.data(), static_cast<int>(n_tet), k,
-                                     as_stream(stream));
+            const char* bad = "reconstruct_e_nodal_block: e_out and magn_out must be k arrays";
+            const auto eo = optional_pack(e_out, k, n_tet, bad);
+            const auto mo = optional_pack(magn_out, k, n_tet, bad);
+            launch_reconstruct_nodal_block(v_block.data(), tet_nodes.data(), g.data(),
+                                           dadt_nodes.data(), static_cast<std::int64_t>(3 * kd),
+                                           kd == 1 ? 0 : 3, eo.data(), mo.data(),
+                                           static_cast<int>(n_tet), k, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("v_block").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
-        nb::arg("dadt_elm").noconvert(), nb::arg("e_out").noconvert(),
+        nb::arg("dadt_nodes").noconvert(), nb::arg("e_out").noconvert(),
         nb::arg("magn_out").noconvert(), nb::arg("stream"),
-        "Block E/magnE reconstruction for <=8 placements: tet_nodes/g read once; "
-        "v_block is row-major (n_nodes, k) float64.");
+        "reconstruct_e_block from nodal dA/dt, averaged onto each element in the kernel. "
+        "dadt_nodes is interleaved (n_nodes, k, 3), or (n_nodes, 1, 3) for one field every "
+        "placement shares.");
 
     m.def(
         "reconstruct_e",
@@ -706,31 +697,42 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "hpr_grad",
         [](const f64_2d& v_block, const Rows3f& w, const i32_1d& pptr, const i32_1d& pidx,
-           const i32_1d& slot_node, const std::vector<Rows3f>& dadt_nodes,
-           const std::vector<Rows3f>& e_slots, uintptr_t stream,
+           const i32_1d& slot_node, const Interleaved& dadt_nodes,
+           const std::vector<Rows3f>& e_slots, const f32_1d& work, uintptr_t stream,
            const std::optional<i32_1d>& active) {
-            const int k = block_width(dadt_nodes.size(), "hpr_grad: bad list sizes");
+            const int k = block_width(e_slots.size(), "hpr_grad: bad list sizes");
             const int stride = static_cast<int>(v_block.shape(1));
             require(stride >= k, "hpr_grad: v_block has fewer columns than placements");
             const std::size_t n_nodes = v_block.shape(0);
             const std::size_t n_slots = pptr.shape(0) - 1;
-            const auto da = pack<const float*>(dadt_nodes, k, n_nodes,
-                                               "hpr_grad: dadt_nodes must be k (n_nodes, 3)");
+            const std::size_t kd = dadt_nodes.shape(1);
+            require(dadt_nodes.shape(0) == n_nodes &&
+                        (kd == static_cast<std::size_t>(k) || kd == 1),
+                    "hpr_grad: dadt_nodes must be (n_nodes, k or 1, 3)");
+            require(work.shape(0) >= hpr_grad_work_floats(static_cast<int>(n_nodes), k),
+                    "hpr_grad: work is smaller than hpr_grad_work_size");
             const auto out = pack<float*>(e_slots, k, n_slots,
                                           "hpr_grad: e_slots must be k (n_slots, 3)");
             launch_hpr_grad(v_block.data(), w.data(), pptr.data(), pidx.data(), slot_node.data(),
-                            da.data(), out.data(), static_cast<int>(n_slots),
-                            data_or_null(active),
+                            dadt_nodes.data(), static_cast<std::int64_t>(3 * kd), kd == 1 ? 0 : 3,
+                            out.data(), static_cast<int>(n_slots), data_or_null(active),
                             static_cast<int>(active ? active->shape(0) : n_slots), k, stride,
-                            static_cast<int>(n_nodes), as_stream(stream));
+                            static_cast<int>(n_nodes), work.data(), as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
         nb::arg("v_block").noconvert(), nb::arg("w").noconvert(), nb::arg("pptr").noconvert(),
         nb::arg("pidx").noconvert(), nb::arg("slot_node").noconvert(),
-        nb::arg("dadt_nodes").noconvert(), nb::arg("e_slots").noconvert(), nb::arg("stream"),
-        nb::arg("active").noconvert() = nb::none(),
+        nb::arg("dadt_nodes").noconvert(), nb::arg("e_slots").noconvert(),
+        nb::arg("work").noconvert(), nb::arg("stream"), nb::arg("active").noconvert() = nb::none(),
         "Recovered E on slots from the nodal potential: E = -grad_v - dA/dt, with dA/dt taken "
-        "exactly at the node rather than averaged over an element.");
+        "exactly at the node rather than averaged over an element. dadt_nodes is interleaved "
+        "(n_nodes, k, 3), or (n_nodes, 1, 3) for one field every placement shares; work holds "
+        "hpr_grad_work_size float32s.");
+
+    m.def(
+        "hpr_grad_work_size",
+        [](int n_nodes, int k) { return hpr_grad_work_floats(n_nodes, k); },
+        nb::arg("n_nodes"), nb::arg("k"), "float32s of work hpr_grad needs.");
 
     m.def(
         "recover_nodes",
@@ -761,8 +763,8 @@ NB_MODULE(_solver_ext, m) {
             const char* bad = "recover_elements: e_out and magn_out must be k arrays of n_tet";
             const auto in = pack<const float*>(e_slots, k, e_slots[0].shape(0),
                                                "recover_elements: e_slots must be k (n_slots, 3)");
-            const auto eo = pack<float*>(e_out, k, n_tet, bad);
-            const auto mo = pack<float*>(magn_out, k, n_tet, bad);
+            const auto eo = optional_pack(e_out, k, n_tet, bad);
+            const auto mo = optional_pack(magn_out, k, n_tet, bad);
             launch_recover_elements(in.data(), slot_of_corner.data(), eo.data(), mo.data(),
                                     static_cast<int>(n_tet), data_or_null(active),
                                     static_cast<int>(active ? active->shape(0) : n_tet), k,
@@ -772,7 +774,8 @@ NB_MODULE(_solver_ext, m) {
         nb::arg("e_slots").noconvert(), nb::arg("slot_of_corner").noconvert(),
         nb::arg("e_out").noconvert(), nb::arg("magn_out").noconvert(), nb::arg("stream"),
         nb::arg("active").noconvert() = nb::none(),
-        "Sample the recovered field back at the barycentres and take its magnitude.");
+        "Sample the recovered field back at the barycentres and take its magnitude. An empty "
+        "e_out or magn_out is not written.");
 
     m.def(
         "element_weight",

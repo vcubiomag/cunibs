@@ -582,7 +582,8 @@ template <int K>
 __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __restrict__ v_lo,
                                 const float* __restrict__ w, const int* __restrict__ pptr,
                                 const int* __restrict__ pidx, const int* __restrict__ slot_node,
-                                ConstPtrPack dadt_nodes, PtrPack e_slots, int n_slots,
+                                const float* __restrict__ dadt_nodes, std::int64_t dadt_row,
+                                int dadt_column, PtrPack e_slots, int n_slots,
                                 const int* __restrict__ active, int n) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n) return;
@@ -627,11 +628,12 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
 
 #pragma unroll
     for (int c = 0; c < K; ++c) {
-        const auto da = unsized<Vec3View<const float>>(dadt_nodes[c]);
+        const float* const da =
+            dadt_nodes + node * dadt_row + static_cast<std::int64_t>(c) * dadt_column;
         const Vec3View<float> dst(e_slots[c], n_slots);
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
-            dst(s, i) = __fadd_rn(__fsub_rn(-acc[c][i], da(node, i)), comp[c][i]);
+            dst(s, i) = __fadd_rn(__fsub_rn(-acc[c][i], da[i]), comp[c][i]);
         }
     }
 }
@@ -706,7 +708,6 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
 #pragma unroll
     for (int c = 0; c < K; ++c) {
         const auto src = unsized<Vec3View<const float>>(e_slots[c]);
-        const Vec3View<float> dst(e_out[c], n_tet);
         float m[3];
 #pragma unroll
         for (int d = 0; d < 3; ++d) {
@@ -715,9 +716,15 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
             const float s2 = two_sum(src(slots[2], d), src(slots[3], d), e2);
             const float s = two_sum(s1, s2, e3);
             m[d] = 0.25f * (s + ((e1 + e2) + e3));
-            dst(e, d) = m[d];
         }
-        magn_out[c][e] = sqrtf(fmaf(m[0], m[0], fmaf(m[1], m[1], m[2] * m[2])));
+        if (e_out[c] != nullptr) {
+            const Vec3View<float> dst(e_out[c], n_tet);
+#pragma unroll
+            for (int d = 0; d < 3; ++d) dst(e, d) = m[d];
+        }
+        if (magn_out[c] != nullptr) {
+            magn_out[c][e] = sqrtf(fmaf(m[0], m[0], fmaf(m[1], m[1], m[2] * m[2])));
+        }
     }
 }
 
@@ -753,18 +760,19 @@ void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx
     }
 }
 
+std::size_t hpr_grad_work_floats(int n_nodes, int k) {
+    return 2 * static_cast<std::size_t>(n_nodes) * k;
+}
+
 void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, const int* pidx,
-                     const int* slot_node, const float* const* dadt_nodes, float* const* e_slots,
-                     int n_slots, const int* active, int n, int k, int stride, int n_nodes,
-                     cudaStream_t stream) {
-    const ConstPtrPack da = ptr_pack(dadt_nodes, k);
+                     const int* slot_node, const float* dadt_nodes, std::int64_t dadt_row,
+                     int dadt_column, float* const* e_slots, int n_slots, const int* active,
+                     int n, int k, int stride, int n_nodes, float* work, cudaStream_t stream) {
     const PtrPack out = ptr_pack(e_slots, k);
     const unsigned blocks = grid_for(n);
     if (!blocks) return;
     const std::size_t count = static_cast<std::size_t>(n_nodes) * k;
-    const ScratchBuffer<float> split =
-        scratch_alloc<float>(2 * count, stream, "hpr_grad", "split potential");
-    float* const v_hi = split.get();
+    float* const v_hi = work;
     float* const v_lo = v_hi + count;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "hpr_grad: unsupported block width", [&](auto kk) {
         constexpr int K = decltype(kk)::value;
@@ -773,7 +781,8 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
                 <<<sb, kBlock, 0, stream>>>(v_block, stride, n_nodes, v_hi, v_lo);
         }
         hpr_grad_kernel<K><<<blocks, kBlock, 0, stream>>>(v_hi, v_lo, w, pptr, pidx, slot_node,
-                                                          da, out, n_slots, active, n);
+                                                          dadt_nodes, dadt_row, dadt_column, out,
+                                                          n_slots, active, n);
     });
 }
 
