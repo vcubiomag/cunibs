@@ -363,6 +363,12 @@ __global__ void __launch_bounds__(kBlock)
     }
 }
 
+__device__ __forceinline__ void decode_point(std::int64_t p, const GridGeom& g, int (&i)[3]) {
+    i[2] = static_cast<int>(p % g.n[2]);
+    i[1] = static_cast<int>((p / g.n[2]) % g.n[1]);
+    i[0] = static_cast<int>(p / (static_cast<std::int64_t>(g.n[1]) * g.n[2]));
+}
+
 // A grid point is reachable when, about some coverage centre's coil axis, its cylindrical
 // coordinates (rho, h) fall in the coil's swept profile: an in-plane rotation carries each dipole
 // round a circle of fixed (rho, h), so the set every rotation reaches is the profile's solid of
@@ -375,12 +381,11 @@ __global__ void __launch_bounds__(kBlock)
     const std::int64_t p = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n_pts = static_cast<std::int64_t>(g.n[0]) * g.n[1] * g.n[2];
     if (p >= n_pts) return;
-    const int iz = static_cast<int>(p % g.n[2]);
-    const int iy = static_cast<int>((p / g.n[2]) % g.n[1]);
-    const int ix = static_cast<int>(p / (static_cast<std::int64_t>(g.n[1]) * g.n[2]));
-    const double x = g.origin[0] + ix * g.spacing[0];
-    const double y = g.origin[1] + iy * g.spacing[1];
-    const double z = g.origin[2] + iz * g.spacing[2];
+    int ip[3];
+    decode_point(p, g, ip);
+    const double x = g.origin[0] + ip[0] * g.spacing[0];
+    const double y = g.origin[1] + ip[1] * g.spacing[1];
+    const double z = g.origin[2] + ip[2] * g.spacing[2];
     unsigned char hit = 0;
     for (int c = 0; c < n_centers && !hit; ++c) {
         const double dx = x - origins[3 * c];
@@ -410,12 +415,6 @@ struct SampleBlock {
     int lo[3];
     int hi[3];
 };
-
-__device__ __forceinline__ void decode_point(std::int64_t p, const GridGeom& g, int (&i)[3]) {
-    i[2] = static_cast<int>(p % g.n[2]);
-    i[1] = static_cast<int>((p / g.n[2]) % g.n[1]);
-    i[0] = static_cast<int>(p / (static_cast<std::int64_t>(g.n[1]) * g.n[2]));
-}
 
 // A tile source's W then W x (s - o), padded to whole float4s so it is a few vector loads.
 template <int D>
@@ -697,17 +696,11 @@ void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_p
     const unsigned blocks = grid_for(static_cast<std::int64_t>(n_frames) * kWarp);
     if (blocks == 0) return;
     const auto near_scale = static_cast<float>(mu0_4pi / (spacing[0] * spacing[0]));
-    if (n_dir == 1) {
-        adm_evaluate_kernel<1><<<blocks, kBlock, 0, stream>>>(
+    dispatch_k<1, 3>(n_dir, "adm_evaluate: directions must be 1 or 3", [&](auto dc) {
+        adm_evaluate_kernel<decltype(dc)::value><<<blocks, kBlock, 0, stream>>>(
             frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, cell_slot, q_near, list_ptr,
             entries, near_scale, g, didt, out, fault);
-    } else if (n_dir == 3) {
-        adm_evaluate_kernel<3><<<blocks, kBlock, 0, stream>>>(
-            frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, cell_slot, q_near, list_ptr,
-            entries, near_scale, g, didt, out, fault);
-    } else {
-        throw std::invalid_argument("adm_evaluate: directions must be 1 or 3");
-    }
+    });
 }
 
 void launch_adm_slot_corners(const std::int64_t* slot_cells, int first_slot, int n_slots,
@@ -718,15 +711,10 @@ void launch_adm_slot_corners(const std::int64_t* slot_cells, int first_slot, int
     const auto scale = static_cast<float>(mu0_4pi / (spacing[0] * spacing[0]));
     const unsigned blocks = grid_for(static_cast<std::int64_t>(n_slots - first_slot) * 8);
     if (blocks == 0) return;
-    if (n_dir == 1) {
-        adm_slot_corners_kernel<1><<<blocks, kBlock, 0, stream>>>(
+    dispatch_k<1, 3>(n_dir, "adm_slot_corners: directions must be 1 or 3", [&](auto dc) {
+        adm_slot_corners_kernel<decltype(dc)::value><<<blocks, kBlock, 0, stream>>>(
             slot_cells, first_slot, n_slots, list_ptr, entries, q, g, scale, q_near);
-    } else if (n_dir == 3) {
-        adm_slot_corners_kernel<3><<<blocks, kBlock, 0, stream>>>(
-            slot_cells, first_slot, n_slots, list_ptr, entries, q, g, scale, q_near);
-    } else {
-        throw std::invalid_argument("adm_slot_corners: directions must be 1 or 3");
-    }
+    });
 }
 
 int adm_sample_tile() { return kSampleBlock; }
@@ -736,15 +724,10 @@ void launch_adm_q_points(const float* src, const float* src_w, int n_src, int n_
                          cudaStream_t stream) {
     const unsigned blocks = grid_for(n_points, kSampleBlock);
     if (blocks == 0) return;
-    if (n_dir == 1) {
-        adm_q_points_kernel<1><<<blocks, kSampleBlock, 0, stream>>>(src, src_w, n_src, points,
-                                                                     n_points, scale, out);
-    } else if (n_dir == 3) {
-        adm_q_points_kernel<3><<<blocks, kSampleBlock, 0, stream>>>(src, src_w, n_src, points,
-                                                                     n_points, scale, out);
-    } else {
-        throw std::invalid_argument("adm_q_points: directions must be 1 or 3");
-    }
+    dispatch_k<1, 3>(n_dir, "adm_q_points: directions must be 1 or 3", [&](auto dc) {
+        adm_q_points_kernel<decltype(dc)::value><<<blocks, kSampleBlock, 0, stream>>>(
+            src, src_w, n_src, points, n_points, scale, out);
+    });
 }
 
 int adm_entry_floats(int n_dir) {
@@ -762,15 +745,11 @@ void launch_adm_sample(const float* src, const float* src_w, int n_src, int n_di
     const double scale = mu0_4pi / (spacing[0] * spacing[0]);
     const unsigned blocks = grid_for(n_points, kSampleBlock * kSamplePoints);
     if (blocks == 0) return;
-    if (n_dir == 1) {
-        adm_sample_kernel<1, kSamplePoints><<<blocks, kSampleBlock, 0, stream>>>(
-            src, src_w, n_src, tile_box, points, n_points, g, scale, q);
-    } else if (n_dir == 3) {
-        adm_sample_kernel<3, kSamplePoints><<<blocks, kSampleBlock, 0, stream>>>(
-            src, src_w, n_src, tile_box, points, n_points, g, scale, q);
-    } else {
-        throw std::invalid_argument("adm_sample: directions must be 1 or 3");
-    }
+    dispatch_k<1, 3>(n_dir, "adm_sample: directions must be 1 or 3", [&](auto dc) {
+        adm_sample_kernel<decltype(dc)::value, kSamplePoints>
+            <<<blocks, kSampleBlock, 0, stream>>>(src, src_w, n_src, tile_box, points, n_points, g,
+                                                  scale, q);
+    });
 }
 
 void launch_adm_mark(const double* frames, int n_frames, const float* coil_pos, int n_dip,
