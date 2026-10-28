@@ -142,8 +142,8 @@ result = subject.simulate(
 )
 
 result.magnE  # |E| per tetrahedron, V/m
-result.E      # E per tetrahedron, V/m
-result.v      # potential per node, V
+result.E  # E per tetrahedron, V/m
+result.v  # potential per node, V
 ```
 
 Save and load results as HDF5 with `result.save(path)` and
