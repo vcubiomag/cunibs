@@ -63,7 +63,7 @@ __global__ void __launch_bounds__(kBlock)
                            double* __restrict__ sums, Peak* __restrict__ peaks) {
     const int c = blockIdx.y;
     const T* __restrict__ m = fields.p[c];
-    double s[kSums] = {};
+    cuda::std::array<double, kSums> s{};
     Peak best{-CUDART_INF, n};
     const int stride = gridDim.x * blockDim.x;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -80,12 +80,9 @@ __global__ void __launch_bounds__(kBlock)
         s[4] += wm * bary[3 * static_cast<std::int64_t>(i) + 2];
         best = better(best, Peak{mi, i});
     }
+    warp_reduce_sum<kWarp>(s);
 #pragma unroll
-    for (int off = kWarp / 2; off > 0; off >>= 1) {
-#pragma unroll
-        for (int k = 0; k < kSums; ++k) s[k] += __shfl_down_sync(kFullWarp, s[k], off);
-        best = better(best, shfl_down(best, off));
-    }
+    for (int off = kWarp / 2; off > 0; off >>= 1) best = better(best, shfl_down(best, off));
     __shared__ double ws[kWarps][kSums];
     __shared__ Peak wp[kWarps];
     const int lane = threadIdx.x % kWarp;
@@ -164,8 +161,7 @@ __global__ void __launch_bounds__(kBlock)
         const double d = static_cast<double>(m[index[i]]) - mean;
         s += w[i] * (d * d);
     }
-#pragma unroll
-    for (int off = kWarp / 2; off > 0; off >>= 1) s += __shfl_down_sync(kFullWarp, s, off);
+    s = warp_reduce_sum<kWarp>(s);
     __shared__ double ws[kWarps];
     if (threadIdx.x % kWarp == 0) ws[threadIdx.x / kWarp] = s;
     __syncthreads();

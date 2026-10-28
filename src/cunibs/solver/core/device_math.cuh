@@ -120,6 +120,14 @@ __device__ __forceinline__ void warp_reduce_sum(cuda::std::array<T, K>& sum) {
     }
 }
 
+// The same tree over one value per lane.
+template <int WIDTH>
+__device__ __forceinline__ double warp_reduce_sum(double v) {
+    cuda::std::array<double, 1> a{v};
+    warp_reduce_sum<WIDTH>(a);
+    return a[0];
+}
+
 // Move the K contiguous values of one row of a (n, K) row-major operand as vector accesses.
 //
 // This is what keeps a wide block off the L1 request limit: scalar accesses ask for K separate
