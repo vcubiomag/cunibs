@@ -349,10 +349,15 @@ __device__ __forceinline__ double patch_radius(Vec3View<const double> nodes_mm,
 
 // Per-warp scratch for one rung of the fit. Sized for the widest basis and reused by the narrower
 // rungs, since a warp runs them one after another and never needs two at once.
+// Row stride of a basis of N terms in the fit's shared arrays. Lanes that each take a row of their
+// own would otherwise sit N doubles apart, which at N = 16 is one bank group for every lane; two
+// doubles of padding give the rows distinct bank groups and keep them 16-byte aligned.
+__host__ __device__ constexpr int fit_stride(int n_terms) { return n_terms + 2; }
+
 struct FitScratch {
-    double* q;     // kFitChunk x N, the staged basis of one chunk of patch entries
-    double* a;     // N x N, the normal matrix, overwritten by its Cholesky factor
-    double* yz;    // 3 x N forward-substitution vectors, then 3 x N solution rows
+    double* q;     // kFitChunk rows, the staged basis of one chunk of patch entries
+    double* a;     // N rows, the normal matrix, overwritten by its Cholesky factor
+    double* yz;    // 3 forward-substitution rows, then 3 solution rows
     int* singular; // set when a pivot fails, so the whole warp leaves the rung together
 };
 
@@ -377,6 +382,7 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
                                      const Vec3& xn, double h, Vec3View<float> wv,
                                      const FitScratch& s, int lane) {
     constexpr int N = Basis::kTerms;
+    constexpr int Ld = fit_stride(N);
     // Lower-triangle entries, and how many of them a lane owns once they are dealt round the warp.
     constexpr int kEntries = N * (N + 1) / 2;
     constexpr int kPerLane = cuda::ceil_div(kEntries, kWarp);
@@ -405,11 +411,11 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
         if (lane < n) {
             const int m = pidx[base + lane];
             Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
-                        (nodes_mm(m, 2) - xn[2]) / h, s.q + lane * N);
+                        (nodes_mm(m, 2) - xn[2]) / h, s.q + lane * Ld);
         }
         __syncwarp();
         for (int p = 0; p < n; ++p) {
-            const double* __restrict__ q = s.q + p * N;
+            const double* __restrict__ q = s.q + p * Ld;
 #pragma unroll
             for (int e = 0; e < kPerLane; ++e) {
                 if (e < mine) acc[e] = fma(q[row[e]], q[col[e]], acc[e]);
@@ -419,7 +425,7 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
     }
 #pragma unroll
     for (int e = 0; e < kPerLane; ++e) {
-        if (e < mine) s.a[row[e] * N + col[e]] = acc[e];
+        if (e < mine) s.a[row[e] * Ld + col[e]] = acc[e];
     }
     if (lane == 0) *s.singular = 0;
     __syncwarp();
@@ -431,38 +437,38 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
     __syncwarp();
     for (int j = 0; j < N; ++j) {
         if (lane == j) {
-            double d = s.a[j * N + j];
-            for (int k = 0; k < j; ++k) d -= s.a[j * N + k] * s.a[j * N + k];
+            double d = s.a[j * Ld + j];
+            for (int k = 0; k < j; ++k) d -= s.a[j * Ld + k] * s.a[j * Ld + k];
             if (!(d > floor_pivot)) *s.singular = 1;
-            else s.a[j * N + j] = sqrt(d);
+            else s.a[j * Ld + j] = sqrt(d);
         }
         __syncwarp();
         if (*s.singular) return false;
-        const double ljj = s.a[j * N + j];
+        const double ljj = s.a[j * Ld + j];
         if (lane > j && lane < N) {
-            double v = s.a[lane * N + j];
-            for (int k = 0; k < j; ++k) v -= s.a[lane * N + k] * s.a[j * N + k];
-            s.a[lane * N + j] = v / ljj;
+            double v = s.a[lane * Ld + j];
+            for (int k = 0; k < j; ++k) v -= s.a[lane * Ld + k] * s.a[j * Ld + k];
+            s.a[lane * Ld + j] = v / ljj;
         }
         __syncwarp();
     }
 
     // Rows 1..3 of the inverse are the coefficients of u, v, t, i.e. the gradient in the scaled
     // frame. One right-hand side per lane; the three are independent given the factor.
-    double* const z = s.yz + 3 * N;
+    double* const z = s.yz + 3 * Ld;
     if (lane < 3) {
-        double* const y = s.yz + lane * N;
-        double* const zc = z + lane * N;
+        double* const y = s.yz + lane * Ld;
+        double* const zc = z + lane * Ld;
         const int rhs_row = lane + 1;
         for (int i = 0; i < N; ++i) {
             double v = (i == rhs_row) ? 1.0 : 0.0;
-            for (int k = 0; k < i; ++k) v -= s.a[i * N + k] * y[k];
-            y[i] = v / s.a[i * N + i];
+            for (int k = 0; k < i; ++k) v -= s.a[i * Ld + k] * y[k];
+            y[i] = v / s.a[i * Ld + i];
         }
         for (int i = N - 1; i >= 0; --i) {
             double v = y[i];
-            for (int k = i + 1; k < N; ++k) v -= s.a[k * N + i] * zc[k];
-            zc[i] = v / s.a[i * N + i];
+            for (int k = i + 1; k < N; ++k) v -= s.a[k * Ld + i] * zc[k];
+            zc[i] = v / s.a[i * Ld + i];
         }
     }
     __syncwarp();
@@ -479,7 +485,7 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
         for (int c = 0; c < 3; ++c) {
             double grad = 0.0;
 #pragma unroll
-            for (int i = 0; i < N; ++i) grad = fma(z[c * N + i], q[i], grad);
+            for (int i = 0; i < N; ++i) grad = fma(z[c * Ld + i], q[i], grad);
             sum[c] += fabs(grad);
             wv(p, c) = static_cast<float>(grad / h);
         }
@@ -501,9 +507,10 @@ __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
     const int* __restrict__ pidx, const int* __restrict__ slot_node, float* __restrict__ w,
     int* __restrict__ status, const int* __restrict__ active, int n) {
     constexpr int kMaxTerms = CubicHarmonicBasis::kTerms;
-    __shared__ double warp_q[kFitWarps][kFitChunk * kMaxTerms];
-    __shared__ double warp_a[kFitWarps][kMaxTerms * kMaxTerms];
-    __shared__ double warp_yz[kFitWarps][6 * kMaxTerms];
+    constexpr int kMaxLd = fit_stride(kMaxTerms);
+    __shared__ double warp_q[kFitWarps][kFitChunk * kMaxLd];
+    __shared__ double warp_a[kFitWarps][kMaxTerms * kMaxLd];
+    __shared__ double warp_yz[kFitWarps][6 * kMaxLd];
     __shared__ int warp_singular[kFitWarps];
 
     const int warp = threadIdx.x / kWarp;
