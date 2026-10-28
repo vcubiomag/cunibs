@@ -406,9 +406,8 @@ __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __r
 }
 
 // Stage 2: one block per column folds that column's partials into a single total, returned to
-// every thread of the block. The two kernels below differ only in what they then do with it, and
-// the sum order here is the same for both, so which one ran cannot move a result. Every thread of
-// the block must reach this.
+// every thread of the block. Every kernel that totals a column does it here, in the same sum
+// order, so which one ran cannot move a result. Every thread of the block must reach this.
 __device__ __forceinline__ double bcg_reduce_column(const double* __restrict__ partials,
                                                     int n_blocks, int c) {
     __shared__ double sdata[kBlock];
@@ -679,13 +678,13 @@ __device__ __forceinline__ void bcg_deflated_rz(const double* __restrict__ parti
 }
 
 __global__ void bcg_reduce_init_kernel(const double* __restrict__ partials, int n_blocks,
-                                       Deflation defl, const float* __restrict__ zf,
+                                       Deflation defl, const float* __restrict__ zf, int k,
                                        const double* __restrict__ rsum,
                                        const double* __restrict__ mask, double* __restrict__ rz,
                                        double* __restrict__ shift) {
     const int c = blockIdx.x;
     double total, sh;
-    bcg_deflated_rz(partials, n_blocks, c, defl, zf, gridDim.x, rsum, total, sh);
+    bcg_deflated_rz(partials, n_blocks, c, defl, zf, k, rsum, total, sh);
     if (threadIdx.x == 0 && marked(mask, c)) {
         rz[c] = total;
         shift[c] = sh;
@@ -694,12 +693,12 @@ __global__ void bcg_reduce_init_kernel(const double* __restrict__ partials, int 
 
 __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int n_blocks,
                                        const double* __restrict__ converged, Deflation defl,
-                                       const float* __restrict__ zf,
+                                       const float* __restrict__ zf, int k,
                                        const double* __restrict__ rsum, double* __restrict__ rz,
                                        double* __restrict__ beta, double* __restrict__ shift) {
     const int c = blockIdx.x;
     double total, sh;
-    bcg_deflated_rz(partials, n_blocks, c, defl, zf, gridDim.x, rsum, total, sh);
+    bcg_deflated_rz(partials, n_blocks, c, defl, zf, k, rsum, total, sh);
     if (threadIdx.x == 0) {
         // beta = 0 on a frozen column pins p at z. Left at total/rz it would be 1, since r has
         // not moved, and p would grow by z every remaining iteration for no purpose.
@@ -1012,7 +1011,7 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const float* r, Def
         bcg_partials_kernel<K, Fold::kDot, float>
             <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
     });
-    bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, converged, defl, zf,
+    bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, converged, defl, zf, k,
                                                      rsum, rz, beta, shift);
 }
 
@@ -1024,7 +1023,7 @@ void launch_bcg_cast_dot_init(int n, int k, const float* zf, const float* r, Def
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, Fold::kDot, float>
             <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
-        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, rsum,
+        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, k, rsum,
                                                          nullptr, rz, shift);
         if (const unsigned blocks = grid_for(n)) {
             bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, nullptr, p);
@@ -1044,7 +1043,7 @@ void launch_bcg_restart(int n, int k, const float* zf, const float* r, Deflation
         bcg_reduce_masked_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, mask, rsum);
         bcg_partials_kernel<K, Fold::kDot, float>
             <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
-        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, rsum,
+        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, k, rsum,
                                                          mask, rz, shift);
         if (const unsigned blocks = grid_for(n)) {
             bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, mask, p);
