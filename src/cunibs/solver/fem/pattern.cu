@@ -7,6 +7,7 @@
 #include <cuda/std/limits>
 
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 
 // Segment-wise CSR construction: for every segment, the sorted distinct values of a candidate list
