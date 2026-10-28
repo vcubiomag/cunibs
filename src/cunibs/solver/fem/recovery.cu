@@ -578,6 +578,14 @@ __global__ void split_potential_kernel(const double* __restrict__ v_block, int s
     lo[t] = static_cast<float>(v - static_cast<double>(h));
 }
 
+// TwoSum: s + e == a + b exactly.
+__device__ __forceinline__ float two_sum(float a, float b, float& e) {
+    const float s = __fadd_rn(a, b);
+    const float bb = __fsub_rn(s, a);
+    e = __fadd_rn(__fsub_rn(a, __fsub_rn(s, bb)), __fsub_rn(b, bb));
+    return s;
+}
+
 // kHprLanes lanes per slot, K placements at a time.
 //   grad_v[s] = Σ_m W[s,m] · (v[m] − v[n_s])
 //   E[s]      = −grad_v[s] − dA/dt(x_n)
@@ -661,12 +669,9 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
             for (int i = 0; i < 3; ++i) {
                 const float a2 = __shfl_down_sync(kFullWarp, acc[c][i], off, kHprLanes);
                 const float c2 = __shfl_down_sync(kFullWarp, comp[c][i], off, kHprLanes);
-                const float sum = __fadd_rn(acc[c][i], a2);
-                const float bb = __fsub_rn(sum, acc[c][i]);
-                const float err =
-                    __fadd_rn(__fsub_rn(acc[c][i], __fsub_rn(sum, bb)), __fsub_rn(a2, bb));
+                float err;
+                acc[c][i] = two_sum(acc[c][i], a2, err);
                 comp[c][i] = __fsub_rn(__fadd_rn(comp[c][i], c2), err);
-                acc[c][i] = sum;
             }
         }
     }
@@ -722,13 +727,6 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
     }
 }
 
-// TwoSum: s + e == a + b exactly.
-__device__ __forceinline__ float two_sum(float a, float b, float& e) {
-    const float s = a + b;
-    const float bb = s - a;
-    e = (a - (s - bb)) + (b - bb);
-    return s;
-}
 
 // One thread per tet: sample the recovered field at the barycentre, which for P1 is the mean of
 // the four corner slots. slot_of_corner is the identity on tet_nodes for the node-slot modes and
