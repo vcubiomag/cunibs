@@ -1,6 +1,8 @@
 #include "core/device_math.cuh"
 #include "fem/fem.hpp"
 
+#include <cuda/std/algorithm>
+
 #include <climits>
 #include <cstdint>
 #include <stdexcept>
@@ -45,17 +47,9 @@ __global__ void node_gather_kernel(const double* __restrict__ corner, const int*
 
 // The position of e in the ascending roi_elems, or -1.
 __device__ __forceinline__ int roi_find(const int* __restrict__ roi_elems, int n_roi, int e) {
-    if (n_roi == 0 || e < __ldg(roi_elems) || e > __ldg(roi_elems + n_roi - 1)) return -1;
-    int lo = 0, hi = n_roi - 1;
-    while (lo < hi) {
-        const int mid = (lo + hi) >> 1;
-        if (__ldg(roi_elems + mid) < e) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    return __ldg(roi_elems + lo) == e ? lo : -1;
+    if (n_roi == 0 || e < roi_elems[0] || e > roi_elems[n_roi - 1]) return -1;
+    const int* const at = cuda::std::lower_bound(roi_elems, roi_elems + n_roi, e);
+    return *at == e ? static_cast<int>(at - roi_elems) : -1;
 }
 
 //   node_w[n,k] = ¼ Σ_{c ∋ n} w_e[c>>2, k],   w_e = (−neg_vc[e]) · (G_e λ) − α_e ê
