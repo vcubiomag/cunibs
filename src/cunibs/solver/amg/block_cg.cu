@@ -158,11 +158,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
         }
     }
     warp_reduce_sum<kTpr>(sum);
-    if (row < n && lane == 0) {
-        const WidthView<float, K> yv(y, n);
-#pragma unroll
-        for (int c = 0; c < K; ++c) yv(row, c) = sum[c];
-    }
+    if (row < n && lane == 0) store_row<K>(&WidthView<float, K>(y, n)(row, 0), sum);
 }
 
 // The affine operator in difference form, each part's segment summed as bcsrmv_diff_kernel sums a
