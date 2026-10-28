@@ -8,23 +8,12 @@ import cupy as cp
 import numpy as np
 import numpy.typing as npt
 
-from cunibs.solver import dadt_nbody, place_transforms
+from cunibs.solver import dadt_block, place_transforms
 
 if TYPE_CHECKING:
     from cunibs.fem.solve import SolverContext
 
 MU0_OVER_4PI = 1e-7  # μ0 / 4π in T·m/A, the magnetic-dipole vector-potential constant
-DADT_COMPUTE_DTYPE = cp.float32
-
-
-# Target nodes in metres about the coil origin, narrowed to float32, in one pass. The intrinsics
-# keep the multiply and the subtract separately rounded, as two array operations would round them.
-_centred_m = cp.ElementwiseKernel(
-    "float64 x_mm, raw float64 o",
-    "float32 r",
-    "r = (float)__dsub_rn(__dmul_rn(x_mm, 1e-3), o[i % 3])",
-    "cunibs_centred_m",
-)
 
 
 def _require_defined_handle_axis(
@@ -146,6 +135,51 @@ def compute_coil_transform(
     return cp.asnumpy(transform[0])
 
 
+def coil_dadt_block(
+    dip_pos_m: npt.ArrayLike,
+    dip_moment: npt.ArrayLike,
+    transforms: npt.NDArray[np.float64] | cp.ndarray,
+    didt: float,
+    target_nodes_mm: cp.ndarray,
+    *,
+    out: cp.ndarray | None = None,
+    column: int = 0,
+) -> cp.ndarray:
+    """Compute dA/dt at each target node for ``k`` placements of one coil.
+
+    For dipole ``m`` at ``s`` and target ``r``:
+        A(r) = (μ0/4π) Σ_j m_j × (r - s_j) / |r - s_j|³
+        dA/dt = didt · A(r)
+
+    ``transforms`` is ``(k, 4, 4)``: the full affine applies to positions and only its rotation
+    to moments. The kernel places the dipoles itself, in float64, and sums them in float32 about
+    each placement's coil origin.
+
+    ``out`` is an optional C-contiguous ``(n_nodes, m, 3)`` float32 block with ``m >= column + k``,
+    of which placements fill columns ``column`` onwards; the block solve stages its placements this
+    way so that a node's values sit together for the RHS gather. Returns the ``(n_nodes, k, 3)``
+    view written.
+    """
+    tf = cp.ascontiguousarray(cp.asarray(transforms, dtype=cp.float64).reshape(-1, 4, 4))
+    k = int(tf.shape[0])
+    nodes = cp.ascontiguousarray(target_nodes_mm, dtype=cp.float64)
+    n = int(nodes.shape[0])
+    if out is None:
+        out = cp.empty((n, k, 3), dtype=cp.float32)
+    dadt_block(
+        cp.ascontiguousarray(cp.asarray(dip_pos_m, dtype=cp.float64)),
+        cp.ascontiguousarray(cp.asarray(dip_moment, dtype=cp.float64)),
+        tf,
+        nodes,
+        out.reshape(n, -1),
+        float(didt),
+        MU0_OVER_4PI,
+        cp.cuda.get_current_stream().ptr,
+        column,
+    )
+    return out[:, column : column + k, :]
+
+
 def coil_dadt_at_nodes(
     dip_pos_m: npt.ArrayLike,
     dip_moment: npt.ArrayLike,
@@ -156,43 +190,12 @@ def coil_dadt_at_nodes(
     out: cp.ndarray | None = None,
     column: int = 0,
 ) -> cp.ndarray:
-    """Compute dA/dt at each target node.
+    """dA/dt at each target node for one placement: :func:`coil_dadt_block` at ``k = 1``.
 
-    For dipole ``m`` at ``s`` and target ``r``:
-        A(r) = (μ0/4π) Σ_j m_j × (r - s_j) / |r - s_j|³
-        dA/dt = didt · A(r)
-
-    Apply the full affine to positions and only its rotation to moments.
-
-    ``out`` is an optional C-contiguous ``(n_nodes, k, 3)`` float32 block, of which this fills
-    placement ``column`` and returns that view. The block solve stages its placements this way so
-    that a node's k values sit together for the RHS gather.
+    Returns ``(n_nodes, 3)``. With ``out``, an ``(n_nodes, m, 3)`` block, it fills placement
+    ``column`` and returns that view.
     """
-    rot = cp.asarray(transform[:3, :3])
-    trans = cp.asarray(transform[:3, 3])
-    s = (cp.asarray(dip_pos_m) * 1e3 @ rot.T + trans) * 1e-3
-    m = cp.asarray(dip_moment) @ rot.T
-
-    # Center coordinates at the coil origin to reduce cancellation in |r - s|².
-    # Use A(r) = μ0/4π (W × r - P), where W = Σ w_j m_j,
-    # P = Σ w_j (m_j × s_j), and w_j = |r - s_j|⁻³.
-    o = trans * 1e-3
-    s = s - o
-    mp = cp.concatenate([m, cp.cross(m, s)], axis=1)
-
-    # Keep centering in float64, then use float32 for the dominant N-body kernel: the
-    # coil-scalp gap bounds |r - s| away from zero, so the |r - s|⁻³ weights stay well
-    # inside float32 range.
-    s = s.astype(DADT_COMPUTE_DTYPE)
-    r = _centred_m(target_nodes_mm, o)
-    mp = cp.ascontiguousarray(mp.astype(DADT_COMPUTE_DTYPE))
-    sn = cp.ascontiguousarray((s * s).sum(1))
-
-    stream = cp.cuda.get_current_stream().ptr
-    if out is None:
-        field = cp.empty_like(r)
-        dadt_nbody(s, mp, sn, r, field, float(didt), MU0_OVER_4PI, stream)
-        return field
-    n = int(r.shape[0])
-    dadt_nbody(s, mp, sn, r, out.reshape(n, -1), float(didt), MU0_OVER_4PI, stream, column)
-    return out[:, column, :]
+    block = coil_dadt_block(
+        dip_pos_m, dip_moment, transform, didt, target_nodes_mm, out=out, column=column
+    )
+    return block[:, 0, :]

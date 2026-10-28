@@ -3,6 +3,7 @@
 from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
 from cunibs.fem.placement import (
     coil_dadt_at_nodes,
+    coil_dadt_block,
     compute_coil_transform,
     compute_coil_transforms,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "apply_recovery",
     "build_context",
     "coil_dadt_at_nodes",
+    "coil_dadt_block",
     "compute_coil_transform",
     "compute_coil_transforms",
     "ensure_recovery",

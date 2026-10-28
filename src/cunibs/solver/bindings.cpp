@@ -395,28 +395,31 @@ NB_MODULE(_solver_ext, m) {
         "coordinates in millimetres; writes into caller-allocated g/vols.");
 
     m.def(
-        "dadt_nbody",
-        [](const Rows3f& s, const Dev<float, -1, 6>& mp, const f32_1d& sn, const Rows3f& r,
-           const f32_2d& out, float didt, float mu0_4pi, uintptr_t stream, int column) {
-            const std::size_t n_dip = s.shape(0);
-            const std::size_t n_nodes = r.shape(0);
+        "dadt_block",
+        [](const Rows3d& pos_m, const Rows3d& mom, const Dev<double, -1, 4, 4>& transforms,
+           const Rows3d& nodes_mm, const f32_2d& out, float didt, float mu0_4pi,
+           uintptr_t stream, int column) {
+            const std::size_t n_nodes = nodes_mm.shape(0);
+            const int k = static_cast<int>(transforms.shape(0));
             const int stride = static_cast<int>(out.shape(1));
-            require(mp.shape(0) == n_dip && sn.shape(0) == n_dip,
-                    "dadt_nbody: s, mp and sn must have one entry per dipole");
+            require(mom.shape(0) == pos_m.shape(0),
+                    "dadt_block: pos_m and mom must have one row per dipole");
             require(out.shape(0) == n_nodes && stride % 3 == 0 && column >= 0 &&
-                        3 * (column + 1) <= stride,
-                    "dadt_nbody: out must be (n_nodes, 3k) with room for column");
-            launch_dadt(s.data(), mp.data(), sn.data(), r.data(), out.data() + 3 * column, stride,
-                        static_cast<int>(n_dip), static_cast<int>(n_nodes), didt, mu0_4pi,
-                        as_stream(stream));
+                        3 * (column + k) <= stride,
+                    "dadt_block: out must be (n_nodes, 3m) with room for k columns from column");
+            launch_dadt_block(pos_m.data(), mom.data(), transforms.data(),
+                              static_cast<int>(pos_m.shape(0)), k, nodes_mm.data(),
+                              static_cast<int>(n_nodes), out.data() + 3 * column, stride, didt,
+                              mu0_4pi, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),
-        nb::arg("s").noconvert(), nb::arg("mp").noconvert(), nb::arg("sn").noconvert(),
-        nb::arg("r").noconvert(), nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"),
-        nb::arg("stream"), nb::arg("column") = 0,
-        "Fused dA/dt at nodes from placed magnetic dipoles: mp is (n_dip, 6), each moment then its "
-        "cross product with the position. out is (n_nodes, 3k), an interleaved (n_nodes, k, 3) "
-        "block, and the field fills column column.");
+        nb::arg("pos_m").noconvert(), nb::arg("mom").noconvert(),
+        nb::arg("transforms").noconvert(), nb::arg("nodes_mm").noconvert(),
+        nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"), nb::arg("stream"),
+        nb::arg("column") = 0,
+        "dA/dt at nodes (mm) for k placements of one coil: coil-frame dipoles (m) and moments, "
+        "and (k, 4, 4) coil-to-head affines in mm. out is (n_nodes, 3m), an interleaved "
+        "(n_nodes, m, 3) block, and placement i fills column column + i.");
 
     m.def(
         "rhs_operator_fill",

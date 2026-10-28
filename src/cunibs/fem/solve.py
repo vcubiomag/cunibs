@@ -17,7 +17,7 @@ from cunibs.fem.assembly import (
     conductivity_per_tet,
     gradient_operator,
 )
-from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transforms
+from cunibs.fem.placement import coil_dadt_block, compute_coil_transforms
 from cunibs.fem.recovery import (
     RecoveredField,
     Recovery,
@@ -1021,17 +1021,7 @@ def solve_placements_block(
 
     # Staged interleaved, so that a node's k values are one contiguous gather for the RHS operator
     # and for the per-element field, which averages them onto each element as it reconstructs.
-    dadt_block = cp.empty((ctx.n_nodes, k, 3), dtype=cp.float32)
-    for i in range(k):
-        coil_dadt_at_nodes(
-            dip_pos_m,
-            dip_moment,
-            device_transforms[i],
-            didt,
-            ctx.nodes_mm,
-            out=dadt_block,
-            column=i,
-        )
+    dadt_block = coil_dadt_block(dip_pos_m, dip_moment, device_transforms, didt, ctx.nodes_mm)
 
     b_block = _assemble_rhs(ctx, dadt_block)
     B_pad = _pad_block(b_block[solver.idx, :].astype(cp.float64), k)

@@ -22,7 +22,7 @@ import numpy as np
 
 from cunibs._memory import build_arena
 from cunibs.fem.assembly import csr_matmul
-from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transforms
+from cunibs.fem.placement import coil_dadt_block, compute_coil_transforms
 from cunibs.solver import sweep_seed, sweep_seed_work_size
 
 if TYPE_CHECKING:
@@ -119,17 +119,9 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
         q = cp.empty((n, 0), dtype=cp.float32)
         for start in range(0, size, MAX_BLOCK):
             k = min(MAX_BLOCK, size - start)
-            dadt = cp.empty((ctx.n_nodes, k, 3), dtype=cp.float32)
-            for i in range(k):
-                coil_dadt_at_nodes(
-                    coil.positions_m,
-                    coil.moments,
-                    transforms[start + i],
-                    1.0,
-                    ctx.nodes_mm,
-                    out=dadt,
-                    column=i,
-                )
+            dadt = coil_dadt_block(
+                coil.positions_m, coil.moments, transforms[start : start + k], 1.0, ctx.nodes_mm
+            )
             b = _pad_block(_assemble_rhs(ctx, dadt)[solver.idx, :].astype(cp.float64), k)
             del dadt
             x0 = SweepBasis(q).seed(b) if q.shape[1] else None

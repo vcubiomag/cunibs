@@ -434,34 +434,49 @@ def test_accumulate_moments_recovers_mean_and_variance(cp, stream):
 # --- N-body and placement, called directly ------------------------------------------------
 
 
-def test_dadt_nbody_matches_analytic_dipoles(cp, stream):
-    """The raw kernel, with the (m | m×s) packing its caller builds, against the closed form."""
+@pytest.mark.parametrize("planar", [False, True])
+def test_dadt_block_matches_analytic_dipoles(cp, stream, planar):
+    """The raw kernel against the closed form, for every placement of a block.
+
+    Moments sharing one direction take the four-accumulator path, so both paths are checked.
+    """
     from cunibs.fem.placement import MU0_OVER_4PI
-    from cunibs.solver import dadt_nbody
+    from cunibs.solver import dadt_block
 
     rng = np.random.default_rng(7)
     s = rng.uniform(-0.05, 0.05, size=(16, 3))
-    m = rng.standard_normal((16, 3))
-    r = rng.uniform(0.1, 0.2, size=(40, 3))  # kept well away from the sources
+    if planar:
+        m = rng.standard_normal((16, 1)) * np.array([0.3, -0.4, 0.866])
+    else:
+        m = rng.standard_normal((16, 3))
+    r_mm = rng.uniform(100.0, 200.0, size=(40, 3))  # kept well away from the sources
     didt = 1e6
+    angles = (0.0, 0.7, 2.1)
+    tf = np.zeros((len(angles), 4, 4))
+    for i, a in enumerate(angles):
+        tf[i, :3, :3] = [[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]]
+        tf[i, :3, 3] = [5.0 * i, -3.0, 2.0]
+        tf[i, 3, 3] = 1.0
 
-    mp = np.concatenate([m, np.cross(m, s)], axis=1).astype(np.float32)
-    out = cp.empty((40, 3), dtype=cp.float32)
-    dadt_nbody(
-        cp.ascontiguousarray(cp.asarray(s.astype(np.float32))),
-        cp.ascontiguousarray(cp.asarray(mp)),
-        cp.ascontiguousarray(cp.asarray((s.astype(np.float32) ** 2).sum(1))),
-        cp.ascontiguousarray(cp.asarray(r.astype(np.float32))),
+    out = cp.empty((40, 3 * len(angles)), dtype=cp.float32)
+    dadt_block(
+        cp.asarray(s),
+        cp.asarray(m),
+        cp.asarray(tf),
+        cp.asarray(r_mm),
         out,
         didt,
         MU0_OVER_4PI,
         stream,
     )
-
-    diff = r[:, None, :] - s[None, :, :]
-    dist3 = np.linalg.norm(diff, axis=2)[:, :, None] ** 3
-    ref = didt * MU0_OVER_4PI * (np.cross(m[None, :, :], diff) / dist3).sum(axis=1)
-    assert np.linalg.norm(cp.asnumpy(out) - ref) / np.linalg.norm(ref) <= 1e-5
+    got = cp.asnumpy(out).reshape(40, len(angles), 3)
+    for i in range(len(angles)):
+        si = s @ tf[i, :3, :3].T + tf[i, :3, 3] * 1e-3
+        mi = m @ tf[i, :3, :3].T
+        diff = r_mm[:, None, :] * 1e-3 - si[None, :, :]
+        dist3 = np.linalg.norm(diff, axis=2)[:, :, None] ** 3
+        ref = didt * MU0_OVER_4PI * (np.cross(mi[None, :, :], diff) / dist3).sum(axis=1)
+        assert np.linalg.norm(got[:, i] - ref) / np.linalg.norm(ref) <= 1e-5
 
 
 def test_place_transforms_batches_independently(cp, cube_subject, stream):
