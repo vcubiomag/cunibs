@@ -162,31 +162,43 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
 }
 
 // The affine operator in difference form, each part's segment summed as bcsrmv_diff_kernel sums a
-// row, with that part's own row sum on its diagonal slot.
+// row, with that part's own row sum on its diagonal slot. One thread per row carries all K
+// columns, so a gathered row of x is one or two vector loads; each column still takes the same
+// terms in the same order, so its arithmetic does not depend on K. At K = 8 the kSpmvMinBlocks
+// floor would leave too few registers for the three K-wide arrays and spill them.
 template <int K>
-__global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
+__global__ void __launch_bounds__(kBlock, K >= 8 ? 4 : kSpmvMinBlocks)
     affine_diff_kernel(int n, const int* __restrict__ order, const int* __restrict__ seg_ptr,
                        const int* __restrict__ seg_start, const std::uint8_t* __restrict__ seg_term,
                        const std::int16_t* __restrict__ cols, const float* __restrict__ vals,
                        const float* __restrict__ sigma, int n_terms, const float* __restrict__ x,
                        float* __restrict__ y) {
-    const std::int64_t tid = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int slot = static_cast<int>(tid / K);
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
     if (slot >= n) return;
     const int row = order[slot];
-    const int c = static_cast<int>(tid % K);
     const WidthView<const float, K> xv(x, n);
-    const float xr = xv(row, c);
-    const float* sig = sigma + c * n_terms;
-    float acc = 0.f;
+    cuda::std::array<float, K> xr, acc;
+    load_row<K>(&xv(row, 0), xr);
+#pragma unroll
+    for (int c = 0; c < K; ++c) acc[c] = 0.f;
     for (int g = seg_ptr[row]; g < seg_ptr[row + 1]; ++g) {
-        float part = 0.f;
+        cuda::std::array<float, K> part;
+#pragma unroll
+        for (int c = 0; c < K; ++c) part[c] = 0.f;
         for (int j = seg_start[g]; j < seg_start[g + 1]; ++j) {
-            part = diff_term(cols, j, vals[j], xv(slot_column(cols, j, row), c), xr, part);
+            const float v = vals[j];
+            cuda::std::array<float, K> xc;
+            load_row<K>(&xv(slot_column(cols, j, row), 0), xc);
+#pragma unroll
+            for (int c = 0; c < K; ++c) part[c] = diff_term(cols, j, v, xc[c], xr[c], part[c]);
         }
-        acc = __fmaf_rn(sig[seg_term[g]], part, acc);
+        const int term = seg_term[g];
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+            acc[c] = __fmaf_rn(sigma[c * n_terms + term], part[c], acc[c]);
+        }
     }
-    WidthView<float, K>(y, n)(row, c) = acc;
+    store_row<K>(&WidthView<float, K>(y, n)(row, 0), acc);
 }
 
 // Setup only. Whether segment g, [bounds[g], bounds[g + 1]), sums to more than a rounding residue
@@ -846,7 +858,7 @@ void launch_affine_diff_block(int n, int k, const AffineOperator& op, const floa
                               const float* sigma, const float* x, float* y, cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
+        if (const unsigned blocks = grid_for(n)) {
             affine_diff_kernel<K><<<blocks, kBlock, 0, stream>>>(
                 n, op.order, op.seg_ptr, op.seg_start, op.seg_term, op.cols, vals, sigma,
                 op.n_terms, x, y);
