@@ -136,9 +136,10 @@ struct PatchGather {
             for (int i = lane; i < ring; i += kWarp) out[i] = r1_idx[begin + i];
             return ring;
         }
-        // Runs of unequal length, so each lane needs where its neighbour's ring starts: a warp
-        // scan of the lengths, chunk by chunk. The shuffle scan keeps nothing in memory, so its
-        // storage is an empty local.
+        // Runs of unequal length, so each neighbour's ring needs where it starts: a warp scan of
+        // the lengths, chunk by chunk. The shuffle scan keeps nothing in memory, so its storage is
+        // an empty local. The warp then copies one ring at a time, so its loads of r1_idx are one
+        // contiguous run rather than a separate line per lane.
         using WarpScan = cub::WarpScan<int>;
         typename WarpScan::TempStorage scan_storage;
         int n = 0;
@@ -152,8 +153,13 @@ struct PatchGather {
             }
             int at = 0, chunk = 0;
             WarpScan(scan_storage).ExclusiveSum(len, at, chunk);
-            at += n;
-            for (int t = 0; t < len; ++t) out[at + t] = r1_idx[src + t];
+            const int here = min(kWarp, ring - base);
+            for (int q = 0; q < here; ++q) {
+                const int q_len = __shfl_sync(kFullWarp, len, q);
+                const int q_src = __shfl_sync(kFullWarp, src, q);
+                const int q_at = n + __shfl_sync(kFullWarp, at, q);
+                for (int t = lane; t < q_len; t += kWarp) out[q_at + t] = r1_idx[q_src + t];
+            }
             n += chunk;
         }
         return n;
