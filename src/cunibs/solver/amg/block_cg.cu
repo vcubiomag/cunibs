@@ -690,9 +690,6 @@ __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int 
 
 // x += alpha p, then p = beta p + z with z = zf + shift rebuilt on the fly as everywhere else.
 // alpha is still this iteration's and p still the one the SpMV read, so x takes exactly the
-// update it would have taken beside r.
-// x += alpha p, then p = beta p + z with z = zf + shift rebuilt on the fly as everywhere else.
-// alpha is still this iteration's and p still the one the SpMV read, so x takes exactly the
 // update it would have taken beside r. x is the one fp64 vector: a grounded potential is large
 // against its change across an element, and every field is a difference of it.
 template <int K>
