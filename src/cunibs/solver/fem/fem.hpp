@@ -63,17 +63,12 @@ void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,
                         cudaStream_t stream);
 
-// v_block is row-major (n_nodes, k) float64. A null e_out[c] or magn_out[c] is not written.
-void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const float* g,
-                              const float* const* dadt_elm, float* const* e_out,
-                              float* const* magn_out, int n_tet, int k, cudaStream_t stream);
-
-// The same from nodal dA/dt, averaged onto each element in the kernel: placement c's value at node
-// n starts at dadt_nodes[n * row_stride + c * column_stride], so an interleaved (n_nodes, k, 3)
-// block has strides (3k, 3) and one field shared by every placement has (3, 0).
+// The same for k placements from nodal dA/dt, averaged onto each element in the kernel. v_block
+// is row-major (n_nodes, k) float64, and dadt_nodes is interleaved (n_nodes, k, 3), or one
+// (n_nodes, 3) field every placement shares when `shared`. A null e_out[c] or magn_out[c] is not
+// written.
 void launch_reconstruct_nodal_block(const double* v_block, const int* tet_nodes, const float* g,
-                                    const float* dadt_nodes, std::int64_t row_stride,
-                                    int column_stride, float* const* e_out,
+                                    const float* dadt_nodes, bool shared, float* const* e_out,
                                     float* const* magn_out, int n_tet, int k,
                                     cudaStream_t stream);
 

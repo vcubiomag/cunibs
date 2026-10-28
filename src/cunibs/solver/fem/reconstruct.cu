@@ -16,15 +16,14 @@
 namespace {
 
 struct TetGeometry {
-    int nodes[4];
+    cuda::std::array<int, 4> nodes;
     float g[3][3];  // g[i - 1] for corners 1..3; corner 0 is implied by the zero sum
 };
 
 __device__ __forceinline__ TetGeometry load_tet(Tet4View<const int> tn, TetGradView<const float> gv,
                                                 int e) {
     TetGeometry t;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) t.nodes[i] = tn(e, i);
+    t.nodes = load_tet_nodes(tn, e);
 #pragma unroll
     for (int i = 0; i < 3; ++i) {
 #pragma unroll
@@ -50,33 +49,75 @@ __device__ __forceinline__ float tet_field(const TetGeometry& t, const double (&
     return sqrtf(sq);
 }
 
-// dA/dt already averaged onto the elements, one (n_tet, 3) array per placement.
+// A dA/dt source answers at<K>(e, nodes) with what element e needs, whose (c, out) writes
+// placement c's dA/dt on that element.
+
+// dA/dt already averaged onto the elements, one (n_tet, 3) array, for a single placement.
 struct ElementDadt {
-    ConstPtrPack elm;
+    const float* __restrict__ elm;
     int n_tet;
 
-    __device__ __forceinline__ void load(int e, const int (&)[4], int c, float (&out)[3]) const {
-        const Vec3View<const float> v(elm[c], n_tet);
+    struct At {
+        const float* __restrict__ row;
+        __device__ __forceinline__ void operator()(int, float (&out)[3]) const {
 #pragma unroll
-        for (int d = 0; d < 3; ++d) out[d] = v(e, d);
+            for (int d = 0; d < 3; ++d) out[d] = row[d];
+        }
+    };
+
+    template <int K>
+    __device__ __forceinline__ At at(int e, const cuda::std::array<int, 4>&) const {
+        static_assert(K == 1, "an element field holds one placement");
+        return {&Vec3View<const float>(elm, n_tet)(e, 0)};
     }
 };
 
-// Nodal dA/dt, averaged onto the element here: placement c of node n is at
-// nodes[n * row + c * column]. The mean is dadt_element.cu's expression, so it is the same bits
-// as reading that kernel's output.
+// Nodal dA/dt interleaved (n_nodes, K, 3), averaged onto the element one placement at a time.
+// Holding all K placements' corners at once costs more registers than the wider loads save.
 struct NodalDadt {
     const float* __restrict__ nodes;
-    std::int64_t row;
-    int column;
 
-    __device__ __forceinline__ void load(int, const int (&tn)[4], int c, float (&out)[3]) const {
+    template <int K>
+    struct At {
+        const float* __restrict__ nodes;
+        cuda::std::array<int, 4> tn;
+        __device__ __forceinline__ void operator()(int c, float (&out)[3]) const {
+            const auto v = unsized<WidthView<const float, 3 * K>>(nodes);
+#pragma unroll
+            for (int d = 0; d < 3; ++d) {
+                const int q = 3 * c + d;
+                out[d] = corner_mean(v(tn[0], q), v(tn[1], q), v(tn[2], q), v(tn[3], q));
+            }
+        }
+    };
+
+    template <int K>
+    __device__ __forceinline__ At<K> at(int, const cuda::std::array<int, 4>& tn) const {
+        return {nodes, tn};
+    }
+};
+
+// One nodal dA/dt (n_nodes, 3) that every placement shares, averaged once per element.
+struct SharedNodalDadt {
+    const float* __restrict__ nodes;
+
+    struct At {
+        float m[3];
+        __device__ __forceinline__ void operator()(int, float (&out)[3]) const {
+#pragma unroll
+            for (int d = 0; d < 3; ++d) out[d] = m[d];
+        }
+    };
+
+    template <int K>
+    __device__ __forceinline__ At at(int, const cuda::std::array<int, 4>& tn) const {
+        const auto v = unsized<Vec3View<const float>>(nodes);
+        At a;
 #pragma unroll
         for (int d = 0; d < 3; ++d) {
-            const std::int64_t off = static_cast<std::int64_t>(c) * column + d;
-            out[d] = 0.25f * (nodes[tn[0] * row + off] + nodes[tn[1] * row + off] +
-                              nodes[tn[2] * row + off] + nodes[tn[3] * row + off]);
+            a.m[d] = corner_mean(v(tn[0], d), v(tn[1], d), v(tn[2], d), v(tn[3], d));
         }
+        return a;
     }
 };
 
@@ -95,11 +136,12 @@ __global__ void reconstruct_block_kernel(const double* __restrict__ v_block,
     cuda::std::array<double, K> vn[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) load_row<K>(&v(t.nodes[i], 0), vn[i]);
+    const auto dadt_at = dadt.template at<K>(e, t.nodes);
 #pragma unroll
     for (int c = 0; c < K; ++c) {
         const double vc[4] = {vn[0][c], vn[1][c], vn[2][c], vn[3][c]};
         float da[3], ec[3];
-        dadt.load(e, t.nodes, c, da);
+        dadt_at(c, da);
         const float m = tet_field(t, vc, da, ec);
         if (e_out[c] != nullptr) {
             const Vec3View<float> out(e_out[c], n_tet);
@@ -127,25 +169,26 @@ void launch_reconstruct_with(const double* v_block, const int* tet_nodes, const 
 
 }  // namespace
 
-void launch_reconstruct_block(const double* v_block, const int* tet_nodes, const float* g,
-                              const float* const* dadt_elm, float* const* e_out,
-                              float* const* magn_out, int n_tet, int k, cudaStream_t stream) {
-    launch_reconstruct_with(v_block, tet_nodes, g, ElementDadt{ptr_pack(dadt_elm, k), n_tet},
-                            e_out, magn_out, n_tet, k, stream);
-}
-
 void launch_reconstruct_nodal_block(const double* v_block, const int* tet_nodes, const float* g,
-                                    const float* dadt_nodes, std::int64_t row_stride,
-                                    int column_stride, float* const* e_out,
+                                    const float* dadt_nodes, bool shared, float* const* e_out,
                                     float* const* magn_out, int n_tet, int k,
                                     cudaStream_t stream) {
-    launch_reconstruct_with(v_block, tet_nodes, g,
-                            NodalDadt{dadt_nodes, row_stride, column_stride}, e_out, magn_out,
-                            n_tet, k, stream);
+    if (shared) {
+        launch_reconstruct_with(v_block, tet_nodes, g, SharedNodalDadt{dadt_nodes}, e_out,
+                                magn_out, n_tet, k, stream);
+    } else {
+        launch_reconstruct_with(v_block, tet_nodes, g, NodalDadt{dadt_nodes}, e_out, magn_out,
+                                n_tet, k, stream);
+    }
 }
 
 void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         const float* dadt_elm, float* e_out, float* magn_out, int n_tet,
                         cudaStream_t stream) {
-    launch_reconstruct_block(v, tet_nodes, g, &dadt_elm, &e_out, &magn_out, n_tet, 1, stream);
+    const PtrPack eo = ptr_pack(&e_out, 1);
+    const PtrPack mo = ptr_pack(&magn_out, 1);
+    if (const unsigned blocks = grid_for(n_tet)) {
+        reconstruct_block_kernel<1, ElementDadt><<<blocks, kBlock, 0, stream>>>(
+            v, tet_nodes, g, ElementDadt{dadt_elm, n_tet}, eo, mo, n_tet);
+    }
 }

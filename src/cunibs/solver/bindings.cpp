@@ -615,8 +615,7 @@ NB_MODULE(_solver_ext, m) {
             const auto eo = optional_pack(e_out, k, n_tet, bad);
             const auto mo = optional_pack(magn_out, k, n_tet, bad);
             launch_reconstruct_nodal_block(v_block.data(), tet_nodes.data(), g.data(),
-                                           dadt_nodes.data(), static_cast<std::int64_t>(3 * kd),
-                                           kd == 1 ? 0 : 3, eo.data(), mo.data(),
+                                           dadt_nodes.data(), kd == 1, eo.data(), mo.data(),
                                            static_cast<int>(n_tet), k, as_stream(stream));
         },
         nb::call_guard<nb::gil_scoped_release>(),

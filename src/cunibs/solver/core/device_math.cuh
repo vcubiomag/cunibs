@@ -55,6 +55,20 @@ __host__ __device__ constexpr View unsized(typename View::data_handle_type p) {
     return View(p, cuda::std::numeric_limits<Index>::max() / inner);
 }
 
+// The four node ids of tetrahedron e as one 16-byte load. tet_nodes is always a contiguous
+// (n_tet, 4) allocation of its own, so every row starts 16-byte aligned.
+template <typename Index>
+__device__ __forceinline__ cuda::std::array<int, 4> load_tet_nodes(Tet4View<const int, Index> tn,
+                                                                   Index e) {
+    const int4 t = *reinterpret_cast<const int4*>(&tn(e, 0));
+    return {t.x, t.y, t.z, t.w};
+}
+
+// A tetrahedron's average of a nodal value, in the one order every element average uses.
+__device__ __forceinline__ float corner_mean(float a, float b, float c, float d) {
+    return 0.25f * (a + b + c + d);
+}
+
 // Three components passed around by value; the geometry kernels build and fold these, the helpers
 // below take plain pointers.
 using Vec3 = cuda::std::array<double, 3>;

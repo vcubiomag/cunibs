@@ -13,10 +13,6 @@ void launch_dadt_block(const double* pos_m, const double* mom, const double* tra
 
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
                                  int n_tet, cudaStream_t stream);
-// dadt_nodes is (n_nodes, k, 3); dadt_elm holds k (n_tet, 3) outputs.
-void launch_dadt_element_average_block(const float* dadt_nodes, const int* tet_nodes,
-                                       float* const* dadt_elm, int n_tet, int k,
-                                       cudaStream_t stream);
 
 // handles may be null, for callers that want only the scalp projection and normal; the frame
 // then takes an arbitrary but deterministic in-plane axis. degenerate (n_pl) is set to 1 where
