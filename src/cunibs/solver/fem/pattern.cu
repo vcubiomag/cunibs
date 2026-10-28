@@ -243,6 +243,60 @@ SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
     return plan;
 }
 
+// The widest segment, in elements per lane, that the register sort below takes. Anything wider
+// sorts in shared memory instead, so the kernel's register budget is set by this rather than by
+// the widest segment a mesh might hold.
+constexpr int kRegisterSortPerLane = 16;
+
+// The same bitonic network as the shared-memory one in segment_unique_one, over E elements a lane
+// with element r * kWarp + lane in v[r]. A stage pairs elements j apart: below the warp width that
+// is the same register in the lane j away, through a shuffle, and above it two registers of one
+// lane. The network itself touches no shared memory, whose stages below the warp width otherwise
+// put two lanes on every bank, and needs no __syncwarp between stages.
+template <int E>
+__device__ __forceinline__ void warp_bitonic_sort(int* b, int n, int lane) {
+    constexpr int m = E * kWarp;
+    cuda::std::array<int, E> v;
+#pragma unroll
+    for (int r = 0; r < E; ++r) {
+        const int i = r * kWarp + lane;
+        v[r] = i < n ? b[i] : cuda::std::numeric_limits<int>::max();
+    }
+#pragma unroll
+    for (int k = 2; k <= m; k <<= 1) {
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            if (j >= kWarp) {
+                const int rj = j / kWarp;
+#pragma unroll
+                for (int r = 0; r < E; ++r) {
+                    if (r & rj) continue;
+                    const bool ascending = ((r * kWarp + lane) & k) == 0;
+                    const int x = v[r], y = v[r | rj];
+                    if ((x > y) == ascending) {
+                        v[r] = y;
+                        v[r | rj] = x;
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int r = 0; r < E; ++r) {
+                    const bool ascending = ((r * kWarp + lane) & k) == 0;
+                    const bool lower = (lane & j) == 0;
+                    const int y = __shfl_xor_sync(kFullWarp, v[r], j);
+                    v[r] = (lower == ascending) ? min(v[r], y) : max(v[r], y);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < E; ++r) {
+        const int i = r * kWarp + lane;
+        if (i < n) b[i] = v[r];
+    }
+    __syncwarp();
+}
+
 // One segment, by one warp, into the buffer `b` the caller chose. Everything that decides the
 // row is here; the two launch classes differ only in where `b` points and how they enumerate
 // segments, so neither can change what a row contains.
@@ -260,6 +314,23 @@ __device__ __forceinline__ void segment_unique_one(Gather g, const int* __restri
     // A bitonic network over the next power of two at or above n, not over pad: most segments stop
     // well short of the widest one, and the padding is what the network would otherwise sort.
     const int m = static_cast<int>(cuda::std::bit_ceil(static_cast<unsigned>(n)));
+    if (m <= kRegisterSortPerLane * kWarp) {
+        if (m <= kWarp) {
+            warp_bitonic_sort<1>(b, n, lane);
+        } else if (m <= 2 * kWarp) {
+            warp_bitonic_sort<2>(b, n, lane);
+        } else if (m <= 4 * kWarp) {
+            warp_bitonic_sort<4>(b, n, lane);
+        } else if (m <= 8 * kWarp) {
+            warp_bitonic_sort<8>(b, n, lane);
+        } else {
+            warp_bitonic_sort<16>(b, n, lane);
+        }
+        const int kept =
+            warp_keep_first_of_each_run<Fill>(b, n, Fill ? out_idx + out_ptr[s] : nullptr, lane);
+        if (lane == 0 && !Fill) counts[s] = kept;
+        return;
+    }
     // Node ids are non-negative, so the maximum pads to the tail and never displaces a candidate.
     for (int i = n + lane; i < m; i += kWarp) {
         b[i] = cuda::std::numeric_limits<int>::max();
