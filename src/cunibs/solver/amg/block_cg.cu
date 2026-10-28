@@ -23,8 +23,8 @@ namespace {
 // spend a single add on the combine.
 constexpr int kTpr = 2;
 
-// Blocks-per-SM floor for both fp64 SpMV kernels, which is what bounds the register budget ptxas
-// will spend. Both are bandwidth-bound and want the residency for latency hiding; without the
+// Blocks-per-SM floor for the SpMV kernels, which is what bounds the register budget ptxas
+// will spend. They are bandwidth-bound and want the residency for latency hiding; without the
 // floor ptxas unrolls a wide instantiation until only two blocks fit per SM.
 constexpr int kSpmvMinBlocks = 6;
 
@@ -112,6 +112,109 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     WidthView<double, K>(y, n)(row, c) = part[0];
 }
 
+// The iteration's operator in difference form, in fp32: (A x)_i = sum_j a_ij (x_j - x_i) + s_i x_i,
+// with s_i the row sum. A conductivity operator's rows sum to zero, so in the plain form a smooth x
+// makes a row's terms cancel down to a small fraction of their size, and fp32 rounding of the
+// terms leaves Ap with a relative error of order 1e-5: the CG then reports a residual 10x below
+// the true one. Each difference x_j - x_i is exact for neighbouring values, and what remains is
+// the fp32 rounding of terms already as small as the result.
+//
+// The diagonal slot's value is replaced by the row sum (diff_values_kernel), which is nonzero
+// only beside the grounded node, and contributes s_i x_i; every other slot contributes
+// v (x_col - x_row). A low-half slot decodes to its own row and carries a zero value, so it adds
+// zero either way. The operator iterated on is therefore the fp64 one with its off-diagonals
+// rounded to fp32: an exact conductivity operator for edge weights perturbed by 6e-8. The fp64
+// operator still decides convergence, through the true-residual check in solver.cpp.
+__device__ __forceinline__ float diff_term(const std::int16_t* __restrict__ cols, int j, float v,
+                                           float xc, float xr, float acc) {
+    const float d = (cols[j] == 0) ? xc : __fsub_rn(xc, xr);
+    return __fmaf_rn(v, d, acc);
+}
+
+// Every width runs this strided form. With fp32 operands a row's K values are one or two vector
+// loads, so the L1 request limit that sends the fp64 kernel to column lanes at K >= 4 does not
+// bind, and one kernel gives every width the same association by construction.
+template <int K>
+__global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
+    bcsrmv_diff_kernel(int n, const int* __restrict__ row_ptr,
+                       const std::int16_t* __restrict__ cols, const float* __restrict__ vals,
+                       const float* __restrict__ x, float* __restrict__ y) {
+    const int row = (blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
+    const int lane = threadIdx.x % kTpr;
+    cuda::std::array<float, K> sum;
+#pragma unroll
+    for (int c = 0; c < K; ++c) sum[c] = 0.f;
+    if (row < n) {
+        const WidthView<const float, K> xv(x, n);
+        cuda::std::array<float, K> xr;
+        load_row<K>(&xv(row, 0), xr);
+        const int row_e = row_ptr[row + 1];
+        for (int j = row_ptr[row] + lane; j < row_e; j += kTpr) {
+            const float v = vals[j];
+            cuda::std::array<float, K> xc;
+            load_row<K>(&xv(slot_column(cols, j, row), 0), xc);
+#pragma unroll
+            for (int c = 0; c < K; ++c) sum[c] = diff_term(cols, j, v, xc[c], xr[c], sum[c]);
+        }
+    }
+    warp_reduce_sum<kTpr>(sum);
+    if (row < n && lane == 0) {
+        const WidthView<float, K> yv(y, n);
+#pragma unroll
+        for (int c = 0; c < K; ++c) yv(row, c) = sum[c];
+    }
+}
+
+// The affine operator in difference form, each part's segment summed as bcsrmv_diff_kernel sums a
+// row, with that part's own row sum on its diagonal slot.
+template <int K>
+__global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
+    affine_diff_kernel(int n, const int* __restrict__ order, const int* __restrict__ seg_ptr,
+                       const int* __restrict__ seg_start, const std::uint8_t* __restrict__ seg_term,
+                       const std::int16_t* __restrict__ cols, const float* __restrict__ vals,
+                       const float* __restrict__ sigma, int n_terms, const float* __restrict__ x,
+                       float* __restrict__ y) {
+    const std::int64_t tid = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int slot = static_cast<int>(tid / K);
+    if (slot >= n) return;
+    const int row = order[slot];
+    const int c = static_cast<int>(tid % K);
+    const WidthView<const float, K> xv(x, n);
+    const float xr = xv(row, c);
+    const float* sig = sigma + c * n_terms;
+    float acc = 0.f;
+    for (int g = seg_ptr[row]; g < seg_ptr[row + 1]; ++g) {
+        float part = 0.f;
+        for (int j = seg_start[g]; j < seg_start[g + 1]; ++j) {
+            part = diff_term(cols, j, vals[j], xv(slot_column(cols, j, row), c), xr, part);
+        }
+        acc = __fmaf_rn(sig[seg_term[g]], part, acc);
+    }
+    WidthView<float, K>(y, n)(row, c) = acc;
+}
+
+// Setup only. The fp32 difference-form values of a slot CSR whose rows (or affine segments) are
+// [bounds[i], bounds[i + 1]): every slot's value rounded, except the diagonal's, which becomes the
+// segment's fp64 sum where that is more than a rounding residue of its l1 norm and zero elsewhere.
+// The residue test is select_deflation_rows', so the rows that keep a sum are the deflation
+// support.
+__global__ void diff_values_kernel(int n_segs, const int* __restrict__ bounds,
+                                   const std::int16_t* __restrict__ cols,
+                                   const double* __restrict__ vals, double tol,
+                                   float* __restrict__ out) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= n_segs) return;
+    double s = 0.0, a = 0.0;
+    for (int j = bounds[g]; j < bounds[g + 1]; ++j) {
+        s += vals[j];
+        a += fabs(vals[j]);
+    }
+    const float diag = fabs(s) > tol * a ? static_cast<float>(s) : 0.f;
+    for (int j = bounds[g]; j < bounds[g + 1]; ++j) {
+        out[j] = (cols[j] == 0) ? diag : static_cast<float>(vals[j]);
+    }
+}
+
 // y = A(sigma_c) x_c for an operator affine in per-column coefficients,
 // A(sigma) = sum_t sigma_t A_t on one pattern: the conductivity-UQ stiffness, a sum of per-tissue
 // parts. A row's entries are grouped into one segment per part that touches it, so each column
@@ -194,27 +297,56 @@ __device__ __forceinline__ void bcg_block_reduce_cols(cuda::std::array<double, K
 // What a column-wise reduction folds each entry into.
 enum class Fold { kDot, kNorm, kSum };
 
-// Column-wise reductions, stage 1: one partial per (column, block). y is read only by kDot, and
-// may be fp32, in which case it is widened exactly on the fly. A grid-stride fold that loads and
-// adds one row at a time serialises its loads behind the adds, so the rows are loaded a batch at a
-// time and then folded in row order.
-template <int K, Fold F, typename TY = double>
-__global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
-                                    const TY* __restrict__ y, double* __restrict__ partials,
-                                    int n_blocks) {
-    const WidthView<const double, K> xv(x, n);
-    const WidthView<const TY, K> yv(y, n);
-    cuda::std::array<double, K> local;
+// A thread's fold over the rows it carries: fp64 for fp64 operands, and fp32 for the fp32 CG
+// vectors, whose products and kRowsPerThread-term sums are then widened once for the fp64 tree.
+// Converting every element instead would put two conversions and an fp64 add per element on the
+// 1:64 fp64 pipe, as many as the loads can feed.
+template <typename T>
+__device__ __forceinline__ T fold_mul_add(T a, T b, T acc) {
+    if constexpr (cuda::std::is_same_v<T, float>) {
+        return __fmaf_rn(a, b, acc);
+    } else {
+        return acc + a * b;
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ T fold_add(T a, T acc) {
+    if constexpr (cuda::std::is_same_v<T, float>) {
+        return __fadd_rn(acc, a);
+    } else {
+        return acc + a;
+    }
+}
+
+template <int K, typename T>
+__device__ __forceinline__ cuda::std::array<double, K> widen(const cuda::std::array<T, K>& v) {
+    cuda::std::array<double, K> out;
 #pragma unroll
-    for (int c = 0; c < K; ++c) local[c] = 0.0;
+    for (int c = 0; c < K; ++c) out[c] = static_cast<double>(v[c]);
+    return out;
+}
+
+// Column-wise reductions, stage 1: one partial per (column, block). y is read only by kDot. x and
+// y are both fp64 or both fp32, and the fold runs in their precision. A grid-stride fold that
+// loads and adds one row at a time serialises its loads behind the adds, so the rows are loaded a
+// batch at a time and then folded in row order.
+template <int K, Fold F, typename T = double>
+__global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __restrict__ y,
+                                    double* __restrict__ partials, int n_blocks) {
+    const WidthView<const T, K> xv(x, n);
+    const WidthView<const T, K> yv(y, n);
+    cuda::std::array<T, K> local;
+#pragma unroll
+    for (int c = 0; c < K; ++c) local[c] = T(0);
     const int stride = gridDim.x * blockDim.x;
     const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
     constexpr int kBatch = 4;
     static_assert(kRowsPerThread % kBatch == 0, "batches must tile the rows a thread carries");
 #pragma unroll
     for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
-        cuda::std::array<double, K> xb[kBatch];
-        cuda::std::array<TY, K> yb[kBatch];
+        cuda::std::array<T, K> xb[kBatch];
+        cuda::std::array<T, K> yb[kBatch];
 #pragma unroll
         for (int t = 0; t < kBatch; ++t) {
             const int i = i0 + (t0 + t) * stride;
@@ -228,18 +360,19 @@ __global__ void bcg_partials_kernel(int n, const double* __restrict__ x,
             if (i0 + (t0 + t) * stride >= n) break;
 #pragma unroll
             for (int c = 0; c < K; ++c) {
-                const double xc = xb[t][c];
+                const T xc = xb[t][c];
                 if constexpr (F == Fold::kDot) {
-                    local[c] += xc * static_cast<double>(yb[t][c]);
+                    local[c] = fold_mul_add(xc, yb[t][c], local[c]);
                 } else if constexpr (F == Fold::kNorm) {
-                    local[c] += xc * xc;
+                    local[c] = fold_mul_add(xc, xc, local[c]);
                 } else {
-                    local[c] += xc;
+                    local[c] = fold_add(xc, local[c]);
                 }
             }
         }
     }
-    bcg_block_reduce_cols<K>(local, partials, n_blocks);
+    cuda::std::array<double, K> wide = widen<K>(local);
+    bcg_block_reduce_cols<K>(wide, partials, n_blocks);
 }
 
 // Stage 2: one block per column folds that column's partials into a single total, returned to
@@ -261,6 +394,19 @@ __global__ void bcg_reduce_kernel(const double* __restrict__ partials, int n_blo
     const int c = blockIdx.x;
     const double total = bcg_reduce_column(partials, n_blocks, c);
     if (threadIdx.x == 0) out[c] = total;
+}
+
+// A restart touches only the columns its mask marks; every other column's state stays as it was.
+__device__ __forceinline__ bool marked(const double* __restrict__ mask, int c) {
+    return mask == nullptr || mask[c] != 0.0;
+}
+
+__global__ void bcg_reduce_masked_kernel(const double* __restrict__ partials, int n_blocks,
+                                         const double* __restrict__ mask,
+                                         double* __restrict__ out) {
+    const int c = blockIdx.x;
+    const double total = bcg_reduce_column(partials, n_blocks, c);
+    if (threadIdx.x == 0 && marked(mask, c)) out[c] = total;
 }
 
 // Deflation of the constant vector w = 1, in the A-DEF2 form of Tang, Nabben, Vuik and Erlangga
@@ -340,50 +486,51 @@ template <int K>
 __global__ void bcg_deflate_rows_kernel(int n_s, const int* __restrict__ rows,
                                         const double* __restrict__ rsum0,
                                         const double* __restrict__ inv_e,
-                                        const double* __restrict__ aw, double* __restrict__ r) {
+                                        const double* __restrict__ aw, float* __restrict__ r) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_s) return;
     const std::int64_t row = rows[t];
 #pragma unroll
-    for (int c = 0; c < K; ++c) r[row * K + c] -= (rsum0[c] * inv_e[c]) * aw[t * kDeflCols + c];
+    for (int c = 0; c < K; ++c) {
+        r[row * K + c] = static_cast<float>(static_cast<double>(r[row * K + c]) -
+                                            (rsum0[c] * inv_e[c]) * aw[t * kDeflCols + c]);
+    }
 }
 
-// The dense half: x += delta everywhere. Also emits rf for the first V-cycle and folds the new
-// sum(r) into partials, which the first preconditioned residual needs.
+// The dense half: x += delta everywhere. Also folds the new sum(r) into partials, which the first
+// preconditioned residual needs.
 template <int K>
 __global__ void bcg_deflate_start_kernel(int n, const double* __restrict__ rsum0,
                                          const double* __restrict__ inv_e, double* __restrict__ x,
-                                         const double* __restrict__ r, float* __restrict__ rf,
+                                         const float* __restrict__ r,
                                          double* __restrict__ partials, int n_blocks) {
     const WidthView<double, K> xrows(x, n);
-    const WidthView<const double, K> rrows(r, n);
-    const WidthView<float, K> rfrows(rf, n);
+    const WidthView<const float, K> rrows(r, n);
     cuda::std::array<double, K> delta;
-    cuda::std::array<double, K> sloc;
+    cuda::std::array<float, K> sloc;
 #pragma unroll
     for (int c = 0; c < K; ++c) {
         delta[c] = rsum0[c] * inv_e[c];
-        sloc[c] = 0.0;
+        sloc[c] = 0.f;
     }
     const int stride = gridDim.x * blockDim.x;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 #pragma unroll
     for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
         if (i >= n) break;
-        cuda::std::array<double, K> xv, rv;
+        cuda::std::array<double, K> xv;
+        cuda::std::array<float, K> rv;
         load_row<K>(&xrows(i, 0), xv);
         load_row<K>(&rrows(i, 0), rv);
-        cuda::std::array<float, K> rfv;
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             xv[c] += delta[c];
-            rfv[c] = static_cast<float>(rv[c]);
-            sloc[c] += rv[c];
+            sloc[c] = fold_add(rv[c], sloc[c]);
         }
         store_row<K>(&xrows(i, 0), xv);
-        store_row<K>(&rfrows(i, 0), rfv);
     }
-    bcg_block_reduce_cols<K>(sloc, partials, n_blocks);
+    cuda::std::array<double, K> wide = widen<K>(sloc);
+    bcg_block_reduce_cols<K>(wide, partials, n_blocks);
 }
 
 // Aw . zf for column c over the support, in a fixed order. Every thread of the block must reach
@@ -432,28 +579,31 @@ __global__ void bcg_alpha_kernel(int k, const double* __restrict__ rz,
     const int c = threadIdx.x;
     if (c < k) {
         // A branch, because a column frozen at an exactly zero residual has rz = pap = 0, and a
-        // quotient masked by multiplication would be 0/0 * 0, a NaN in x.
-        const double a = frozen(converged, c) ? 0.0 : rz[c] / pap[c];
+        // quotient masked by multiplication would be 0/0 * 0, a NaN in x. Rounded to fp32, the
+        // precision the r update applies it in, so that x and r take the same step.
+        const double a =
+            frozen(converged, c) ? 0.0 : static_cast<double>(static_cast<float>(rz[c] / pap[c]));
         alpha[c] = a;
         neg_alpha[c] = -a;
     }
 }
 
-// r -= alpha Ap, with rf, |r|^2 and sum(r) from the same pass. x is not touched here: its
+// r -= alpha Ap, with |r|^2 and sum(r) from the same pass. x is not touched here: its
 // x += alpha p rides on bcg_update_p_kernel, which reads p anyway, so p is read once per
 // iteration.
 template <int K>
 __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
-                                    const double* __restrict__ ap, double* __restrict__ r,
-                                    float* __restrict__ rf, double* __restrict__ partials,
-                                    int n_blocks) {
-    const WidthView<const double, K> aprows(ap, n);
-    const WidthView<double, K> rrows(r, n);
-    const WidthView<float, K> rfrows(rf, n);
-    // [0, K) is |r|^2 and [K, 2K) is sum(r), which the deflation's Q r term needs.
-    cuda::std::array<double, 2 * K> rloc;
+                                    const float* __restrict__ ap, float* __restrict__ r,
+                                    double* __restrict__ partials, int n_blocks) {
+    const WidthView<const float, K> aprows(ap, n);
+    const WidthView<float, K> rrows(r, n);
+    cuda::std::array<float, K> na;
 #pragma unroll
-    for (int c = 0; c < 2 * K; ++c) rloc[c] = 0.0;
+    for (int c = 0; c < K; ++c) na[c] = static_cast<float>(__ldg(neg_alpha + c));
+    // [0, K) is |r|^2 and [K, 2K) is sum(r), which the deflation's Q r term needs.
+    cuda::std::array<float, 2 * K> rloc;
+#pragma unroll
+    for (int c = 0; c < 2 * K; ++c) rloc[c] = 0.f;
     const int stride = gridDim.x * blockDim.x;
     const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
     // Rows go in batches whose loads are all issued before any is consumed. A plain loop with an
@@ -463,7 +613,7 @@ __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
     static_assert(kRowsPerThread % kBatch == 0, "batches must tile the rows a thread carries");
 #pragma unroll
     for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
-        cuda::std::array<double, K> apv[kBatch], rv[kBatch];
+        cuda::std::array<float, K> apv[kBatch], rv[kBatch];
 #pragma unroll
         for (int t = 0; t < kBatch; ++t) {
             const int i = i0 + (t0 + t) * stride;
@@ -476,19 +626,17 @@ __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
         for (int t = 0; t < kBatch; ++t) {
             const int i = i0 + (t0 + t) * stride;
             if (i >= n) break;
-            cuda::std::array<float, K> rfv;
 #pragma unroll
             for (int c = 0; c < K; ++c) {
-                rv[t][c] += __ldg(neg_alpha + c) * apv[t][c];
-                rfv[c] = static_cast<float>(rv[t][c]);
-                rloc[c] += rv[t][c] * rv[t][c];
-                rloc[K + c] += rv[t][c];
+                rv[t][c] = __fmaf_rn(na[c], apv[t][c], rv[t][c]);
+                rloc[c] = fold_mul_add(rv[t][c], rv[t][c], rloc[c]);
+                rloc[K + c] = fold_add(rv[t][c], rloc[K + c]);
             }
             store_row<K>(&rrows(i, 0), rv[t]);
-            store_row<K>(&rfrows(i, 0), rfv);
         }
     }
-    bcg_block_reduce_cols<2 * K>(rloc, partials, n_blocks);
+    cuda::std::array<double, 2 * K> wide = widen<2 * K>(rloc);
+    bcg_block_reduce_cols<2 * K>(wide, partials, n_blocks);
 }
 
 // Folds column c of r . zf, adds the support's Aw . zf, and turns them into the deflated r . z
@@ -506,12 +654,13 @@ __device__ __forceinline__ void bcg_deflated_rz(const double* __restrict__ parti
 
 __global__ void bcg_reduce_init_kernel(const double* __restrict__ partials, int n_blocks,
                                        Deflation defl, const float* __restrict__ zf,
-                                       const double* __restrict__ rsum, double* __restrict__ rz,
+                                       const double* __restrict__ rsum,
+                                       const double* __restrict__ mask, double* __restrict__ rz,
                                        double* __restrict__ shift) {
     const int c = blockIdx.x;
     double total, sh;
     bcg_deflated_rz(partials, n_blocks, c, defl, zf, gridDim.x, rsum, total, sh);
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && marked(mask, c)) {
         rz[c] = total;
         shift[c] = sh;
     }
@@ -537,24 +686,31 @@ __global__ void bcg_reduce_beta_kernel(const double* __restrict__ partials, int 
 // x += alpha p, then p = beta p + z with z = zf + shift rebuilt on the fly as everywhere else.
 // alpha is still this iteration's and p still the one the SpMV read, so x takes exactly the
 // update it would have taken beside r.
+// x += alpha p, then p = beta p + z with z = zf + shift rebuilt on the fly as everywhere else.
+// alpha is still this iteration's and p still the one the SpMV read, so x takes exactly the
+// update it would have taken beside r. x is the one fp64 vector: a grounded potential is large
+// against its change across an element, and every field is a difference of it.
 template <int K>
 __global__ void bcg_update_p_kernel(int n, const double* __restrict__ alpha,
                                     const double* __restrict__ beta,
                                     const double* __restrict__ shift,
-                                    const float* __restrict__ zf, double* __restrict__ p,
+                                    const float* __restrict__ zf, float* __restrict__ p,
                                     double* __restrict__ x) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const WidthView<double, K> prows(p, n);
+        const WidthView<float, K> prows(p, n);
         const WidthView<double, K> xrows(x, n);
         const WidthView<const float, K> zfv(zf, n);
-        cuda::std::array<double, K> pv, xv;
+        cuda::std::array<float, K> pv, zv;
+        cuda::std::array<double, K> xv;
         load_row<K>(&prows(i, 0), pv);
         load_row<K>(&xrows(i, 0), xv);
+        load_row<K>(&zfv(i, 0), zv);
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            xv[c] += __ldg(alpha + c) * pv[c];
-            pv[c] = __ldg(beta + c) * pv[c] + (static_cast<double>(zfv(i, c)) + __ldg(shift + c));
+            xv[c] += __ldg(alpha + c) * static_cast<double>(pv[c]);
+            pv[c] = __fmaf_rn(static_cast<float>(__ldg(beta + c)), pv[c],
+                              __fadd_rn(zv[c], static_cast<float>(__ldg(shift + c))));
         }
         store_row<K>(&xrows(i, 0), xv);
         store_row<K>(&prows(i, 0), pv);
@@ -564,21 +720,54 @@ __global__ void bcg_update_p_kernel(int n, const double* __restrict__ alpha,
 // p0 = z0 = zf + shift.
 template <int K>
 __global__ void bcg_init_p_kernel(int n, const double* __restrict__ shift,
-                                  const float* __restrict__ zf, double* __restrict__ p) {
+                                  const float* __restrict__ zf, const double* __restrict__ mask,
+                                  float* __restrict__ p) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        const WidthView<double, K> pv(p, n);
+        const WidthView<float, K> pv(p, n);
         const WidthView<const float, K> zfv(zf, n);
 #pragma unroll
-        for (int c = 0; c < K; ++c) pv(i, c) = static_cast<double>(zfv(i, c)) + __ldg(shift + c);
+        for (int c = 0; c < K; ++c) {
+            if (marked(mask, c)) {
+                pv(i, c) = __fadd_rn(zfv(i, c), static_cast<float>(__ldg(shift + c)));
+            }
+        }
     }
 }
 
-// R = B - AP (warm-start residual), all (n, k) row-major.
-__global__ void bcg_residual_kernel(std::int64_t n_total, const double* __restrict__ b,
-                                    const double* __restrict__ ap, double* __restrict__ r) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n_total) r[i] = b[i] - ap[i];
+// The fp64 residual b - Ap of the fp64 operator, which is what convergence is measured on: |r|^2
+// per column into partials, and r rounded into the fp32 CG residual for the columns `write`
+// marks (all of them when it is null). A null ap is a zero x.
+template <int K>
+__global__ void bcg_residual_kernel(int n, const double* __restrict__ b,
+                                    const double* __restrict__ ap,
+                                    const double* __restrict__ write, float* __restrict__ r,
+                                    double* __restrict__ partials, int n_blocks) {
+    const WidthView<const double, K> bv(b, n);
+    const WidthView<const double, K> apv(ap, n);
+    const WidthView<float, K> rv(r, n);
+    cuda::std::array<bool, K> keep;
+#pragma unroll
+    for (int c = 0; c < K; ++c) keep[c] = write == nullptr || write[c] != 0.0;
+    cuda::std::array<double, K> local;
+#pragma unroll
+    for (int c = 0; c < K; ++c) local[c] = 0.0;
+    const int stride = gridDim.x * blockDim.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
+        if (i >= n) break;
+        cuda::std::array<double, K> bb, aa{};
+        load_row<K>(&bv(i, 0), bb);
+        if (ap != nullptr) load_row<K>(&apv(i, 0), aa);
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+            const double d = bb[c] - aa[c];
+            local[c] += d * d;
+            if (keep[c]) rv(i, c) = static_cast<float>(d);
+        }
+    }
+    bcg_block_reduce_cols<K>(local, partials, n_blocks);
 }
 
 constexpr const char* kBadK = "block CG supports k in {1, 2, 4, 8}";
@@ -605,6 +794,35 @@ void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const std::int16_
     });
 }
 
+void launch_bcsrmv_diff_block(int n, int k, const int* row_ptr, const std::int16_t* cols,
+                              const float* vals, const float* x, float* y, cudaStream_t stream) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
+            bcsrmv_diff_kernel<K><<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, vals, x, y);
+        }
+    });
+}
+
+void launch_affine_diff_block(int n, int k, const AffineOperator& op, const float* vals,
+                              const float* sigma, const float* x, float* y, cudaStream_t stream) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
+            affine_diff_kernel<K><<<blocks, kBlock, 0, stream>>>(
+                n, op.order, op.seg_ptr, op.seg_start, op.seg_term, op.cols, vals, sigma,
+                op.n_terms, x, y);
+        }
+    });
+}
+
+void launch_diff_values(int n_segs, const int* bounds, const std::int16_t* cols,
+                        const double* vals, double tol, float* out, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(n_segs)) {
+        diff_values_kernel<<<blocks, kBlock, 0, stream>>>(n_segs, bounds, cols, vals, tol, out);
+    }
+}
+
 void launch_affine_spmv_block(int n, int k, const AffineOperator& op, const double* sigma,
                               const double* x, double* y, cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
@@ -617,12 +835,12 @@ void launch_affine_spmv_block(int n, int k, const AffineOperator& op, const doub
     });
 }
 
-void launch_bcg_dot(int n, int k, const double* x, const double* y, double* partials,
-                    double* out, cudaStream_t stream) {
+void launch_bcg_dot(int n, int k, const float* x, const float* y, double* partials, double* out,
+                    cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kDot>
+        bcg_partials_kernel<K, Fold::kDot, float>
             <<<n_blocks, kBlock, 0, stream>>>(n, x, y, partials, n_blocks);
     });
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
@@ -642,13 +860,13 @@ void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* o
 
 namespace {
 
-void launch_bcg_sum(int n, int k, const double* x, double* partials, double* out,
+void launch_bcg_sum(int n, int k, const float* x, double* partials, double* out,
                     cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kSum>
-            <<<n_blocks, kBlock, 0, stream>>>(n, x, static_cast<const double*>(nullptr),
+        bcg_partials_kernel<K, Fold::kSum, float>
+            <<<n_blocks, kBlock, 0, stream>>>(n, x, static_cast<const float*>(nullptr),
                                               partials, n_blocks);
     });
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
@@ -697,7 +915,7 @@ void launch_bcg_defl_affine(int n_s, int n_terms, const double* aw_t, const doub
     bcg_defl_energy_kernel<<<1, kDeflCols, 0, stream>>>(n_s, aw, inv_e);
 }
 
-void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, double* r, float* rf,
+void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, float* r,
                               double* partials, double* rsum, cudaStream_t stream) {
     launch_bcg_sum(n, k, r, partials, rsum, stream);
     const int n_blocks = bcg_partials_blocks(n);
@@ -708,7 +926,7 @@ void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, double* r
                                                                       rsum, defl.inv_e, defl.aw,
                                                                       r);
         }
-        bcg_deflate_start_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, rsum, defl.inv_e, x, r, rf,
+        bcg_deflate_start_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, rsum, defl.inv_e, x, r,
                                                                      partials, n_blocks);
     });
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rsum);
@@ -724,19 +942,18 @@ void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_s
     bcg_mark_converged_kernel<<<1, k, 0, stream>>>(k, norm_sq, ref_sq, tolerance, converged);
 }
 
-void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const double* ap, double* r,
-                              float* rf, double* partials, double* norms_sums,
-                              cudaStream_t stream) {
+void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const float* ap, float* r,
+                              double* partials, double* norms_sums, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_update_r_kernel<K>
-            <<<n_blocks, kBlock, 0, stream>>>(n, neg_alpha, ap, r, rf, partials, n_blocks);
+            <<<n_blocks, kBlock, 0, stream>>>(n, neg_alpha, ap, r, partials, n_blocks);
     });
     bcg_reduce_kernel<<<2 * k, kBlock, 0, stream>>>(partials, n_blocks, norms_sums);
 }
 
-void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r, Deflation defl,
+void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const float* r, Deflation defl,
                               const double* converged, const double* rsum, double* partials,
                               double* rz, double* beta, double* shift, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
@@ -749,24 +966,45 @@ void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const double* r, De
                                                      rsum, rz, beta, shift);
 }
 
-void launch_bcg_cast_dot_init(int n, int k, const float* zf, const double* r, Deflation defl,
+void launch_bcg_cast_dot_init(int n, int k, const float* zf, const float* r, Deflation defl,
                               const double* rsum, double* partials, double* rz, double* shift,
-                              double* p, cudaStream_t stream) {
+                              float* p, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         bcg_partials_kernel<K, Fold::kDot, float>
             <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
-        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, rsum, rz,
-                                                         shift);
+        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, rsum,
+                                                         nullptr, rz, shift);
         if (const unsigned blocks = grid_for(n)) {
-            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, p);
+            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, nullptr, p);
         }
     });
 }
 
+void launch_bcg_restart(int n, int k, const float* zf, const float* r, Deflation defl,
+                        const double* mask, double* partials, double* rsum, double* rz,
+                        double* shift, float* p, cudaStream_t stream) {
+    const int n_blocks = bcg_partials_blocks(n);
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        bcg_partials_kernel<K, Fold::kSum, float>
+            <<<n_blocks, kBlock, 0, stream>>>(n, r, static_cast<const float*>(nullptr), partials,
+                                              n_blocks);
+        bcg_reduce_masked_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, mask, rsum);
+        bcg_partials_kernel<K, Fold::kDot, float>
+            <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
+        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, rsum,
+                                                         mask, rz, shift);
+        if (const unsigned blocks = grid_for(n)) {
+            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, mask, p);
+        }
+    });
+}
+
+
 void launch_bcg_update_p(int n, int k, const double* alpha, const double* beta,
-                         const double* shift, const float* zf, double* p, double* x,
+                         const double* shift, const float* zf, float* p, double* x,
                          cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
@@ -777,9 +1015,13 @@ void launch_bcg_update_p(int n, int k, const double* alpha, const double* beta,
     });
 }
 
-void launch_bcg_residual(std::int64_t n_total, const double* b, const double* ap, double* r,
-                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_total)) {
-        bcg_residual_kernel<<<blocks, kBlock, 0, stream>>>(n_total, b, ap, r);
-    }
+void launch_bcg_residual(int n, int k, const double* b, const double* ap, const double* write,
+                         float* r, double* partials, double* norms, cudaStream_t stream) {
+    const int n_blocks = bcg_partials_blocks(n);
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        bcg_residual_kernel<K>
+            <<<n_blocks, kBlock, 0, stream>>>(n, b, ap, write, r, partials, n_blocks);
+    });
+    bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, norms);
 }

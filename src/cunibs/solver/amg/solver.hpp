@@ -18,9 +18,11 @@ struct PcgResult {
 
 struct PcgBlockResult {
     int iterations = 0;                     // iterations the block ran, i.e. its slowest column
-    std::vector<double> relative_residual;  // per-column final relative residual
-    // Per-column iteration at which that column reached tolerance and froze, so the count it
-    // would have taken solving alone. max_iters for a column that never reached it.
+    // Per-column final relative residual, of the fp64 operator.
+    std::vector<double> relative_residual;
+    // Per-column iterations run until that column met tolerance, not counting any it spent frozen
+    // while the block's other columns caught up, so the count it would have taken solving alone.
+    // max_iters for a column that never reached it.
     std::vector<int> column_iterations;
 };
 
@@ -150,10 +152,13 @@ private:
     const PcgAmgSolver* solver_;
     int n_;
     AffineSlots slots_;
+    // slots_.vals in the fp32 difference form the CG iterates with (launch_diff_values).
+    DeviceBuffer<float> vals32_;
     // Each part's Aw on the solver's deflation rows (n_terms, defl_n_).
     DeviceBuffer<double> aw_t_;
-    // The per-column coefficients a block runs with, [column][term].
+    // The per-column coefficients a block runs with, [column][term], and their fp32 copy.
     DeviceBuffer<double> sigma_;
+    DeviceBuffer<float> sigma32_;
     GraphCache graph_;
 };
 
@@ -203,8 +208,11 @@ private:
     Deflation deflation() const;
     // Sets the deflation state from values_, unless it already holds it.
     void deflation_from_values(cudaStream_t stream);
-    // `terms` is the affine operator to apply, or null for values_.
+    // `terms` is the affine operator to apply, or null for values_: in fp64, and in the fp32
+    // difference form the iteration uses.
     void apply_operator(int k, const AffineTerms* terms, const double* x, double* y,
+                        cudaStream_t stream);
+    void apply_operator(int k, const AffineTerms* terms, const float* x, float* y,
                         cudaStream_t stream);
     enum class Path { kSingle, kBlock, kAffine };
     PcgBlockResult solve_block(NativeVCycle& preconditioner, const double* B, double* X, int k,
@@ -220,6 +228,8 @@ private:
     DeviceBuffer<int> row_ptr_;
     SlotCsr slots_;
     DeviceBuffer<double> values_;
+    // values_ in the fp32 difference form the CG iterates with (launch_diff_values).
+    DeviceBuffer<float> values32_;
     // Deflation of the constant vector (block_cg.cu): the rows where A 1 is nonzero, chosen once
     // from the pattern's values, then Aw on them per column and 1/E per column. It holds either
     // values_' state or one affine block's; the flag says which.
@@ -241,16 +251,18 @@ private:
     // block_buffers_ counts their allocations and is part of every graph's key.
     int block_k_ = 0;
     int block_buffers_ = 0;
-    DeviceBuffer<double> r_blk_;
-    DeviceBuffer<double> p_blk_;
-    DeviceBuffer<double> ap_blk_;
-    DeviceBuffer<double> x_int_blk_;
-    DeviceBuffer<float> rf_blk_;
+    DeviceBuffer<float> r_blk_;
+    DeviceBuffer<float> p_blk_;
+    DeviceBuffer<float> ap_blk_;
     DeviceBuffer<float> zf_blk_;
-    // Layout: [rz | pap | alpha | neg_alpha | norm | rsum | beta | shift | ref_sq | converged],
-    // each k wide, then the solve's tolerance.
+    DeviceBuffer<double> x_int_blk_;
+    // A X in fp64, for the residuals convergence is decided on.
+    DeviceBuffer<double> ap64_blk_;
+    // Layout: [rz | pap | alpha | neg_alpha | norm | rsum | beta | shift | ref_sq | converged |
+    // true_sq | write], each k wide, then the solve's tolerance.
     DeviceBuffer<double> scalars_blk_;
     DeviceBuffer<double> partials_blk_;
-    PinnedBuffer<double> h_norms_blk_;  // pinned, k residual norms + k reference norms
+    // pinned: k recurrence norms, k reference norms, k true-residual norms
+    PinnedBuffer<double> h_norms_blk_;
     GraphCache block_graph_;
 };

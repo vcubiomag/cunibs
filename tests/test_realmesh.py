@@ -164,8 +164,8 @@ def test_patch_multilevel_solve_true_residual(
 ):
     """A multi-level V-cycle solve, checked against a freshly computed ``b - Ax``.
 
-    ``solve_mixed`` returns the residual carried by the CG recurrence, not one recomputed from
-    the operator, so a converged-looking result is not self-evidently converged. The cube
+    ``solve_mixed`` iterates in float32 and confirms convergence on the float64 residual itself;
+    this recomputes that residual independently, so the check cannot vouch for itself. The cube
     fixture in ``test_solver.py`` already compares against a dense solve, but it is small
     enough that the hierarchy has no coarse levels at all; this is the same guarantee at a
     size where the V-cycle actually runs.

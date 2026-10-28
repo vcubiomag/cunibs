@@ -4,10 +4,10 @@ Backs the solver paragraph of the cuNIBS paper's verification results, and the r
 statement that tightening the tolerance to 1e-12 changes the field by less than the
 discretisation error.
 
-The CG residual the solver reports is its recurrence, which drifts from the true residual in
-finite precision, and the preconditioner runs in reduced precision. The true residual
-``||b - K v|| / ||b||`` of the grounded system is recomputed here in float64 at the default
-tolerance and compared with the reported one. The raw gray-matter field is then solved at a
+The CG iterates in float32 and the preconditioner in reduced precision, and the solver confirms
+convergence on the float64 residual of the grounded system, which is the one it reports. That
+residual ``||b - K v|| / ||b||`` is recomputed here independently at the default tolerance and
+compared with the reported one. The raw gray-matter field is then solved at a
 sweep of tolerances and compared, volume weighted, with a solve to 1e-12 on the reference
 subject at C3.
 """
@@ -65,13 +65,13 @@ def run(ctx: _run.Context) -> dict:
     b = b.astype(cp.float64)
     stiffness = solver.matrix()
     true = float(cp.linalg.norm(b - stiffness @ result["v"][solver.idx]) / cp.linalg.norm(b))
-    recurrence = result["relative_residual"]
+    reported = result["relative_residual"]
     residual = {
         "tolerance": default,
         "iterations": result["iterations"],
-        "recurrence": recurrence,
+        "reported": reported,
         "true": true,
-        "recurrence_over_true": recurrence / true,
+        "reported_over_true": reported / true,
     }
     del result, dadt, b, stiffness
 
