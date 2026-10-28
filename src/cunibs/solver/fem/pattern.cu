@@ -1,3 +1,4 @@
+#include "core/device_math.cuh"
 #include "core/scan.cuh"
 #include "fem/fem.hpp"
 
@@ -91,12 +92,9 @@ struct IncidentGather {
         const int begin = ptr[s], end = ptr[s + 1];
         for (int c = begin + lane; c < end; c += kWarp) {
             const int corner = idx[c];
-            // A 16-byte load: tet_nodes is one contiguous 4 * n_tet block, so a tet's four ids
-            // never straddle the boundary and the base is an allocation start, not a strided view.
-            const int4 t = *reinterpret_cast<const int4*>(
-                tet_nodes + static_cast<std::int64_t>(corner >> 2) * 4);
+            const cuda::std::array<int, 4> ids =
+                load_tet_nodes(unsized<Tet4View<const int>>(tet_nodes), corner >> 2);
             const int own = corner & 3;
-            const int ids[4] = {t.x, t.y, t.z, t.w};
             int* slot = out + 1 + (c - begin) * 3;
 #pragma unroll
             for (int q = 0; q < 4; ++q) {

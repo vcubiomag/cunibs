@@ -43,10 +43,11 @@ __global__ void stiffness_rows_kernel(const double* __restrict__ g,
         const double gi0 = gv(corner, 0);
         const double gi1 = gv(corner, 1);
         const double gi2 = gv(corner, 2);
+        const cuda::std::array<int, 4> t = load_tet_nodes(tn, e);
         for (int j = 0; j < 4; ++j) {
             const std::int64_t cj = static_cast<std::int64_t>(e) * 4 + j;
             const double dot = gi0 * gv(cj, 0) + gi1 * gv(cj, 1) + gi2 * gv(cj, 2);
-            const int col = tn(e, j);
+            const int col = t[j];
             // The row's columns are sorted, since the caller canonicalises the pattern.
             data[cuda::std::lower_bound(indices + row_begin, indices + row_end, col) - indices] +=
                 s * dot;

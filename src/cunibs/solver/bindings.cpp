@@ -812,6 +812,8 @@ NB_MODULE(_solver_ext, m) {
            const std::optional<i32_1d>& active) {
             const int k = block_width(e_slots.size(), "recover_elements: bad list sizes");
             const std::size_t n_tet = slot_of_corner.shape(0) / 4;
+            require(reinterpret_cast<std::uintptr_t>(slot_of_corner.data()) % 16 == 0,
+                    "recover_elements: slot_of_corner must start 16-byte aligned");
             const char* bad = "recover_elements: e_out and magn_out must be k arrays of n_tet";
             const auto in = pack<const float*>(e_slots, k, e_slots[0].shape(0),
                                                "recover_elements: e_slots must be k (n_slots, 3)");

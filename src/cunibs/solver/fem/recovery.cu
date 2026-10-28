@@ -67,11 +67,12 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
     const int e = f >> 2, skip = f & 3;
 
     const Tet4View<const int> tn(tet_nodes, n_face >> 2);
+    const cuda::std::array<int, 4> t = load_tet_nodes(tn, e);
     int a[3];
     int m = 0;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        if (i != skip) a[m++] = tn(e, i);
+        if (i != skip) a[m++] = t[i];
     }
 
     // Rotate the shortest incidence list into the pivot slot with scalar selects: indexing a[] by
@@ -87,11 +88,9 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
     const int begin = ptr[n], end = begin + len;
     int owners = 0;
     for (int k = begin; k < end && owners < 2; ++k) {
-        // A 16-byte load: tet_nodes is one contiguous 4 * n_tet block, so a tet's four ids never
-        // straddle the boundary and the base is an allocation start rather than a strided view.
-        const int4 t = *reinterpret_cast<const int4*>(tet_nodes + (idx[k] >> 2) * 4);
-        owners += (t.x == p || t.y == p || t.z == p || t.w == p) &&
-                  (t.x == q || t.y == q || t.z == q || t.w == q);
+        const cuda::std::array<int, 4> t = load_tet_nodes(tn, idx[k] >> 2);
+        owners += (t[0] == p || t[1] == p || t[2] == p || t[3] == p) &&
+                  (t[0] == q || t[1] == q || t[2] == q || t[3] == q);
     }
     if (owners != 1) return;
 
@@ -143,9 +142,10 @@ __device__ __forceinline__ void tet_barycentre(Vec3View<const double> nodes_mm,
                                                Tet4View<const int> tet_nodes, int e,
                                                double b[3]) {
     b[0] = b[1] = b[2] = 0.0;
+    const cuda::std::array<int, 4> t = load_tet_nodes(tet_nodes, e);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const int n = tet_nodes(e, i);
+        const int n = t[i];
         b[0] += nodes_mm(n, 0);
         b[1] += nodes_mm(n, 1);
         b[2] += nodes_mm(n, 2);
@@ -746,10 +746,8 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
     if (t >= n) return;
     const int e = active ? active[t] : t;
 
-    const Tet4View<const int> soc(slot_of_corner, n_tet);
-    int slots[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) slots[i] = soc(e, i);
+    const cuda::std::array<int, 4> slots =
+        load_tet_nodes(Tet4View<const int>(slot_of_corner, n_tet), e);
 
 #pragma unroll
     for (int c = 0; c < K; ++c) {

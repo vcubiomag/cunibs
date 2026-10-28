@@ -16,11 +16,9 @@ __global__ void tet_lowest_node_kernel(const int* __restrict__ inverse,
                                        int n_tet) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= n_tet) return;
-    // One 16-byte load of the row: the view is over one contiguous 4 * n_tet block, so a tet's
-    // four ids never straddle the boundary.
-    const int4 t = *reinterpret_cast<const int4*>(&tet_nodes(e, 0));
-    lowest[e] = cuda::std::min(cuda::std::min(inverse[t.x], inverse[t.y]),
-                               cuda::std::min(inverse[t.z], inverse[t.w]));
+    const cuda::std::array<int, 4> t = load_tet_nodes(tet_nodes, e);
+    lowest[e] = cuda::std::min(cuda::std::min(inverse[t[0]], inverse[t[1]]),
+                               cuda::std::min(inverse[t[2]], inverse[t[3]]));
 }
 
 }  // namespace

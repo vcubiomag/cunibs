@@ -4,6 +4,7 @@
 #include <cuda/std/array>
 #include <cuda/std/limits>
 #include <cuda/std/mdspan>
+#include <cuda/std/type_traits>
 
 // __device__ helpers shared across kernels. .cu only. Keep this out of dadt.cu: that
 // translation unit alone compiles with --use_fast_math, which would give these fp64
@@ -58,8 +59,8 @@ __host__ __device__ constexpr View unsized(typename View::data_handle_type p) {
 // The four node ids of tetrahedron e as one 16-byte load. tet_nodes is always a contiguous
 // (n_tet, 4) allocation of its own, so every row starts 16-byte aligned.
 template <typename Index>
-__device__ __forceinline__ cuda::std::array<int, 4> load_tet_nodes(Tet4View<const int, Index> tn,
-                                                                   Index e) {
+__device__ __forceinline__ cuda::std::array<int, 4> load_tet_nodes(
+    Tet4View<const int, Index> tn, cuda::std::type_identity_t<Index> e) {
     const int4 t = *reinterpret_cast<const int4*>(&tn(e, 0));
     return {t.x, t.y, t.z, t.w};
 }
