@@ -193,23 +193,32 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     WidthView<float, K>(y, n)(row, c) = acc;
 }
 
+// Setup only. Whether segment g, [bounds[g], bounds[g + 1]), sums to more than a rounding residue
+// of its l1 norm, with the sum left in `s`. The fp32 diagonal and the deflation support both take
+// the test from here, so the rows that keep a sum are the deflation support.
+__device__ __forceinline__ bool keeps_sum(const int* __restrict__ bounds,
+                                          const double* __restrict__ vals, int g, double tol,
+                                          double& s) {
+    double a = 0.0;
+    s = 0.0;
+    for (int j = bounds[g]; j < bounds[g + 1]; ++j) {
+        s += vals[j];
+        a += fabs(vals[j]);
+    }
+    return fabs(s) > tol * a;
+}
+
 // Setup only. The fp32 difference-form values of a slot CSR whose rows (or affine segments) are
 // [bounds[i], bounds[i + 1]): every slot's value rounded, except the diagonal's, which becomes the
-// segment's fp64 sum where that is more than a rounding residue of its l1 norm and zero elsewhere.
-// The residue test is select_deflation_rows', so the rows that keep a sum are the deflation
-// support.
+// segment's sum where it keeps one and zero elsewhere.
 __global__ void diff_values_kernel(int n_segs, const int* __restrict__ bounds,
                                    const std::int16_t* __restrict__ cols,
                                    const double* __restrict__ vals, double tol,
                                    float* __restrict__ out) {
     const int g = blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= n_segs) return;
-    double s = 0.0, a = 0.0;
-    for (int j = bounds[g]; j < bounds[g + 1]; ++j) {
-        s += vals[j];
-        a += fabs(vals[j]);
-    }
-    const float diag = fabs(s) > tol * a ? static_cast<float>(s) : 0.f;
+    double s;
+    const float diag = keeps_sum(bounds, vals, g, tol, s) ? static_cast<float>(s) : 0.f;
     for (int j = bounds[g]; j < bounds[g + 1]; ++j) {
         out[j] = (cols[j] == 0) ? diag : static_cast<float>(vals[j]);
     }
@@ -428,18 +437,14 @@ __global__ void bcg_reduce_masked_kernel(const double* __restrict__ partials, in
 // own matrix. It never moves the fixed point, only the preconditioner. inv_e = 0 switches it off
 // and leaves every shift exactly zero, which is what an operator with no positive E gets.
 
-// Setup only: whether a row's sum is more than a rounding residue of its l1 norm.
+// Setup only: whether a row keeps its sum.
 __global__ void bcg_support_flags_kernel(int n, const int* __restrict__ row_ptr,
                                          const double* __restrict__ vals, double tol,
                                          unsigned char* __restrict__ flags) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n) return;
-    double s = 0.0, a = 0.0;
-    for (int j = row_ptr[row]; j < row_ptr[row + 1]; ++j) {
-        s += vals[j];
-        a += fabs(vals[j]);
-    }
-    flags[row] = fabs(s) > tol * a;
+    double s;
+    flags[row] = keeps_sum(row_ptr, vals, row, tol, s);
 }
 
 // Aw on the support from the operator's own values, the same in every column. In the CSR's own
