@@ -195,9 +195,7 @@ __global__ void __launch_bounds__(kBlock)
     }
     warp_reduce_sum<kRestrictTpr>(sum);
     if (row < n_coarse && lane == 0) {
-        const WidthView<float, K> out(b_coarse, n_coarse);
-#pragma unroll
-        for (int c = 0; c < K; ++c) out(row, c) = sum[c];
+        store_row<K>(&WidthView<float, K>(b_coarse, n_coarse)(row, 0), sum);
     }
 }
 
@@ -339,13 +337,13 @@ __global__ void __launch_bounds__(kBlock)
         cuda::std::array<float, K> x1;
 #pragma unroll
         for (int c = 0; c < K; ++c) x1[c] = w * rhs[c];
-        const WidthView<float, K> outv(x_out, n);
+        cuda::std::array<float, K> out;
         // Spelled out so that every K contracts the same way: c_cur x1 rounds on its own.
 #pragma unroll
         for (int c = 0; c < K; ++c) {
-            outv(row, c) =
-                __fmaf_rn(d, __fmaf_rn(-s, sum[c], rhs[c]), __fmul_rn(c_cur, x1[c]));
+            out[c] = __fmaf_rn(d, __fmaf_rn(-s, sum[c], rhs[c]), __fmul_rn(c_cur, x1[c]));
         }
+        store_row<K>(&WidthView<float, K>(x_out, n)(row, 0), out);
         if (x1_out != nullptr) store_row<K>(&WidthView<float, K>(x1_out, n)(row, 0), x1);
     }
 }
@@ -379,11 +377,7 @@ __global__ void __launch_bounds__(kBlock)
         }
     }
     warp_reduce_sum<kWarp>(sum);
-    if (row < n && lane == 0) {
-        const WidthView<float, K> out(x, n);
-#pragma unroll
-        for (int c = 0; c < K; ++c) out(row, c) = sum[c];
-    }
+    if (row < n && lane == 0) store_row<K>(&WidthView<float, K>(x, n)(row, 0), sum);
 }
 
 // The launchers deliberately do not check cudaGetLastError(). A cycle runs inside the CG
