@@ -562,7 +562,7 @@ __global__ void split_potential_kernel(const double* __restrict__ v_block, int s
     lo[t] = static_cast<float>(v - static_cast<double>(h));
 }
 
-// One thread per slot, K placements at a time.
+// kHprLanes lanes per slot, K placements at a time.
 //   grad_v[s] = Σ_m W[s,m] · (v[m] − v[n_s])
 //   E[s]      = −grad_v[s] − dA/dt(x_n)
 // The nodal dA/dt is used exactly here rather than the element average the raw path builds, so
@@ -573,11 +573,16 @@ __global__ void split_potential_kernel(const double* __restrict__ v_block, int s
 // weights' rounding otherwise leaks into the gradient at |v| |W| eps. The difference comes from
 // the float pairs: hi_m − hi_0 is exact whenever the two are within a factor of two (Sterbenz)
 // and otherwise the difference is as large as the values, so either way it carries a float's
-// relative precision. The sum over the patch is compensated, so its error does not grow with the
-// patch, and nothing here needs the 1:64 fp64 pipe.
+// relative precision. Each lane's share of the patch is a Kahan sum and the lanes combine by
+// TwoSum, so the error does not grow with the patch, and nothing here needs the 1:64 fp64 pipe.
+//
+// The lanes take a slot's entries in turn, so a warp's loads of w and idx are a few contiguous
+// runs. A thread walking a whole patch alone would touch a line of its own on every load, and the
+// kernel would move several times the bytes it reads.
 //
 // Every operation is an explicit round-to-nearest intrinsic. nvcc may otherwise fuse a multiply
 // into the add after it in one instantiation and not another, which made the result depend on K.
+constexpr int kHprLanes = 8;
 template <int K>
 __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __restrict__ v_lo,
                                 const float* __restrict__ w, const int* __restrict__ pptr,
@@ -585,18 +590,15 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
                                 const float* __restrict__ dadt_nodes, std::int64_t dadt_row,
                                 int dadt_column, PtrPack e_slots, int n_slots,
                                 const int* __restrict__ active, int n) {
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= n) return;
-    const int s = active ? active[t] : t;
+    const std::int64_t gt = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int t = static_cast<int>(gt / kHprLanes);
+    const int lane = static_cast<int>(gt % kHprLanes);
+    const bool live = t < n;
+    const int s = !live ? 0 : active ? active[t] : t;
 
     const auto wv = unsized<Vec3View<const float>>(w);
     const auto hi = unsized<WidthView<const float, K>>(v_hi);
     const auto lo = unsized<WidthView<const float, K>>(v_lo);
-    const int node = slot_node[s];
-
-    cuda::std::array<float, K> h0, l0;
-    load_row<K>(&hi(node, 0), h0);
-    load_row<K>(&lo(node, 0), l0);
     float acc[K][3], comp[K][3];
 #pragma unroll
     for (int c = 0; c < K; ++c) {
@@ -604,27 +606,55 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
         comp[c][0] = comp[c][1] = comp[c][2] = 0.f;
     }
 
-    const int begin = pptr[s], end = pptr[s + 1];
-    for (int p = begin; p < end; ++p) {
-        const float wx = wv(p, 0), wy = wv(p, 1), wz = wv(p, 2);
-        const int m = pidx[p];
-        cuda::std::array<float, K> hm, lm;
-        load_row<K>(&hi(m, 0), hm);
-        load_row<K>(&lo(m, 0), lm);
+    int node = 0;
+    if (live) {
+        node = slot_node[s];
+        cuda::std::array<float, K> h0, l0;
+        load_row<K>(&hi(node, 0), h0);
+        load_row<K>(&lo(node, 0), l0);
+        const int end = pptr[s + 1];
+        for (int p = pptr[s] + lane; p < end; p += kHprLanes) {
+            const float wx = wv(p, 0), wy = wv(p, 1), wz = wv(p, 2);
+            const int m = pidx[p];
+            cuda::std::array<float, K> hm, lm;
+            load_row<K>(&hi(m, 0), hm);
+            load_row<K>(&lo(m, 0), lm);
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            const float d = __fadd_rn(__fsub_rn(hm[c], h0[c]), __fsub_rn(lm[c], l0[c]));
-            const float wd[3] = {__fmul_rn(wx, d), __fmul_rn(wy, d), __fmul_rn(wz, d)};
+            for (int c = 0; c < K; ++c) {
+                const float d = __fadd_rn(__fsub_rn(hm[c], h0[c]), __fsub_rn(lm[c], l0[c]));
+                const float wd[3] = {__fmul_rn(wx, d), __fmul_rn(wy, d), __fmul_rn(wz, d)};
 #pragma unroll
-            for (int i = 0; i < 3; ++i) {
-                // Kahan: comp carries what the running sum dropped.
-                const float y = __fsub_rn(wd[i], comp[c][i]);
-                const float t = __fadd_rn(acc[c][i], y);
-                comp[c][i] = __fsub_rn(__fsub_rn(t, acc[c][i]), y);
-                acc[c][i] = t;
+                for (int i = 0; i < 3; ++i) {
+                    // Kahan: comp carries what the running sum dropped, so a lane holds acc - comp.
+                    const float y = __fsub_rn(wd[i], comp[c][i]);
+                    const float u = __fadd_rn(acc[c][i], y);
+                    comp[c][i] = __fsub_rn(__fsub_rn(u, acc[c][i]), y);
+                    acc[c][i] = u;
+                }
             }
         }
     }
+
+    // A fixed tree over the slot's lanes. TwoSum splits acc_a + acc_b exactly into a sum and its
+    // error, which joins the compensations.
+#pragma unroll
+    for (int off = kHprLanes / 2; off > 0; off >>= 1) {
+#pragma unroll
+        for (int c = 0; c < K; ++c) {
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                const float a2 = __shfl_down_sync(kFullWarp, acc[c][i], off, kHprLanes);
+                const float c2 = __shfl_down_sync(kFullWarp, comp[c][i], off, kHprLanes);
+                const float sum = __fadd_rn(acc[c][i], a2);
+                const float bb = __fsub_rn(sum, acc[c][i]);
+                const float err =
+                    __fadd_rn(__fsub_rn(acc[c][i], __fsub_rn(sum, bb)), __fsub_rn(a2, bb));
+                comp[c][i] = __fsub_rn(__fadd_rn(comp[c][i], c2), err);
+                acc[c][i] = sum;
+            }
+        }
+    }
+    if (!live || lane != 0) return;
 
 #pragma unroll
     for (int c = 0; c < K; ++c) {
@@ -769,13 +799,13 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
                      int dadt_column, float* const* e_slots, int n_slots, const int* active,
                      int n, int k, int stride, int n_nodes, float* work, cudaStream_t stream) {
     const PtrPack out = ptr_pack(e_slots, k);
-    const unsigned blocks = grid_for(n);
-    if (!blocks) return;
+    if (n <= 0) return;
     const std::size_t count = static_cast<std::size_t>(n_nodes) * k;
     float* const v_hi = work;
     float* const v_lo = v_hi + count;
     dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "hpr_grad: unsupported block width", [&](auto kk) {
         constexpr int K = decltype(kk)::value;
+        const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kHprLanes);
         if (const unsigned sb = grid_for(static_cast<std::int64_t>(count))) {
             split_potential_kernel<K>
                 <<<sb, kBlock, 0, stream>>>(v_block, stride, n_nodes, v_hi, v_lo);
