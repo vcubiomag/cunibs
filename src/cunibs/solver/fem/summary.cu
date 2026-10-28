@@ -57,9 +57,10 @@ int tiles(int n) { return static_cast<int>(grid_for(n, kTile)); }
 // Partials per (field, block): kSums sums, then the block's peak.
 template <typename T>
 __global__ void __launch_bounds__(kBlock)
-    summary_moments_kernel(Fields<T> fields, int n, const int* __restrict__ index,
-                           const double* __restrict__ w, const double* __restrict__ bary,
-                           int n_blocks, double* __restrict__ sums, Peak* __restrict__ peaks) {
+    summary_moments_kernel(const __grid_constant__ Fields<T> fields, int n,
+                           const int* __restrict__ index, const double* __restrict__ w,
+                           const double* __restrict__ bary, int n_blocks,
+                           double* __restrict__ sums, Peak* __restrict__ peaks) {
     const int c = blockIdx.y;
     const T* __restrict__ m = fields.p[c];
     double s[kSums] = {};
@@ -147,9 +148,10 @@ __global__ void __launch_bounds__(kBlock)
 
 template <typename T>
 __global__ void __launch_bounds__(kBlock)
-    summary_spread_kernel(Fields<T> fields, int n, const int* __restrict__ index,
-                          const double* __restrict__ w, const double* __restrict__ scratch,
-                          double* __restrict__ part, int n_blocks) {
+    summary_spread_kernel(const __grid_constant__ Fields<T> fields, int n,
+                          const int* __restrict__ index, const double* __restrict__ w,
+                          const double* __restrict__ scratch, double* __restrict__ part,
+                          int n_blocks) {
     const int c = blockIdx.y;
     const T* __restrict__ m = fields.p[c];
     const double mean = scratch[2 * c];

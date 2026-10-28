@@ -7,8 +7,8 @@ namespace {
 
 // A block of draws folded in draw order, so per element the additions are the same whatever
 // block width the draws were split into. The fp64 sums are read and written once per block.
-__global__ void accumulate_moments_block_kernel(ConstPtrPack magn, int k,
-                                                double* __restrict__ sum_e,
+__global__ void accumulate_moments_block_kernel(const __grid_constant__ ConstPtrPack magn,
+                                                int k, double* __restrict__ sum_e,
                                                 double* __restrict__ sumsq_e, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
