@@ -43,10 +43,10 @@ __global__ void seed_project_kernel(const float* __restrict__ q, const float* __
     for (int c = 0; c < K; ++c) acc[c] = 0.0f;
     for (int r = r0; r < r1; ++r) {
         const float qv = q[static_cast<std::int64_t>(r) * m + j];
+        cuda::std::array<float, K> bv;
+        load_row<K>(b + static_cast<std::int64_t>(r) * K, bv);
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            acc[c] = fmaf(qv, b[static_cast<std::int64_t>(r) * K + c], acc[c]);
-        }
+        for (int c = 0; c < K; ++c) acc[c] = fmaf(qv, bv[c], acc[c]);
     }
     double* out = partials + (static_cast<std::int64_t>(blockIdx.x) * m + j) * K;
 #pragma unroll
@@ -64,18 +64,46 @@ __global__ void seed_reduce_kernel(const double* __restrict__ partials, int n_ti
     y[idx] = static_cast<float>(s);
 }
 
-// x0[r][c] = sum over j of q[r, j] y[j][c], one thread per entry, basis vectors in order.
+// Columns of q a block of the expansion stages at a time.
+constexpr int kExpandCols = 16;
+
+// x0[r][c] = sum over j of q[r, j] y[j][c], basis vectors in order, one thread per row carrying all
+// K columns. A thread reading its own row of q would put every lane of a load on a separate line,
+// so the block stages kExpandCols columns of its rows at a time through coalesced loads, and each
+// thread folds its row from shared memory. The padding column keeps the row reads off one bank.
 template <int K>
-__global__ void seed_expand_kernel(const float* __restrict__ q, const float* __restrict__ y,
-                                   int n, int m, double* __restrict__ x0) {
-    const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (idx >= static_cast<std::int64_t>(n) * K) return;
-    const std::int64_t r = idx / K;
-    const int c = static_cast<int>(idx - r * K);
-    const float* row = q + r * m;
-    float acc = 0.0f;
-    for (int j = 0; j < m; ++j) acc = fmaf(row[j], __ldg(y + j * K + c), acc);
-    x0[idx] = static_cast<double>(acc);
+__global__ void __launch_bounds__(kBlock)
+    seed_expand_kernel(const float* __restrict__ q, const float* __restrict__ y, int n, int m,
+                       double* __restrict__ x0) {
+    __shared__ float tile[kBlock][kExpandCols + 1];
+    const int r0 = blockIdx.x * kBlock;
+    cuda::std::array<float, K> acc;
+#pragma unroll
+    for (int c = 0; c < K; ++c) acc[c] = 0.0f;
+    for (int j0 = 0; j0 < m; j0 += kExpandCols) {
+        const int w = min(kExpandCols, m - j0);
+        for (int e = threadIdx.x; e < kBlock * kExpandCols; e += kBlock) {
+            const int rr = e / kExpandCols, jj = e % kExpandCols;
+            const int row = r0 + rr;
+            tile[rr][jj] =
+                (row < n && jj < w) ? q[static_cast<std::int64_t>(row) * m + j0 + jj] : 0.0f;
+        }
+        __syncthreads();
+        for (int jj = 0; jj < w; ++jj) {
+            const float qv = tile[threadIdx.x][jj];
+            cuda::std::array<float, K> yv;
+            load_row<K>(y + static_cast<std::int64_t>(j0 + jj) * K, yv);
+#pragma unroll
+            for (int c = 0; c < K; ++c) acc[c] = fmaf(qv, yv[c], acc[c]);
+        }
+        __syncthreads();
+    }
+    const int r = r0 + threadIdx.x;
+    if (r >= n) return;
+    cuda::std::array<double, K> out;
+#pragma unroll
+    for (int c = 0; c < K; ++c) out[c] = static_cast<double>(acc[c]);
+    store_row<K>(x0 + static_cast<std::int64_t>(r) * K, out);
 }
 
 }  // namespace
@@ -107,8 +135,7 @@ void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, dou
         const dim3 grid(n_tiles, cuda::ceil_div(m, threads));
         seed_project_kernel<K><<<grid, threads, 0, stream>>>(q, b32, n, m, work);
         seed_reduce_kernel<K><<<grid_for(m * K), kBlock, 0, stream>>>(work, n_tiles, m, y);
-        seed_expand_kernel<K><<<grid_for(static_cast<std::int64_t>(n) * K), kBlock, 0, stream>>>(
-            q, y, n, m, x0);
+        seed_expand_kernel<K><<<grid_for(n), kBlock, 0, stream>>>(q, y, n, m, x0);
     });
     check_cuda(cudaGetLastError(), "seed", "launch");
 }
