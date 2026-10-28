@@ -332,10 +332,33 @@ __device__ __forceinline__ cuda::std::array<double, K> widen(const cuda::std::ar
     return out;
 }
 
+// The kRowsPerThread rows a thread of a reducing kernel carries, a grid stride apart, in row order.
+// A loop that loads and folds one row at a time serialises its loads behind the arithmetic, so
+// `load(t, i)` runs for a batch of rows before `fold(t, i)` takes them in order. t is the row's
+// place in its batch, a compile-time constant once unrolled, for indexing the caller's staging.
+template <int kBatch, typename Load, typename Use>
+__device__ __forceinline__ void batched_rows(int n, Load&& load, Use&& fold) {
+    static_assert(kRowsPerThread % kBatch == 0, "batches must tile the rows a thread carries");
+    const int stride = gridDim.x * blockDim.x;
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+#pragma unroll
+    for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
+#pragma unroll
+        for (int t = 0; t < kBatch; ++t) {
+            const int i = i0 + (t0 + t) * stride;
+            if (i < n) load(t, i);
+        }
+#pragma unroll
+        for (int t = 0; t < kBatch; ++t) {
+            const int i = i0 + (t0 + t) * stride;
+            if (i >= n) return;
+            fold(t, i);
+        }
+    }
+}
+
 // Column-wise reductions, stage 1: one partial per (column, block). y is read only by kDot. x and
-// y are both fp64 or both fp32, and the fold runs in their precision. A grid-stride fold that
-// loads and adds one row at a time serialises its loads behind the adds, so the rows are loaded a
-// batch at a time and then folded in row order.
+// y are both fp64 or both fp32, and the fold runs in their precision.
 template <int K, Fold F, typename T = double>
 __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __restrict__ y,
                                     double* __restrict__ partials, int n_blocks) {
@@ -344,25 +367,16 @@ __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __r
     cuda::std::array<T, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = T(0);
-    const int stride = gridDim.x * blockDim.x;
-    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
     constexpr int kBatch = 4;
-    static_assert(kRowsPerThread % kBatch == 0, "batches must tile the rows a thread carries");
-#pragma unroll
-    for (int t0 = 0; t0 < kRowsPerThread; t0 += kBatch) {
-        cuda::std::array<T, K> xb[kBatch];
-        cuda::std::array<T, K> yb[kBatch];
-#pragma unroll
-        for (int t = 0; t < kBatch; ++t) {
-            const int i = i0 + (t0 + t) * stride;
-            if (i < n) {
-                load_row<K>(&xv(i, 0), xb[t]);
-                if constexpr (F == Fold::kDot) load_row<K>(&yv(i, 0), yb[t]);
-            }
-        }
-#pragma unroll
-        for (int t = 0; t < kBatch; ++t) {
-            if (i0 + (t0 + t) * stride >= n) break;
+    cuda::std::array<T, K> xb[kBatch];
+    cuda::std::array<T, K> yb[kBatch];
+    batched_rows<kBatch>(
+        n,
+        [&](int t, int i) {
+            load_row<K>(&xv(i, 0), xb[t]);
+            if constexpr (F == Fold::kDot) load_row<K>(&yv(i, 0), yb[t]);
+        },
+        [&](int t, int) {
 #pragma unroll
             for (int c = 0; c < K; ++c) {
                 const T xc = xb[t][c];
@@ -374,8 +388,7 @@ __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __r
                     local[c] = fold_add(xc, local[c]);
                 }
             }
-        }
-    }
+        });
     cuda::std::array<double, K> wide = widen<K>(local);
     bcg_block_reduce_cols<K>(wide, partials, n_blocks);
 }
@@ -721,15 +734,23 @@ __global__ void bcg_init_p_kernel(int n, const double* __restrict__ shift,
                                   const float* __restrict__ zf, const double* __restrict__ mask,
                                   float* __restrict__ p) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const WidthView<float, K> pv(p, n);
-        const WidthView<const float, K> zfv(zf, n);
+    if (i >= n) return;
+    const WidthView<float, K> prows(p, n);
+    cuda::std::array<float, K> pv;
+    load_row<K>(&WidthView<const float, K>(zf, n)(i, 0), pv);
+    bool all = true;
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            if (marked(mask, c)) {
-                pv(i, c) = __fadd_rn(zfv(i, c), static_cast<float>(__ldg(shift + c)));
-            }
-        }
+    for (int c = 0; c < K; ++c) {
+        pv[c] = __fadd_rn(pv[c], static_cast<float>(__ldg(shift + c)));
+        all = all && marked(mask, c);
+    }
+    if (all) {
+        store_row<K>(&prows(i, 0), pv);
+        return;
+    }
+#pragma unroll
+    for (int c = 0; c < K; ++c) {
+        if (marked(mask, c)) prows(i, c) = pv[c];
     }
 }
 
@@ -750,21 +771,40 @@ __global__ void bcg_residual_kernel(int n, const double* __restrict__ b,
     cuda::std::array<double, K> local;
 #pragma unroll
     for (int c = 0; c < K; ++c) local[c] = 0.0;
-    const int stride = gridDim.x * blockDim.x;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    bool all = true;
 #pragma unroll
-    for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
-        if (i >= n) break;
-        cuda::std::array<double, K> bb, aa{};
-        load_row<K>(&bv(i, 0), bb);
-        if (ap != nullptr) load_row<K>(&apv(i, 0), aa);
+    for (int c = 0; c < K; ++c) all = all && keep[c];
+    constexpr int kBatch = 4;
+    cuda::std::array<double, K> bb[kBatch];
+    cuda::std::array<double, K> aa[kBatch];
+    batched_rows<kBatch>(
+        n,
+        [&](int t, int i) {
+            load_row<K>(&bv(i, 0), bb[t]);
+            if (ap != nullptr) {
+                load_row<K>(&apv(i, 0), aa[t]);
+            } else {
 #pragma unroll
-        for (int c = 0; c < K; ++c) {
-            const double d = bb[c] - aa[c];
-            local[c] += d * d;
-            if (keep[c]) rv(i, c) = static_cast<float>(d);
-        }
-    }
+                for (int c = 0; c < K; ++c) aa[t][c] = 0.0;
+            }
+        },
+        [&](int t, int i) {
+            cuda::std::array<float, K> rr;
+#pragma unroll
+            for (int c = 0; c < K; ++c) {
+                const double d = bb[t][c] - aa[t][c];
+                local[c] += d * d;
+                rr[c] = static_cast<float>(d);
+            }
+            if (all) {
+                store_row<K>(&rv(i, 0), rr);
+                return;
+            }
+#pragma unroll
+            for (int c = 0; c < K; ++c) {
+                if (keep[c]) rv(i, c) = rr[c];
+            }
+        });
     bcg_block_reduce_cols<K>(local, partials, n_blocks);
 }
 
