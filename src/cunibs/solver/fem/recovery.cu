@@ -383,6 +383,7 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
                                      const FitScratch& s, int lane) {
     constexpr int N = Basis::kTerms;
     constexpr int Ld = fit_stride(N);
+    const double inv_h = 1.0 / h;
     // Lower-triangle entries, and how many of them a lane owns once they are dealt round the warp.
     constexpr int kEntries = N * (N + 1) / 2;
     constexpr int kPerLane = cuda::ceil_div(kEntries, kWarp);
@@ -410,8 +411,8 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
         const int n = min(kFitChunk, end - base);
         if (lane < n) {
             const int m = pidx[base + lane];
-            Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
-                        (nodes_mm(m, 2) - xn[2]) / h, s.q + lane * Ld);
+            Basis::eval((nodes_mm(m, 0) - xn[0]) * inv_h, (nodes_mm(m, 1) - xn[1]) * inv_h,
+                        (nodes_mm(m, 2) - xn[2]) * inv_h, s.q + lane * Ld);
         }
         __syncwarp();
         for (int p = 0; p < n; ++p) {
@@ -432,23 +433,30 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
 
     // Cholesky in place: a[i][j] is read exactly once, at the moment l[i][j] is formed, so the
     // factor may overwrite it. Lane i owns row i. a[0][0] is the patch size, so it sets the pivot
-    // scale, and it has to be read before the first column overwrites it.
+    // scale, and it has to be read before the first column overwrites it. 1 / l[i][i] goes in the
+    // row's padding at a[i][N]: the column update and both substitutions multiply by it, which
+    // keeps fp64 division, a long dependent sequence, off their serial chains.
     const double floor_pivot = 1e-12 * s.a[0];
     __syncwarp();
     for (int j = 0; j < N; ++j) {
         if (lane == j) {
             double d = s.a[j * Ld + j];
             for (int k = 0; k < j; ++k) d -= s.a[j * Ld + k] * s.a[j * Ld + k];
-            if (!(d > floor_pivot)) *s.singular = 1;
-            else s.a[j * Ld + j] = sqrt(d);
+            if (!(d > floor_pivot)) {
+                *s.singular = 1;
+            } else {
+                const double l = sqrt(d);
+                s.a[j * Ld + j] = l;
+                s.a[j * Ld + N] = 1.0 / l;
+            }
         }
         __syncwarp();
         if (*s.singular) return false;
-        const double ljj = s.a[j * Ld + j];
+        const double inv_ljj = s.a[j * Ld + N];
         if (lane > j && lane < N) {
             double v = s.a[lane * Ld + j];
             for (int k = 0; k < j; ++k) v -= s.a[lane * Ld + k] * s.a[j * Ld + k];
-            s.a[lane * Ld + j] = v / ljj;
+            s.a[lane * Ld + j] = v * inv_ljj;
         }
         __syncwarp();
     }
@@ -463,12 +471,12 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
         for (int i = 0; i < N; ++i) {
             double v = (i == rhs_row) ? 1.0 : 0.0;
             for (int k = 0; k < i; ++k) v -= s.a[i * Ld + k] * y[k];
-            y[i] = v / s.a[i * Ld + i];
+            y[i] = v * s.a[i * Ld + N];
         }
         for (int i = N - 1; i >= 0; --i) {
             double v = y[i];
             for (int k = i + 1; k < N; ++k) v -= s.a[k * Ld + i] * zc[k];
-            zc[i] = v / s.a[i * Ld + i];
+            zc[i] = v * s.a[i * Ld + N];
         }
     }
     __syncwarp();
@@ -479,15 +487,15 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
     for (int p = begin + lane; p < end; p += kWarp) {
         const int m = pidx[p];
         double q[N];
-        Basis::eval((nodes_mm(m, 0) - xn[0]) / h, (nodes_mm(m, 1) - xn[1]) / h,
-                    (nodes_mm(m, 2) - xn[2]) / h, q);
+        Basis::eval((nodes_mm(m, 0) - xn[0]) * inv_h, (nodes_mm(m, 1) - xn[1]) * inv_h,
+                    (nodes_mm(m, 2) - xn[2]) * inv_h, q);
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             double grad = 0.0;
 #pragma unroll
             for (int i = 0; i < N; ++i) grad = fma(z[c * Ld + i], q[i], grad);
             sum[c] += fabs(grad);
-            wv(p, c) = static_cast<float>(grad / h);
+            wv(p, c) = static_cast<float>(grad * inv_h);
         }
     }
 #pragma unroll
