@@ -156,11 +156,11 @@ __device__ __forceinline__ void tet_barycentre(Vec3View<const double> nodes_mm,
 }
 
 // w_c = z . p~(b_e), the fit evaluated at one patch element in the node-centred, radius-scaled
-// frame p~ = [1, (b_e - x_n)/h].
+// frame p~ = [1, (b_e - x_n)/h], given inv_h = 1/h.
 __device__ __forceinline__ double spr_corner_weight(const double z[4], const double b[3],
-                                                    const double xn[3], double h) {
-    return z[0] + z[1] * (b[0] - xn[0]) / h + z[2] * (b[1] - xn[1]) / h +
-           z[3] * (b[2] - xn[2]) / h;
+                                                    const double xn[3], double inv_h) {
+    return z[0] + z[1] * (b[0] - xn[0]) * inv_h + z[2] * (b[1] - xn[1]) * inv_h +
+           z[3] * (b[2] - xn[2]) * inv_h;
 }
 
 // One thread per slot. Four passes over the patch: the scaling radius, the normal matrix, the
@@ -209,13 +209,14 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         }
         fit = h > 0.0;
     }
+    const double inv_h = 1.0 / h;
     if (fit) {
         double a[4][4] = {};
         for (int p = begin; p < end; ++p) {
             double b[3];
             tet_barycentre(nodes, tn, idx[p] >> 2, b);
-            const double q[4] = {1.0, (b[0] - xn[0]) / h, (b[1] - xn[1]) / h,
-                                 (b[2] - xn[2]) / h};
+            const double q[4] = {1.0, (b[0] - xn[0]) * inv_h, (b[1] - xn[1]) * inv_h,
+                                 (b[2] - xn[2]) * inv_h};
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
 #pragma unroll
@@ -235,7 +236,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
         for (int p = begin; p < end; ++p) {
             double b[3];
             tet_barycentre(nodes, tn, idx[p] >> 2, b);
-            lebesgue += fabs(spr_corner_weight(z, b, xn, h));
+            lebesgue += fabs(spr_corner_weight(z, b, xn, inv_h));
         }
         fit = lebesgue <= kMaxLebesgue;
     }
@@ -262,7 +263,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     for (int p = begin; p < end; ++p) {
         double b[3];
         tet_barycentre(nodes, tn, idx[p] >> 2, b);
-        w[p] = static_cast<float>(spr_corner_weight(z, b, xn, h));
+        w[p] = static_cast<float>(spr_corner_weight(z, b, xn, inv_h));
     }
 }
 
