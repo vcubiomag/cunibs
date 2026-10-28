@@ -210,8 +210,7 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
         int m = 0;
         if (fabs(z[1]) < fabs(z[m])) m = 1;
         if (fabs(z[2]) < fabs(z[m])) m = 2;
-        double ref[3] = {0.0, 0.0, 0.0};
-        ref[m] = 1.0;
+        const double ref[3] = {m == 0 ? 1.0 : 0.0, m == 1 ? 1.0 : 0.0, m == 2 ? 1.0 : 0.0};
         cross3(z, ref, y);
         const double inv = rnorm3d(y[0], y[1], y[2]);
         for (int i = 0; i < 3; ++i) y[i] *= inv;
