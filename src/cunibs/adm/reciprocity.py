@@ -24,6 +24,7 @@ from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 from cunibs.fem.assembly import csr_offsets
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.fem.solve import (
+    DEFAULT_TOLERANCE,
     GroundedSolver,
     SolverContext,
     _pad_block,
@@ -46,11 +47,10 @@ if TYPE_CHECKING:
     from cunibs.coil import Coil
     from cunibs.simulation import Subject
 
-# The adjoint RHS is a near-point source (Green's-function-like, singular at the target), so its
-# residual carries far more pointwise error in the functional than the same relative residual does
-# for a forward solve. The adjoint solves are one-time (3 per target), so they can afford a
-# tighter tolerance than the forward solve.
-ADJOINT_TOLERANCE = 1e-9
+# The forward solve's tolerance. At 1e-5 the adjoint moves the surrogate by under 3e-6 of its
+# maximum, against the surrogate's own ~1e-3 error to a forward solve, and never changes the best
+# candidate.
+ADJOINT_TOLERANCE = DEFAULT_TOLERANCE
 ADJOINT_MAX_ITERS = 3000
 
 # One byte per (rho, h) raster cell: whether some profile entry lies within reach of its centre.

@@ -51,8 +51,12 @@ if TYPE_CHECKING:
 # Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
 RESIDENT_G_DTYPE = cp.float32
 
-# Stopping criterion of the mixed PCG: ||r||_2 / ||b||_2 <= DEFAULT_TOLERANCE.
-DEFAULT_TOLERANCE = 1e-6
+# Stopping criterion of the mixed PCG: ||r||_2 / ||b||_2 <= DEFAULT_TOLERANCE, on the fp64
+# residual. The solve error it leaves, 2.4e-6 relative L2 in gray matter at worst over six heads,
+# is ~60x below the cuNIBS-SimNIBS difference and far below discretisation error. 1e-4 is not
+# safe: a cortical patch away from the hotspot can still be several percent off when the global
+# residual is met.
+DEFAULT_TOLERANCE = 1e-5
 DEFAULT_MAX_ITERS = 2000
 
 

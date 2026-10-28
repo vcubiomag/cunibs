@@ -87,10 +87,14 @@ def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
     gram = cp.asnumpy(q.T @ (a @ q))
     np.testing.assert_allclose(gram, np.eye(gram.shape[0]), atol=1e-3)
 
+    from cunibs.fem.solve import DEFAULT_TOLERANCE
+
     seeded = _magn(seeded_subject, d70_coil, placements, 8)
     for i, ((s, _), (u, _)) in enumerate(zip(seeded, unseeded, strict=True)):
         rel = np.linalg.norm(s - u) / np.linalg.norm(u)
-        assert rel < 1e-5, f"placement {i}: seeded field is {rel:.2e} off the unseeded one"
+        assert rel < 10 * DEFAULT_TOLERANCE, (
+            f"placement {i}: seeded field is {rel:.2e} off the unseeded one"
+        )
     assert sum(i for _, i in seeded) <= sum(i for _, i in unseeded)
 
     for k in (1, 3):
