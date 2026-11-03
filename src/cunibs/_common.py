@@ -100,7 +100,7 @@ def opt_array(h5f: h5py.File, name: str) -> npt.NDArray[Any] | None:
 
 
 def as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
-    p = np.ascontiguousarray(value, dtype=np.float64).reshape(-1)
+    p = np.array(value, dtype=np.float64).reshape(-1)
     if p.shape != (3,):
         raise ValueError(f"Expected a 3-vector, got shape {np.shape(value)}.")
     return p

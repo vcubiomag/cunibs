@@ -44,6 +44,15 @@ def test_all_exports_importable():
     assert isinstance(cunibs.__version__, str) and cunibs.__version__
 
 
+def test_placement_does_not_alias_its_inputs():
+    center, handle = np.array([1.0, 2.0, 3.0]), np.array([4.0, 5.0, 6.0])
+    p = Placement(center, handle)
+    center += 10.0
+    handle += 10.0
+    np.testing.assert_array_equal(p.center_mm, [1.0, 2.0, 3.0])
+    np.testing.assert_array_equal(p.handle_mm, [4.0, 5.0, 6.0])
+
+
 @pytest.mark.parametrize("bad", [[1, 2], [1, 2, 3, 4], [[1, 2], [3, 4]], []])
 def test_placement_rejects_non_3vector(bad):
     with pytest.raises(ValueError):
