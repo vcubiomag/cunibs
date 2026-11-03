@@ -155,49 +155,58 @@ def _coil_invariance(sweep, groups, footprints) -> dict:
     }
 
 
-def _ladder(ctx, coil) -> dict:
+def _ladder_rung(rung, coil, cap_path, pose) -> tuple[dict, tuple]:
+    """One rung's row, and the placement and frame every coarser rung shares.
+
+    A function of its own so that nothing of this rung's is alive while the next one builds.
+    """
     from cunibs import Subject
     from cunibs.fem import solve_placements_block
     from cunibs.fem.recovery import build_recovery_operator
     from cunibs.metrics import region_slice
 
+    subject = Subject.from_mesh(rung.path)
+    try:
+        if pose is None:
+            (placement,) = _data.placements(subject, cap_path, labels=("C3",))
+            pose = placement, _data.frames(subject, [placement])[0]
+        placement, frame = pose
+        c = subject.context
+        gm = region_slice(c.vols, c.tet_barycenters_mm, c.tet_tags, "gray_matter")
+        site = [(placement.center_mm, placement.handle_mm, placement.distance_mm)]
+        row = {}
+        for mode in MODES:
+            # Built uncached, so one operator at a time is resident on the finest rungs.
+            op = None if mode == "raw" else build_recovery_operator(c, mode)
+            (out,) = solve_placements_block(
+                c,
+                coil.positions_m,
+                coil.moments,
+                site,
+                _data.DIDT,
+                recovery=op,
+                transforms=frame[None],
+            )
+            s = gm.summarize(out["magnE"])
+            row[mode] = {"peak": s["peak_magnE"]} | {
+                q: s["distribution"][q] for q in ("p99", "p99.9")
+            }
+            del op, out
+        return row, pose
+    finally:
+        subject.free()
+
+
+def _ladder(ctx, coil) -> dict:
     rungs = ctx.data.ladder[:2] if ctx.quick else ctx.data.ladder
     cap_path = ctx.data.mesh(rungs[0].subject)
-    frame, rows, skipped = None, {}, []
+    pose, rows, skipped = None, {}, []
     for rung in reversed(rungs):
-        subject = None
         try:
-            subject = Subject.from_mesh(rung.path)
-            if frame is None:
-                (placement,) = _data.placements(subject, cap_path, labels=("C3",))
-                frame = _data.frames(subject, [placement])[0]
-            c = subject.context
-            gm = region_slice(c.vols, c.tet_barycenters_mm, c.tet_tags, "gray_matter")
-            site = [(placement.center_mm, placement.handle_mm, placement.distance_mm)]
-            rows[rung.path.stem] = {}
-            for mode in MODES:
-                # Built uncached, so one operator at a time is resident on the finest rungs.
-                op = None if mode == "raw" else build_recovery_operator(c, mode)
-                (out,) = solve_placements_block(
-                    c,
-                    coil.positions_m,
-                    coil.moments,
-                    site,
-                    _data.DIDT,
-                    recovery=op,
-                    transforms=frame[None],
-                )
-                s = gm.summarize(out["magnE"])
-                rows[rung.path.stem][mode] = {"peak": s["peak_magnE"]} | {
-                    q: s["distribution"][q] for q in ("p99", "p99.9")
-                }
-                del op, out
+            rows[rung.path.stem], pose = _ladder_rung(rung, coil, cap_path, pose)
         except MemoryError as exc:
             skipped.append({"rung": rung.path.stem, "error": str(exc)})
-        finally:
-            if subject is not None:
-                subject.free()
-            _measure.free_pools()
+        _measure.free_pools()
     names = list(reversed(rows))
     spread = {
         mode: {

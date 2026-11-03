@@ -96,8 +96,26 @@ def _measure_rung(subject, coil, placement, frame, probes) -> dict:
     }
 
 
+def _ladder_rung(rung, coil, cap_path, n_probes, pinned) -> tuple[dict, tuple]:
+    """One rung's measurements, and the placement, frame and probes every coarser rung shares.
+
+    A function of its own so that nothing of this rung's is alive while the next one builds.
+    """
+    from cunibs import Subject
+
+    subject = Subject.from_mesh(rung.path)
+    try:
+        if pinned is None:
+            (placement,) = _data.placements(subject, cap_path, labels=("C3",))
+            frame = _data.frames(subject, [placement])[0]
+            pinned = (placement, frame, _probes(subject, n_probes), rung)
+        return _measure_rung(subject, coil, *pinned[:3]), pinned
+    finally:
+        subject.free()
+
+
 def run(ctx: _run.Context) -> dict:
-    from cunibs import Coil, Subject
+    from cunibs import Coil
 
     rungs = ctx.data.ladder[:3] if ctx.quick else ctx.data.ladder
     n_probes = 50 if ctx.quick else N_PROBES
@@ -105,20 +123,11 @@ def run(ctx: _run.Context) -> dict:
     coil = Coil.load(_data.COIL)
     pinned, rows, skipped = None, {}, []
     for rung in reversed(rungs):
-        subject = None
         try:
-            subject = Subject.from_mesh(rung.path)
-            if pinned is None:
-                (placement,) = _data.placements(subject, cap_path, labels=("C3",))
-                frame = _data.frames(subject, [placement])[0]
-                pinned = (placement, frame, _probes(subject, n_probes), rung)
-            rows[rung] = _measure_rung(subject, coil, *pinned[:3])
+            rows[rung], pinned = _ladder_rung(rung, coil, cap_path, n_probes, pinned)
         except MemoryError as exc:
             skipped.append({"rung": rung.path.stem, "error": str(exc)})
-        finally:
-            if subject is not None:
-                subject.free()
-            _measure.free_pools()
+        _measure.free_pools()
 
     finest = pinned[3]
     coarser = [r for r in sorted(rows, key=lambda r: -r.scale) if r is not finest]
