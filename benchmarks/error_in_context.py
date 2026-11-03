@@ -65,7 +65,6 @@ def _rung(rung: _data.Rung, placement, frame: np.ndarray, center: np.ndarray) ->
 def _mesh_resolution(ctx: _run.Context) -> dict | None:
     from cunibs import Subject
     from cunibs.head import project_to_scalp
-    from cunibs.solver import clear_cuda_error
 
     path = ctx.data.mesh(ctx.data.ladder[0].subject)
     subject = Subject.from_mesh(path)
@@ -83,8 +82,6 @@ def _mesh_resolution(ctx: _run.Context) -> dict | None:
         except MemoryError:
             skipped.append(rung.scale)
             solved.clear()
-            # A failed allocation leaves the thread's CUDA error set for the next launch to find.
-            clear_cuda_error()
         _measure.free_pools()
         if len(solved) == 2:
             fine, coarse = solved

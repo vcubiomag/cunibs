@@ -75,7 +75,6 @@ def run(ctx: _run.Context) -> dict:
     import cupy as cp
 
     from cunibs import load_mesh
-    from cunibs.solver import clear_cuda_error
 
     rungs = ctx.data.ladder[:3] if ctx.quick else ctx.data.ladder
     # The first solve in a process also loads the library's CUDA modules into device memory,
@@ -89,8 +88,6 @@ def run(ctx: _run.Context) -> dict:
             skipped.append(
                 {"scale": rung.scale, "n_tets": load_mesh(rung.path).n_tets, "error": str(exc)}
             )
-            # A failed allocation leaves the thread's CUDA error set for the next launch to find.
-            clear_cuda_error()
         # Outside the handler, whose traceback keeps the failed rung's arrays alive.
         _measure.free_pools()
 

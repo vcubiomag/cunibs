@@ -44,7 +44,6 @@ from cunibs.fem import (
     validate_recovery,
 )
 from cunibs.mesh import HeadMesh, load_mesh
-from cunibs.solver import clear_cuda_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -291,9 +290,6 @@ class Subject:
         reach of the others until handed back. The default pool is the caller's, but its free
         blocks are unused memory, and a failed allocation is the moment they are needed.
         """
-        # A failed allocation leaves the thread's last CUDA error set, and the next launch check
-        # would report it as its own.
-        clear_cuda_error()
         for pool in (self._scratch, cp.get_default_memory_pool()):
             if pool is not None:
                 pool.free_all_blocks()
@@ -608,9 +604,6 @@ class Subject:
         # kernels go and halves when the device runs out of memory for it, which never moves a
         # result: every placement's arithmetic is the same at any width.
         width = _widest_block
-        # An allocation that failed before this call, in CuPy or the caller's own code, leaves the
-        # thread's last CUDA error set, which the first launch check here would report as its own.
-        clear_cuda_error()
         # With arrays to keep and more than one chunk, a chunk's copies to the host run while the
         # next chunk computes, so its results are yielded one chunk late. The pending chunk's
         # device outputs are held until its copies land.
