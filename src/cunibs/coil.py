@@ -123,7 +123,11 @@ def _read_ccd(ccd_file: Path) -> tuple[npt.NDArray[np.float64], dict[str, str | 
     with Path.open(ccd_file) as f:
         meta_line = f.readline().strip().lstrip("#").strip()
         num_elements = int(f.readline().strip())
-        data = np.loadtxt(f, dtype=np.float64, skiprows=1, max_rows=num_elements, ndmin=2)
+        data = np.loadtxt(f, dtype=np.float64, max_rows=num_elements, ndmin=2)
+    if data.shape[0] != num_elements:
+        raise ValueError(
+            f"{ccd_file}: header says {num_elements} dipoles, found {data.shape[0]}"
+        )
 
     parts = (p.split("=", 1) for p in meta_line.split(";") if "=" in p)
     metadata: dict[str, str | int] = {k.strip(): v.strip() for k, v in parts}

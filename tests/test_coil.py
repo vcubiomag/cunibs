@@ -119,6 +119,21 @@ def test_coil_is_frozen():
         c.name = "other"  # ty:ignore[invalid-assignment]
 
 
+def test_encode_ccd_keeps_every_dipole_without_a_comment_line(tmp_path):
+    ccd = tmp_path / "synth.ccd"
+    ccd.write_text("".join(line for line in _CCD.splitlines(True) if "x y z" not in line))
+    h5 = tmp_path / "synth.h5"
+    encode_ccd(ccd, h5)
+    assert Coil.load(h5).n_dipoles == 2
+
+
+def test_encode_ccd_rejects_a_dipole_count_the_file_does_not_hold(tmp_path):
+    ccd = tmp_path / "synth.ccd"
+    ccd.write_text(_CCD.replace("\n2\n", "\n3\n", 1))
+    with pytest.raises(ValueError, match="header says 3 dipoles, found 2"):
+        encode_ccd(ccd, tmp_path / "synth.h5")
+
+
 def test_encode_ccd_preserves_metadata(tmp_path):
     ccd = tmp_path / "synth.ccd"
     ccd.write_text(_CCD)
