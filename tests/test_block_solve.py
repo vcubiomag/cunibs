@@ -582,3 +582,51 @@ def test_retained_arrays_copied_behind_the_next_chunk_match_a_direct_copy(
             np.testing.assert_array_equal(
                 getattr(result, name), getattr(alone, name), err_msg=f"{name}, placement {i}"
             )
+
+
+def _integer_laplacian(cp, m: int = 8):
+    """A 7-point grid Laplacian with integer entries, whose residuals can be exactly zero."""
+    from cunibs.fem.solve import build_native_vcycle
+    from cunibs.solver import PcgAmgSolver
+
+    grid = np.arange(m**3).reshape(m, m, m)
+    ahead = [np.delete(grid, -1, axis=a).ravel() for a in range(3)]
+    behind = [np.delete(grid, 0, axis=a).ravel() for a in range(3)]
+    row = np.concatenate([grid.ravel(), *ahead, *behind])
+    col = np.concatenate([grid.ravel(), *behind, *ahead])
+    val = np.concatenate([np.full(m**3, 6.0), np.full(row.size - m**3, -1.0)])
+    order = np.lexsort((col, row))
+    row, col, val = row[order], col[order].astype(np.int32), val[order]
+    ptr = np.searchsorted(row, np.arange(m**3 + 1)).astype(np.int32)
+    a = (cp.asarray(ptr), cp.asarray(col), cp.asarray(val))
+    stream = cp.cuda.get_current_stream().ptr
+    return (
+        PcgAmgSolver(*a, stream),
+        build_native_vcycle(a[0], a[1], a[2].astype(cp.float32)),
+        lambda x: np.add.reduceat(val[:, None] * x[col], ptr[:-1], axis=0),
+    )
+
+
+def test_block_solve_keeps_a_column_x0_solves_exactly(cp):
+    """Its residual is exactly zero, and the first CG step of such a column would be 0/0."""
+    pcg, vcycle, matmul = _integer_laplacian(cp)
+    stream = cp.cuda.get_current_stream().ptr
+    rng = np.random.default_rng(0)
+    x0 = rng.integers(-5, 5, size=(pcg.n, 2)).astype(np.float64)
+    b = matmul(x0)
+    b[:, 1] = rng.standard_normal(pcg.n)
+    x0[:, 1] = 0.0
+
+    x = cp.empty((pcg.n, 2), dtype=cp.float64)
+    _, rels, col_iters = pcg.solve_mixed_block(
+        vcycle, cp.asarray(b), x, 1e-6, 200, stream, cp.asarray(x0)
+    )
+    assert col_iters[0] == 0
+    assert rels[0] == 0.0
+    np.testing.assert_array_equal(cp.asnumpy(x[:, 0]), x0[:, 0])
+
+    alone = cp.empty((pcg.n, 1), dtype=cp.float64)
+    pcg.solve_mixed_block(
+        vcycle, cp.asarray(b[:, 1:]), alone, 1e-6, 200, stream, cp.asarray(x0[:, 1:])
+    )
+    np.testing.assert_array_equal(cp.asnumpy(x[:, 1]), cp.asnumpy(alone[:, 0]))

@@ -376,6 +376,19 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                 return {0, {rel0}, {0}};
             }
         }
+        // A column X0 solves exactly has no residual to step along: its first alpha would be 0/0.
+        bool exact = false;
+        for (int c = 0; c < k; ++c) {
+            if (frozen[c] != 0.0 || h_true[c] != 0.0) continue;
+            frozen[c] = 1.0;
+            exact = true;
+        }
+        if (exact) {
+            check_cuda(cudaMemcpyAsync(d_converged, frozen.data(),
+                                       static_cast<size_t>(k) * sizeof(double),
+                                       cudaMemcpyHostToDevice, s),
+                       "block:copy(converged)");
+        }
     } else {
         check_cuda(cudaMemsetAsync(X_int, 0, nk * sizeof(double), s), "block:memset(X)");
         launch_bcg_residual(n_, k, B, nullptr, nullptr, R, partials, d_true_sq, s);
