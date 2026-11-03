@@ -62,7 +62,7 @@ def run(ctx: _run.Context) -> dict:
     (placement,) = _data.placements(subject, path, labels=("C3",))
     target = _objective.cortical_target(subject, placement)
     roi = resolve_target(subject, target)
-    centers, frames, _ = _objective.candidate_frames(subject, target.position_mm)
+    centers, _, _ = _objective.candidate_frames(subject, target.position_mm)
     repeats = 3 if ctx.quick else 10
 
     def build():
@@ -104,10 +104,17 @@ def run(ctx: _run.Context) -> dict:
     simnibs = ((crosscode or {}).get("coils") or {}).get(_data.COIL, {}).get("simnibs")
     if simnibs:
         n = simnibs["n_candidates"]
-        search = np.resize(frames, (n, 4, 4))
-        ms = _measure.stats(
-            _measure.timed(lambda: evaluate_frames(build(), coil, search, _data.DIDT), repeats)
-        )
+
+        # From the target to the answer, as SimNIBS's total is.
+        def search():
+            resolved = resolve_target(subject, target)
+            at, candidates, _ = _objective.candidate_frames(subject, target.position_mm)
+            field = build_reciprocity(
+                subject, coil, resolved, at, distance_mm=_data.DISTANCE_MM
+            )
+            return evaluate_frames(field, coil, np.resize(candidates, (n, 4, 4)), _data.DIDT)
+
+        ms = _measure.stats(_measure.timed(search, repeats))
         values["search"] = {
             "n_candidates": n,
             "cunibs_ms": ms,
