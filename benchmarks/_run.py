@@ -40,10 +40,16 @@ class Context:
     simnibs: Simnibs
     tag: str = ""
 
-    def result(self, name: str, tag: str | None = None) -> dict | None:
-        """The values another benchmark wrote on this machine (or ``tag``), if it has run."""
-        path = self.out / (tag or self.tag) / f"{name}.json"
-        return json.loads(path.read_text())["values"] if path.exists() else None
+    def _values(self, path: Path) -> dict:
+        record = json.loads(path.read_text())
+        if record["quick"] and not self.quick:
+            raise RuntimeError(f"{path} is a --quick result; rerun it before this benchmark")
+        return record["values"]
+
+    def result(self, name: str) -> dict | None:
+        """The values another benchmark wrote on this machine, if it has run."""
+        path = self.out / self.tag / f"{name}.json"
+        return self._values(path) if path.exists() else None
 
     def latest(self, name: str) -> dict | None:
         """The most recent result of ``name`` from any machine, with ``machine`` set to its tag.
@@ -54,7 +60,7 @@ class Context:
         if not found:
             return None
         newest = max(found, key=lambda p: p.stat().st_mtime)
-        return json.loads(newest.read_text())["values"] | {"machine": newest.parent.name}
+        return self._values(newest) | {"machine": newest.parent.name}
 
     def artifact(self, filename: str) -> Path:
         """A path beside this machine's results, for arrays too large for the JSON."""
