@@ -780,6 +780,27 @@ def test_affine_values_rejects_a_short_output(cp, cube_subject):
         terms.values(np.ones(1), cp.empty(pcg.nnz - 1, dtype=cp.float64), stream)
 
 
+def test_native_call_ignores_an_error_left_by_a_failed_allocation(cp):
+    """A failed allocation sets the last CUDA error, which is not the next launch's failure."""
+    from cunibs.fem.placement import MU0_OVER_4PI
+    from cunibs.solver import dadt_block
+
+    with pytest.raises(MemoryError):
+        cp.empty(1 << 46, dtype=cp.uint8)
+    s = cp.zeros((1, 3), dtype=cp.float64)
+    out = cp.empty((4, 3), dtype=cp.float32)
+    dadt_block(
+        s,
+        cp.asarray(np.array([[0.0, 0.0, 1.0]])),
+        cp.eye(4, dtype=cp.float64)[None],
+        cp.ones((4, 3), dtype=cp.float64),
+        out,
+        1e6,
+        MU0_OVER_4PI,
+        cp.cuda.get_current_stream().ptr,
+    )
+
+
 def test_update_values_rejects_a_wrong_nonzero_count(cp, cube_subject):
     """A short ``values`` would otherwise be read past its end on the device."""
     pcg = cube_subject.context.solver.pcg

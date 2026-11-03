@@ -380,11 +380,9 @@ __global__ void __launch_bounds__(kBlock)
     if (row < n && lane == 0) store_row<K>(&WidthView<float, K>(x, n)(row, 0), sum);
 }
 
-// The launchers deliberately do not check cudaGetLastError(). A cycle runs inside the CG
-// stream capture, and throwing there would skip cudaStreamEndCapture and leave the stream
-// capturing for good; PcgAmgSolver already handles a failed capture, and anything a launch
-// could report surfaces at its next synchronize. Grid dimensions are checked here instead,
-// which is the only launch failure this code can cause on its own.
+// The launchers do not check cudaGetLastError(): the native call reads it once on return, and
+// GraphCache handles a launch that fails inside the CG stream capture. Grid dimensions are checked
+// here, which is the only launch failure this code can cause on its own.
 template <int K>
 void launch_jacobi_zero(int n, const float* dinv, const float* b, float alpha, float* x,
                         cudaStream_t stream) {

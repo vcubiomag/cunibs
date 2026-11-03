@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <new>
 #include <stdexcept>
@@ -61,6 +62,24 @@ template <typename T>
 auto data_or_null(const std::optional<T>& a) -> decltype(a->data()) {
     return a ? a->data() : nullptr;
 }
+
+// A failed launch reports itself only through the thread's last error: no synchronise returns it.
+// So a native call reads it on the way out, before the caller can use what the launch was to write.
+// It starts cleared, so that an error left by CuPy or the caller, such as a failed allocation, is
+// not reported as this call's.
+class NativeCall {
+public:
+    NativeCall() : exceptions_(std::uncaught_exceptions()) { (void)cudaGetLastError(); }
+    ~NativeCall() noexcept(false) {
+        if (std::uncaught_exceptions() == exceptions_) {
+            check_cuda(cudaGetLastError(), "native", "launch");
+        }
+    }
+
+private:
+    nb::gil_scoped_release release_;
+    int exceptions_;
+};
 
 int block_width(std::size_t k, const char* what) {
     require(k >= 1 && k <= static_cast<std::size_t>(kMaxStageBlock), what);
@@ -171,7 +190,7 @@ NB_MODULE(_solver_ext, m) {
     nb::class_<NativeVCycle>(m, "NativeVCycle")
         .def(nb::init<>())
         .def("set_smoother", &NativeVCycle::set_smoother,
-             nb::call_guard<nb::gil_scoped_release>(),
+             nb::call_guard<NativeCall>(),
              nb::arg("degree"), nb::arg("lower_ratio"),
              "Set the Chebyshev degree and the lower end of its interval, as a divisor of the "
              "smoother's spectral upper bound. Must precede the first add_level.")
@@ -197,7 +216,7 @@ NB_MODULE(_solver_ext, m) {
                                p_col_idx.data(), p_values.data(), r_row_ptr.data(),
                                r_col_idx.data(), r_values.data(), as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
             nb::arg("values").noconvert(), nb::arg("dinv").noconvert(),
             nb::arg("p_row_ptr").noconvert(), nb::arg("p_col_idx").noconvert(),
@@ -212,7 +231,7 @@ NB_MODULE(_solver_ext, m) {
                 require(ainv.shape(0) == ainv.shape(1), "coarse inverse must be square");
                 self.set_coarse(static_cast<int>(ainv.shape(0)), ainv.data(), as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("ainv").noconvert(), nb::arg("stream"),
             "Set the dense (row-major) inverse of the coarsest matrix.")
         .def("finalize", &NativeVCycle::finalize,
@@ -233,7 +252,7 @@ NB_MODULE(_solver_ext, m) {
                                 col_idx.data(), values.data(), aggregates.data(),
                                 as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
         nb::arg("values").noconvert(), nb::arg("aggregates").noconvert(), nb::arg("stream"),
         "Unsmoothed pairwise aggregation (AMGx SIZE_4). Fills `aggregates` with a surjective "
@@ -249,7 +268,7 @@ NB_MODULE(_solver_ext, m) {
                                         static_cast<int>(values.shape(0)), row_ptr.data(),
                                         col_idx.data(), values.data(), as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert(),
             nb::arg("values").noconvert(), nb::arg("stream"))
         .def_prop_ro("n", &PcgAmgSolver::n, "Rows of the matrix.")
@@ -265,7 +284,7 @@ NB_MODULE(_solver_ext, m) {
                 self.export_csr(row_ptr.data(), data_or_null(col_idx), data_or_null(values),
                                 as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("row_ptr").noconvert(), nb::arg("col_idx").noconvert().none(),
             nb::arg("values").noconvert().none(), nb::arg("stream"),
             "Write the matrix's entry CSR into caller arrays; col_idx or values may be None.")
@@ -276,7 +295,7 @@ NB_MODULE(_solver_ext, m) {
                         "values must have one entry per nonzero");
                 self.update_values(values.data(), as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("values").noconvert(), nb::arg("stream"))
         .def(
             "solve_mixed",
@@ -290,7 +309,7 @@ NB_MODULE(_solver_ext, m) {
                                      as_stream(stream), data_or_null(x0));
                 return std::make_tuple(r.iterations, r.relative_residual);
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("preconditioner"), nb::arg("b").noconvert(), nb::arg("x").noconvert(),
             nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
             nb::arg("x0").noconvert() = nb::none())
@@ -307,7 +326,7 @@ NB_MODULE(_solver_ext, m) {
                                                        static_cast<int>(k), tolerance, max_iters,
                                                        as_stream(stream), data_or_null(X0)));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("preconditioner"), nb::arg("B").noconvert(), nb::arg("X").noconvert(),
             nb::arg("tolerance"), nb::arg("max_iters"), nb::arg("stream"),
             nb::arg("X0").noconvert() = nb::none(),
@@ -332,7 +351,7 @@ NB_MODULE(_solver_ext, m) {
                     preconditioner, terms, B.data(), X.data(), static_cast<int>(k), sigma.data(),
                     tolerance, max_iters, as_stream(stream), data_or_null(X0)));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("preconditioner"), nb::arg("terms"), nb::arg("B").noconvert(),
             nb::arg("X").noconvert(), nb::arg("sigma").noconvert(), nb::arg("tolerance"),
             nb::arg("max_iters"), nb::arg("stream"), nb::arg("X0").noconvert() = nb::none(),
@@ -351,7 +370,7 @@ NB_MODULE(_solver_ext, m) {
                 new (self) AffineTerms(solver, static_cast<int>(terms.shape(0)), terms.data(),
                                        as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(), nb::keep_alive<1, 2>(),
+            nb::call_guard<NativeCall>(), nb::keep_alive<1, 2>(),
             nb::arg("solver"), nb::arg("terms").noconvert(), nb::arg("stream"),
             "An operator affine in per-column coefficients over solver's pattern, "
             "A(sigma) = sum_t sigma_t A_t, from its parts' values in entry order (n_terms, nnz). "
@@ -368,7 +387,7 @@ NB_MODULE(_solver_ext, m) {
                         "values: out must have one entry per nonzero");
                 self.values(sigma.data(), out.data(), as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("sigma").noconvert(), nb::arg("out").noconvert(), nb::arg("stream"),
             "out = sum_t sigma[t] A_t in the solver's entry order, for host sigma (n_terms,).")
         .def(
@@ -381,7 +400,7 @@ NB_MODULE(_solver_ext, m) {
                 self.matmul(term, x.data(), y.data(), static_cast<int>(x.shape(1)),
                             as_stream(stream));
             },
-            nb::call_guard<nb::gil_scoped_release>(),
+            nb::call_guard<NativeCall>(),
             nb::arg("term"), nb::arg("x").noconvert(), nb::arg("y").noconvert(), nb::arg("stream"),
             "y = A_term x for row-major (n, m) float64 x, each row summed over the part's own "
             "nonzeros in column order with one fused multiply-add per entry.");
@@ -396,7 +415,7 @@ NB_MODULE(_solver_ext, m) {
             launch_p1_gradients(nodes_mm.data(), tet_nodes.data(), g.data(), vols.data(),
                                 static_cast<int>(n_tet), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("g").noconvert(), nb::arg("vols").noconvert(), nb::arg("stream"),
         "P1 basis-function gradients (n_tet, 4, 3) in 1/m and element volumes in m^3, from node "
@@ -420,7 +439,7 @@ NB_MODULE(_solver_ext, m) {
                               static_cast<int>(n_nodes), out.data() + 3 * column, stride, didt,
                               mu0_4pi, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("pos_m").noconvert(), nb::arg("mom").noconvert(),
         nb::arg("transforms").noconvert(), nb::arg("nodes_mm").noconvert(),
         nb::arg("out").noconvert(), nb::arg("didt"), nb::arg("mu0_4pi"), nb::arg("stream"),
@@ -440,7 +459,7 @@ NB_MODULE(_solver_ext, m) {
                                      idx.data(), indptr.data(), indices.data(), op.data(),
                                      static_cast<int>(indptr.shape(0)) - 1, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("g").noconvert(), nb::arg("scale").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("indptr").noconvert(),
         nb::arg("indices").noconvert(), nb::arg("op").noconvert(), nb::arg("stream"),
@@ -459,7 +478,7 @@ NB_MODULE(_solver_ext, m) {
             launch_rhs_operator(indptr.data(), op.data(), a.data(), b.data(),
                                 static_cast<int>(n_nodes), k, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("indptr").noconvert(), nb::arg("op").noconvert(), nb::arg("a").noconvert(),
         nb::arg("b").noconvert(), nb::arg("stream"),
         "b = B a for an interleaved (n_nodes, k, 3) nodal dA/dt; writes row-major (n_nodes, k) "
@@ -473,7 +492,7 @@ NB_MODULE(_solver_ext, m) {
             launch_dadt_element_average(dadt_nodes.data(), tet_nodes.data(), out.data(),
                                         static_cast<int>(tet_nodes.shape(0)), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("dadt_nodes").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("out").noconvert(), nb::arg("stream"),
         "Average nodal dA/dt onto tetrahedra; writes into caller-allocated out.");
@@ -486,7 +505,7 @@ NB_MODULE(_solver_ext, m) {
             launch_rhs(dadt_elm.data(), g.data(), neg_vc.data(), ptr.data(), idx.data(), b.data(),
                        static_cast<int>(b.shape(0)), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("dadt_elm").noconvert(), nb::arg("g").noconvert(), nb::arg("neg_vc").noconvert(),
         nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("b").noconvert(),
         nb::arg("stream"),
@@ -500,7 +519,7 @@ NB_MODULE(_solver_ext, m) {
             launch_tet_lowest_node(inverse.data(), tet_nodes.data(), lowest.data(),
                                    static_cast<int>(tet_nodes.shape(0)), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("inverse").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("lowest").noconvert(), nb::arg("stream"),
         "Smallest permuted node index of each tetrahedron, the sort key of the Morton layout.");
@@ -516,7 +535,7 @@ NB_MODULE(_solver_ext, m) {
                                            static_cast<int>(out_ptr.shape(0)) - 1,
                                            as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("out_ptr").noconvert(), nb::arg("stream"),
         "Row offsets of the distinct nodes of the tetrahedra in each segment of a corner CSR. "
@@ -533,7 +552,7 @@ NB_MODULE(_solver_ext, m) {
                                    out_idx.data(), static_cast<int>(out_ptr.shape(0)) - 1,
                                    as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("out_ptr").noconvert(), nb::arg("out_idx").noconvert(), nb::arg("stream"),
         "Fill the column index for the rows count_incident_node_csr sized.");
@@ -550,7 +569,7 @@ NB_MODULE(_solver_ext, m) {
                                    out_ptr.data(), static_cast<int>(r1_ptr.shape(0)) - 1,
                                    as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
         nb::arg("neighbour").noconvert(), nb::arg("min_nodes"), nb::arg("out_ptr").noconvert(),
         nb::arg("stream"),
@@ -569,7 +588,7 @@ NB_MODULE(_solver_ext, m) {
                            out_ptr.data(), out_idx.data(),
                            static_cast<int>(r1_ptr.shape(0)) - 1, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("r1_ptr").noconvert(), nb::arg("r1_idx").noconvert(),
         nb::arg("neighbour").noconvert(), nb::arg("min_nodes"), nb::arg("out_ptr").noconvert(),
         nb::arg("out_idx").noconvert(), nb::arg("stream"),
@@ -586,7 +605,7 @@ NB_MODULE(_solver_ext, m) {
                                   indptr.data(), indices.data(), data.data(),
                                   static_cast<int>(indptr.shape(0)) - 1, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("g").noconvert(), nb::arg("scale").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(), nb::arg("indptr").noconvert(),
         nb::arg("indices").noconvert(), nb::arg("data").noconvert(), nb::arg("stream"),
@@ -603,7 +622,7 @@ NB_MODULE(_solver_ext, m) {
             launch_l1_dinv(indptr.data(), indices.data(), data.data(), dinv.data(),
                            static_cast<int>(n_rows), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("indptr").noconvert(), nb::arg("indices").noconvert(), nb::arg("data").noconvert(),
         nb::arg("dinv").noconvert(), nb::arg("stream"),
         "l1-Jacobi smoother scaling 1 / (sign(a_ii) * sum_j |a_ij|), one thread per row.");
@@ -626,7 +645,7 @@ NB_MODULE(_solver_ext, m) {
                                            dadt_nodes.data(), kd == 1, eo.data(), mo.data(),
                                            static_cast<int>(n_tet), k, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("v_block").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
         nb::arg("dadt_nodes").noconvert(), nb::arg("e_out").noconvert(),
         nb::arg("magn_out").noconvert(), nb::arg("stream"),
@@ -645,7 +664,7 @@ NB_MODULE(_solver_ext, m) {
             launch_reconstruct(v.data(), tet_nodes.data(), g.data(), dadt_elm.data(), e_out.data(),
                                magn_out.data(), static_cast<int>(n_tet), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("v").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
         nb::arg("dadt_elm").noconvert(), nb::arg("e_out").noconvert(),
         nb::arg("magn_out").noconvert(), nb::arg("stream"),
@@ -664,7 +683,7 @@ NB_MODULE(_solver_ext, m) {
                                        is_boundary.data(), static_cast<int>(n_tet),
                                        as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("tet_nodes").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("is_boundary").noconvert(), nb::arg("stream"),
         "Mark the nodes of every face owned by exactly one tet, counted over the node2corner "
@@ -685,7 +704,7 @@ NB_MODULE(_solver_ext, m) {
                                w.data(), data_or_null(n_fallback), static_cast<int>(n_slots),
                                as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("vols").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("slot_node").noconvert(), nb::arg("is_boundary").noconvert(),
@@ -705,7 +724,7 @@ NB_MODULE(_solver_ext, m) {
                                 out.data(), static_cast<int>(n_tri),
                                 static_cast<int>(node_ptr.shape(0)) - 1, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tris").noconvert(),
         nb::arg("node_ptr").noconvert(), nb::arg("node_idx").noconvert(),
         nb::arg("out").noconvert(), nb::arg("stream"),
@@ -724,7 +743,7 @@ NB_MODULE(_solver_ext, m) {
                                  static_cast<int>(n_rays), static_cast<int>(verts.shape(0)),
                                  min_t, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("origins").noconvert(), nb::arg("directions").noconvert(),
         nb::arg("verts").noconvert(), nb::arg("out_t").noconvert(), nb::arg("min_t"),
         nb::arg("stream"),
@@ -746,7 +765,7 @@ NB_MODULE(_solver_ext, m) {
                                static_cast<int>(active ? active->shape(0) : n_slots),
                                as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("pptr").noconvert(), nb::arg("pidx").noconvert(),
         nb::arg("slot_node").noconvert(), nb::arg("w").noconvert(), nb::arg("status").noconvert(),
         nb::arg("stream"), nb::arg("active").noconvert() = nb::none(),
@@ -779,7 +798,7 @@ NB_MODULE(_solver_ext, m) {
                             static_cast<int>(active ? active->shape(0) : n_slots), k, stride,
                             static_cast<int>(n_nodes), work.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("v_block").noconvert(), nb::arg("w").noconvert(), nb::arg("pptr").noconvert(),
         nb::arg("pidx").noconvert(), nb::arg("slot_node").noconvert(),
         nb::arg("dadt_nodes").noconvert(), nb::arg("e_slots").noconvert(),
@@ -807,7 +826,7 @@ NB_MODULE(_solver_ext, m) {
             launch_recover_nodes(in.data(), w.data(), ptr.data(), idx.data(), out.data(),
                                  static_cast<int>(n_slots), k, as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("e_in").noconvert(), nb::arg("w").noconvert(), nb::arg("ptr").noconvert(),
         nb::arg("idx").noconvert(), nb::arg("e_slots").noconvert(), nb::arg("stream"),
         "Patch gather E*[s] = sum_c w[c] E[c>>2] for <=8 placements; the operator is read once "
@@ -832,7 +851,7 @@ NB_MODULE(_solver_ext, m) {
                                     static_cast<int>(active ? active->shape(0) : n_tet), k,
                                     as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("e_slots").noconvert(), nb::arg("slot_of_corner").noconvert(),
         nb::arg("e_out").noconvert(), nb::arg("magn_out").noconvert(), nb::arg("stream"),
         nb::arg("active").noconvert() = nb::none(),
@@ -848,7 +867,7 @@ NB_MODULE(_solver_ext, m) {
             launch_node_gather(corner.data(), ptr.data(), idx.data(), out.data(),
                                static_cast<int>(n_nodes), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("corner").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("out").noconvert(), nb::arg("stream"),
         "Node-centric scalar corner gather over the node2corner CSR; into caller-allocated out.");
@@ -873,7 +892,7 @@ NB_MODULE(_solver_ext, m) {
                                static_cast<int>(roi_elems.shape(0)), direction.data(),
                                node_w.data(), static_cast<int>(n_nodes), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("lam").noconvert(), nb::arg("tet_nodes").noconvert(), nb::arg("g").noconvert(),
         nb::arg("neg_vc").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("roi_elems").noconvert(), nb::arg("roi_alpha").noconvert(), nb::arg("direction"),
@@ -909,7 +928,7 @@ NB_MODULE(_solver_ext, m) {
                                 entries.data(), mu0_4pi, g.origin, g.spacing, g.shape, n_dir,
                                 didt, out.data(), fault.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(),
         nb::arg("coil_mom").noconvert(), nb::arg("q").noconvert(), nb::arg("cell_ok").noconvert(),
         nb::arg("cell_slot").noconvert(), nb::arg("q_near").noconvert(),
@@ -942,7 +961,7 @@ NB_MODULE(_solver_ext, m) {
                               tile_box.data(), points.data(), static_cast<int>(points.shape(0)),
                               mu0_4pi, g.origin, g.spacing, g.shape, q.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("src").noconvert(), nb::arg("src_w").noconvert(),
         nb::arg("tile_box").noconvert(), nb::arg("points").noconvert(), nb::arg("mu0_4pi"),
         nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("q").noconvert(),
@@ -966,7 +985,7 @@ NB_MODULE(_solver_ext, m) {
                                 points.data(), static_cast<int>(points.shape(0)), scale,
                                 out.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("src").noconvert(), nb::arg("src_w").noconvert(), nb::arg("points").noconvert(),
         nb::arg("scale"), nb::arg("out").noconvert(), nb::arg("stream"),
         "out (n_points, 3 * n_dir) = scale * sum over every source of W x (p - s) / |p - s|^3, "
@@ -989,7 +1008,7 @@ NB_MODULE(_solver_ext, m) {
                                     g.origin, g.spacing, g.shape, q_near.data(),
                                     as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("slot_cells").noconvert(), nb::arg("first_slot"), nb::arg("list_ptr").noconvert(),
         nb::arg("entries").noconvert(), nb::arg("n_dir"), nb::arg("q").noconvert(),
         nb::arg("mu0_4pi"), nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"),
@@ -1012,7 +1031,7 @@ NB_MODULE(_solver_ext, m) {
                             static_cast<int>(coil_pos.shape(0)), g.origin, g.spacing, g.shape,
                             need.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(), nb::arg("origin"),
         nb::arg("spacing"), nb::arg("shape"), nb::arg("need").noconvert(), nb::arg("stream"),
         "Sets need to 1 at every grid point a frame's dipoles interpolate from.");
@@ -1031,7 +1050,7 @@ NB_MODULE(_solver_ext, m) {
                              static_cast<int>(profile.shape(0)), static_cast<int>(profile.shape(1)),
                              h0, cell, mask.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("origins").noconvert(),
         nb::arg("axes").noconvert(), nb::arg("profile").noconvert(), nb::arg("h0"),
         nb::arg("cell"), nb::arg("mask").noconvert(), nb::arg("stream"),
@@ -1039,7 +1058,7 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "clear_cuda_error", [] { (void)cudaGetLastError(); },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         "Reset the calling thread's last CUDA error, which a failed allocation leaves set.");
     m.def(
         "host_copy_async",
@@ -1050,7 +1069,7 @@ NB_MODULE(_solver_ext, m) {
                        "host_copy_async", "launch host func");
             (void)copy.release();
         },
-        nb::call_guard<nb::gil_scoped_release>(), nb::arg("src"), nb::arg("dst"),
+        nb::call_guard<NativeCall>(), nb::arg("src"), nb::arg("dst"),
         nb::arg("bytes"), nb::arg("stream"),
         "Copy bytes from src to dst (host pointers) once the stream reaches this point. The "
         "caller keeps both buffers alive until then.");
@@ -1088,7 +1107,7 @@ NB_MODULE(_solver_ext, m) {
                                   w.data(), bary.data(), qs.data(), n_q, anchor, fracs.data(),
                                   n_f, work.data(), work.shape(0), out.data(), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(), nb::arg("fields").noconvert(),
+        nb::call_guard<NativeCall>(), nb::arg("fields").noconvert(),
         nb::arg("index").noconvert(), nb::arg("w").noconvert(), nb::arg("bary").noconvert(),
         nb::arg("qs"), nb::arg("anchor"), nb::arg("fracs"), nb::arg("work").noconvert(),
         nb::arg("out").noconvert(), nb::arg("stream"),
@@ -1106,7 +1125,7 @@ NB_MODULE(_solver_ext, m) {
             launch_accumulate_moments_block(ptrs.data(), k, sum_e.data(), sumsq_e.data(),
                                             static_cast<int>(n), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("magn").noconvert(), nb::arg("sum_e").noconvert(), nb::arg("sumsq_e").noconvert(),
         nb::arg("stream"),
         "Streaming |E| moments for up to 8 draws, folded in the order given: sum_e += magn and "
@@ -1123,7 +1142,7 @@ NB_MODULE(_solver_ext, m) {
             launch_row_dot(a.data(), s.data(), out.data(), static_cast<int>(n),
                            static_cast<int>(p), static_cast<int>(k), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("a").noconvert(), nb::arg("s").noconvert(), nb::arg("out").noconvert(),
         nb::arg("stream"),
         "out = a @ s.T for a tall, narrow a, each entry summed in term order. A column's result "
@@ -1150,7 +1169,7 @@ NB_MODULE(_solver_ext, m) {
             launch_sweep_seed(q.data(), b.data(), n, m_basis, k, work.data(), x0.data(),
                               as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("q").noconvert(), nb::arg("b").noconvert(), nb::arg("work").noconvert(),
         nb::arg("x0").noconvert(), nb::arg("stream"),
         "x0 = q (q^T b) per column for an A-orthonormal fp32 basis; a column's result does not "
@@ -1172,7 +1191,7 @@ NB_MODULE(_solver_ext, m) {
                          tnorm.data(), out.data(), data_or_null(degenerate),
                          static_cast<int>(n_pl), static_cast<int>(n_tri), as_stream(stream));
         },
-        nb::call_guard<nb::gil_scoped_release>(),
+        nb::call_guard<NativeCall>(),
         nb::arg("centers").noconvert(), nb::arg("handles").noconvert(),
         nb::arg("dists").noconvert(), nb::arg("verts").noconvert(),
         nb::arg("tnorm").noconvert(), nb::arg("out").noconvert(),
