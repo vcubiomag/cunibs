@@ -182,6 +182,11 @@ NB_MODULE(_solver_ext, m) {
                const i32_1d& p_col_idx, const f32_1d& p_values, const i32_1d& r_row_ptr,
                const i32_1d& r_col_idx, const f32_1d& r_values, uintptr_t stream) {
                 const int n_rows = static_cast<int>(row_ptr.shape(0)) - 1;
+                require(col_idx.shape(0) == values.shape(0) &&
+                            p_col_idx.shape(0) == p_values.shape(0) &&
+                            r_col_idx.shape(0) == r_values.shape(0),
+                        "each CSR must have one column per value");
+                require(dinv.shape(0) + 1 == row_ptr.shape(0), "dinv must have one entry per row");
                 require(r_values.shape(0) == p_values.shape(0), "R must be the transpose of P");
                 require(p_row_ptr.shape(0) == row_ptr.shape(0),
                         "P must have one row per fine row");
@@ -239,6 +244,7 @@ NB_MODULE(_solver_ext, m) {
             "__init__",
             [](PcgAmgSolver* self, const i32_1d& row_ptr, const i32_1d& col_idx,
                const f64_1d& values, uintptr_t stream) {
+                require(col_idx.shape(0) == values.shape(0), "CSR must have one column per value");
                 new (self) PcgAmgSolver(static_cast<int>(row_ptr.shape(0)) - 1,
                                         static_cast<int>(values.shape(0)), row_ptr.data(),
                                         col_idx.data(), values.data(), as_stream(stream));
@@ -358,6 +364,8 @@ NB_MODULE(_solver_ext, m) {
                const f64_1d& out, uintptr_t stream) {
                 require(static_cast<int>(sigma.shape(0)) == self.n_terms(),
                         "values: sigma must have one entry per term");
+                require(static_cast<int>(out.shape(0)) == self.nnz(),
+                        "values: out must have one entry per nonzero");
                 self.values(sigma.data(), out.data(), as_stream(stream));
             },
             nb::call_guard<nb::gil_scoped_release>(),

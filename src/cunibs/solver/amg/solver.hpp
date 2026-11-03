@@ -141,6 +141,8 @@ public:
     int n_terms() const { return slots_.n_terms; }
     // Rows of the solver's matrix.
     int n() const { return n_; }
+    // Nonzeros of the solver's entry CSR.
+    int nnz() const;
     // out (nnz, entry order) = sum_t sigma[t] A_t, for host sigma (n_terms).
     void values(const double* sigma, double* out, cudaStream_t stream) const;
     // y (n, m) = A_term x for row-major (n, m) x, each row summed over the part's own nonzeros in

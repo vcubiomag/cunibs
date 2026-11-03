@@ -722,6 +722,64 @@ def test_dadt_of_a_coil_with_no_dipoles_is_zero(cp):
         np.testing.assert_array_equal(cp.asnumpy(out), 0.0)
 
 
+def _laplacian_csr(cp):
+    """The 3-node path graph's Laplacian with a Dirichlet shift, as device CSR arrays."""
+    row = cp.asarray(np.array([0, 2, 5, 7], dtype=np.int32))
+    col = cp.asarray(np.array([0, 1, 0, 1, 2, 1, 2], dtype=np.int32))
+    val = cp.asarray(np.array([3.0, -1.0, -1.0, 3.0, -1.0, -1.0, 3.0]))
+    return row, col, val
+
+
+def test_solver_rejects_columns_that_do_not_match_values(cp):
+    """A short ``col_idx`` would otherwise be read past its end on the device."""
+    from cunibs.solver import PcgAmgSolver
+
+    row, col, val = _laplacian_csr(cp)
+    with pytest.raises(ValueError, match="one column per value"):
+        PcgAmgSolver(row, col[:-1], val, cp.cuda.get_current_stream().ptr)
+
+
+def test_vcycle_level_rejects_arrays_that_do_not_match(cp):
+    from cunibs.solver import NativeVCycle
+
+    row, col, val = _laplacian_csr(cp)
+    f32 = val.astype(cp.float32)
+    args = {
+        "row_ptr": row,
+        "col_idx": col,
+        "values": f32,
+        "dinv": cp.ones(3, dtype=cp.float32),
+        "p_row_ptr": row,
+        "p_col_idx": col,
+        "p_values": f32,
+        "r_row_ptr": row,
+        "r_col_idx": col,
+        "r_values": f32,
+    }
+    stream = cp.cuda.get_current_stream().ptr
+    for name, match in (
+        ("col_idx", "one column per value"),
+        ("p_col_idx", "one column per value"),
+        ("r_col_idx", "one column per value"),
+        ("dinv", "one entry per row"),
+    ):
+        vcycle = NativeVCycle()
+        vcycle.set_smoother(2, 30.0)
+        with pytest.raises(ValueError, match=match):
+            vcycle.add_level(**(args | {name: args[name][:-1]}), stream=stream)
+
+
+def test_affine_values_rejects_a_short_output(cp, cube_subject):
+    """It would otherwise write past the end of ``out``."""
+    from cunibs.solver import AffineTerms
+
+    pcg = cube_subject.context.solver.pcg
+    stream = cp.cuda.get_current_stream().ptr
+    terms = AffineTerms(pcg, cp.zeros((1, pcg.nnz), dtype=cp.float64), stream)
+    with pytest.raises(ValueError, match="one entry per nonzero"):
+        terms.values(np.ones(1), cp.empty(pcg.nnz - 1, dtype=cp.float64), stream)
+
+
 def test_update_values_rejects_a_wrong_nonzero_count(cp, cube_subject):
     """A short ``values`` would otherwise be read past its end on the device."""
     pcg = cube_subject.context.solver.pcg

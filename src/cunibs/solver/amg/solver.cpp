@@ -141,6 +141,8 @@ AffineTerms::AffineTerms(const PcgAmgSolver& solver, int n_terms, const double* 
     check_cuda(cudaStreamSynchronize(stream), "sync(affine terms)");
 }
 
+int AffineTerms::nnz() const { return solver_->nnz(); }
+
 void AffineTerms::values(const double* sigma, double* out, cudaStream_t stream) const {
     const int t = slots_.n_terms;
     // A copy from pageable memory has read sigma by the time it returns, so the caller's array
