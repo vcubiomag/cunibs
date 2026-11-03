@@ -36,6 +36,15 @@ class Arena:
             return a.copy()
 
 
+def unpooled(size: int) -> cp.cuda.MemoryPointer:
+    """An allocator giving each array its own device allocation, released when the array dies.
+
+    For state that can outlive whatever built it: a block from a pool that has since been dropped
+    strands the chunk it came from.
+    """
+    return cp.cuda.MemoryPointer(cp.cuda.Memory(size), 0)
+
+
 @contextmanager
 def build_arena() -> Iterator[Arena]:
     """Run a build of long-lived device state with its temporaries outside the caller's pool.

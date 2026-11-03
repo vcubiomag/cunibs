@@ -28,6 +28,7 @@ from cunibs._common import (
     write_metrics,
     write_provenance,
 )
+from cunibs._memory import unpooled
 from cunibs._transfer import AsyncCopier, Fence
 from cunibs.fem import (
     MAX_BLOCK,
@@ -222,7 +223,6 @@ class Subject:
         ] = {}
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
-        self._resident: cp.cuda.MemoryPool | None = None
         self._scratch: cp.cuda.MemoryPool | None = None
         self._copier: AsyncCopier | None = None
         # Guards every lazy field above: under the free-threaded build two threads sharing a
@@ -238,11 +238,11 @@ class Subject:
     def free(self) -> None:
         """Release cached GPU state: solver context, AMG hierarchies, UQ precompute and scratch.
 
-        The subject keeps its device memory in pools of its own, which this returns to the device,
-        so a loop over many subjects can reclaim memory as it goes. Arrays a caller still holds
-        from the cached state, such as ``subject.context``'s, stay valid and are released when
-        dropped. The subject stays usable afterwards; cached state is rebuilt lazily on the next
-        call. Also available via the context manager:
+        This returns the subject's device memory to the device, so a loop over many subjects can
+        reclaim memory as it goes. Arrays a caller still holds from the cached state, such as
+        ``subject.context``'s, stay valid and are released when dropped. The subject stays usable
+        afterwards; cached state is rebuilt lazily on the next call. Also available via the context
+        manager:
         ``with Subject.from_mesh(path) as subject: ...``.
         """
         with self._lock:
@@ -256,11 +256,9 @@ class Subject:
             if self._copier is not None:
                 self._copier.drain()
                 self._copier = None
-            for pool in (self._scratch, self._resident):
-                if pool is not None:
-                    pool.free_all_blocks()
-            self._scratch = None
-            self._resident = None
+            if self._scratch is not None:
+                self._scratch.free_all_blocks()
+                self._scratch = None
 
     def __enter__(self) -> Self:
         return self
@@ -296,20 +294,18 @@ class Subject:
         # A failed allocation leaves the thread's last CUDA error set, and the next launch check
         # would report it as its own.
         clear_cuda_error()
-        for pool in (self._scratch, self._resident, cp.get_default_memory_pool()):
+        for pool in (self._scratch, cp.get_default_memory_pool()):
             if pool is not None:
                 pool.free_all_blocks()
 
     def _build[T](self, build: Callable[[], T]) -> T:
-        """Run a build of cached state, allocating what it keeps from the subject's resident pool.
+        """Run a build of cached state, giving each array it keeps its own allocation.
 
-        Its temporaries come from the build's own arena (see :mod:`cunibs._memory`), so the
-        resident pool holds nothing but cached state. A build that runs out of memory is retried
-        once after :meth:`_release_free_blocks`. Callers hold the subject's lock.
+        Its temporaries come from the build's own arena (see :mod:`cunibs._memory`). A build that
+        runs out of memory is retried once after :meth:`_release_free_blocks`. Callers hold the
+        subject's lock.
         """
-        if self._resident is None:
-            self._resident = cp.cuda.MemoryPool()
-        with cp.cuda.using_allocator(self._resident.malloc):
+        with cp.cuda.using_allocator(unpooled):
             try:
                 return _published(build())
             except MemoryError:
@@ -445,7 +441,7 @@ class Subject:
         """Build (and cache on the context) the patch weights for ``recovery``.
 
         Held here rather than reached from inside a solve so the build is serialised against
-        other threads sharing this subject, and so it lands in the resident pool, since the
+        other threads sharing this subject, and so it is built as cached state, since the
         operator outlives the chunk that first asked for it. ``tissues`` is what the call reads;
         see :meth:`_needed_tissues`.
         """

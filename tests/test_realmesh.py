@@ -11,11 +11,13 @@ Marked ``reference`` tests need the full 184 MB mesh via ``CUNIBS_REFERENCE_MESH
 
 from __future__ import annotations
 
+import gc
 import itertools
 
 import numpy as np
 import pytest
 
+from cunibs import Subject
 from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
 from cunibs.mesh import VOLUME_KEY_TO_LABEL, load_mesh
 
@@ -299,7 +301,7 @@ def test_full_mesh_load_counts(reference_mesh_path):
 
 @pytest.mark.reference
 @pytest.mark.slow
-def test_full_mesh_forward(fresh_subject, reference_mesh_path, d70_coil):
+def test_full_mesh_forward(cp, fresh_subject, reference_mesh_path, d70_coil):
     """4.9M tetrahedra end to end: block-vs-serial parity and the peak field at scale.
 
     Pinned on ``recovery="raw"`` so it stays a pin on the *solve*; recovery has its own coverage
@@ -309,6 +311,8 @@ def test_full_mesh_forward(fresh_subject, reference_mesh_path, d70_coil):
 
     mesh = load_mesh(reference_mesh_path)
     subj = fresh_subject(mesh)
+    free, total = cp.cuda.runtime.memGetInfo()
+    device_before = total - free
 
     skin_nodes = np.unique(mesh.skin_tris)
     coords = mesh.nodes_mm[skin_nodes]
@@ -320,7 +324,27 @@ def test_full_mesh_forward(fresh_subject, reference_mesh_path, d70_coil):
 
     serialized = list(subj.iter_simulate(d70_coil, placements[:1], 1e6, recovery="raw"))
     assert blocked[0].peak_magnE() == pytest.approx(serialized[0].peak_magnE(), rel=2e-5)
-    held = sum(
-        pool.used_bytes() for pool in (subj._resident, subj._scratch) if pool is not None
-    )
-    assert held < 4e9
+    free, total = cp.cuda.runtime.memGetInfo()
+    assert total - free - device_before < 4e9
+
+
+@pytest.mark.reference
+@pytest.mark.slow
+def test_context_held_across_free_is_released_when_dropped(cp, reference_mesh_path):
+    """free() leaves a held context valid, and dropping it later must still return its memory."""
+    mesh = load_mesh(reference_mesh_path)
+
+    def cycle():
+        subj = Subject(mesh)
+        ctx = subj.context
+        subj.free()
+        assert ctx.vols.size > 0
+        del ctx, subj
+        gc.collect()
+        cp.cuda.Device().synchronize()
+        free, total = cp.cuda.runtime.memGetInfo()
+        return total - free
+
+    settled = cycle()
+    assert cycle() - settled < 1 << 20
+    assert cycle() - settled < 1 << 20

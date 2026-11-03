@@ -7,6 +7,9 @@ Both are memory contracts that nothing else in the suite checks.
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import numpy as np
 import pytest
 
@@ -93,27 +96,36 @@ def test_mesh_property_is_the_context_mesh(cube_mesh):
 
 
 def _held(cp, subj) -> int:
-    """Bytes in use across every pool device arrays can come from: the subject's and the caller's."""
-    pools = [subj._resident, subj._scratch, cp.get_default_memory_pool()]
+    """Bytes in use across the pools a call's device arrays can come from."""
+    pools = [subj._scratch, cp.get_default_memory_pool()]
     return sum(pool.used_bytes() for pool in pools if pool is not None)
 
 
 @pytest.mark.realmesh
 def test_free_releases_device_memory(cp, patch_mesh):
-    """The cached state lives in the subject's own pool, and free() hands all of it back."""
+    """The cached state stays out of the caller's pool, and free() lets go of all of it."""
     caller = cp.get_default_memory_pool()
     caller.free_all_blocks()
     baseline = caller.used_bytes()
 
     subj = Subject(patch_mesh)
-    assert subj.context is not None
-    resident = subj._resident
-    assert resident.used_bytes() > 1_000_000  # the patch's resident arrays are several MB
+    held = weakref.ref(subj.context)
     assert caller.used_bytes() - baseline < 1_000_000
 
     subj.free()
-    assert resident.total_bytes() == 0
+    gc.collect()
+    assert held() is None
+    assert subj._scratch is None
     assert caller.used_bytes() - baseline < 1_000_000
+
+
+@pytest.mark.realmesh
+def test_cached_arrays_do_not_share_a_pool_chunk(cp, patch_mesh):
+    """An array sharing a chunk with a dropped pool's other blocks would strand that chunk."""
+    subj = Subject(patch_mesh)
+    assert type(subj.context.vols.data.mem) is cp.cuda.Memory
+    assert type(subj.context.rhs_indptr.data.mem) is cp.cuda.Memory
+    subj.free()
 
 
 @pytest.mark.realmesh
