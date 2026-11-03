@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from typing import NamedTuple
 
 import cupy as cp
 import numpy as np
@@ -15,13 +14,6 @@ _SLOT_BYTES = 64 << 20
 _SLOTS = 2
 
 
-class Fence(NamedTuple):
-    """The point in the copy queue a set of events marks, and how many copies precede it."""
-
-    events: list[cp.cuda.Event]
-    copies: int
-
-
 class AsyncCopier:
     """Copies device arrays into new host arrays through a pinned ring, off the calling thread.
 
@@ -30,9 +22,10 @@ class AsyncCopier:
     callback thread. Each slot has its own stream, so its next transfer waits in stream order for
     its last drain.
 
-    The copier keeps every source and destination alive until a :meth:`settle` or :meth:`drain`
-    has seen its copy land, so dropping a result early can never free memory the callback thread
-    is still writing.
+    Each caller keeps what its copies touch alive until its :meth:`settle` or :meth:`drain`, in the
+    list it passes :meth:`copy`. Holding them here would let one thread release another's device
+    arrays, and on a free-threaded build those then stay allocated until their creating thread
+    next wakes.
     """
 
     def __init__(self) -> None:
@@ -45,18 +38,17 @@ class AsyncCopier:
         self._streams = [cp.cuda.Stream(non_blocking=True) for _ in range(_SLOTS)]
         self._turn = 0
         self._lock = threading.Lock()
-        # (sequence number, destination, source) for every copy not yet known to have landed.
-        self._inflight: list[tuple[int, np.ndarray, cp.ndarray]] = []
-        self._queued = 0
 
-    def copy(self, src: cp.ndarray, after: cp.cuda.Event) -> np.ndarray:
-        """A host array holding ``src`` once a later :meth:`fence` has been settled."""
+    def copy(self, src: cp.ndarray, after: cp.cuda.Event, held: list[object]) -> np.ndarray:
+        """A host array holding ``src`` once a later :meth:`fence` has been settled.
+
+        Appends ``src`` and that array to ``held``, which must outlive the fence.
+        """
         if not src.flags.c_contiguous:
             raise ValueError("AsyncCopier.copy needs a C-contiguous source")
         dst = np.empty(src.shape, dtype=src.dtype)
+        held += (dst, src)
         with self._lock:
-            self._queued += 1
-            self._inflight.append((self._queued, dst, src))
             for stream in self._streams:
                 stream.wait_event(after)
             offset = 0
@@ -76,23 +68,21 @@ class AsyncCopier:
                 offset += n
         return dst
 
-    def fence(self) -> Fence:
-        """A marker that is passed once every copy queued so far has landed."""
+    def fence(self) -> list[cp.cuda.Event]:
+        """Markers that are passed once every copy queued so far has landed."""
         with self._lock:
             events = []
             for stream in self._streams:
                 event = cp.cuda.Event(disable_timing=True)
                 event.record(stream)
                 events.append(event)
-            return Fence(events, self._queued)
+            return events
 
-    def settle(self, fence: Fence) -> None:
-        """Wait for ``fence`` and release the buffers of the copies before it."""
-        for event in fence.events:
+    def settle(self, fence: list[cp.cuda.Event]) -> None:
+        """Wait for ``fence``."""
+        for event in fence:
             event.synchronize()
-        with self._lock:
-            self._inflight = [entry for entry in self._inflight if entry[0] > fence.copies]
 
     def drain(self) -> None:
-        """Wait for every queued copy and release all of their buffers."""
+        """Wait for every queued copy."""
         self.settle(self.fence())

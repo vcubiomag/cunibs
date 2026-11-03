@@ -29,7 +29,7 @@ from cunibs._common import (
     write_provenance,
 )
 from cunibs._memory import release_scratch, scratch_pool, unpooled
-from cunibs._transfer import AsyncCopier, Fence
+from cunibs._transfer import AsyncCopier
 from cunibs.fem import (
     MAX_BLOCK,
     PlacementResult,
@@ -458,9 +458,10 @@ class Subject:
         region: metrics.RegionSlice,
         recovery: Recovery,
         op: RecoveryOperator | None,
-        record_rois: Mapping[str, ResolvedTarget] = NO_ROIS,
-        provenance: dict[str, Any] | None = None,
-        copier: AsyncCopier | None = None,
+        record_rois: Mapping[str, ResolvedTarget],
+        provenance: dict[str, Any] | None,
+        copier: AsyncCopier | None,
+        held: list[object],
     ) -> list[FieldResult]:
         """Turn one solved chunk into results, summarising on the device.
 
@@ -469,7 +470,8 @@ class Subject:
         when every input is on the device.
 
         With a ``copier`` the retained arrays are queued behind the chunk's GPU work rather than
-        copied now, and are complete only once ``copier.fence()`` passes.
+        copied now, and are complete only once ``copier.fence()`` passes. ``held`` must keep what
+        they touch alive until then.
         """
         if copier is None:
             to_host = cp.asnumpy
@@ -478,7 +480,7 @@ class Subject:
             produced.record()
 
             def to_host(a: cp.ndarray) -> npt.NDArray[Any]:
-                return copier.copy(a, produced)
+                return copier.copy(a, produced, held)
 
         # nodal_field resolves its region against tet_tags, so a nodal result needs the host
         # metric inputs even without magnitude.
@@ -594,12 +596,13 @@ class Subject:
         # device outputs are held until its copies land.
         keeps = retain.magnitude or retain.vectors or retain.potential or retain.nodal
         copier = self._async_copier() if keeps and len(sites) > width else None
-        pending: tuple[list[FieldResult], Fence] | None = None
+        pending: tuple[list[FieldResult], list[cp.cuda.Event], list[object]] | None = None
         start = 0
         try:
             while start < len(sites):
                 chunk = sites[start : start + width]
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
+                held: list[object] = []
                 try:
                     with cp.cuda.using_allocator(temp_pool.malloc):
                         outs = solve_placements_block(
@@ -627,6 +630,7 @@ class Subject:
                             record_rois,
                             provenance,
                             copier,
+                            held,
                         )
                         del outs
                 except MemoryError:
@@ -642,12 +646,18 @@ class Subject:
                     yield from batch
                     continue
                 if pending is not None:
+                    results = pending[0]
                     copier.settle(pending[1])
-                    yield from pending[0]
-                pending = (batch, copier.fence())
+                    # Before the results go to the caller, who may hold up the next chunk.
+                    pending = None
+                    yield from results
+                    del results
+                pending = (batch, copier.fence(), held)
             if pending is not None and copier is not None:
+                results = pending[0]
                 copier.settle(pending[1])
-                yield from pending[0]
+                pending = None
+                yield from results
         finally:
             # An abandoned sweep still has copies writing into its arrays.
             if copier is not None:
