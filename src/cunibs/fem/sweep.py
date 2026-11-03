@@ -36,8 +36,6 @@ _BASIS_DISTANCE_MM = 4.0
 _CAP_BOTTOM = -0.3
 # Radius of that sphere: outside any head, so every point projects onto the scalp beneath it.
 _CAP_RADIUS_MM = 150.0
-# How far from its point a basis placement's handle point sits; any distance gives the same axis.
-_HANDLE_MM = 30.0
 # Relative eigenvalue below which a new direction counts as already spanned.
 _SPAN_RTOL = 1e-10
 
@@ -79,7 +77,7 @@ def _cap_points(ctx: SolverContext, count: int) -> np.ndarray:
 
 
 def _basis_transforms(ctx: SolverContext, size: int) -> np.ndarray:
-    """Coil frames for the basis: points on the cap, each taken at two handle angles 90 apart.
+    """Coil frames for the basis: points on the cap, each taken at two handles 90 degrees apart.
 
     The field under a figure-of-eight coil turns with its handle, to first order as
     (cos t, sin t), so a pair of orthogonal handles at each point spans the rotations there.
@@ -87,15 +85,12 @@ def _basis_transforms(ctx: SolverContext, size: int) -> np.ndarray:
     count = (size + 1) // 2
     points = _cap_points(ctx, count)
     dist = np.full(count, _BASIS_DISTANCE_MM, dtype=np.float64)
-    # Handle-free frames give each point an in-plane pair of axes to take the angles from.
     base = cp.asnumpy(compute_coil_transforms(ctx, points, None, dist))
-    idx = np.repeat(np.arange(count), 2)[:size]
-    angles = np.tile([0.0, np.pi / 2], count)[:size]
-    x, y = base[idx, :3, 0], base[idx, :3, 1]
-    handles = points[idx] + _HANDLE_MM * (
-        np.cos(angles)[:, None] * x + np.sin(angles)[:, None] * y
-    )
-    return cp.asnumpy(compute_coil_transforms(ctx, points[idx], handles, dist[idx]))
+    frames = np.repeat(base, 2, axis=0)
+    # The same frame turned a quarter about its normal.
+    frames[0::2, :3, 0] = -base[:, :3, 1]
+    frames[0::2, :3, 1] = base[:, :3, 0]
+    return frames[:size]
 
 
 def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepBasis:

@@ -58,6 +58,19 @@ def _magn(subject, coil, placements, width):
 
 
 @pytest.mark.realmesh
+def test_basis_handle_pairs_are_right_angles(fresh_subject, patch_mesh):
+    """The field turns as (cos t, sin t) with the handle, so a pair spans it at 90 degrees."""
+    from cunibs.fem.sweep import _basis_transforms
+
+    frames = _basis_transforms(fresh_subject(patch_mesh).context, 16)
+    first, second = frames[0::2], frames[1::2]
+    assert np.abs((first[:, :3, 1] * second[:, :3, 1]).sum(axis=1)).max() < 1e-12
+    np.testing.assert_allclose(first[:, :3, 2], second[:, :3, 2], atol=1e-12)
+    np.testing.assert_allclose(first[:, :3, 3], second[:, :3, 3], atol=1e-12)
+    np.testing.assert_allclose(np.linalg.det(frames[:, :3, :3]), 1.0, atol=1e-12)
+
+
+@pytest.mark.realmesh
 def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
     cp, fresh_subject, patch_mesh, d70_coil
 ):
