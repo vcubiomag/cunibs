@@ -239,7 +239,9 @@ void launch_dadt_block(const double* pos_m, const double* mom, const double* tra
     const ScratchBuffer<float2> m2 = scratch_alloc<float2>(kn, stream, "dadt", "moments");
     const ScratchBuffer<double> origin = scratch_alloc<double>(3 * k, stream, "dadt", "origin");
     const ScratchBuffer<float> axis = scratch_alloc<float>(3 * k, stream, "dadt", "axis");
-    check_cuda(cudaMemsetAsync(planar.get(), 1, sizeof(int), stream), "dadt", "planar");
+    // With no dipoles nothing sets the axis the planar path reads.
+    check_cuda(cudaMemsetAsync(planar.get(), n_dip > 0 ? 1 : 0, sizeof(int), stream), "dadt",
+               "planar");
     if (n_dip > 0) {
         dadt_planar_kernel<<<grid_for(n_dip), kBlock, 0, stream>>>(mom, n_dip, planar.get());
     }

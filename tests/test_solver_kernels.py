@@ -698,6 +698,30 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
 # --- PcgAmgSolver argument validation ------------------------------------------------------
 
 
+def test_dadt_of_a_coil_with_no_dipoles_is_zero(cp):
+    """The flat-coil path reads an axis no dipole set, from whatever the mempool held."""
+    from cunibs.fem.placement import MU0_OVER_4PI
+    from cunibs.solver import dadt_block
+
+    stream = cp.cuda.get_current_stream().ptr
+    empty = cp.zeros((0, 3), dtype=cp.float64)
+    with cp.cuda.using_allocator(cp.cuda.malloc_async):
+        del_later = [cp.full(1024, cp.nan, dtype=cp.float32) for _ in range(8)]
+        del del_later
+        out = cp.full((64, 3), 7.0, dtype=cp.float32)
+        dadt_block(
+            empty,
+            empty,
+            cp.eye(4, dtype=cp.float64)[None],
+            cp.ones((64, 3), dtype=cp.float64),
+            out,
+            1e6,
+            MU0_OVER_4PI,
+            stream,
+        )
+        np.testing.assert_array_equal(cp.asnumpy(out), 0.0)
+
+
 def test_update_values_rejects_a_wrong_nonzero_count(cp, cube_subject):
     """A short ``values`` would otherwise be read past its end on the device."""
     pcg = cube_subject.context.solver.pcg
