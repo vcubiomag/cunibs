@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from cunibs import Placement, Subject
+from cunibs._memory import scratch_pool
 from cunibs.mesh import load_mesh
 
 pytestmark = pytest.mark.gpu
@@ -95,10 +96,9 @@ def test_mesh_property_is_the_context_mesh(cube_mesh):
         subj.free()
 
 
-def _held(cp, subj) -> int:
+def _held(cp) -> int:
     """Bytes in use across the pools a call's device arrays can come from."""
-    pools = [subj._scratch, cp.get_default_memory_pool()]
-    return sum(pool.used_bytes() for pool in pools if pool is not None)
+    return scratch_pool().used_bytes() + cp.get_default_memory_pool().used_bytes()
 
 
 @pytest.mark.realmesh
@@ -115,7 +115,7 @@ def test_free_releases_device_memory(cp, patch_mesh):
     subj.free()
     gc.collect()
     assert held() is None
-    assert subj._scratch is None
+    assert scratch_pool().total_bytes() == 0
     assert caller.used_bytes() - baseline < 1_000_000
 
 
@@ -137,10 +137,10 @@ def test_summary_sweep_does_not_grow_pool(
 
     subj.simulate(d70_coil, patch_placement)
     subj.simulate(d70_coil, patch_placement)
-    settled = _held(cp, subj)
+    settled = _held(cp)
     for _ in range(8):
         subj.simulate(d70_coil, patch_placement)
-    assert _held(cp, subj) - settled < 1_000_000
+    assert _held(cp) - settled < 1_000_000
 
 
 @pytest.mark.realmesh
@@ -151,7 +151,7 @@ def test_retained_fields_are_host_backed_and_leave_the_pool_flat(
     subj = fresh_subject(patch_mesh)
 
     subj.simulate(d70_coil, patch_placement)  # warm the context and its caches
-    settled = _held(cp, subj)
+    settled = _held(cp)
     results = list(subj.iter_simulate(d70_coil, [patch_placement] * 4, magnitude=True))
 
     for r in results:
@@ -160,7 +160,7 @@ def test_retained_fields_are_host_backed_and_leave_the_pool_flat(
     # Retained results share the metric inputs rather than copying them per result.
     assert results[0].vols is results[1].vols
     # Holding every result on the host must not have grown the device pools.
-    assert _held(cp, subj) - settled < 1_000_000
+    assert _held(cp) - settled < 1_000_000
 
 
 def test_roi_radius_zero_is_nearest_gm_element(cp, cube_subject, cube_mesh):

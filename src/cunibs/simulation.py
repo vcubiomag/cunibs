@@ -28,7 +28,7 @@ from cunibs._common import (
     write_metrics,
     write_provenance,
 )
-from cunibs._memory import unpooled
+from cunibs._memory import release_scratch, scratch_pool, unpooled
 from cunibs._transfer import AsyncCopier, Fence
 from cunibs.fem import (
     MAX_BLOCK,
@@ -222,7 +222,6 @@ class Subject:
         ] = {}
         self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
-        self._scratch: cp.cuda.MemoryPool | None = None
         self._copier: AsyncCopier | None = None
         # Guards every lazy field above: under the free-threaded build two threads sharing a
         # subject would otherwise each build a solver context, and free() could clear one out
@@ -255,9 +254,7 @@ class Subject:
             if self._copier is not None:
                 self._copier.drain()
                 self._copier = None
-            if self._scratch is not None:
-                self._scratch.free_all_blocks()
-                self._scratch = None
+            release_scratch()
 
     def __enter__(self) -> Self:
         return self
@@ -272,17 +269,6 @@ class Subject:
                 self._copier = AsyncCopier()
             return self._copier
 
-    def _scratch_pool(self) -> cp.cuda.MemoryPool:
-        """The pool a call's temporaries come from, kept until :meth:`free`.
-
-        Keeping it lets repeated calls reuse its blocks rather than allocate and release them each
-        time.
-        """
-        with self._lock:
-            if self._scratch is None:
-                self._scratch = cp.cuda.MemoryPool()
-            return self._scratch
-
     def _release_free_blocks(self) -> None:
         """Return every free block a pool holds to the device, after an allocation failed.
 
@@ -290,9 +276,8 @@ class Subject:
         reach of the others until handed back. The default pool is the caller's, but its free
         blocks are unused memory, and a failed allocation is the moment they are needed.
         """
-        for pool in (self._scratch, cp.get_default_memory_pool()):
-            if pool is not None:
-                pool.free_all_blocks()
+        release_scratch()
+        cp.get_default_memory_pool().free_all_blocks()
 
     def _build[T](self, build: Callable[[], T]) -> T:
         """Run a build of cached state, giving each array it keeps its own allocation.
@@ -372,7 +357,7 @@ class Subject:
         from cunibs.uq import build_conductivity_uq_precompute
 
         ctx = self.context
-        with cp.cuda.using_allocator(self._scratch_pool().malloc):
+        with cp.cuda.using_allocator(scratch_pool().malloc):
             tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
         with self._lock:
             if tags not in self._conductivity_uq_pre:
@@ -572,7 +557,7 @@ class Subject:
     ) -> Iterator[FieldResult]:
         """Solve ``sites`` in chunks, reducing inside a scratch pool and yielding outside it.
 
-        The reduction runs under the subject's scratch allocator, whose blocks every chunk and
+        The reduction runs under the scratch allocator, whose blocks every chunk and
         every later call reuse, but the yield happens after the allocator is popped: control
         passes to caller code between chunks, and its allocations must not land in our pool.
         """
@@ -580,7 +565,7 @@ class Subject:
             return
         ctx = self.context
         region = self._region_slice(DEFAULT_REGION)
-        temp_pool = self._scratch_pool()
+        temp_pool = scratch_pool()
         with cp.cuda.using_allocator(temp_pool.malloc):
             dip_pos_m = cp.asarray(coil.positions_m)
             dip_moment = cp.asarray(coil.moments)
@@ -804,7 +789,7 @@ class Subject:
 
         ctx = self.context
         pre = self._conductivity_uq_precompute(config)
-        temp_pool = self._scratch_pool()
+        temp_pool = scratch_pool()
         with cp.cuda.using_allocator(temp_pool.malloc):
             tissues = self._needed_tissues(moments, record_rois)
         op = self._recovery_operator(recovery, tissues)

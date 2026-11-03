@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, TypeVar
 
@@ -34,6 +35,31 @@ class Arena:
         """A copy of ``a`` in the caller's allocator, for an array computed among temporaries."""
         with self.resident():
             return a.copy()
+
+
+_scratch: cp.cuda.MemoryPool | None = None
+_scratch_lock = threading.Lock()
+
+
+def scratch_pool() -> cp.cuda.MemoryPool:
+    """The pool that per-call temporaries come from, shared by the whole process and never dropped.
+
+    A block released after its pool is gone strands the pool's chunk, and a call's temporaries can
+    outlive whatever owned a pool: another thread may still be using them, or may not yet have
+    run the release of one it created.
+    """
+    global _scratch
+    with _scratch_lock:
+        if _scratch is None:
+            _scratch = cp.cuda.MemoryPool()
+        return _scratch
+
+
+def release_scratch() -> None:
+    """Return the scratch pool's free blocks to the device, if it was ever used."""
+    with _scratch_lock:
+        if _scratch is not None:
+            _scratch.free_all_blocks()
 
 
 def unpooled(size: int) -> cp.cuda.MemoryPointer:
