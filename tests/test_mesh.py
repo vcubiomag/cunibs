@@ -363,6 +363,19 @@ def test_parser_rejects_a_mesh_with_no_tetrahedra(tmp_path):
         parse_msh_binary(path)
 
 
+@pytest.mark.parametrize("ids", [[2, 1, 3, 4, 5], [1, 2, 3, 4, 7]], ids=["permuted", "sparse"])
+def test_parser_rejects_node_ids_that_are_not_their_positions(tmp_path, ids):
+    """Elements name nodes by id, and the reader resolves an id as a position in the table."""
+    blob = bytearray(pack_msh(_NODES, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS))
+    start = blob.index(b"$Nodes\n5\n") + len(b"$Nodes\n5\n")
+    for i, node_id in enumerate(ids):
+        struct.pack_into("<i", blob, start + 28 * i, node_id)
+    path = tmp_path / "ids.msh"
+    path.write_bytes(blob)
+    with pytest.raises(ValueError, match=r"node ids must be 1\.\.N"):
+        parse_msh_binary(path)
+
+
 @pytest.mark.parametrize("bad_id", [0, 6])
 def test_parser_rejects_out_of_range_node_ids(tmp_path, bad_id):
     """Gmsh node ids are 1-based; 0 underflows to -1 and 6 overruns a 5-node table."""

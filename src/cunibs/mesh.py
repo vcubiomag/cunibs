@@ -151,12 +151,17 @@ def _read_format(cursor: _MshCursor) -> None:
     cursor.expect("$EndMeshFormat")
 
 
-def _read_nodes(cursor: _MshCursor) -> tuple[int, npt.NDArray[np.float64]]:
+def _read_nodes(cursor: _MshCursor) -> npt.NDArray[np.float64]:
     cursor.expect("$Nodes")
     num_nodes = cursor.count("node")
-    nodes_xyz = cursor.block(_NODE_DTYPE, num_nodes)["xyz"]
+    nodes = cursor.block(_NODE_DTYPE, num_nodes)
     cursor.expect("$EndNodes")
-    return num_nodes, nodes_xyz
+    # Elements name a node by its position, so the ids must be those positions. Rising from 1 to
+    # N leaves no other values for them.
+    ids = nodes["id"]
+    if num_nodes and not (ids[0] == 1 and ids[-1] == num_nodes and (ids[1:] > ids[:-1]).all()):
+        cursor.fail("node ids must be 1..N in file order")
+    return nodes["xyz"]
 
 
 def _known_surfaces(block: npt.NDArray[np.int32]) -> _ElementBlock:
@@ -237,7 +242,6 @@ def _node_id_error(path: Path, what: str) -> ValueError:
 
 def _reindex_nodes(
     nodes_xyz: npt.NDArray[np.float64],
-    num_nodes: int,
     tet_nodes: npt.NDArray[np.int32],
     surf_tris: npt.NDArray[np.int32],
     path: Path,
@@ -248,6 +252,7 @@ def _reindex_nodes(
     that shift is the whole answer, the id-to-index map is the identity, so the
     gather is skipped entirely.
     """
+    num_nodes = nodes_xyz.shape[0]
     used = np.zeros(num_nodes, dtype=bool)
     # Viewing as unsigned turns a negative index, meaning a node id of 0 or less in the
     # file, into a huge one, so numpy's own bounds check covers both ends in one pass.
@@ -294,7 +299,7 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
     with mesh_file.open("rb") as f:
         cursor = _MshCursor(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ), mesh_file)
         _read_format(cursor)
-        num_nodes, nodes_xyz = _read_nodes(cursor)
+        nodes_xyz = _read_nodes(cursor)
         tet_blocks, surf_blocks = _read_element_blocks(cursor)
 
         tet = _join_blocks(tet_blocks, _ELEMENT_NODES[_ELEM_TYPE_TET])
@@ -305,7 +310,7 @@ def parse_msh_binary(mesh_file: Path) -> MeshArrays:
 
         surface = _join_blocks(surf_blocks, _ELEMENT_NODES[_ELEM_TYPE_TRIANGLE])
         nodes_mm, tet_nodes, surf_tris = _reindex_nodes(
-            nodes_xyz, num_nodes, tet.nodes - 1, surface.nodes - 1, mesh_file
+            nodes_xyz, tet.nodes - 1, surface.nodes - 1, mesh_file
         )
         _reject_nonfinite_nodes(nodes_mm, mesh_file)
         return MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surface.tags)
