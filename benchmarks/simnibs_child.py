@@ -90,10 +90,12 @@ def op_forward(p, a):
     # A user's run starts by reading the mesh from a .msh file, so that read is what is timed,
     # not building it from the request's arrays.
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "mesh.msh"
-        mesh_io.write_msh(_mesh(a), str(path), mode="binary")
+        path = p.get("msh_path")
+        if path is None:
+            path = str(Path(tmp) / "mesh.msh")
+            mesh_io.write_msh(_mesh(a), path, mode="binary")
         with _clock(setup, "mesh_read_s"):
-            msh = mesh_io.read_msh(str(path))
+            msh = mesh_io.read_msh(path)
     with _clock(setup, "conductivity_s"):
         cond = _conductivity(msh)
     with _clock(setup, "coil_load_s"):
@@ -405,18 +407,28 @@ def op_throughput(p, a):
     """Solve one subject's request in ``processes`` SimNIBS processes at once, as a cohort would.
 
     The CPUs this process may use are split evenly between them. Returns the wall time for all
-    of them together and each one's own phase timings.
+    of them together and each one's own phase timings. The .msh they read is written before the
+    clock starts: a user already has it on disk.
     """
+    from simnibs import mesh_io
+
     n = p["processes"]
     threads = max(1, len(os.sched_getaffinity(0)) // n)
-    header = {k: v for k, v in p.items() if k != "processes"} | {
-        "op": "forward",
-        "fields": False,
-    }
     env = os.environ | dict.fromkeys(THREAD_VARS, str(threads))
     with tempfile.TemporaryDirectory() as tmp:
+        msh = str(Path(tmp) / "mesh.msh")
+        mesh_io.write_msh(_mesh(a), msh, mode="binary")
+        header = {k: v for k, v in p.items() if k != "processes"} | {
+            "op": "forward",
+            "fields": False,
+            "msh_path": msh,
+        }
         request = Path(tmp) / "one.request.npz"
-        np.savez(request, __request__=np.frombuffer(json.dumps(header).encode(), np.uint8), **a)
+        np.savez(
+            request,
+            __request__=np.frombuffer(json.dumps(header).encode(), np.uint8),
+            frames=a["frames"],
+        )
         responses = [Path(tmp) / f"{i}.response.npz" for i in range(n)]
         t0 = time.perf_counter()
         procs = [
