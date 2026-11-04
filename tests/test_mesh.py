@@ -321,6 +321,45 @@ def test_parser_rejects_a_node_block_longer_than_the_file(tmp_path):
         parse_msh_binary(path)
 
 
+def test_parser_rejects_a_negative_element_count_in_a_skipped_block(tmp_path):
+    """A negative count must not walk the cursor backwards: this pair of blocks would loop forever."""
+    blob = pack_msh(
+        _NODES,
+        _TETS_1B,
+        _TET_TAGS,
+        np.empty((0, 3), np.int32),
+        np.empty(0, np.int32),
+        extra_blocks=[(15, 1, b"\0" * 16), (1, -2, b"")],
+    )
+    path = tmp_path / "negative.msh"
+    path.write_bytes(blob.replace(b"$Elements\n0\n", b"$Elements\n3\n"))
+    with pytest.raises(ValueError, match="extends past"):
+        parse_msh_binary(path)
+
+
+@pytest.mark.parametrize("count", [-1, -100_000, 1_000_000])
+def test_parser_rejects_a_skipped_block_with_a_bad_count(tmp_path, count):
+    """A count steering the cursor before the file start must not reach struct as an offset."""
+    from cunibs import validate_mesh
+
+    blob = bytearray(
+        pack_msh(
+            _NODES,
+            _TETS_1B,
+            _TET_TAGS,
+            _TRIS_1B,
+            _TRI_TAGS,
+            extra_blocks=[_element_block(1, 1, 2)],
+        )
+    )
+    struct.pack_into("<3i", blob, blob.rindex(struct.pack("<3i", 1, 1, 2)), 1, count, 2)
+    path = tmp_path / "badskip.msh"
+    path.write_bytes(blob)
+    with pytest.raises(ValueError, match="past the end of the file"):
+        parse_msh_binary(path)
+    assert not validate_mesh(path).ok
+
+
 def test_parser_rejects_a_non_numeric_count(tmp_path):
     blob = pack_msh(_NODES, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS)
     path = tmp_path / "badcount.msh"
@@ -357,6 +396,26 @@ def test_parser_rejects_a_mesh_with_no_tetrahedra(tmp_path):
     path.write_bytes(blob.replace(empty_tet_header, b"", 1))
     with pytest.raises(ValueError, match="no tetrahedron block"):
         parse_msh_binary(path)
+
+
+def test_parser_rejects_a_tetrahedron_block_holding_nothing(tmp_path):
+    from cunibs import validate_mesh
+
+    empty_tri, empty_tag = np.empty((0, 3), np.int32), np.empty(0, np.int32)
+    path = tmp_path / "emptytets.msh"
+    path.write_bytes(
+        pack_msh(
+            _NODES,
+            np.empty((0, 4), np.int32),
+            empty_tag,
+            empty_tri,
+            empty_tag,
+            extra_blocks=[_element_block(15, 1, 1)],
+        )
+    )
+    with pytest.raises(ValueError, match="no tetrahedron block"):
+        parse_msh_binary(path)
+    assert not validate_mesh(path).ok
 
 
 @pytest.mark.parametrize("ids", [[2, 1, 3, 4, 5], [1, 2, 3, 4, 7]], ids=["permuted", "sparse"])
@@ -499,7 +558,7 @@ def test_validate_mesh_reports_a_degenerate_tet_without_a_gpu(tmp_path):
     report = validate_mesh(_write_mesh(tmp_path, nodes, tets, tags))
     assert not report.ok
     assert report.n_nonpositive_volume == 1
-    assert "zero, negative or non-finite volume" in report.errors[0]
+    assert "zero or non-finite volume" in report.errors[0]
 
 
 @pytest.mark.gpu
@@ -507,7 +566,8 @@ def test_validate_mesh_volume_verdict_agrees_with_build_context(tmp_path):
     """Two implementations of one predicate must not drift.
 
     validate_mesh computes volumes on the host and build_context on the device, so a mesh either
-    passes both or fails both; otherwise screening a cohort would admit meshes the solver rejects.
+    passes both or fails both; otherwise screening a cohort would admit meshes the solver rejects,
+    or turn away meshes it solves.
     """
     from cunibs import load_mesh, validate_mesh
     from cunibs.fem import build_context
@@ -516,6 +576,13 @@ def test_validate_mesh_volume_verdict_agrees_with_build_context(tmp_path):
     good = _write_mesh(tmp_path, nodes, tets, tags, name="good.msh")
     assert validate_mesh(good).ok
     build_context(load_mesh(good))  # must not raise
+
+    tets[0, [0, 1]] = tets[0, [1, 0]]
+    inverted = _write_mesh(tmp_path, nodes, tets, tags, name="inverted.msh")
+    report = validate_mesh(inverted)
+    assert report.ok and any("inverted" in w for w in report.warnings)
+    assert report.n_nonpositive_volume == 1
+    build_context(load_mesh(inverted))  # must not raise
 
     nodes[3] = nodes[2]
     bad = _write_mesh(tmp_path, nodes, tets, tags, name="bad.msh")
@@ -576,6 +643,45 @@ def test_validate_mesh_returns_a_reason_instead_of_raising(tmp_path):
     assert not report.ok and report.errors
 
 
+def test_validate_mesh_reports_a_tetrahedron_block_with_no_elements(tmp_path):
+    from cunibs import validate_mesh
+
+    blob = pack_msh(
+        _NODES,
+        np.empty((0, 4), np.int32),
+        np.empty(0, np.int32),
+        np.empty((0, 3), np.int32),
+        np.empty(0, np.int32),
+        extra_blocks=[(15, 1, b"\0" * 16)],
+    )
+    path = tmp_path / "empty_block.msh"
+    path.write_bytes(blob)
+    report = validate_mesh(path)
+    assert not report.ok and "no tetrahedron block" in report.errors[0]
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"tet_tags": _TET_TAGS[:0]}, "differ in length"),
+        ({"surf_tags": np.array([1005, 1005], np.int32)}, "differ in length"),
+        ({"tet_nodes": np.array([[0, 1, 2]], np.int32)}, "expected"),
+        ({"nodes_mm": _NODES[:, :2]}, "expected"),
+    ],
+)
+def test_head_mesh_rejects_arrays_that_disagree_in_shape(change, match):
+    """Tags of the wrong length built a context, with each tetrahedron given another's tissue."""
+    arrays = {
+        "nodes_mm": _NODES,
+        "tet_nodes": _TETS_1B - 1,
+        "tet_tags": _TET_TAGS,
+        "surf_tris": _TRIS_1B - 1,
+        "surf_tags": _TRI_TAGS,
+    }
+    with pytest.raises(ValueError, match=match):
+        HeadMesh(**(arrays | change))
+
+
 # --- HeadMesh.save ----------------------------------------------------------------------------
 
 
@@ -621,6 +727,21 @@ def test_msh_cannot_carry_eeg_positions(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("n_tet_tags", "n_surf_tags", "match"), [(2, 1, "tet_tags"), (1, 2, "surf_tags")]
+)
+def test_head_mesh_rejects_a_tag_array_of_the_wrong_length(n_tet_tags, n_surf_tags, match):
+    """The device gather wraps a short tag array, which assigns tissues silently and wrongly."""
+    with pytest.raises(ValueError, match=match):
+        HeadMesh(
+            _NODES[:4],
+            _TETS_1B - 1,
+            np.full(n_tet_tags, 2, np.int32),
+            _TRIS_1B - 1,
+            np.full(n_surf_tags, 1005, np.int32),
+        )
+
+
 def _rewrite_h5(path, **changes):
     import h5py
 
@@ -652,6 +773,20 @@ def test_h5_load_applies_the_msh_checks(tmp_path, changes, match):
         load_mesh(path)
 
 
+def test_validate_mesh_reports_a_corrupt_h5_instead_of_raising(tmp_path):
+    import h5py
+
+    from cunibs import validate_mesh
+
+    path = tmp_path / "mesh.h5"
+    load_mesh(_write(tmp_path)).save(path)
+    with h5py.File(path, "r+") as f:
+        del f["nodes_mm"]
+        f.create_group("nodes_mm")
+    report = validate_mesh(path)
+    assert not report.ok and "corrupt HDF5" in report.errors[0]
+
+
 @pytest.mark.realmesh
 def test_patch_round_trips_through_h5(tmp_path, patch_mesh):
     patch_mesh.save(tmp_path / "patch.h5")
@@ -672,3 +807,12 @@ def test_reference_mesh_round_trips_with_its_caps(tmp_path, reference_mesh_path)
     assert from_h5.keys() == from_csv.keys()
     for label, xyz in from_csv.items():
         np.testing.assert_array_equal(from_h5[label], xyz)
+
+
+@pytest.mark.parametrize(("name", "value"), [("tet_tags", 258), ("surf_tags", 66541)])
+def test_save_refuses_a_tag_the_file_cannot_hold(tmp_path, name, value):
+    """Stored narrowed, tag 258 would reload as 2, which is gray matter."""
+    mesh = load_mesh(_write(tmp_path))
+    getattr(mesh, name)[0] = value
+    with pytest.raises(ValueError, match=name):
+        mesh.save(tmp_path / "saved.h5")

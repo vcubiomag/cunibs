@@ -9,6 +9,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn
 
+import cupy as cp
 import h5py
 import numpy as np
 import numpy.typing as npt
@@ -128,16 +129,15 @@ class _MshCursor:
         self.pos += size
         return values
 
-    def block(self, dtype: np.dtype, count: int) -> npt.NDArray:
-        n_bytes = count * dtype.itemsize
-        if count < 0 or self.pos + n_bytes > len(self.mm):
-            self.fail("truncated: a block extends past the end of the file")
-        out = np.frombuffer(self.mm, dtype=dtype, count=count, offset=self.pos)
-        self.pos += n_bytes
-        return out
-
     def skip(self, n_bytes: int) -> None:
+        if n_bytes < 0 or self.pos + n_bytes > len(self.mm):
+            self.fail("truncated: a block extends past the end of the file")
         self.pos += n_bytes
+
+    def block(self, dtype: np.dtype, count: int) -> npt.NDArray:
+        start = self.pos
+        self.skip(count * dtype.itemsize)
+        return np.frombuffer(self.mm, dtype=dtype, count=count, offset=start)
 
 
 def _read_format(cursor: _MshCursor) -> None:
@@ -216,7 +216,7 @@ def _read_element_blocks(cursor: _MshCursor) -> tuple[list[_ElementBlock], list[
         consumed += count
 
     cursor.expect("$EndElements")
-    if not tet_blocks:
+    if not any(block.nodes.size for block in tet_blocks):
         cursor.fail("no tetrahedron block")
     return tet_blocks, surf_blocks
 
@@ -278,7 +278,7 @@ def _reindex_nodes(
             f"{path}: {int(orphaned.any(axis=1).sum())} surface triangles reference nodes "
             "that no tetrahedron uses"
         )
-    return np.ascontiguousarray(nodes_xyz[unique_ids]), node_index[tet_nodes], surf_tris
+    return nodes_xyz[unique_ids], node_index[tet_nodes], surf_tris
 
 
 def _reject_nonfinite_nodes(nodes_mm: npt.NDArray[np.float64], path: Path) -> None:
@@ -378,7 +378,6 @@ def _pack_msh(
     return b"".join(parts)
 
 
-_H5_MAGIC = b"\x89HDF\r\n\x1a\n"
 _H5_FORMAT_VERSION = 1
 # Tags are stored at the narrowest width that holds every known key and widened on load. Nothing
 # is compressed, because loading has to stay faster than parsing the equivalent .msh.
@@ -392,50 +391,63 @@ _H5_DTYPES = {
 EEG_POSITIONS_GROUP = "eeg_positions"
 
 
-def is_hdf5(path: str | Path) -> bool:
-    with Path(path).open("rb") as f:
-        return f.read(len(_H5_MAGIC)) == _H5_MAGIC
-
-
 def _write_h5(arrays: MeshArrays, path: Path, caps: dict[str, str]) -> None:
     with h5py.File(path, "w") as f:
         f.attrs["format_version"] = _H5_FORMAT_VERSION
         for name, dtype in _H5_DTYPES.items():
-            f.create_dataset(name, data=np.asarray(getattr(arrays, name)).astype(dtype))
+            data = getattr(arrays, name)
+            if (
+                data.size
+                and dtype.kind == "u"
+                and not 0 <= data.min() <= data.max() < 256**dtype.itemsize
+            ):
+                raise ValueError(f"{name} holds values outside the file's {dtype} range.")
+            f.create_dataset(name, data=data.astype(dtype, copy=False))
         if caps:
             group = f.create_group(EEG_POSITIONS_GROUP)
             for cap, text in caps.items():
                 group[cap] = text
 
 
-def parse_h5(mesh_file: Path) -> MeshArrays:
-    """Read a mesh written by :meth:`HeadMesh.save`, applying the checks the .msh parser makes."""
-    with h5py.File(mesh_file, "r") as f:
-        stored = int(f.attrs.get("format_version", 0))
-        if stored != _H5_FORMAT_VERSION:
-            raise ValueError(
-                f"{mesh_file}: mesh format version {stored} is not readable by this version of "
-                f"cuNIBS (expected {_H5_FORMAT_VERSION})"
-            )
-        missing = [name for name in _H5_DTYPES if name not in f]
-        if missing:
-            raise ValueError(f"{mesh_file}: no {', '.join(missing)} dataset")
-        arrays = MeshArrays(
-            f["nodes_mm"][...],
-            f["tet_nodes"][...],
-            f["tet_tags"][...].astype(np.int32),
-            f["surf_tris"][...],
-            f["surf_tags"][...].astype(np.int32),
-        )
-
+def _shape_problem(arrays: MeshArrays) -> str | None:
+    """What is wrong with the arrays' shapes, or ``None``. Nothing on the device checks them."""
     for name, width in (("nodes_mm", 3), ("tet_nodes", 4), ("surf_tris", 3)):
         shape = getattr(arrays, name).shape
         if len(shape) != 2 or shape[1] != width:
-            raise ValueError(f"{mesh_file}: {name} has shape {shape}, expected (n, {width})")
-    if arrays.tet_tags.shape[0] != arrays.tet_nodes.shape[0]:
-        raise ValueError(f"{mesh_file}: tet_tags and tet_nodes differ in length")
-    if arrays.surf_tags.shape[0] != arrays.surf_tris.shape[0]:
-        raise ValueError(f"{mesh_file}: surf_tags and surf_tris differ in length")
+            return f"{name} has shape {shape}, expected (n, {width})"
+    if arrays.tet_tags.shape != arrays.tet_nodes.shape[:1]:
+        return "tet_tags and tet_nodes differ in length"
+    if arrays.surf_tags.shape != arrays.surf_tris.shape[:1]:
+        return "surf_tags and surf_tris differ in length"
+    return None
+
+
+def parse_h5(mesh_file: Path) -> MeshArrays:
+    """Read a mesh written by :meth:`HeadMesh.save`, applying the checks the .msh parser makes."""
+    try:
+        with h5py.File(mesh_file, "r") as f:
+            stored = int(f.attrs.get("format_version", 0))
+            if stored != _H5_FORMAT_VERSION:
+                raise ValueError(
+                    f"{mesh_file}: mesh format version {stored} is not readable by this version "
+                    f"of cuNIBS (expected {_H5_FORMAT_VERSION})"
+                )
+            missing = [name for name in _H5_DTYPES if name not in f]
+            if missing:
+                raise ValueError(f"{mesh_file}: no {', '.join(missing)} dataset")
+            arrays = MeshArrays(
+                f["nodes_mm"][...].astype(np.float64, copy=False),
+                f["tet_nodes"][...].astype(np.int32, copy=False),
+                f["tet_tags"][...].astype(np.int32),
+                f["surf_tris"][...].astype(np.int32, copy=False),
+                f["surf_tags"][...].astype(np.int32),
+            )
+    # h5py reports damage inside a valid file as whichever of these its failing step raises.
+    except (RuntimeError, KeyError, TypeError) as exc:
+        raise ValueError(f"{mesh_file}: corrupt HDF5 file: {exc}") from exc
+
+    if (problem := _shape_problem(arrays)) is not None:
+        raise ValueError(f"{mesh_file}: {problem}")
     if arrays.tet_nodes.shape[0] == 0:
         raise ValueError(f"{mesh_file}: no tetrahedra")
     _reject_unknown_volume_tags(arrays.tet_tags, mesh_file)
@@ -452,7 +464,7 @@ def parse_h5(mesh_file: Path) -> MeshArrays:
 
 def parse_mesh(mesh_file: Path) -> MeshArrays:
     """Parse a mesh in either format :meth:`HeadMesh.save` writes, told apart by content."""
-    return parse_h5(mesh_file) if is_hdf5(mesh_file) else parse_msh_binary(mesh_file)
+    return parse_h5(mesh_file) if h5py.is_hdf5(mesh_file) else parse_msh_binary(mesh_file)
 
 
 def _eeg_caps(source: str | Path | None) -> dict[str, str]:
@@ -464,14 +476,6 @@ def _eeg_caps(source: str | Path | None) -> dict[str, str]:
     if not files:
         raise ValueError(f"{source}: no EEG cap CSV files")
     return {p.stem: p.read_text() for p in files}
-
-
-def _on_host(array: Any) -> npt.NDArray[Any]:
-    """Copy a device-resident array to the host, passing a host array straight through.
-
-    Duck-typed on cupy's ``.get()`` so that this module stays importable without cupy.
-    """
-    return array if isinstance(array, np.ndarray) else array.get()
 
 
 class HeadMesh:
@@ -492,8 +496,8 @@ class HeadMesh:
     are built on the device with the rest of the solver context; see
     :func:`~cunibs.fem.solve.skin_triangle_normals` and ``SolverContext.skin_tri_normals``.
 
-    ``validate`` checks that every element names a node of the mesh, since nothing on the device
-    bounds-checks them. :func:`load_mesh` has already done so.
+    ``validate`` checks the arrays' shapes and that every element names a node of the mesh, since
+    nothing on the device bounds-checks them. :func:`load_mesh` has already done so.
     """
 
     def __init__(
@@ -507,6 +511,11 @@ class HeadMesh:
         validate: bool = True,
     ) -> None:
         if validate:
+            problem = _shape_problem(
+                MeshArrays(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags)
+            )
+            if problem is not None:
+                raise ValueError(problem)
             for what, ids in (("tetrahedron", tet_nodes), ("surface triangle", surf_tris)):
                 if ids.size and not (
                     int(ids.min()) >= 0 and int(ids.max()) < nodes_mm.shape[0]
@@ -521,22 +530,20 @@ class HeadMesh:
         self._surf_tags = surf_tags
         self._surfaces: dict[int, npt.NDArray[np.int32]] = {}
 
-    # None of the cached_property members below holds a lock. cached_property has held none since
-    # 3.12, so under the free-threaded build two threads racing on one can both compute it. All are
-    # pure functions of the arrays handed to __init__, so the loser's result is identical and the
-    # dict store that publishes it is atomic. A lock would buy nothing here and would make HeadMesh
-    # unpicklable.
+    # Two threads racing on a cached_property below can both compute it. All are pure functions of
+    # the arrays handed to __init__, so the loser's result is identical and the dict store that
+    # publishes it is atomic. A lock would make HeadMesh unpicklable.
     @cached_property
     def nodes_mm(self) -> npt.NDArray[np.float64]:
-        return _on_host(self._nodes_mm)
+        return cp.asnumpy(self._nodes_mm)
 
     @cached_property
     def tet_nodes(self) -> npt.NDArray[np.int32]:
-        return _on_host(self._tet_nodes)
+        return cp.asnumpy(self._tet_nodes)
 
     @cached_property
     def tet_tags(self) -> npt.NDArray[np.int32]:
-        return _on_host(self._tet_tags)
+        return cp.asnumpy(self._tet_tags)
 
     @property
     def skin_tris(self) -> npt.NDArray[np.int32]:
@@ -559,12 +566,12 @@ class HeadMesh:
     @cached_property
     def surf_tags(self) -> npt.NDArray[np.int32]:
         """Surface tag per triangle in :attr:`surf_tris`, on the host."""
-        return _on_host(self._surf_tags)
+        return cp.asnumpy(self._surf_tags)
 
     @cached_property
     def surf_tris(self) -> npt.NDArray[np.int32]:
         """Every surface triangle, of every tag, on the host."""
-        return _on_host(self._surf_tris)
+        return cp.asnumpy(self._surf_tris)
 
     @property
     def surface_tags(self) -> tuple[int, ...]:
@@ -591,7 +598,7 @@ class HeadMesh:
         """Triangles of one tag, split out of :attr:`surf_tris` on first request and cached."""
         cached = self._surfaces.get(tag)
         if cached is None:
-            cached = np.ascontiguousarray(self.surf_tris[self.surf_tags == tag])
+            cached = self.surf_tris[self.surf_tags == tag]
             self._surfaces[tag] = cached
         return cached
 
@@ -705,23 +712,21 @@ class MeshReport:
 def _volumes_and_flatness(
     nodes_mm: npt.NDArray[np.float64], tet_nodes: npt.NDArray[np.int32]
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Signed volumes and flatness in one pass; the four vertex gathers dominate.
-
-    The volume sign convention is the one ``build_context`` checks.
-    """
+    """Signed volumes and flatness in one pass; the four vertex gathers dominate."""
     p0, e1, e2, e3 = (nodes_mm.take(column, axis=0) for column in tet_nodes.T)
     e1 -= p0
     e2 -= p0
     e3 -= p0
-    vols = np.einsum("ij,ij->i", np.cross(e1, e2), e3) / 6.0
 
     def sq(d: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         return np.einsum("ij,ij->i", d, d)
 
-    # Over the six edges, sum |pi - pj|^2 = 4 sum |ei|^2 - |sum ei|^2 with e0 = 0, which avoids
-    # materialising the three edges that do not touch p0.
-    edges_sq = 4.0 * (sq(e1) + sq(e2) + sq(e3)) - sq(e1 + e2 + e3)
-    with np.errstate(divide="ignore", invalid="ignore"):
+    # Coordinates near float64's range overflow here, and the caller reports the non-finite result.
+    with np.errstate(all="ignore"):
+        vols = np.einsum("ij,ij->i", np.cross(e1, e2), e3) / 6.0
+        # Over the six edges, sum |pi - pj|^2 = 4 sum |ei|^2 - |sum ei|^2 with e0 = 0, which avoids
+        # materialising the three edges that do not touch p0.
+        edges_sq = 4.0 * (sq(e1) + sq(e2) + sq(e3)) - sq(e1 + e2 + e3)
         flatness = 12.0 * np.cbrt(3.0 * np.abs(vols)) ** 2 / edges_sq
     return vols, np.where(np.isfinite(flatness), flatness, 0.0)
 
@@ -729,9 +734,11 @@ def _volumes_and_flatness(
 def validate_mesh(mesh_file: str | Path) -> MeshReport:
     """Check a mesh on the host, without building a solver context.
 
-    Screens for everything a mesh can be rejected for, including the zero and inverted tetrahedra
-    that :func:`~cunibs.fem.build_context` otherwise only catches after a CUDA context, a full
-    upload and a Morton reorder.
+    Screens for everything a mesh can be rejected for, including the zero-volume tetrahedra that
+    :func:`~cunibs.fem.build_context` otherwise only catches after a CUDA context, a full upload
+    and a Morton reorder. An inverted tetrahedron is only a warning, because the solver works from
+    the magnitude of its volume and the field does not depend on its node order. A mesh in several
+    pieces passes here and fails at its first solve.
 
     Problems are collected rather than raised, so a cohort driver gets a reason per mesh instead of
     an exception on the first bad one. ``build_context`` remains the authority on the volume test:
@@ -749,10 +756,14 @@ def validate_mesh(mesh_file: str | Path) -> MeshReport:
     nodes_mm, tet_nodes = arrays.nodes_mm, arrays.tet_nodes
     vols, flatness = _volumes_and_flatness(nodes_mm, tet_nodes)
 
-    n_bad = int(np.count_nonzero((vols <= 0.0) | ~np.isfinite(vols)))
+    n_bad = int(np.count_nonzero((vols == 0.0) | ~np.isfinite(vols)))
     if n_bad:
         subject = "tetrahedron has" if n_bad == 1 else "tetrahedra have"
-        errors.append(f"{n_bad} {subject} zero, negative or non-finite volume")
+        errors.append(f"{n_bad} {subject} zero or non-finite volume")
+    n_inverted = int(np.count_nonzero(vols < 0.0))
+    if n_inverted:
+        subject = "tetrahedron has" if n_inverted == 1 else "tetrahedra have"
+        warnings.append(f"{n_inverted} {subject} inverted node order, which the solver accepts")
 
     tags, counts = np.unique(arrays.tet_tags, return_counts=True)
     tag_counts = {int(t): int(c) for t, c in zip(tags, counts, strict=True)}
@@ -791,7 +802,7 @@ def validate_mesh(mesh_file: str | Path) -> MeshReport:
         tag_counts=tag_counts,
         missing_tags=missing,
         bbox_mm=(tuple(lo.tolist()), tuple(hi.tolist())),
-        n_nonpositive_volume=n_bad,
-        min_abs_volume_mm3=float(np.abs(vols).min()) if vols.size else None,
-        min_flatness=float(flatness.min()) if flatness.size else None,
+        n_nonpositive_volume=n_bad + n_inverted,
+        min_abs_volume_mm3=float(np.abs(vols).min()),
+        min_flatness=float(flatness.min()),
     )
