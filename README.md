@@ -152,6 +152,11 @@ Save and load results as HDF5 with `result.save(path)` and
 `FieldResult.load(path)`. Saved files record the software versions, GPU, mesh,
 and coil used.
 
+Full-volume arrays follow `subject.mesh`, which reorders the elements and nodes
+of the file you loaded. Index them with `result.tet_tags` and
+`result.barycenters_mm`, or with `subject.mesh`, not with the arrays from
+`load_mesh`.
+
 The `recovery` argument selects how the reported field is computed from the
 finite-element solution. The default, `"harmonic"`, is accurate at tissue
 interfaces. Use `"spr_tissue"` or `"spr_global"` to compare with SimNIBS
