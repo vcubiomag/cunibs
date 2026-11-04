@@ -176,6 +176,8 @@ print(uq.max_local_cov())
 print(uq.peak_samples)
 ```
 
+A tissue named in `tissue_cov` that the mesh does not hold is skipped with a warning.
+
 `tissue_cov` sets the coefficient of variation for each tissue. Only the tissues
 it names are varied. Samples are lognormal by default.
 

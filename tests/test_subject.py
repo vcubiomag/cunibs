@@ -370,3 +370,22 @@ def test_a_roi_outside_the_mesh_is_rejected(
         subj.simulate(d70_coil, patch_placement, 1e6, record_rois={"a": roi})
     with pytest.raises(ValueError, match="outside this mesh"):
         resolve_target(subj, roi)
+
+
+@pytest.mark.realmesh
+def test_uq_skips_a_named_tissue_the_mesh_does_not_hold(
+    fresh_subject, patch_mesh, d70_coil, patch_placement
+):
+    absent = next(t for t in (6, 7, 8, 9, 10) if t not in patch_mesh.tet_tags)
+    subj = fresh_subject(patch_mesh)
+    with_absent = ConductivityUQConfig(n_samples=4, seed=0, tissue_cov={2: 0.2, absent: 0.1})
+    with pytest.warns(UserWarning, match="Skipping tissues"):
+        skipped = subj.simulate_conductivity_uq(d70_coil, patch_placement, with_absent, 1e6)
+    alone = subj.simulate_conductivity_uq(
+        d70_coil,
+        patch_placement,
+        ConductivityUQConfig(n_samples=4, seed=0, tissue_cov={2: 0.2}),
+        1e6,
+    )
+    assert skipped.perturbed_tags == (2,)
+    np.testing.assert_array_equal(skipped.peak_samples, alone.peak_samples)

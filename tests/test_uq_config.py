@@ -37,7 +37,13 @@ def test_a_cov_for_a_tissue_held_fixed_is_rejected():
         ConductivityUQConfig(tissue_cov={2: 0.2, 3: 0.1}, perturbed_tags=(2,))
 
 
-def test_a_tissue_missing_from_the_mesh_is_rejected():
+def test_a_tissue_missing_from_the_mesh_is_skipped_with_a_warning():
+    config = ConductivityUQConfig(tissue_cov={2: 0.2, 9: 0.1})
+    with pytest.warns(UserWarning, match=r"Skipping tissues \[9\]"):
+        assert config.tags_for(MESH_TAGS) == (2,)
+
+
+def test_naming_only_missing_tissues_is_rejected():
     with pytest.raises(ValueError, match="holds none of their elements"):
         ConductivityUQConfig(tissue_cov={9: 0.1}).tags_for(MESH_TAGS)
 

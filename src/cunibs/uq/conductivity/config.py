@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, get_args
 
@@ -124,8 +125,8 @@ class ConductivityUQConfig:
     def tags_for(self, mesh_tags: Iterable[int]) -> tuple[int, ...]:
         """The tissues this configuration perturbs on a mesh holding ``mesh_tags``, sorted.
 
-        Raises when a named tissue is not in the mesh: its stiffness part would be empty, and
-        its draws would change nothing while still being reported.
+        A named tissue the mesh does not hold is skipped with a warning, since its draws would
+        change nothing while still being reported. Naming only such tissues raises.
         """
         present = {int(t) for t in mesh_tags}
         if self.perturbed_tags is not None:
@@ -135,12 +136,18 @@ class ConductivityUQConfig:
         else:
             tags = present
         missing = sorted(tags - present)
-        if missing:
+        if missing and not tags & present:
             raise ValueError(
                 f"tissues {missing} are named for perturbation but the mesh holds none of their "
                 f"elements (it holds {sorted(present)})."
             )
-        return tuple(sorted(tags))
+        if missing:
+            warnings.warn(
+                f"Skipping tissues {missing}: they are named for perturbation but the mesh holds "
+                f"none of their elements (it holds {sorted(present)}).",
+                stacklevel=2,
+            )
+        return tuple(sorted(tags & present))
 
 
 def sample_conductivities(
