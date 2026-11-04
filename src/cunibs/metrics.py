@@ -108,6 +108,8 @@ def _prefix_sum(w: ArrayT, tile: int = 1024) -> ArrayT:
 
 def weighted_quantiles(values: ArrayT, weights: ArrayT, qs: ArrayT) -> ArrayT:
     """Volume-weighted quantiles of ``values`` (``qs`` in [0, 1])."""
+    if values.size == 0:
+        raise ValueError("Quantiles of a region with no elements are undefined.")
     xp = cp.get_array_module(values)
     # Stable so that ties in |E|, of which a million tetrahedra have tens of thousands, always
     # send the same weight to the same slot of the prefix sum.
@@ -169,6 +171,8 @@ def _weights(vols: ArrayT, mask: ArrayT) -> ArrayT:
 
 def percentile_magnitude(magnE: ArrayT, vols: ArrayT, mask: ArrayT, percentile: float) -> float:
     """Volume-weighted percentile of |E| in the region."""
+    if not 0.0 <= percentile <= 100.0:
+        raise ValueError(f"percentile must be in [0, 100], got {percentile!r}.")
     return _percentile(magnE[mask], _weights(vols, mask), percentile)
 
 

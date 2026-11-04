@@ -309,3 +309,16 @@ def test_a_float32_device_summary_matches_the_host_path(cp):
         assert dev["distribution"][key] == pytest.approx(value, rel=1e-6), key
     for key, value in host["focality_m3"].items():
         assert dev["focality_m3"][key] == pytest.approx(value, rel=1e-6), key
+
+
+@pytest.mark.parametrize("percentile", [-1.0, 101.0, float("nan")])
+def test_percentile_outside_its_range_is_rejected(percentile):
+    values, vols = np.ones(4), np.ones(4)
+    with pytest.raises(ValueError, match="percentile must be"):
+        metrics.percentile_magnitude(values, vols, np.ones(4, dtype=bool), percentile)
+
+
+def test_a_percentile_of_no_elements_is_rejected():
+    values, vols = np.ones(4), np.ones(4)
+    with pytest.raises(ValueError, match="no elements"):
+        metrics.percentile_magnitude(values, vols, np.zeros(4, dtype=bool), 50.0)
