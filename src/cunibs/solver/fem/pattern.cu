@@ -38,18 +38,16 @@ constexpr int kSortWarps = 4;
 constexpr std::size_t kMaxSharedBytes = 48 * 1024;
 // The widest padded candidate list kSortWarps warps can hold at once, and so the boundary between
 // the two classes. Keeping the shared class at full occupancy matters more than stretching it to
-// cover one more segment: the widest segment on a real head is a few hundred candidates, so nothing
-// there ever leaves this class.
+// cover one more segment: the widest segment on a real head is under a thousand candidates, so
+// nothing there ever leaves this class.
 constexpr int kFastPad = 2048;
 static_assert(static_cast<std::size_t>(kFastPad) * sizeof(int) * kSortWarps <= kMaxSharedBytes);
 static_assert(std::has_single_bit(static_cast<unsigned>(kFastPad)),
               "the pad is rounded to a power of two, so the class boundary must be one");
 
-// The warp's index across the grid, for the kernels that put one segment on each. Off blockDim
-// rather than kSortWarps so the mapping holds whatever width the block was launched at.
+// The warp's index across the grid, for the kernels that put one segment on each.
 __device__ __forceinline__ int warp_in_grid() {
-    return blockIdx.x * static_cast<int>(blockDim.x / kWarp) +
-           static_cast<int>(threadIdx.x) / kWarp;
+    return blockIdx.x * kSortWarps + threadIdx.x / kWarp;
 }
 
 // Keep the first of each equal run in a sorted list, by one warp. Whether the list was sorted in
@@ -328,31 +326,29 @@ __device__ __forceinline__ void segment_unique_one(Gather g, const int* __restri
         } else {
             warp_bitonic_sort<16>(b, n, lane);
         }
-        const int kept =
-            warp_keep_first_of_each_run<Fill>(b, n, Fill ? out_idx + out_ptr[s] : nullptr, lane);
-        if (lane == 0 && !Fill) counts[s] = kept;
-        return;
-    }
-    // Node ids are non-negative, so the maximum pads to the tail and never displaces a candidate.
-    for (int i = n + lane; i < m; i += kWarp) {
-        b[i] = cuda::std::numeric_limits<int>::max();
-    }
-    __syncwarp();
+    } else {
+        // Node ids are non-negative, so the maximum pads to the tail and never displaces a
+        // candidate.
+        for (int i = n + lane; i < m; i += kWarp) {
+            b[i] = cuda::std::numeric_limits<int>::max();
+        }
+        __syncwarp();
 
-    for (int k = 2; k <= m; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            // A stage compares m / 2 disjoint pairs (i, i | j), i having bit j clear, so each lane
-            // takes whole pairs and every lane has one: no two stores in a stage collide.
-            for (int q = lane; q < m / 2; q += kWarp) {
-                const int i = ((q & ~(j - 1)) << 1) | (q & (j - 1));
-                const int ixj = i | j;
-                const int x = b[i], y = b[ixj];
-                if ((x > y) == ((i & k) == 0)) {
-                    b[i] = y;
-                    b[ixj] = x;
+        for (int k = 2; k <= m; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                // A stage compares m / 2 disjoint pairs (i, i | j), i having bit j clear, so each
+                // lane takes whole pairs and every lane has one: no two stores in a stage collide.
+                for (int q = lane; q < m / 2; q += kWarp) {
+                    const int i = ((q & ~(j - 1)) << 1) | (q & (j - 1));
+                    const int ixj = i | j;
+                    const int x = b[i], y = b[ixj];
+                    if ((x > y) == ((i & k) == 0)) {
+                        b[i] = y;
+                        b[ixj] = x;
+                    }
                 }
+                __syncwarp();
             }
-            __syncwarp();
         }
     }
 
@@ -384,10 +380,8 @@ template <bool Fill, typename Gather>
 void launch_fast(Gather g, const int* out_ptr, int* out_idx, int* counts, int n_seg, int pad,
                  cudaStream_t stream) {
     const std::size_t shared = static_cast<std::size_t>(pad) * sizeof(int) * kSortWarps;
-    const unsigned grid = grid_for(n_seg, kSortWarps);
-    if (!grid) return;
-    segment_unique_kernel<Gather, Fill><<<grid, kWarp * kSortWarps, shared, stream>>>(
-        g, out_ptr, out_idx, counts, n_seg, pad);
+    segment_unique_kernel<Gather, Fill><<<grid_for(n_seg, kSortWarps), kWarp * kSortWarps, shared,
+                                          stream>>>(g, out_ptr, out_idx, counts, n_seg, pad);
     check_cuda(cudaGetLastError(), "segment unique launch");
 }
 

@@ -43,7 +43,7 @@ __global__ void p1_gradients_kernel(const double* __restrict__ nodes_mm,
     cross3(t[1], t[2], adj[0]);
     cross3(t[2], t[0], adj[1]);
     cross3(t[0], t[1], adj[2]);
-    const double det = t[0][0] * adj[0][0] + t[0][1] * adj[0][1] + t[0][2] * adj[0][2];
+    const double det = dot3(t[0], adj[0]);
     const double inv = kGradScale / det;
 
 #pragma unroll

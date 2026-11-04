@@ -1,13 +1,11 @@
 #include "amg/aggregate.hpp"
+#include "core/scan.cuh"
 
 #include <cuda/atomic>
 #include <cuda/cmath>
 
-#include <cub/device/device_scan.cuh>
-
 #include <cstddef>
 #include <stdexcept>
-#include <string>
 
 namespace {
 
@@ -276,10 +274,6 @@ __global__ __launch_bounds__(kBlock) void agg_relabel_kernel(int n, int* __restr
     if (tid < n) agg[tid] = excl[agg[tid]];
 }
 
-constexpr size_t kArenaAlign = 256;
-
-constexpr size_t align_up(size_t bytes) { return cuda::round_up(bytes, kArenaAlign); }
-
 // Bump allocator over one device block. Sizing runs it against a null base first, so the
 // sizing pass and the pointer pass cannot drift apart.
 class Bump {
@@ -289,7 +283,7 @@ class Bump {
     template <typename T>
     T* take(size_t count) {
         std::byte* p = base_ != nullptr ? base_ + used_ : nullptr;
-        used_ += align_up(count * sizeof(T));
+        used_ += cuda::round_up(count * sizeof(T), size_t{256});
         return reinterpret_cast<T*>(p);
     }
 
@@ -311,28 +305,25 @@ struct Scratch {
     int* used;
     int* excl;
     int* counter;
-    std::byte* cub;
 };
 
-Scratch lay_out(Bump& bump, size_t n, size_t nnz, size_t cub_bytes) {
+// Every scratch buffer shares one stream-ordered allocation: on the small coarse levels a dozen
+// separate ones cost more than the aggregation itself.
+Scratch lay_out(Bump& bump, size_t n, size_t nnz) {
     Scratch s{};
     s.diag = bump.take<float>(n);
-    s.w = bump.take<float>(nnz > 0 ? nnz : 1);
+    s.w = bump.take<float>(nnz);
     s.wsn = bump.take<float>(n);
     s.partner = bump.take<int>(n);
     s.strongest = bump.take<int>(n);
     s.aggregated = bump.take<int>(n);
     s.cand = bump.take<int>(n);
-    // One slot past the flags so the exclusive scan has somewhere to deposit the total.
     s.used = bump.take<int>(n + 1);
     s.excl = bump.take<int>(n + 1);
     s.counter = bump.take<int>(1);
-    s.cub = bump.take<std::byte>(cub_bytes);
     return s;
 }
 
-// Every scratch buffer shares one stream-ordered allocation: on the small coarse levels a dozen
-// separate ones cost more than the aggregation itself.
 // The matching loops are data dependent, so each one costs a round trip per iteration.
 int read_counter(const int* counter, cudaStream_t stream) {
     int host = 0;
@@ -358,23 +349,16 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     // Nonzero: n_rows > 0 above, and grid_for only returns 0 for an empty range.
     const unsigned blocks = grid_for(n_rows, kBlock);
 
-    size_t cub_bytes = 0;
-    check_cuda(cub::DeviceScan::ExclusiveSum(nullptr, cub_bytes, static_cast<int*>(nullptr),
-                                             static_cast<int*>(nullptr), n_rows + 1, stream),
-               "size(renumber scan)");
-
     Bump sizing(nullptr);
-    lay_out(sizing, n_rows, nnz, cub_bytes);
+    lay_out(sizing, n_rows, nnz);
     const ScratchBuffer<std::byte> arena =
         scratch_alloc<std::byte>(sizing.bytes(), stream, "aggregate", "scratch");
     Bump bump(arena.get());
-    const Scratch s = lay_out(bump, n_rows, nnz, cub_bytes);
+    const Scratch s = lay_out(bump, n_rows, nnz);
 
     agg_diag_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, row_ptr, col_idx, values, s.diag);
-    if (nnz > 0) {
-        agg_edge_weight_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, row_ptr, col_idx, values,
-                                                              s.diag, s.w);
-    }
+    agg_edge_weight_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, row_ptr, col_idx, values, s.diag,
+                                                          s.w);
     agg_init_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.partner, s.strongest,
                                                    s.wsn, s.aggregated);
     check_cuda(cudaGetLastError(), "init launch");
@@ -436,16 +420,13 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     }
 
     // Order-preserving dense renumbering (agg_selector.cu): mark the labels in use,
-    // exclusive-scan the flags, and gather. Surjective by construction. The scan runs over one
-    // slot more than there are rows, so excl[n_rows] comes back holding the aggregate count.
-    check_cuda(cudaMemsetAsync(s.used, 0, (static_cast<size_t>(n_rows) + 1) * sizeof(int), stream),
+    // exclusive-scan the flags, and gather. Surjective by construction.
+    check_cuda(cudaMemsetAsync(s.used, 0, static_cast<size_t>(n_rows) * sizeof(int), stream),
                "memset used");
     agg_mark_used_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.used);
     check_cuda(cudaGetLastError(), "mark used launch");
-    check_cuda(cub::DeviceScan::ExclusiveSum(s.cub, cub_bytes, s.used, s.excl, n_rows + 1, stream),
-               "renumber scan");
+    const int n_coarse = scan_counts(n_rows, s.used, s.excl, stream, "aggregate");
     agg_relabel_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.excl);
     check_cuda(cudaGetLastError(), "relabel launch");
-
-    return read_counter(s.excl + n_rows, stream);
+    return n_coarse;
 }

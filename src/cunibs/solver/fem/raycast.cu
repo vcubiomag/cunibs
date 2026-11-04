@@ -106,6 +106,4 @@ void launch_ray_first_hit(const double* origins, const double* directions, const
         origins, directions, VertsView(verts, n_tri), chunk_t.get(), n_tri, n_chunks, min_t);
     ray_select_kernel<<<grid_for(n_rays), kBlock, 0, stream>>>(chunk_t.get(), out_t, n_rays,
                                                                n_chunks);
-
-    check_cuda(cudaGetLastError(), "raycast", "first hit launch");
 }

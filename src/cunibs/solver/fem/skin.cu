@@ -17,12 +17,10 @@
 
 namespace {
 
-void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "skin", what); }
-
 // Unit vector, leaving a zero vector alone. Only skin nodes are reached through the CSR, but the
 // accumulators are indexed by mesh node, so the rest stay zero and must not become NaN.
 __device__ __forceinline__ void normalise(Vec3& v) {
-    const double n = cuda::std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    const double n = cuda::std::sqrt(dot3(v.data(), v.data()));
     if (n > 0.0) {
 #pragma unroll
         for (int i = 0; i < 3; ++i) v[i] /= n;
@@ -141,5 +139,4 @@ void launch_skin_normals(const double* nodes_mm, const int* tris_ptr, const int*
     normalise_rows_kernel<<<node_blocks, kBlock, 0, stream>>>(node.get(), n_nodes);
     gather_to_faces_kernel<<<tri_blocks, kBlock, 0, stream>>>(node.get(), tris, out_tri_normals,
                                                               n_tri);
-    check_cuda(cudaGetLastError(), "skin normals launch");
 }

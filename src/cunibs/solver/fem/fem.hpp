@@ -8,8 +8,8 @@
 void launch_p1_gradients(const double* nodes_mm, const int* tet_nodes, double* g, double* vols,
                          int n_tet, cudaStream_t stream);
 
-// The per-element RHS gathered at each node; the UQ draws use it, since their conductivities
-// change per draw.
+// The per-element RHS gathered at each node; UQ forms its per-tissue right-hand sides with it, one
+// call per tissue's conductivities.
 void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
                 const int* idx, float* b, int n_nodes, cudaStream_t stream);
 

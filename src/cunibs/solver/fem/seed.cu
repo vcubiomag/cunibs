@@ -137,5 +137,4 @@ void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, dou
         seed_reduce_kernel<K><<<grid_for(m * K), kBlock, 0, stream>>>(work, n_tiles, m, y);
         seed_expand_kernel<K><<<grid_for(n), kBlock, 0, stream>>>(q, y, n, m, x0);
     });
-    check_cuda(cudaGetLastError(), "seed", "launch");
 }

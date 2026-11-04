@@ -18,7 +18,8 @@ void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, 
 // then takes an arbitrary but deterministic in-plane axis. degenerate (n_pl) is set to 1 where
 // a supplied handle left the in-plane axis undefined and that same fallback was used instead;
 // pass null alongside a null handles, where the flag would carry no information. The transform
-// is orthonormal either way.
+// is orthonormal either way, except that a non-finite centre gets an all-NaN transform and the
+// flag.
 // verts is (n_tri, 3, 3) and tnorm (n_tri, 3); out is (n_pl, 4, 4).
 void launch_place(const double* centers, const double* handles, const double* dists,
                   const double* verts, const double* tnorm, double* out, int* degenerate,

@@ -22,7 +22,7 @@ constexpr int kDadtBlock = 128;
 // One dipole per thread of the block, so a tile loads in one pass.
 constexpr int kDipTile = kDadtBlock;
 // Nodes each thread carries, the register tiling that lets one dipole tile load amortise over
-// K nodes.
+// them.
 constexpr int kNodesPerThread = 8;
 
 // Tolerance on |m_j x u| / |m_j| below which a coil counts as having one moment direction u.
@@ -111,7 +111,7 @@ __global__ void place_dipoles_kernel(const double* __restrict__ pos_m,
     }
 }
 
-template <int K, bool kFlat>
+template <bool kFlat>
 __device__ __forceinline__ void dadt_column(const double* __restrict__ nodes_mm,
                                             const float4* __restrict__ sc,
                                             const float4* __restrict__ mc,
@@ -124,12 +124,14 @@ __device__ __forceinline__ void dadt_column(const double* __restrict__ nodes_mm,
     __shared__ float2 s_mhi[kDipTile];
     const int T = gridDim.x * blockDim.x;
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    int node[K];
-    float rx[K], ry[K], rz[K], rn[K], qx[K], qy[K], qz[K];
+    int node[kNodesPerThread];
+    float rx[kNodesPerThread], ry[kNodesPerThread], rz[kNodesPerThread], rn[kNodesPerThread];
+    float qx[kNodesPerThread], qy[kNodesPerThread], qz[kNodesPerThread];
     // General: W = a0..a2, P = a3..a5. Flat: A = a0, V = a1..a3.
-    float a0[K], a1[K], a2[K], a3[K], a4[K], a5[K];
+    float a0[kNodesPerThread], a1[kNodesPerThread], a2[kNodesPerThread];
+    float a3[kNodesPerThread], a4[kNodesPerThread], a5[kNodesPerThread];
 #pragma unroll
-    for (int k = 0; k < K; ++k) {
+    for (int k = 0; k < kNodesPerThread; ++k) {
         node[k] = t + k * T;
         rx[k] = ry[k] = rz[k] = rn[k] = 0.f;
         if (node[k] < n_nodes) {
@@ -161,7 +163,7 @@ __device__ __forceinline__ void dadt_column(const double* __restrict__ nodes_mm,
             float2 mh;
             if constexpr (!kFlat) mh = s_mhi[j];
 #pragma unroll
-            for (int k = 0; k < K; ++k) {
+            for (int k = 0; k < kNodesPerThread; ++k) {
                 const float d2 =
                     fmaf(qx[k], sp.x, fmaf(qy[k], sp.y, fmaf(qz[k], sp.z, rn[k] + sp.w)));
                 // The coil-scalp gap keeps d2 positive.
@@ -181,7 +183,7 @@ __device__ __forceinline__ void dadt_column(const double* __restrict__ nodes_mm,
     }
 
 #pragma unroll
-    for (int k = 0; k < K; ++k) {
+    for (int k = 0; k < kNodesPerThread; ++k) {
         if (node[k] >= n_nodes) continue;
         float* const p = out + static_cast<std::int64_t>(node[k]) * out_stride;
         if constexpr (kFlat) {
@@ -207,7 +209,6 @@ __device__ __forceinline__ void dadt_column(const double* __restrict__ nodes_mm,
 // one moment direction u needs only A = sum w mu and V = sum w mu s, since W = u A and P = u x V
 // give dA/dt = u x (A r - V): four accumulations instead of six. The flag is uniform, and each
 // branch is a whole column's loop, so neither path is scheduled around the other's registers.
-template <int K>
 __global__ void dadt_block_kernel(const double* __restrict__ nodes_mm,
                                   const float4* __restrict__ s4, const float4* __restrict__ m4,
                                   const float2* __restrict__ m2,
@@ -218,10 +219,10 @@ __global__ void dadt_block_kernel(const double* __restrict__ nodes_mm,
     const int c = blockIdx.y;
     const std::int64_t off = static_cast<std::int64_t>(c) * n_dip;
     if (*planar != 0) {
-        dadt_column<K, true>(nodes_mm, s4 + off, m4 + off, m2 + off, origin + 3 * c, axis + 3 * c,
+        dadt_column<true>(nodes_mm, s4 + off, m4 + off, m2 + off, origin + 3 * c, axis + 3 * c,
                              out + 3 * c, out_stride, n_dip, n_nodes, scale);
     } else {
-        dadt_column<K, false>(nodes_mm, s4 + off, m4 + off, m2 + off, origin + 3 * c,
+        dadt_column<false>(nodes_mm, s4 + off, m4 + off, m2 + off, origin + 3 * c,
                               axis + 3 * c, out + 3 * c, out_stride, n_dip, n_nodes, scale);
     }
 }
@@ -232,11 +233,11 @@ void launch_dadt_block(const double* pos_m, const double* mom, const double* tra
                        int n_dip, int k, const double* nodes_mm, int n_nodes, float* out,
                        int out_stride, float didt, float mu0_4pi, cudaStream_t stream) {
     if (k <= 0 || n_nodes <= 0) return;
-    const std::size_t kn = static_cast<std::size_t>(k) * std::max(n_dip, 1);
+    const std::int64_t placed = static_cast<std::int64_t>(k) * std::max(n_dip, 1);
     const ScratchBuffer<int> planar = scratch_alloc<int>(1, stream, "dadt", "planar");
-    const ScratchBuffer<float4> s4 = scratch_alloc<float4>(kn, stream, "dadt", "positions");
-    const ScratchBuffer<float4> m4 = scratch_alloc<float4>(kn, stream, "dadt", "moments");
-    const ScratchBuffer<float2> m2 = scratch_alloc<float2>(kn, stream, "dadt", "moments");
+    const ScratchBuffer<float4> s4 = scratch_alloc<float4>(placed, stream, "dadt", "positions");
+    const ScratchBuffer<float4> m4 = scratch_alloc<float4>(placed, stream, "dadt", "moments");
+    const ScratchBuffer<float2> m2 = scratch_alloc<float2>(placed, stream, "dadt", "moments");
     const ScratchBuffer<double> origin = scratch_alloc<double>(3 * k, stream, "dadt", "origin");
     const ScratchBuffer<float> axis = scratch_alloc<float>(3 * k, stream, "dadt", "axis");
     // With no dipoles nothing sets the axis the planar path reads.
@@ -245,14 +246,12 @@ void launch_dadt_block(const double* pos_m, const double* mom, const double* tra
     if (n_dip > 0) {
         dadt_planar_kernel<<<grid_for(n_dip), kBlock, 0, stream>>>(mom, n_dip, planar.get());
     }
-    const std::int64_t placed = static_cast<std::int64_t>(std::max(n_dip, 1)) * k;
     place_dipoles_kernel<<<grid_for(placed), kBlock, 0, stream>>>(
         pos_m, mom, transforms, n_dip, k, planar.get(), s4.get(), m4.get(), m2.get(),
         origin.get(), axis.get());
     const std::int64_t threads = grid_for(n_nodes, kNodesPerThread);
     const dim3 grid(grid_for(threads, kDadtBlock), k);
-    dadt_block_kernel<kNodesPerThread><<<grid, kDadtBlock, 0, stream>>>(
+    dadt_block_kernel<<<grid, kDadtBlock, 0, stream>>>(
         nodes_mm, s4.get(), m4.get(), m2.get(), origin.get(), axis.get(), planar.get(), out,
         out_stride, n_dip, n_nodes, didt * mu0_4pi);
-    check_cuda(cudaGetLastError(), "dadt", "launch");
 }

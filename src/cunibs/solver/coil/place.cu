@@ -30,22 +30,13 @@ constexpr double kMinSin2 = 1e-12;
 // need no special case.
 constexpr int kNoTri = INT_MAX;
 
-// The corners (n_tri, 3, 3) and outward normals (n_tri, 3) of the scalp triangles.
-struct Scalp {
-    TriVertView<const double> verts;
-    Vec3View<const double> normals;
-
-    __device__ double closest(const double* p, int j, double* q) const;
-};
-
 // (n_pl, 4, 4) row-major coil-to-head transforms.
 using TransformView =
     cuda::std::mdspan<double, cuda::std::extents<int, cuda::std::dynamic_extent, 4, 4>>;
 
-// Ordered by (d2, triangle index), so ties break to the lower index, matching cupy's argmin. A
-// minimum over this total order is associative and commutative, so cub may combine it in
-// whatever order it likes: unlike the float sums elsewhere in this directory, no association can
-// change what it returns.
+// Ordered by (d2, triangle index), so ties break to the lower index. A minimum over this total
+// order is associative and commutative, so cub may combine it in whatever order it likes: unlike
+// the float sums elsewhere in this directory, no association can change what it returns.
 struct Candidate {
     double d2;
     int tri;
@@ -55,66 +46,70 @@ struct Candidate {
     }
 };
 
-// Closest point q on triangle (a,b,c) to p; returns squared distance. Full Ericson ordering:
-// vertex A, vertex B, edge AB, vertex C, edge AC, edge BC, interior.
-__device__ double closest_on_tri(const double* p, const double* a, const double* b,
-                                 const double* c, double* q) {
-    double ab[3], ac[3], ap[3];
-    for (int i = 0; i < 3; ++i) {
-        ab[i] = b[i] - a[i];
-        ac[i] = c[i] - a[i];
-        ap[i] = p[i] - a[i];
-    }
-    const double d1 = dot3(ab, ap), d2 = dot3(ac, ap);
-    bool done = false;
-    if (d1 <= 0.0 && d2 <= 0.0) {
-        for (int i = 0; i < 3; ++i) q[i] = a[i];
-        done = true;
-    }
-    double bp[3];
-    for (int i = 0; i < 3; ++i) bp[i] = p[i] - b[i];
-    const double d3 = dot3(ab, bp), d4 = dot3(ac, bp);
-    if (!done && d3 >= 0.0 && d4 <= d3) {
-        for (int i = 0; i < 3; ++i) q[i] = b[i];
-        done = true;
-    }
-    const double vc = d1 * d4 - d3 * d2;
-    if (!done && vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
-        double t = d1 / (d1 - d3);
-        for (int i = 0; i < 3; ++i) q[i] = a[i] + t * ab[i];
-        done = true;
-    }
-    double cp[3];
-    for (int i = 0; i < 3; ++i) cp[i] = p[i] - c[i];
-    const double d5 = dot3(ab, cp), d6 = dot3(ac, cp);
-    if (!done && d6 >= 0.0 && d5 <= d6) {
-        for (int i = 0; i < 3; ++i) q[i] = c[i];
-        done = true;
-    }
-    const double vb = d5 * d2 - d1 * d6;
-    if (!done && vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
-        double t = d2 / (d2 - d6);
-        for (int i = 0; i < 3; ++i) q[i] = a[i] + t * ac[i];
-        done = true;
-    }
-    const double va = d3 * d6 - d5 * d4;
-    if (!done && va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
-        double t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        for (int i = 0; i < 3; ++i) q[i] = b[i] + t * (c[i] - b[i]);
-        done = true;
-    }
-    if (!done) {
-        double denom = 1.0 / (va + vb + vc);
-        double v = vb * denom, w = vc * denom;
-        for (int i = 0; i < 3; ++i) q[i] = a[i] + v * ab[i] + w * ac[i];
-    }
-    double dx = q[0] - p[0], dy = q[1] - p[1], dz = q[2] - p[2];
-    return dx * dx + dy * dy + dz * dz;
-}
+// The corners (n_tri, 3, 3) and outward normals (n_tri, 3) of the scalp triangles.
+struct Scalp {
+    TriVertView<const double> verts;
+    Vec3View<const double> normals;
 
-__device__ double Scalp::closest(const double* p, int j, double* q) const {
-    return closest_on_tri(p, &verts(j, 0, 0), &verts(j, 1, 0), &verts(j, 2, 0), q);
-}
+    // Closest point q on triangle j to p; returns squared distance. Full Ericson ordering: vertex
+    // A, vertex B, edge AB, vertex C, edge AC, edge BC, interior.
+    __device__ double closest(const double* p, int j, double* q) const {
+        const double* a = &verts(j, 0, 0);
+        const double* b = &verts(j, 1, 0);
+        const double* c = &verts(j, 2, 0);
+        double ab[3], ac[3], ap[3];
+        for (int i = 0; i < 3; ++i) {
+            ab[i] = b[i] - a[i];
+            ac[i] = c[i] - a[i];
+            ap[i] = p[i] - a[i];
+        }
+        const double d1 = dot3(ab, ap), d2 = dot3(ac, ap);
+        bool done = false;
+        if (d1 <= 0.0 && d2 <= 0.0) {
+            for (int i = 0; i < 3; ++i) q[i] = a[i];
+            done = true;
+        }
+        double bp[3];
+        for (int i = 0; i < 3; ++i) bp[i] = p[i] - b[i];
+        const double d3 = dot3(ab, bp), d4 = dot3(ac, bp);
+        if (!done && d3 >= 0.0 && d4 <= d3) {
+            for (int i = 0; i < 3; ++i) q[i] = b[i];
+            done = true;
+        }
+        const double vc = d1 * d4 - d3 * d2;
+        if (!done && vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+            double t = d1 / (d1 - d3);
+            for (int i = 0; i < 3; ++i) q[i] = a[i] + t * ab[i];
+            done = true;
+        }
+        double cp[3];
+        for (int i = 0; i < 3; ++i) cp[i] = p[i] - c[i];
+        const double d5 = dot3(ab, cp), d6 = dot3(ac, cp);
+        if (!done && d6 >= 0.0 && d5 <= d6) {
+            for (int i = 0; i < 3; ++i) q[i] = c[i];
+            done = true;
+        }
+        const double vb = d5 * d2 - d1 * d6;
+        if (!done && vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+            double t = d2 / (d2 - d6);
+            for (int i = 0; i < 3; ++i) q[i] = a[i] + t * ac[i];
+            done = true;
+        }
+        const double va = d3 * d6 - d5 * d4;
+        if (!done && va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+            double t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            for (int i = 0; i < 3; ++i) q[i] = b[i] + t * (c[i] - b[i]);
+            done = true;
+        }
+        if (!done) {
+            double denom = 1.0 / (va + vb + vc);
+            double v = vb * denom, w = vc * denom;
+            for (int i = 0; i < 3; ++i) q[i] = a[i] + v * ab[i] + w * ac[i];
+        }
+        double dx = q[0] - p[0], dy = q[1] - p[1], dz = q[2] - p[2];
+        return dx * dx + dy * dy + dz * dz;
+    }
+};
 
 // One block per (placement, chunk): the closest triangle in this block's slice of the scan.
 __global__ void place_scan_kernel(const double* __restrict__ centers, Scalp scalp,
@@ -249,5 +244,4 @@ void launch_place(const double* centers, const double* handles, const double* di
                                                                    n_tri, n_chunks);
     place_frame_kernel<<<grid_for(n_pl), kBlock, 0, stream>>>(
         centers, handles, dists, scalp, cand.get(), out, degenerate, n_pl, n_chunks);
-    check_cuda(cudaGetLastError(), "place", "launch");
 }

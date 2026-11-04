@@ -28,6 +28,5 @@ void launch_tet_lowest_node(const int* inverse, const int* tet_nodes, int* lowes
     if (const unsigned blocks = grid_for(n_tet)) {
         tet_lowest_node_kernel<<<blocks, kBlock, 0, stream>>>(
             inverse, Tet4View<const int>(tet_nodes, n_tet), lowest, n_tet);
-        check_cuda(cudaGetLastError(), "reorder", "tet lowest node launch");
     }
 }
