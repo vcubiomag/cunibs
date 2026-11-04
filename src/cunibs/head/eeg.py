@@ -43,7 +43,7 @@ def _cap_text(path: Path, cap: str) -> str:
                 available = ", ".join(sorted(caps)) or "none"
                 raise ValueError(f"{path}: carries no {cap} EEG positions (has: {available})")
             return caps[cap][()].decode()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"{path}: cannot read EEG positions: {exc}") from exc
 
 

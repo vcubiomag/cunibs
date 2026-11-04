@@ -305,3 +305,10 @@ def test_a_missing_cap_in_a_mesh_names_what_is_there(tmp_path):
     path = _cap_mesh(tmp_path, ["EEG10-20_Okamoto_2004"])
     with pytest.raises(ValueError, match="has: EEG10-20_Okamoto_2004"):
         eeg.read_cap(path)
+
+
+def test_read_subject_cap_rejects_a_binary_mesh_with_a_clear_error(tmp_path):
+    path = tmp_path / "subject.msh"
+    path.write_bytes(bytes(range(256)))
+    with pytest.raises(ValueError, match="cannot read EEG positions"):
+        eeg.read_subject_cap(path)
