@@ -30,45 +30,7 @@ if TYPE_CHECKING:
 _FORMAT_VERSION = 1
 
 
-def _tissue_sensitivity(result, output: str) -> dict[int, float]:
-    """First-order variance share of each perturbed tissue from a log-linear regression.
-
-    Regresses ``log`` of the chosen per-draw scalar on the ``log`` conductivity draws. Because the
-    ensemble is i.i.d., the inputs are independent, so ``beta_j^2·Var(log σ_j)/Var(log y)`` is tag
-    ``j``'s prior-weighted contribution under the fitted log-linear response, normalized by the
-    observed log-output variance. It is not a Sobol estimator and captures neither interactions nor
-    departures from log-linearity.
-    """
-    if output in ("peak", "focality") and result.peak_samples is None:
-        raise ValueError(
-            f"This mesh has no gray matter, so no per-draw {output} was recorded. Name a "
-            "recorded ROI instead."
-        )
-    if output == "peak":
-        y = result.peak_samples
-    elif output == "focality":
-        y = result.focality_samples
-    elif output in result.roi_samples:
-        y = result.roi_samples[output]
-    else:
-        raise ValueError(
-            f"Unknown output {output!r}; expected 'peak', 'focality', or a recorded ROI name "
-            f"(available: {['peak', 'focality', *result.roi_samples]}). Name an ROI with "
-            "simulate_conductivity_uq(..., record_rois={...}) to select it here."
-        )
-    x = np.log(np.asarray(result.sigma_samples, dtype=np.float64))
-    logy = np.log(np.asarray(y, dtype=np.float64))
-    xc = x - x.mean(0)
-    yc = logy - logy.mean()
-    var_y = float(yc.var())
-    if var_y == 0.0:
-        return {int(t): 0.0 for t in result.perturbed_tags}
-    beta, *_ = np.linalg.lstsq(xc, yc, rcond=None)
-    contrib = beta**2 * xc.var(0) / var_y
-    return {int(t): float(c) for t, c in zip(result.perturbed_tags, contrib, strict=False)}
-
-
-@dataclass
+@dataclass(eq=False)
 class ConductivityUQSummary:
     """Metrics of the ensemble-mean field, plus the largest local CoV, for one placement.
 
@@ -82,7 +44,7 @@ class ConductivityUQSummary:
     max_local_cov: float
 
 
-@dataclass
+@dataclass(eq=False)
 class ConductivityUQResult:
     """Conductivity-UQ metrics for one placement, plus the moment arrays if retained.
 
@@ -172,10 +134,38 @@ class ConductivityUQResult:
 
         ``output`` is ``"peak"``, ``"focality"``, or the name of an ROI the run recorded.
         Regressing the log output on the log conductivity draws gives each tag's prior-weighted
-        contribution under the fitted log-linear response. It is not a Sobol estimator and
+        contribution, ``beta_j^2·Var(log σ_j)/Var(log y)``, under the fitted log-linear response.
+        The draws are i.i.d., so the inputs are independent. It is not a Sobol estimator and
         captures neither interactions nor departures from log-linearity.
         """
-        return _tissue_sensitivity(self, output)
+        if output in ("peak", "focality") and self.peak_samples is None:
+            raise ValueError(
+                f"This mesh has no gray matter, so no per-draw {output} was recorded. Name a "
+                "recorded ROI instead."
+            )
+        if output == "peak":
+            y = self.peak_samples
+        elif output == "focality":
+            y = self.focality_samples
+        elif output in self.roi_samples:
+            y = self.roi_samples[output]
+        else:
+            raise ValueError(
+                f"Unknown output {output!r}; expected 'peak', 'focality', or a recorded ROI name "
+                f"(available: {['peak', 'focality', *self.roi_samples]}). Name an ROI with "
+                "simulate_conductivity_uq(..., record_rois={...}) to select it here."
+            )
+        y = np.asarray(y, dtype=np.float64)
+        # Checked before the log: a zero field has no log, and a constant has no share to give.
+        if (y == y[0]).all():
+            return dict.fromkeys(self.perturbed_tags, 0.0)
+        x = np.log(np.asarray(self.sigma_samples, dtype=np.float64))
+        logy = np.log(y)
+        xc = x - x.mean(0)
+        yc = logy - logy.mean()
+        beta, *_ = np.linalg.lstsq(xc, yc, rcond=None)
+        contrib = beta**2 * xc.var(0) / yc.var()
+        return {int(t): float(c) for t, c in zip(self.perturbed_tags, contrib, strict=True)}
 
     def to_numpy(self) -> ConductivityUQResult:
         """Copy any device arrays to NumPy."""
@@ -246,6 +236,14 @@ class ConductivityUQResult:
         """Read a saved conductivity-UQ result into NumPy arrays."""
         with h5py.File(Path(path), "r") as h5f:
             check_format_version(h5f, path, _FORMAT_VERSION)
+            # HDF5 stores a name holding a slash as nested groups, so walk them.
+            roi_samples: dict[str, npt.NDArray[np.float64]] = {}
+
+            def read_roi(name: str, node: h5py.Group | h5py.Dataset) -> None:
+                if isinstance(node, h5py.Dataset):
+                    roi_samples[name] = np.asarray(node)
+
+            h5f["roi_samples"].visititems(read_roi)
             return cls(
                 mean_magnE=opt_array(h5f, "mean_magnE"),
                 std_magnE=opt_array(h5f, "std_magnE"),
@@ -273,7 +271,7 @@ class ConductivityUQResult:
                     if "summary" in h5f
                     else None
                 ),
-                roi_samples={k: np.asarray(v) for k, v in h5f["roi_samples"].items()},
+                roi_samples=roi_samples,
                 peak_samples=opt_array(h5f, "peak_samples"),
                 focality_samples=opt_array(h5f, "focality_samples"),
                 peak_location_samples=opt_array(h5f, "peak_location_samples"),

@@ -80,6 +80,12 @@ def test_tissue_sensitivity_constant_output_is_all_zero():
     assert s == {1: 0.0, 2: 0.0}
 
 
+def test_tissue_sensitivity_of_a_zero_output_is_all_zero():
+    sigma = _lognormal_draws(8, 2)
+    s = _result(sigma, y_peak=np.zeros(8)).tissue_sensitivity("peak")
+    assert s == {1: 0.0, 2: 0.0}
+
+
 def test_tissue_sensitivity_reads_focality_and_roi_outputs():
     sigma = _lognormal_draws(2000, 2, seed=7)
     r = _result(
@@ -103,6 +109,16 @@ def test_tissue_sensitivity_unknown_output_lists_what_is_available():
     bare = _result(sigma)
     with pytest.raises(ValueError, match=r"available: \['peak', 'focality'\]"):
         bare.tissue_sensitivity("m1")
+
+
+def test_an_roi_name_holding_a_slash_survives_a_round_trip(tmp_path):
+    samples = np.arange(8.0)
+    r = _result(_lognormal_draws(8, 2), roi={"m1/hand": samples, "dlpfc": samples + 1.0})
+    r = dataclasses.replace(r, summary=r.compute_summary())
+    r.save(tmp_path / "uq.h5")
+    loaded = ConductivityUQResult.load(tmp_path / "uq.h5")
+    assert set(loaded.roi_samples) == {"m1/hand", "dlpfc"}
+    np.testing.assert_array_equal(loaded.roi_samples["m1/hand"], samples)
 
 
 def test_per_draw_samples_and_sensitivity_live_on_the_result():

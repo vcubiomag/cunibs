@@ -170,7 +170,7 @@ def _adjoint_rhs(
     return c
 
 
-@dataclass
+@dataclass(eq=False)
 class AdjointField:
     """Nodal reciprocity weights for each adjoint direction (pre-grid)."""
 
@@ -239,7 +239,7 @@ def exact_functional(node_weights: cp.ndarray, dadt_nodes: cp.ndarray) -> cp.nda
     return cp.einsum("dnk,nk->d", node_weights, dn)
 
 
-@dataclass
+@dataclass(eq=False)
 class ReciprocityField:
     """Adjoint weights sampled as a Q-field on a regular grid, the input to the placement evaluator.
 

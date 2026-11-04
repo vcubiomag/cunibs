@@ -273,33 +273,33 @@ class _ReducedBasis:
         nominal = np.concatenate([[1.0], cp.asnumpy(pre.nominal_sigma)])
         coef_nom = nominal if pre.affine_has_base else nominal[1:]
         # The columns differ in scale by orders of magnitude, so they are equilibrated first and
-        # the cutoff only sees dependence, not size.
+        # the cutoff only sees dependence, not size. A zero column, which a zero field makes of all
+        # of them, has an eigenvalue of zero and is dropped with the dependent ones.
         g = np.tensordot(coef_nom, e_terms, axes=1)
-        d = 1.0 / np.sqrt(np.diag(g))
+        energy = np.diag(g)
+        d = np.divide(1.0, np.sqrt(energy), out=np.zeros_like(energy), where=energy > 0.0)
         w, u = np.linalg.eigh(g * d[:, None] * d[None, :])
         live = w > _BASIS_RTOL * w[-1]
         tr = d[:, None] * u[:, live] / np.sqrt(w[live])
         self._e_terms = np.einsum("ji,tjk,kl->til", tr, e_terms, tr)
-        self._b_terms = b_terms @ tr
+        self._b_terms = (b_terms if pre.affine_has_base else b_terms[1:]) @ tr
         self._v = cp.ascontiguousarray(v[:n] @ cp.asarray(tr))
-        self._has_base = pre.affine_has_base
 
     @property
     def width(self) -> int:
         return int(self._v.shape[1])
 
-    def coefficients(self, sigmas: np.ndarray) -> np.ndarray:
-        """Each draw's reduced coordinates ``y`` (N, m), its own arithmetic whatever N is."""
-        n = sigmas.shape[0]
+    def coefficients(self, coef: np.ndarray) -> np.ndarray:
+        """Reduced coordinates ``y`` (N, m) for draws with affine coefficients ``coef`` (N, terms).
+
+        Each draw's own arithmetic, whatever N is.
+        """
+        n = coef.shape[0]
         e = np.zeros((n, self.width, self.width))
         rhs = np.zeros((n, self.width))
-        first = 1 if self._has_base else 0
-        if self._has_base:
-            e = e + self._e_terms[0][None]
-        rhs = rhs + self._b_terms[0][None]
-        for t in range(sigmas.shape[1]):
-            e = e + sigmas[:, t, None, None] * self._e_terms[first + t][None]
-            rhs = rhs + sigmas[:, t, None] * self._b_terms[1 + t][None]
+        for t in range(coef.shape[1]):
+            e = e + coef[:, t, None, None] * self._e_terms[t][None]
+            rhs = rhs + coef[:, t, None] * self._b_terms[t][None]
         return _cholesky_solve(e, rhs)
 
     def guess_into(self, y: cp.ndarray, out: cp.ndarray, stream: int) -> None:
@@ -453,7 +453,7 @@ def run_conductivity_uq(
         log_ratio = log_ratio - log_ratio.mean(axis=1, keepdims=True)
     log_dist = cp.asnumpy(cp.sqrt((log_ratio**2).sum(axis=1)))
     del log_ratio
-    schedule = [int(k) for k in np.argsort(log_dist, kind="stable")]
+    schedule = np.argsort(log_dist, kind="stable").tolist()
     schedule_dev = cp.asarray(schedule)
     table = None
     for start in range(0, config.n_samples, width):
@@ -463,13 +463,14 @@ def run_conductivity_uq(
         # column by column, so neither depends on which block the draw landed in.
         for c, k in enumerate(cols):
             b_blk[:, c] = (b_base + sig_f32[k] @ b_tissue)[pre.idx]
-        basis.guess_into(cp.asarray(basis.coefficients(sigmas_host[cols])), x_blk, stream)
+        coef = pre.affine_coefficients(sigmas_host[cols])
+        basis.guess_into(cp.asarray(basis.coefficients(coef)), x_blk, stream)
         _, rels, _ = pcg.solve_affine_block(
             precond,
             pre.terms,
             b_blk,
             x_blk,
-            pre.affine_coefficients(sigmas_host[cols]),
+            coef,
             pre.tolerance,
             pre.max_iters,
             stream,

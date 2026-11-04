@@ -55,7 +55,7 @@ _distance_sq = cp.ElementwiseKernel(
 )
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class Target:
     """Define the cortical target of a reciprocity solve.
 
@@ -99,7 +99,7 @@ class Target:
         object.__setattr__(self, "radius_mm", float(radius_mm))
 
 
-@dataclass
+@dataclass(eq=False)
 class ResolvedTarget:
     """Target reduced to weighted mesh elements and the adjoint directions."""
 

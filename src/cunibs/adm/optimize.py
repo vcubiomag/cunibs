@@ -53,7 +53,7 @@ _interpolate = cp.ElementwiseKernel(
 )
 
 
-@dataclass
+@dataclass(eq=False)
 class OptimizeResult:
     """Best placement plus the full per-candidate objective map, all as host arrays.
 

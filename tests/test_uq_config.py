@@ -53,6 +53,8 @@ def test_naming_only_missing_tissues_is_rejected():
     [
         {"n_samples": 0},
         {"n_samples": 2.5},
+        {"seed": 1.5},
+        {"seed": -1},
         {"distribution": "uniform"},
         {"tissue_cov": {2: -0.1}},
         {"tissue_cov": {2: float("nan")}},

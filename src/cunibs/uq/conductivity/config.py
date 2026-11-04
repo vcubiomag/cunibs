@@ -82,6 +82,8 @@ class ConductivityUQConfig:
     ) -> None:
         if isinstance(n_samples, bool) or int(n_samples) != n_samples or n_samples < 1:
             raise ValueError(f"n_samples must be a positive integer, got {n_samples!r}.")
+        if isinstance(seed, bool) or int(seed) != seed or seed < 0:
+            raise ValueError(f"seed must be a non-negative integer, got {seed!r}.")
         if distribution not in get_args(Distribution.__value__):
             raise ValueError(
                 f"distribution must be one of {get_args(Distribution.__value__)}, got "

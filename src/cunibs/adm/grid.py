@@ -9,7 +9,7 @@ import cupy as cp
 import numpy as np
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class SweptCoverage:
     """Where a coil can sit over a set of centres at any in-plane rotation.
 
@@ -24,7 +24,7 @@ class SweptCoverage:
     margin_m: float
 
 
-@dataclass
+@dataclass(eq=False)
 class Grid:
     """Axis-aligned regular grid in metres.
 

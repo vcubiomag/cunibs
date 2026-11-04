@@ -211,6 +211,19 @@ def test_uq_homogeneous_has_no_sensitivity(cp, cube_mesh):
     assert float(cp.asarray(r.cov_magnE).max()) < 1e-5
 
 
+def test_uq_of_a_zero_field_is_zero(two_tissue_subject):
+    """A forward solve at didt=0 returns a zero field, so the warm start must cope with one."""
+    from cunibs import ConductivityUQConfig
+
+    config = ConductivityUQConfig(n_samples=4, seed=0)
+    result = two_tissue_subject.simulate_conductivity_uq(
+        _coil(), _placement(), config, didt=0.0, moments=True, recovery="raw"
+    )
+    assert not result.mean_magnE.any()
+    assert not result.peak_samples.any()
+    assert set(result.tissue_sensitivity().values()) == {0.0}
+
+
 def test_uq_two_tissue_has_variance(cp, two_tissue_cube):
     """Distinct tissues make |E| depend on the conductivity ratio, so the ensemble has spread."""
     from cunibs import ConductivityUQConfig, Subject
@@ -469,7 +482,7 @@ def test_uq_reduced_basis_guess_tracks_the_solution(cp, two_tissue_subject):
         return x[:, 0]
 
     def guess_at(basis, sigma):
-        y = basis.coefficients(cp.asnumpy(sigma)[None])
+        y = basis.coefficients(pre.affine_coefficients(sigma[None]))
         out = cp.empty((n_red, 1), dtype=cp.float64)
         basis.guess_into(cp.asarray(y), out, stream)
         return out[:, 0]

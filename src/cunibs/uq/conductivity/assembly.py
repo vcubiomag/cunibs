@@ -33,7 +33,7 @@ from cunibs.fem.solve import (
 from cunibs.solver import AffineTerms, NativeVCycle
 
 
-@dataclass
+@dataclass(eq=False)
 class ConductivityUQPrecompute:
     """Reusable state for conductivity UQ on one mesh, amortised across placements/samples.
 

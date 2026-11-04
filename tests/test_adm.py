@@ -457,6 +457,14 @@ def test_a_single_dipole_at_the_origin_needs_no_margin(cube_subject):
     assert np.isfinite(evaluate(recip, dipole, Placement(center, [50.0, 150.0, 100.0]))).all()
 
 
+def test_a_target_compares_by_identity():
+    from cunibs.adm import Target
+
+    one = Target([1.0, 2.0, 3.0])
+    assert one != Target([1.0, 2.0, 3.0])
+    assert len({one, Target([1.0, 2.0, 3.0])}) == 2
+
+
 def test_evaluate_is_linear_in_didt(cp, cube_reciprocity, coil):
     from cunibs.adm import evaluate
     from cunibs.simulation import Placement
