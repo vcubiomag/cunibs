@@ -492,7 +492,7 @@ def run_conductivity_uq(
                 stream,
                 x_red,
             )
-            if retry_rels[0] > pre.tolerance:
+            if not retry_rels[0] <= pre.tolerance:
                 raise SolverConvergenceError(int(retry_iters), retry_rels[0], pre.tolerance)
             x_blk[:, c] = x_red[:, 0]
 

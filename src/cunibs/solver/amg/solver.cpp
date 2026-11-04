@@ -451,6 +451,11 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
             if (done[c]) continue;
             if (!waiting[c]) ++ran[c];
             rel[c] = std::sqrt(h_norm[c]) / norm_ref[c];
+            // Past fp32's range the column is NaN from here on, and no iteration brings it back.
+            if (!std::isfinite(rel[c])) {
+                done[c] = true;
+                continue;
+            }
             waiting[c] = rel[c] <= tolerance;
             check_now = check_now || (!waiting[c] && rel[c] <= checkpoint(c));
             all_waiting = all_waiting && waiting[c];

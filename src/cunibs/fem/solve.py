@@ -533,12 +533,12 @@ def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
     iters, rel = solver.pcg.solve_mixed(
         solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream
     )
-    if float(rel) > solver.tolerance:
+    if not float(rel) <= solver.tolerance:
         solver.rebuild_preconditioner()
         iters, rel = solver.pcg.solve_mixed(
             solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
         )
-        if float(rel) > solver.tolerance:
+        if not float(rel) <= solver.tolerance:
             raise SolverConvergenceError(int(iters), float(rel), solver.tolerance)
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(rel)
@@ -574,7 +574,8 @@ def _solve_grounded_block_mat(
     solver.last_iterations = int(iters)
     solver.last_relative_residual = float(max(rels[:k]))
 
-    missed = [c for c in range(k) if rels[c] > solver.tolerance]
+    # Written so that a NaN residual, from a field too small or large for fp32, counts as missed.
+    missed = [c for c in range(k) if not rels[c] <= solver.tolerance]
     if missed:
         solver.rebuild_preconditioner()
         worst = 0.0
@@ -584,7 +585,7 @@ def _solve_grounded_block_mat(
             retry_iters, rel = solver.pcg.solve_mixed(
                 solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
             )
-            if float(rel) > solver.tolerance:
+            if not float(rel) <= solver.tolerance:
                 raise SolverConvergenceError(
                     int(retry_iters), float(rel), solver.tolerance, column=c
                 )

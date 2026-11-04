@@ -15,6 +15,7 @@ import pytest
 
 from cunibs import Placement, Subject
 from cunibs._memory import build_arena, scratch_pool, unpooled
+from cunibs.fem.solve import SolverConvergenceError
 from cunibs.mesh import load_mesh
 
 pytestmark = pytest.mark.gpu
@@ -324,3 +325,14 @@ def test_out_of_memory_is_a_memory_error_from_every_allocator(cp):
         unpooled(huge)
     with pytest.raises(MemoryError), cp.cuda.using_allocator(scratch_pool().malloc):
         cp.empty(huge, dtype=cp.uint8)
+
+
+@pytest.mark.realmesh
+def test_a_field_outside_fp32_range_raises(
+    fresh_subject, patch_mesh, d70_coil, patch_placement
+):
+    """fp32 CG breaks down with a NaN residual, which must not pass for convergence."""
+    subj = fresh_subject(patch_mesh)
+    with pytest.raises(SolverConvergenceError):
+        subj.simulate(d70_coil, patch_placement, 1e-12)
+    assert np.isfinite(subj.simulate(d70_coil, patch_placement, 1e6).peak_magnE())
