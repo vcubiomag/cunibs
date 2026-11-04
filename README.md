@@ -155,7 +155,17 @@ and coil used.
 Full-volume arrays follow `subject.mesh`, which reorders the elements and nodes
 of the file you loaded. Index them with `result.tet_tags` and
 `result.barycenters_mm`, or with `subject.mesh`, not with the arrays from
-`load_mesh`.
+`load_mesh`. `subject.element_order` and `subject.node_order` convert between the
+two:
+
+```python
+import numpy as np
+
+atlas_in_result_order = atlas[subject.element_order]
+
+magnE_in_file_order = np.empty_like(result.magnE)
+magnE_in_file_order[subject.element_order] = result.magnE
+```
 
 The `recovery` argument selects how the reported field is computed from the
 finite-element solution. The default, `"harmonic"`, is accurate at tissue

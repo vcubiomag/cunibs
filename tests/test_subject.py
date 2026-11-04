@@ -515,3 +515,43 @@ def test_a_library_out_of_memory_is_a_memory_error(status):
 def test_other_library_errors_pass_through():
     with pytest.raises(RuntimeError, match="INVALID_VALUE"), build_arena():
         raise RuntimeError("CUBLAS_STATUS_INVALID_VALUE")
+
+
+@pytest.mark.realmesh
+def test_element_and_node_order_map_results_to_the_loaded_mesh(
+    patch_mesh, d70_coil, patch_placement
+):
+    with Subject(patch_mesh) as subj:
+        result = subj.simulate(d70_coil, patch_placement, 1e6, magnitude=True, potential=True)
+        elements, nodes = subj.element_order, subj.node_order
+
+        assert sorted(elements.tolist()) == list(range(patch_mesh.n_tets))
+        assert sorted(nodes.tolist()) == list(range(patch_mesh.n_nodes))
+        np.testing.assert_array_equal(patch_mesh.tet_tags[elements], result.tet_tags)
+        np.testing.assert_array_equal(patch_mesh.nodes_mm[nodes], subj.mesh.nodes_mm)
+        np.testing.assert_allclose(
+            patch_mesh.nodes_mm[patch_mesh.tet_nodes].mean(axis=1)[elements],
+            result.barycenters_mm,
+            atol=1e-9,
+        )
+
+        in_file_order = np.empty_like(result.magnE)
+        in_file_order[elements] = result.magnE
+        np.testing.assert_array_equal(in_file_order[elements], result.magnE)
+        gray = patch_mesh.tet_tags == 2
+        assert in_file_order[gray].sum() == pytest.approx(
+            result.magnE[result.tet_tags == 2].sum(), rel=1e-6
+        )
+
+
+@pytest.mark.realmesh
+def test_order_does_not_depend_on_when_it_is_asked_for(patch_mesh):
+    with Subject(patch_mesh) as subj:
+        before = subj.element_order.copy(), subj.node_order.copy()
+        assert subj.context is not None
+        np.testing.assert_array_equal(subj.element_order, before[0])
+        np.testing.assert_array_equal(subj.node_order, before[1])
+        with pytest.raises(ValueError, match="read-only"):
+            subj.element_order[0] = 0
+        subj.free()
+        np.testing.assert_array_equal(subj.element_order, before[0])

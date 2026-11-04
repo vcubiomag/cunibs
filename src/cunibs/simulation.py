@@ -45,6 +45,7 @@ from cunibs.fem import (
     solve_placements_block,
     validate_recovery,
 )
+from cunibs.fem.solve import spatial_order
 from cunibs.mesh import HeadMesh, load_mesh
 
 if TYPE_CHECKING:
@@ -219,6 +220,7 @@ class Subject:
         self._ctx: SolverContext | None = None
         self._host_metrics: _HostMetricInputs | None = None
         self._host_tets: npt.NDArray[np.int32] | None = None
+        self._file_order: tuple[npt.NDArray[np.integer], npt.NDArray[np.integer]] | None = None
         self._host_slots: dict[
             Recovery, tuple[npt.NDArray[np.int32], npt.NDArray[np.int32] | None]
         ] = {}
@@ -251,6 +253,7 @@ class Subject:
             self._ctx = None
             self._host_metrics = None
             self._host_tets = None
+            self._file_order = None
             self._host_slots.clear()
             self._region_slices.clear()
             if self._copier is not None:
@@ -306,6 +309,38 @@ class Subject:
         :func:`~cunibs.mesh.load_mesh` returned. Reading it builds the solver context.
         """
         return self.context.mesh
+
+    def _orders(self) -> tuple[npt.NDArray[np.integer], npt.NDArray[np.integer]]:
+        # Recomputed rather than kept from the build: the sorts are stable, so the same inputs give
+        # the same permutations, and a run that never asks holds neither.
+        with self._lock:
+            if self._file_order is None:
+                with cp.cuda.using_allocator(scratch_pool().malloc):
+                    node_perm, _, tet_perm = spatial_order(
+                        cp.asarray(self._mesh.nodes_mm), cp.asarray(self._mesh.tet_nodes)
+                    )
+                    nodes, elements = cp.asnumpy(node_perm), cp.asnumpy(tet_perm)
+                nodes.setflags(write=False)
+                elements.setflags(write=False)
+                self._file_order = (nodes, elements)
+            return self._file_order
+
+    @property
+    def element_order(self) -> npt.NDArray[np.integer]:
+        """For each element of :attr:`mesh`, its index in the mesh this subject was loaded from.
+
+        ``file_data[subject.element_order]`` puts per-element data from the file in result order.
+        ``out[subject.element_order] = result.magnE`` puts a result in file order.
+        """
+        return self._orders()[1]
+
+    @property
+    def node_order(self) -> npt.NDArray[np.integer]:
+        """For each node of :attr:`mesh`, its index in the mesh this subject was loaded from.
+
+        Used as :attr:`element_order` is, for per-node arrays such as ``result.v``.
+        """
+        return self._orders()[0]
 
     @property
     def context(self) -> SolverContext:
