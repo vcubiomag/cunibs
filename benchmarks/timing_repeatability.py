@@ -4,10 +4,10 @@ Backs the timing protocol of the cuNIBS paper (the interquartile range within a 
 between processes) and the range of the sweep cost across processes in the cost section.
 
 Three warm timings are repeated in each of several new interpreter processes: one placement
-through ``Subject.simulate``, the cost per placement of the 64-placement sweep that
-sweep_throughput quotes, and the cost per draw of a conductivity ensemble. Each process loads the
-mesh, builds its own solver state and warms up before timing, so the spread between their
-medians is what a rerun of any benchmark would see.
+through ``Subject.simulate`` with |E| returned to the host, the cost per placement of the
+64-placement sweep that sweep_throughput quotes, and the cost per draw of a conductivity ensemble.
+Each process loads the mesh, builds its own solver state and warms up before timing, so the spread
+between their medians is what a rerun of any benchmark would see.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def measure(mesh_path: str, quick: bool) -> dict[str, list[float]]:
 
     return {
         "placement_ms": _measure.timed(
-            lambda: subject.simulate(coil, placements[0], _data.DIDT), 4 * n
+            lambda: subject.simulate(coil, placements[0], _data.DIDT, magnitude=True), 4 * n
         ),
         "sweep_ms_per_placement": [t / sweep for t in _measure.timed(run_sweep, n // 2)],
         "uq_ms_per_draw": [
@@ -63,7 +63,7 @@ def run(ctx: _run.Context) -> dict:
         out = subprocess.run(
             [sys.executable, "-m", __name__, path, str(ctx.device), str(int(ctx.quick))],
             cwd=_run.REPO,
-            capture_output=True,
+            stdout=subprocess.PIPE,
             text=True,
             check=True,
         ).stdout

@@ -1,9 +1,9 @@
 """Whether the solver converges the same way on every head and at every resolution.
 
-Backs the cuNIBS results that every solve over the cohort, the four targets and the resolution
-ladder converged, with a largest final relative residual of 9.9993e-7; that the iteration count
-varied by a factor of 1.22 over the ladder rungs with three-level hierarchies and by 1.8 over the
-cohort; and that the 17.1M-element rung coarsened to a fourth level and took 34 iterations.
+Backs the cuNIBS results on convergence over the cohort, the four targets and the resolution
+ladder: that every solve converged and its largest final relative residual, how far the iteration
+count varied over the cohort and over the ladder rungs of one hierarchy depth, and the depth and
+iteration count of the finest rung.
 
 The cohort varies anatomy at nearly constant element count, and the ladder varies element count at
 fixed anatomy. Counts are per placement: in a block solve each column stops at its own residual.
@@ -28,31 +28,29 @@ def _solve(path, cap_path, labels) -> dict:
     from cunibs import Coil, Subject
     from cunibs.fem import SolverConvergenceError
 
-    subject = Subject.from_mesh(path)
-    coil = Coil.load(_data.COIL)
-    placements = _data.placements(subject, cap_path, labels)
-    failures = 0
-    try:
-        results = list(subject.iter_simulate(coil, placements, _data.DIDT))
-    except SolverConvergenceError:
-        results = []
-        for placement in placements:
-            try:
-                results.append(subject.simulate(coil, placement, _data.DIDT))
-            except SolverConvergenceError:
-                failures += 1
-    row = {
-        "n_tets": subject.mesh.n_tets,
-        # The hierarchy depth is not exposed publicly; the preconditioner reports it.
-        "n_levels": int(subject.context.solver.precond.n_levels()),
-        "targets": list(labels),
-        "iterations": [r.iterations for r in results],
-        "max_relative_residual": max((r.relative_residual for r in results), default=None),
-        "tolerance": results[0].provenance["solver_tolerance"] if results else None,
-        "n_failures": failures,
-    }
-    subject.free()
-    return row
+    with Subject.from_mesh(path) as subject:
+        coil = Coil.load(_data.COIL)
+        placements = _data.placements(subject, cap_path, labels)
+        failures = 0
+        try:
+            results = list(subject.iter_simulate(coil, placements, _data.DIDT))
+        except SolverConvergenceError:
+            results = []
+            for placement in placements:
+                try:
+                    results.append(subject.simulate(coil, placement, _data.DIDT))
+                except SolverConvergenceError:
+                    failures += 1
+        return {
+            "n_tets": subject.mesh.n_tets,
+            # The hierarchy depth is not exposed publicly; the preconditioner reports it.
+            "n_levels": int(subject.context.solver.precond.n_levels()),
+            "targets": list(labels),
+            "iterations": [r.iterations for r in results],
+            "max_relative_residual": max((r.relative_residual for r in results), default=None),
+            "tolerance": results[0].provenance["solver_tolerance"] if results else None,
+            "n_failures": failures,
+        }
 
 
 def _spread(values) -> dict:
@@ -76,15 +74,17 @@ def run(ctx: _run.Context) -> dict:
     for rung in rungs:
         try:
             row = _solve(rung.path, ctx.data.mesh(rung.subject), _data.TARGETS[:1])
+            ladder[rung.path.stem] = row | {"scale": rung.scale}
         except MemoryError as exc:
             skipped.append({"rung": rung.path.stem, "error": str(exc)})
-            _measure.free_pools()
-            continue
-        ladder[rung.path.stem] = row | {"scale": rung.scale, "median": row["iterations"][0]}
+        # Outside the handler, whose traceback keeps the failed rung's arrays alive.
+        _measure.free_pools()
 
+    # A rung whose one placement failed has no count, and is charged under n_failures.
+    counts = {name: r["iterations"][0] for name, r in ladder.items() if r["iterations"]}
     by_depth = {}
-    for name, row in ladder.items():
-        by_depth.setdefault(str(row["n_levels"]), {})[name] = row["median"]
+    for name, count in counts.items():
+        by_depth.setdefault(str(ladder[name]["n_levels"]), {})[name] = count
     depths = {
         depth: {"rungs": members, **_spread(list(members.values()))}
         for depth, members in sorted(by_depth.items())
@@ -101,13 +101,13 @@ def run(ctx: _run.Context) -> dict:
         "ladder": {
             "rungs": ladder,
             "skipped": skipped,
-            "iterations": _spread([r["median"] for r in ladder.values()]) if ladder else None,
+            "iterations": _spread(list(counts.values())) if counts else None,
             "by_depth": depths,
             "finest": next(({"rung": k, **v} for k, v in reversed(ladder.items())), None),
         },
         "n_solves": sum(len(r["iterations"]) for r in rows),
         "n_failures": sum(r["n_failures"] for r in rows),
         "worst_relative_residual": max(
-            r["max_relative_residual"] for r in rows if r["max_relative_residual"] is not None
+            (r["max_relative_residual"] for r in rows if r["iterations"]), default=None
         ),
     }

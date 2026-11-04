@@ -170,6 +170,8 @@ def run(ctx: _run.Context) -> dict:
                 recovery=operator,
             )
 
+        # Blocks cached by the previous width would otherwise count against this width's baseline.
+        _measure.free_pools()
         with _measure.PeakMemory() as peak:
             samples = _measure.timed(block, n)
         widths[str(k)] = {

@@ -3,16 +3,25 @@
 Backs the grid-spacing sentences of the cuNIBS paper's placement-optimisation results. The
 reciprocity field is tabulated on a Cartesian grid and interpolated at the coil's dipoles; 3 mm
 is the shipped spacing. On one head and target, every candidate is scored at spacings from 1 to
-6 mm against one set of forward solves, which do not depend on the spacing. Memory is the size of
-the tabulated field.
+6 mm against one set of forward solves, which do not depend on the spacing. Memory is every array
+the field holds on the device, of which the tabulated grid is only a part.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 from benchmarks import _data, _measure, _objective, _run
 
 SPACINGS_MM = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 SHIPPED_MM = 3.0
+
+
+def _field_mib(recip) -> float:
+    import cupy as cp
+
+    arrays = (getattr(recip, f.name) for f in dataclasses.fields(recip))
+    return sum(a.nbytes for a in arrays if isinstance(a, cp.ndarray)) / 2**20
 
 
 def run(ctx: _run.Context) -> dict:
@@ -41,6 +50,7 @@ def run(ctx: _run.Context) -> dict:
                 "spacing_mm": spacing,
                 "grid_shape": list(recip.grid.shape),
                 "grid_mib": recip.q.nbytes / 2**20,
+                "field_mib": _field_mib(recip),
                 **_objective.score(surrogate, forward),
             }
         )
@@ -59,7 +69,7 @@ def run(ctx: _run.Context) -> dict:
         "same_pick_at_every_spacing": all(r["same_pick"] for r in rows),
         "finest_vs_shipped": {
             "finest_mm": finest["spacing_mm"],
-            "memory_ratio": finest["grid_mib"] / shipped["grid_mib"],
+            "memory_ratio": finest["field_mib"] / shipped["field_mib"],
             "error_ratio": finest["median_error"] / shipped["median_error"],
         },
     }

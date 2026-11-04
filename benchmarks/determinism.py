@@ -34,8 +34,7 @@ def _diff(a: np.ndarray, b: np.ndarray) -> dict:
 
 
 def _gm_digest(result) -> str:
-    gm = np.ascontiguousarray(result.magnE[result.tet_tags == GRAY_MATTER])
-    return hashlib.sha256(gm.tobytes()).hexdigest()
+    return hashlib.sha256(result.magnE[result.tet_tags == GRAY_MATTER].tobytes()).hexdigest()
 
 
 def _probe(mesh_path):
@@ -74,7 +73,7 @@ def run(ctx: _run.Context) -> dict:
     child = subprocess.run(
         [sys.executable, "-m", "benchmarks.determinism", str(mesh_path), str(ctx.device)],
         cwd=_run.REPO,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
         check=True,
     )

@@ -1,16 +1,16 @@
 """How far the field moves when the same input is solved on a different GPU.
 
-Backs the cuNIBS reproducibility result that across three GPU models the largest per-element
-difference was 7.3e-8 of the peak. Each machine solves the four targets on the reference subject
+Backs the cuNIBS reproducibility result on the largest per-element difference across GPU models,
+as a fraction of the peak. Each machine solves the four targets on the reference subject
 and saves its gray-matter |E| beside its results as ``cross_hardware.npz``. The run then reads
 every machine's file under the results root and compares each pair of machines: the largest
 per-element difference over the four targets, divided by the peak of the first machine's field.
 
 A pair is only compared when both solved the same mesh with the same coil frames, since any other
 difference would read as one between GPUs. Frames count as the same within 1e-9 mm: each GPU
-computes them itself, and their last bits differ between architectures. Each card's fp64 rate relative to fp32 is recorded:
-consumer cards run fp64 at 1:64 and datacentre cards at 1:2, and a portability claim across that
-axis needs machines on both sides of it.
+computes them itself, and their last bits differ between architectures. Each card's fp64 rate
+relative to fp32 is recorded: consumer cards run fp64 at 1:64 and datacentre cards at 1:2, and a
+portability claim across that axis needs machines on both sides of it.
 """
 
 from __future__ import annotations

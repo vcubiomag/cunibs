@@ -2,9 +2,9 @@
 
 Backs fig_uq(a) and the conductivity rows of the cuNIBS cost table. An ensemble of each size is
 run end to end through ``run_conductivity_uq`` with harmonic recovery, so the per-placement setup
-is spread over the draws. The baseline does in this library what a draw costs without reuse:
-assemble the stiffness matrix at the draw's conductivities, build its hierarchy and RHS operator,
-then solve, reconstruct and recover the field.
+is spread over the draws, and its median over a few repeats is reported. The baseline does in this
+library what a draw costs without reuse: assemble the stiffness matrix at the draw's conductivities,
+build its hierarchy and RHS operator, then solve, reconstruct and recover the field.
 
 SimNIBS has no conductivity-sampling mode, so its draw is a full rebuild and solve, as timed by
 ``simnibs_timing``. The hierarchy is built once at nominal conductivity; the number of draws that
@@ -22,6 +22,7 @@ from benchmarks import _data, _measure, _objective, _run
 N_SWEEP = (50, 100, 200, 500, 1000)
 NAIVE_DRAWS = 10
 ENSEMBLE = 500
+REPEATS = 5
 
 
 def _naive_draw(subject, coil, placement, operator, tags):
@@ -45,7 +46,14 @@ def _naive_draw(subject, coil, placement, operator, tags):
         lut = nominal.copy()
         lut[list(tags)] = sigma
         cond = cp.asarray(lut)[ctx.tet_tags]
-        a = assemble_stiffness(g, vols, cond, ctx.n_nodes, ctx.tet_nodes)
+        a = assemble_stiffness(
+            g,
+            vols,
+            cond,
+            ctx.n_nodes,
+            ctx.tet_nodes,
+            (ctx.node2corner_ptr, ctx.node2corner_idx),
+        )
         rebuilt = dataclasses.replace(
             ctx,
             solver=prepare_grounded_solver(a, ground),
@@ -93,19 +101,24 @@ def run(ctx: _run.Context) -> dict:
         )  # fmt: skip
 
     ensemble(ConductivityUQConfig(n_samples=8, seed=1))
-    rebuilds = []
+    rebuilds = set()
     # The library does not report fallbacks; this hook on our own precompute is where a draw
     # that missed tolerance gets a hierarchy of its own.
     pre.preconditioner_for = lambda data, f=pre.preconditioner_for: (
-        rebuilds.append(1) or f(data)
+        rebuilds.add(data.tobytes()) or f(data)
     )
 
     sweep, contrast = [], []
     for n in (10, 20) if ctx.quick else N_SWEEP:
-        config = ConductivityUQConfig(n_samples=n)
-        ms, _ = _measure.once(lambda c=config: ensemble(c))
+        # A seed's smaller ensembles are prefixes of its larger ones, so each size takes its own
+        # and every draw counted below is a different draw.
+        config = ConductivityUQConfig(n_samples=n, seed=n)
+        wall = _measure.stats(
+            _measure.timed(lambda c=config: ensemble(c), 2 if ctx.quick else REPEATS, warmup=0)
+        )
+        ms = wall["median"]
         sigmas = cp.asnumpy(sample_conductivities(config, pre.perturbed_tags))
-        sweep.append({"n": n, "wall_s": ms / 1e3, "ms_per_draw": ms / n})
+        sweep.append({"n": n, "wall_s": ms / 1e3, "ms_per_draw": ms / n, "wall_ms": wall})
         contrast.append(float((sigmas.max(axis=1) / sigmas.min(axis=1)).max()))
         print(f"{n:>5} draws: {ms / n:.2f} ms/draw", flush=True)
     per_draw_ms = min(s["ms_per_draw"] for s in sweep)
@@ -147,7 +160,7 @@ def run(ctx: _run.Context) -> dict:
             "draw": best["draw_s"] * 1e3 / per_draw_ms,
             "ensemble": {
                 "n": n_ens["n"],
-                "ratio": best["draw_s"] * n_ens["n"] / n_ens["wall_s"],
+                "ratio": best["draw_s"] * n_ens["n"] / (n_ens["wall_s"] + precompute_ms * 1e-3),
             },
         }
 

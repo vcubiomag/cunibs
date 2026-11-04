@@ -10,9 +10,10 @@ needs no exact solution. At each node on a face between tissues A and B, the are
     r_t = |P (E_A - E_B)|                        s_t = |P (E_A + E_B) / 2|,  P = I - n n^T.
 
 A residual is ``|r| / sqrt(mean s^2)`` over the scored node pairs, summarised by its median (and,
-on the manufactured problems, by ``|r|``'s RMS over the same scale). Outer-surface nodes are left
-out. ``raw`` is scored on each interface face from its two tetrahedra; ``spr_global`` has one
-value per node, so its tangential residual is zero by construction.
+on the manufactured problems, by ``|r|``'s RMS over the same scale). Outer-surface nodes, and
+faces touching them, are left out. ``raw`` is scored on each interface face from its two
+tetrahedra; ``spr_global`` has one value per node, so its tangential residual is zero by
+construction.
 
 The residual is first checked against the true interface error on the manufactured ladders of
 ``_exact``, where it should order the rules as the true error does. On the heads, each node pair
@@ -70,8 +71,15 @@ def _geometry(nodes, tets, tags, on_surface, slot_node, slot_tag) -> dict:
     )
     length = np.linalg.norm(vector, axis=1)
     node = pair // _TAGS**2
+    off = ~on_surface[tri].any(axis=1)
     return {
-        "face": {"lo": lo, "hi": hi, "normal": normal, "lo_tag": tags[lo], "hi_tag": tags[hi]},
+        "face": {
+            "lo": lo[off],
+            "hi": hi[off],
+            "normal": normal[off],
+            "lo_tag": tags[lo[off]],
+            "hi_tag": tags[hi[off]],
+        },
         "node": node,
         "lo_tag": pair // _TAGS % _TAGS,
         "hi_tag": pair % _TAGS,

@@ -6,8 +6,9 @@ per dipole.
 
 The coil enters a placement only through dA/dt at the mesh nodes, a direct sum over its dipoles,
 so that is the only cost expected to move with the coil. Each coil is placed at C3 on one mesh and
-timed twice: a whole placement through ``Subject.simulate``, and dA/dt alone through
-``fem.coil_dadt_at_nodes`` at the same coil frame. Both are fitted as lines in the dipole count.
+timed twice: a whole placement through ``Subject.simulate`` with |E| returned, as single_placement
+times it, and dA/dt alone through ``fem.coil_dadt_at_nodes`` at the same coil frame. Both are
+fitted as lines in the dipole count.
 """
 
 from __future__ import annotations
@@ -34,7 +35,9 @@ def run(ctx: _run.Context) -> dict:
     rows = []
     for name in names[:4] if ctx.quick else names:
         coil = Coil.load(name)
-        whole = _measure.timed(lambda c=coil: subject.simulate(c, placement, _data.DIDT), n)
+        whole = _measure.timed(
+            lambda c=coil: subject.simulate(c, placement, _data.DIDT, magnitude=True), n
+        )
         dadt = _measure.timed(
             lambda c=coil: coil_dadt_at_nodes(
                 c.positions_m, c.moments, frame, _data.DIDT, nodes

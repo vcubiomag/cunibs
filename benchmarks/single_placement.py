@@ -6,14 +6,20 @@ only one where a ratio against SimNIBS compares like with like. Dividing one cod
 by the other's measures which side happened to do the work earlier.
 
 "Cold" is the first subject in this process, so it includes the library's one-time CUDA module
-loads. The same path is then repeated on a second subject, which is what every subject after the
-first costs. A warm placement is timed at two tiers: ``Subject.simulate``, which returns host
-arrays as a user gets them, and ``fem.solve_placement``, which leaves everything on the device.
+loads, and it happens once. The same path is then repeated on further subjects, and its median is
+what every subject after the first costs. A warm placement is timed at two tiers:
+``Subject.simulate`` with |E| for every element returned to the host, the output the SimNIBS solves
+it is compared with also produce, and ``fem.solve_placement``, which leaves everything on the
+device.
 """
 
 from __future__ import annotations
 
+import numpy as np
+
 from benchmarks import _data, _measure, _run
+
+NEXT_SUBJECTS = 5
 
 
 def _cold(path) -> tuple[dict[str, float], object, object, object]:
@@ -31,7 +37,9 @@ def _cold(path) -> tuple[dict[str, float], object, object, object]:
     ms["coil_load"], coil = _measure.once(lambda: Coil.load(_data.COIL))
     # Choosing the pose is the user's input, not work the library does, so it is not timed.
     (placement,) = _data.placements(subject, path, labels=("C3",))
-    ms["first_placement"], _ = _measure.once(lambda: subject.simulate(coil, placement))
+    ms["first_placement"], _ = _measure.once(
+        lambda: subject.simulate(coil, placement, _data.DIDT, magnitude=True)
+    )
     ms["total"] = sum(ms.values())
     return ms, subject, coil, placement
 
@@ -44,12 +52,17 @@ def run(ctx: _run.Context) -> dict:
     # still has the file cached.
     path.read_bytes()
     first, subject, _, _ = _cold(path)
-    subject.free()
-    with _measure.PeakMemory() as peak:
-        later, subject, coil, placement = _cold(path)
+    later = []
+    for _ in range(2 if ctx.quick else NEXT_SUBJECTS):
+        subject.free()
+        with _measure.PeakMemory() as peak:
+            ms, subject, coil, placement = _cold(path)
+        later.append(ms)
 
     n = 20 if ctx.quick else 200
-    user = _measure.timed(lambda: subject.simulate(coil, placement), n)
+    user = _measure.timed(
+        lambda: subject.simulate(coil, placement, _data.DIDT, magnitude=True), n
+    )
     operator = ensure_recovery(subject.context, "harmonic")
     device = _measure.timed(
         lambda: solve_placement(
@@ -69,7 +82,7 @@ def run(ctx: _run.Context) -> dict:
         "n_tets": subject.mesh.n_tets,
         "coil": _data.COIL,
         "cold_ms": first,
-        "next_subject_ms": later,
+        "next_subject_ms": {k: float(np.median([r[k] for r in later])) for k in first},
         "placement_ms": {"simulate": _measure.stats(user), "device": _measure.stats(device)},
         "peak_device_mib": peak.peak_mib,
     }
@@ -94,8 +107,7 @@ def run(ctx: _run.Context) -> dict:
             "warm_placement": sweep["steady_placement_s"] * 1e3 / warm_ms,
         }
 
-    # OnlineFEM's full-volume output is the like-for-like counterpart: a placement here returns
-    # |E| for every tetrahedron too.
+    # OnlineFEM's full-volume output is the like-for-like counterpart.
     onlinefem = ctx.latest("simnibs_onlinefem")
     if onlinefem:
         cold, sweep = onlinefem["best"]["cold"]["volume"], onlinefem["best"]["sweep"]["volume"]
