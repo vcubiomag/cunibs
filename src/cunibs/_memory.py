@@ -38,6 +38,11 @@ class Arena:
 
 
 _CUDA_ERROR_MEMORY_ALLOCATION = 2
+_LIBRARY_OUT_OF_MEMORY = {
+    "CUBLAS_STATUS_ALLOC_FAILED",
+    "CUSOLVER_STATUS_ALLOC_FAILED",
+    "CUSOLVER_STATUS_INTERNAL_ERROR",
+}
 
 _scratch: cp.cuda.MemoryPool | None = None
 _scratch_lock = threading.Lock()
@@ -91,6 +96,22 @@ def _stream_ordered(size: int) -> cp.cuda.MemoryPointer:
 
 
 @contextmanager
+def library_memory_errors() -> Iterator[None]:
+    """Report cuBLAS or cuSOLVER running out of device memory as the MemoryError it is.
+
+    Each creates a handle on a thread's first use, whose allocations can fail on a nearly full
+    device, where cuBLAS says so and cuSOLVER reports an internal error. Their exception types are
+    RuntimeErrors matched by message, since importing them would load both libraries.
+    """
+    try:
+        yield
+    except RuntimeError as error:
+        if str(error) in _LIBRARY_OUT_OF_MEMORY:
+            raise cp.cuda.memory.OutOfMemoryError(0, 0) from error
+        raise
+
+
+@contextmanager
 def build_arena() -> Iterator[Arena]:
     """Run a build of long-lived device state with its temporaries outside the caller's pool.
 
@@ -105,5 +126,5 @@ def build_arena() -> Iterator[Arena]:
     the device at the next synchronisation. Nothing a build keeps shares a chunk with them.
     """
     arena = Arena(cp.cuda.get_allocator())
-    with cp.cuda.using_allocator(_stream_ordered):
+    with library_memory_errors(), cp.cuda.using_allocator(_stream_ordered):
         yield arena

@@ -496,3 +496,22 @@ def test_a_retried_build_does_not_hold_the_failed_attempts_memory(cp, cube_mesh)
     with Subject(cube_mesh) as subj:
         assert subj._build(build) == "built"
     assert seen[1] == 0
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "CUBLAS_STATUS_ALLOC_FAILED",
+        "CUSOLVER_STATUS_ALLOC_FAILED",
+        "CUSOLVER_STATUS_INTERNAL_ERROR",
+    ],
+)
+def test_a_library_out_of_memory_is_a_memory_error(status):
+    """A handle's first allocation fails this way on a nearly full device."""
+    with pytest.raises(MemoryError), build_arena():
+        raise RuntimeError(status)
+
+
+def test_other_library_errors_pass_through():
+    with pytest.raises(RuntimeError, match="INVALID_VALUE"), build_arena():
+        raise RuntimeError("CUBLAS_STATUS_INVALID_VALUE")

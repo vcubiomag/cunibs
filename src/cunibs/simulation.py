@@ -29,7 +29,7 @@ from cunibs._common import (
     write_metrics,
     write_provenance,
 )
-from cunibs._memory import release_scratch, scratch_pool, unpooled
+from cunibs._memory import library_memory_errors, release_scratch, scratch_pool, unpooled
 from cunibs._transfer import AsyncCopier
 from cunibs.adm.target import check_elements
 from cunibs.fem import (
@@ -614,7 +614,7 @@ class Subject:
                 held: list[object] = []
                 batch = None
                 try:
-                    with cp.cuda.using_allocator(temp_pool.malloc):
+                    with library_memory_errors(), cp.cuda.using_allocator(temp_pool.malloc):
                         outs = solve_placements_block(
                             ctx,
                             dip_pos_m,
@@ -823,7 +823,7 @@ class Subject:
         host = self._host_metric_inputs if moments else None
 
         def reduce(site: Placement) -> ConductivityUQResult:
-            with cp.cuda.using_allocator(temp_pool.malloc):
+            with library_memory_errors(), cp.cuda.using_allocator(temp_pool.malloc):
                 result = run_conductivity_uq(
                     ctx,
                     pre,
