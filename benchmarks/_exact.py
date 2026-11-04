@@ -104,6 +104,19 @@ def _jitter(points: np.ndarray, movable: np.ndarray, step: float, rng, jitter: f
         points[movable] += rng.uniform(-jitter, jitter, (int(movable.sum()), 3)) * step
 
 
+def _untangle(nodes: np.ndarray, rest: np.ndarray, tets: np.ndarray) -> None:
+    """Return to ``rest`` the nodes of every element the jitter turned inside out."""
+
+    def signed(points: np.ndarray) -> np.ndarray:
+        p = points[tets]
+        return np.linalg.det(p[:, 1:] - p[:, :1])
+
+    orientation = np.sign(signed(rest))
+    while (flipped := signed(nodes) * orientation < 0).any():
+        moved = np.unique(tets[flipped])
+        nodes[moved] = rest[moved]
+
+
 def ball_mesh(subdivisions: int, tags=BALL_TAGS) -> HeadMesh:
     """A solid ball of concentric shells, with conforming interfaces at ``BALL_RADII_MM``.
 
@@ -115,13 +128,14 @@ def ball_mesh(subdivisions: int, tags=BALL_TAGS) -> HeadMesh:
     edge = float(np.linalg.norm(sphere[tris[:, 0]] - sphere[tris[:, 1]], axis=1).mean())
     tris = np.sort(tris, axis=1)
     rng = np.random.default_rng(0)
-    nodes, tets, tet_tags = [np.zeros((1, 3))], [], []
+    nodes, rest, tets, tet_tags = [np.zeros((1, 3))], [np.zeros((1, 3))], [], []
     inner, start = 0.0, 1
     for shell, (outer, tag) in enumerate(zip(BALL_RADII_MM, tags, strict=True)):
         n_layers = max(1, round((outer - inner) / (edge * outer)))
         radii = np.linspace(inner, outer, n_layers + 1)[1:]
         rings = (radii[:, None, None] * sphere).reshape(-1, 3)
         step = min(radii[0] - inner, edge * max(inner, radii[0]))
+        rest.append(rings.copy())
         _jitter(rings, np.arange(len(rings)) < (n_layers - 1) * n_v, step, rng, JITTER)
         nodes.append(rings)
         block = (
@@ -138,9 +152,11 @@ def ball_mesh(subdivisions: int, tags=BALL_TAGS) -> HeadMesh:
         tet_tags += [np.full(sum(len(b) for b in block), tag)]
         inner, start = outer, start + n_layers * n_v
     surface = (tris + start - n_v).astype(np.int32)
+    nodes, tets = np.concatenate(nodes), np.concatenate(tets)
+    _untangle(nodes, np.concatenate(rest), tets)
     return HeadMesh(
-        np.concatenate(nodes),
-        np.concatenate(tets).astype(np.int32),
+        nodes,
+        tets.astype(np.int32),
         np.concatenate(tet_tags).astype(np.int32),
         surface,
         np.full(len(surface), SKIN_SURFACE_TAG, np.int32),
@@ -179,6 +195,7 @@ class Planar:
         lin = np.linspace(0.0, BOX_MM, n)
         nodes = np.stack(np.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
         inside = ((nodes > 0) & (nodes < BOX_MM)).all(axis=1) & ~np.isclose(nodes[:, 2], Z0)
+        rest = nodes.copy()
         _jitter(nodes, inside, self.h_mm, np.random.default_rng(0), self.jitter)
         corner = np.array([[i, j, k] for k in (0, 1) for j in (0, 1) for i in (0, 1)])
         cube = [
@@ -193,6 +210,7 @@ class Planar:
         ids = ijk.reshape(-1, 1, 3) + corner
         verts = (ids[..., 0] * n + ids[..., 1]) * n + ids[..., 2]
         tets = verts[:, cube].reshape(-1, 4)
+        _untangle(nodes, rest, tets)
         return _mesh(nodes, tets, np.where(nodes[tets].mean(1)[:, 2] < Z0, INNER, OUTER))
 
     def _f(self, z: np.ndarray, tag: int) -> tuple[np.ndarray, np.ndarray]:
@@ -244,11 +262,14 @@ class Shell:
         held = np.isin(np.arange(self.layers + 1), (0, self.layers // 2, self.layers))
         edge = np.linalg.norm(sphere[tris[:, 0]] - sphere[tris[:, 1]], axis=1).mean()
         step = min(radii[1] - radii[0], edge * R_IN)
+        rest = nodes.copy()
         _jitter(nodes, np.repeat(~held, n_v), step, np.random.default_rng(0), self.jitter)
         lo = np.arange(self.layers)[:, None, None] * n_v + np.sort(tris, axis=1)
         tets = np.concatenate([_prisms(a, a + n_v) for a in lo])
-        radius = np.linalg.norm(nodes[tets].mean(1), axis=1)
-        return _mesh(nodes, tets, np.where(radius < R_MID, INNER, OUTER))
+        _untangle(nodes, rest, tets)
+        # By layer: on a coarse sphere the chords sag, so a centroid test misfiles outer elements.
+        below = tets.max(axis=1) < (self.layers // 2 + 1) * n_v
+        return _mesh(nodes, tets, np.where(below, INNER, OUTER))
 
     def _harmonic(self, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``r^4 P_4(cos theta)`` and its gradient."""

@@ -9,6 +9,7 @@ A slot is a (node, tissue) pair, and a node's tissue count is how many slots it 
 replaces the fit with the tissue's volume-weighted average at every slot on the boundary of its
 own tissue, which includes every mixed node and the outer surface; that is the rule, not a
 rejection. ``harmonic`` has no boundary rule, so each of its fallbacks is a rejected fit.
+``harmonic_quadratic`` is the share of slots on the rung below the cubic, which is not a fallback.
 Nothing here solves a placement: these are properties of the mesh and the recovery operators.
 """
 
@@ -52,6 +53,7 @@ def _subject(path) -> dict:
             np.mean((tags_per_node[tet_nodes[gm]] > 2).any(axis=1))
         ),
         "spr_tissue_average": tissue.n_fallback / tissue.n_slots,
+        "harmonic_quadratic": int((harmonic.status == 1).sum()) / harmonic.n_slots,
         "harmonic_fallback": harmonic.n_fallback / harmonic.n_slots,
         "harmonic_undetermined": int(harmonic.n_undetermined),
     }

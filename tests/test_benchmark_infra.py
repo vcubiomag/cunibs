@@ -59,3 +59,32 @@ def test_field_metrics_on_values_worked_by_hand():
 
     fit = _fields.fit_power([1.0, 2.0, 4.0], [3.0, 12.0, 48.0])
     assert (fit["slope"], fit["a"], fit["r2"]) == pytest.approx((2.0, 3.0, 1.0))
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [("Planar", {"cells": 40}), ("Shell", {"subdivisions": 1, "layers": 4})],
+    ids=lambda g: g[0],
+)
+def test_exact_meshes_keep_every_element_the_right_way_out(geometry):
+    from benchmarks import _exact
+
+    cls, kwargs = geometry
+    mesh = getattr(_exact, cls)(**kwargs, jitter=0.25).mesh()
+    p = mesh.nodes_mm[mesh.tet_nodes]
+    rest = getattr(_exact, cls)(**kwargs, jitter=0.0).mesh()
+    r = rest.nodes_mm[rest.tet_nodes]
+    signs = np.linalg.det(p[:, 1:] - p[:, :1]) * np.linalg.det(r[:, 1:] - r[:, :1])
+    assert (signs > 0.0).all()
+
+
+def test_coarse_shell_tags_each_element_by_its_layer():
+    """The chords of a coarse sphere sag below R_MID, so radius alone misfiles outer elements."""
+    from benchmarks import _exact
+
+    shell = _exact.Shell(subdivisions=1, layers=4, jitter=0.0)
+    mesh = shell.mesh()
+    per_layer = mesh.n_tets // shell.layers
+    tags = mesh.tet_tags.reshape(shell.layers, per_layer)
+    assert (tags[: shell.layers // 2] == _exact.INNER).all()
+    assert (tags[shell.layers // 2 :] == _exact.OUTER).all()

@@ -9,7 +9,8 @@ volume-weighted mean of gray-matter |E| in a 2.5 mm ball around a fixed point. T
 gray-matter barycentres on the finest rung, half from tetrahedra touching a node shared by two
 tissues (interface) and half from the rest (interior). A rule's error on a rung is the RMS relative
 difference of its functionals from the finest rung's, and its order is the log-log slope of that
-error against the rung's element scale. This is self-convergence: the finest rung is not truth.
+error against the rung's median gray-matter edge length, recorded with the successive orders between neighbouring
+rungs and the slope over the three finest. This is self-convergence: the finest rung is not truth.
 
 The coil frame is computed once on the finest rung and passed to every solve. A frame derived on
 each rung from the same placement would follow that rung's smoothed scalp normal, and the tilt
@@ -22,13 +23,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from benchmarks import _data, _fields, _measure, _run
+from benchmarks import _data, _exact, _fields, _measure, _run
 from cunibs import RECOVERY_MODES as MODES
 
 FAMILIES = ("interface", "interior")
 PROBE_RADIUS_MM = 2.5
 N_PROBES = 400
-GRAY_MATTER = 2
 
 
 def _mixed_nodes(ctx):
@@ -45,7 +45,7 @@ def _mixed_nodes(ctx):
 
 def _probes(subject, n: int) -> dict[str, np.ndarray]:
     mesh = subject.mesh
-    gm = mesh.tet_tags == GRAY_MATTER
+    gm = mesh.tet_tags == _data.GRAY_MATTER
     touches = _mixed_nodes(subject.context)[mesh.tet_nodes].any(axis=1)
     rng = np.random.default_rng(0)
     return {
@@ -64,7 +64,7 @@ def _measure_rung(subject, coil, placement, frame, probes) -> dict:
     ctx = subject.context
     own = _data.frames(subject, [placement])[0]
     rois = [subject.roi(p, PROBE_RADIUS_MM) for f in FAMILIES for p in probes[f]]
-    site = [(placement.center_mm, placement.handle_mm, placement.distance_mm)]
+    site = _data.sites([placement])
     functionals = {}
     for mode in MODES:
         # Built uncached, so one operator at a time is resident on the finest rungs.
@@ -86,8 +86,13 @@ def _measure_rung(subject, coil, placement, frame, probes) -> dict:
         iterations = out["iterations"]
         del op, out
     tilt = np.degrees(np.arccos(np.clip(own[:3, 2] @ frame[:3, 2], -1.0, 1.0)))
+    mesh = subject.mesh
+    corners = mesh.nodes_mm[mesh.tet_nodes[mesh.tet_tags == _data.GRAY_MATTER]]
+    pairs = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+    edges = [np.linalg.norm(corners[:, i] - corners[:, j], axis=1) for i, j in pairs]
     return {
         "n_tets": subject.mesh.n_tets,
+        "gray_matter_edge_mm": float(np.median(edges)),
         "iterations": iterations,
         "pose_drift": {
             "axis_tilt_deg": float(tilt),
@@ -140,9 +145,13 @@ def run(ctx: _run.Context) -> dict:
                 float(np.sqrt(np.mean(((rows[r]["functionals"][mode][i] - ref) / ref) ** 2)))
                 for r in coarser
             ]
+            h = [rows[r]["gray_matter_edge_mm"] for r in coarser]
+            fit = _exact.order(h, errors)
             convergence.setdefault(family, {})[mode] = {
                 "rms_relative_difference": errors,
-                **_fields.fit_power([r.scale for r in coarser], errors),
+                **_fields.fit_power(h, errors),
+                "local": fit["local"],
+                "tail": fit.get("tail"),
             }
 
     np.savez_compressed(

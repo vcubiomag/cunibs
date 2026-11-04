@@ -15,8 +15,9 @@ target. Intervals resample subjects, not pairs, because a subject's four targets
 error-in-context table places beside the cross-code, mesh and conductivity terms.
 
 ``coils`` repeats the displacement comparison with each of the 25 bundled coils (skipped in quick
-mode). A coil's footprint is the larger in-plane extent of its dipole set. A coil dependence is only shown when the interquartile range of the per-coil medians exceeds the width
-of one coil's own bootstrap interval, which ``iqr_over_ci_width`` measures.
+mode). A coil's footprint is the larger in-plane extent of its dipole set. A coil dependence is
+only shown when the interquartile range of the per-coil medians exceeds the width of one coil's
+own bootstrap interval, which ``iqr_over_ci_width`` measures.
 
 ``ladder`` is how each rule's peak and percentiles move across the resolution ladder, with the
 coil frame of the finest rung that fits used on every rung.
