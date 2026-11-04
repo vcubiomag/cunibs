@@ -101,7 +101,7 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
     basis twice (classical Gram-Schmidt run twice keeps it orthogonal in finite precision), then
     within itself through its own Gram matrix, dropping any direction the basis already holds.
     """
-    from cunibs.fem.solve import MAX_BLOCK, _assemble_rhs, _pad_block
+    from cunibs.fem.solve import MAX_BLOCK, SolverConvergenceError, _assemble_rhs, _pad_block
 
     if size < 1:
         raise ValueError(f"build_sweep_basis: size must be positive, got {size}")
@@ -121,9 +121,12 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
             del dadt
             x0 = SweepBasis(q).seed(b) if q.shape[1] else None
             x = cp.empty_like(b)
-            solver.pcg.solve_mixed_block(
+            iters, rels, _ = solver.pcg.solve_mixed_block(
                 solver.precond, b, x, solver.tolerance, solver.max_iters, stream, x0
             )
+            # A column short of tolerance still seeds well, and NaN would poison the whole basis.
+            if not np.isfinite(rels).all():
+                raise SolverConvergenceError(int(iters), max(rels), solver.tolerance)
             x = x[:, :k].astype(cp.float32)
             for _ in range(2):
                 if q.shape[1]:

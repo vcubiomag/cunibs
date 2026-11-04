@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict
 
@@ -404,10 +405,16 @@ class SolverConvergenceError(RuntimeError):
         column: int | None = None,
     ) -> None:
         where = "" if column is None else f" (column {column} of the block)"
+        cause = (
+            ". A residual that is not finite means the field is outside fp32's range or part of "
+            "the mesh is not connected to the rest"
+            if not math.isfinite(relative_residual)
+            else ""
+        )
         super().__init__(
             f"PCG did not converge{where}: {iterations} iterations, relative residual "
             f"{relative_residual:.3e} > tolerance {tolerance:.3e}, after rebuilding the "
-            f"preconditioner at the current matrix values"
+            f"preconditioner at the current matrix values{cause}"
         )
         self.iterations = iterations
         self.relative_residual = relative_residual

@@ -430,6 +430,33 @@ def test_csr_matmul_is_the_product_and_repeats_bitwise(cp):
     np.testing.assert_array_equal(cp.asnumpy(csr_matmul(a, x[:, 3])), cp.asnumpy(y[:, 3]))
 
 
+def _with_a_detached_tetrahedron(mesh):
+    from cunibs.mesh import HeadMesh
+
+    far = mesh.nodes_mm.max(axis=0) + 500.0
+    extra = far + np.array([[0, 0, 0], [10, 0, 0], [0, 10, 0], [0, 0, 10.0]])
+    n = mesh.nodes_mm.shape[0]
+    return HeadMesh(
+        np.concatenate([mesh.nodes_mm, extra]),
+        np.concatenate([mesh.tet_nodes, np.arange(n, n + 4, dtype=np.int32)[None]]),
+        np.concatenate([mesh.tet_tags, mesh.tet_tags[:1]]),
+        mesh.surf_tris,
+        mesh.surf_tags,
+    )
+
+
+@pytest.mark.realmesh
+def test_a_disconnected_mesh_raises_and_says_why(patch_mesh, patch_placement, d70_coil):
+    from cunibs import Subject
+    from cunibs.fem.solve import SolverConvergenceError
+
+    with Subject(_with_a_detached_tetrahedron(patch_mesh)) as subject:
+        with pytest.raises(SolverConvergenceError, match="not connected to the rest"):
+            subject.simulate(d70_coil, patch_placement)
+        with pytest.raises(SolverConvergenceError, match="not connected to the rest"):
+            subject.prepare_sweep(d70_coil, 4)
+
+
 @pytest.mark.parametrize(
     ("field", "bad"),
     [("tet_nodes", 10**6), ("tet_nodes", -1), ("surf_tris", 10**6), ("surf_tris", -1)],
