@@ -48,7 +48,7 @@ def _naive_draw(subject, coil, placement, operator, tags):
         a = assemble_stiffness(g, vols, cond, ctx.n_nodes, ctx.tet_nodes)
         rebuilt = dataclasses.replace(
             ctx,
-            solver=prepare_grounded_solver(a, ctx.nodes_mm, ground),
+            solver=prepare_grounded_solver(a, ground),
             rhs_op=build_rhs_operator(
                 a, g, -(vols * cond), ctx.tet_nodes, ctx.node2corner_ptr, ctx.node2corner_idx
             ),

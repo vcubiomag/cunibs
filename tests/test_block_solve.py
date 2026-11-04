@@ -8,13 +8,15 @@ single-RHS ``solve_grounded``, held to the same 2e-5 relative-L2 gate the block 
 
 from __future__ import annotations
 
+import cupy as cp
 import numpy as np
 import pytest
 
 from cunibs.fem import solve_grounded, solve_placements_block
 from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-from cunibs.fem.solve import MAX_BLOCK, _assemble_rhs, _dadt_node_to_elm, _reconstruct_e_kernel
+from cunibs.fem.solve import MAX_BLOCK, _assemble_rhs, _dadt_node_to_elm
 from cunibs.simulation import Placement
+from cunibs.solver import reconstruct_e
 
 pytestmark = pytest.mark.gpu
 
@@ -62,9 +64,18 @@ def serial(ctx, coil, sites):
         tf = compute_coil_transform(ctx, c, h, d)
         dadt = coil_dadt_at_nodes(coil.positions_m, coil.moments, tf, DIDT, ctx.nodes_mm)
         b = _assemble_rhs(ctx, dadt.reshape(ctx.n_nodes, 1, 3)).ravel()
-        v = solve_grounded(ctx.solver, b)
-        e, magn = _reconstruct_e_kernel(
-            v, ctx.tet_nodes, ctx.g, _dadt_node_to_elm(dadt, ctx.tet_nodes)
+        v, telemetry = solve_grounded(ctx.solver, b)
+        n_tet = int(ctx.tet_nodes.shape[0])
+        e = cp.empty((n_tet, 3), dtype=cp.float32)
+        magn = cp.empty(n_tet, dtype=cp.float32)
+        reconstruct_e(
+            v,
+            ctx.tet_nodes,
+            ctx.g,
+            _dadt_node_to_elm(dadt, ctx.tet_nodes),
+            e,
+            magn,
+            cp.cuda.get_current_stream().ptr,
         )
         out.append(
             {
@@ -72,8 +83,8 @@ def serial(ctx, coil, sites):
                 "E": e,
                 "magnE": magn,
                 "v": v,
-                "iterations": ctx.solver.last_iterations,
-                "relative_residual": ctx.solver.last_relative_residual,
+                "iterations": telemetry.iterations,
+                "relative_residual": telemetry.relative_residual,
             }
         )
     return out
@@ -500,7 +511,6 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     ctx = subj.context
     site = patch_sites[0]
     reference = serial(ctx, d70_coil, [site])[0]
-    good_iters = ctx.solver.last_iterations
     good_levels = ctx.solver.precond.n_levels()
     assert good_levels >= 1
 
@@ -513,7 +523,7 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
 
     swapped = serial(ctx, d70_coil, [site])[0]
     assert ctx.solver.precond is other, "the substitute should converge unaided"
-    assert ctx.solver.last_relative_residual <= ctx.solver.tolerance
+    assert swapped["relative_residual"] <= ctx.solver.tolerance
     assert rel_l2(swapped["magnE"], reference["magnE"]) <= PARITY
 
     ctx.solver.rebuild_preconditioner()
@@ -521,7 +531,7 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     rebuilt = serial(ctx, d70_coil, [site])[0]
     # Rebuilt from the same values by the same deterministic selector, so the hierarchy is
     # identical and the solve must repeat exactly.
-    assert ctx.solver.last_iterations == good_iters
+    assert rebuilt["iterations"] == reference["iterations"]
     assert rel_l2(rebuilt["magnE"], reference["magnE"]) <= PARITY
 
 

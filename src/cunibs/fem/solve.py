@@ -27,14 +27,11 @@ from cunibs.fem.recovery import (
 )
 from cunibs.mesh import SKIN_SURFACE_TAG, HeadMesh
 from cunibs.solver import (
-    BLOCK_SIZES as _BLOCK_SIZES,
-)
-from cunibs.solver import (
+    BLOCK_SIZES,
     NativeVCycle,
     PcgAmgSolver,
     dadt_node_to_element,
     l1_dinv,
-    reconstruct_e,
     reconstruct_e_nodal_block,
     rhs_operator_apply,
     rhs_operator_fill,
@@ -48,9 +45,6 @@ if TYPE_CHECKING:
 
     from cunibs.fem.sweep import SweepBasis
     from cunibs.simulation import Subject
-
-# Stiffness assembly needs float64. Placement kernels use float32 to reduce memory use.
-RESIDENT_G_DTYPE = cp.float32
 
 # Stopping criterion of the mixed PCG: ||r||_2 / ||b||_2 <= DEFAULT_TOLERANCE, on the fp64
 # residual. The solve error it leaves, 2.4e-6 relative L2 in gray matter at worst over six heads,
@@ -129,7 +123,6 @@ def _smooth_prolongator(
     )
     p = (p_tent - cp.float32(_SA_DAMPING) * scaled).tocsr()
     p.sum_duplicates()
-    p.sort_indices()
     return p
 
 
@@ -137,7 +130,6 @@ def _galerkin(a: csp.csr_matrix, p: csp.csr_matrix) -> csp.csr_matrix:
     """A_{l+1} = P^T A_l P."""
     coarse = (p.T.tocsr() @ a @ p).tocsr()
     coarse.sum_duplicates()
-    coarse.sort_indices()
     return coarse
 
 
@@ -204,8 +196,6 @@ def _aggregate(
     agg: cp.ndarray | None = None
     n_coarse = a.shape[0]
     for round_i in range(params.rounds):
-        if cur.shape[0] <= params.min_coarse_rows:
-            break
         step, nc = _select_once(cur, stream)
         if nc == cur.shape[0] or nc < params.min_coarse_rows:
             break
@@ -244,9 +234,6 @@ def aggregation_levels(
     Each level's prolongator is built here rather than by the caller because the next level's
     operator is the Galerkin product over it, so the transfer and the coarse operator have to
     agree.
-
-    Each level is built in an arena of its own, since the Galerkin product's SpGEMM workspace is
-    many times the operator it produces, and only the level's results are kept.
     """
     if params is None:
         params = AggregationParams()
@@ -255,18 +242,15 @@ def aggregation_levels(
     stream = cp.cuda.get_current_stream().ptr
     levels: list[AggregationLevel] = []
     for _ in range(params.max_levels):
-        n_rows = a.shape[0]
-        if n_rows <= params.min_coarse_rows:
+        if a.shape[0] <= params.min_coarse_rows:
             break
-        with build_arena() as arena:
-            agg, n_coarse = _aggregate(a, params, stream)
-            if agg is None or n_coarse == n_rows or n_coarse < params.min_coarse_rows:
-                break
-            dinv = _l1_dinv(a)
-            p = _smooth_prolongator(a, _tentative_prolongator(agg, n_coarse), dinv)
-            level = AggregationLevel(a, arena.keep(agg), arena.keep(p), arena.keep(dinv))
-            a = arena.keep(_galerkin(a, p))
-        levels.append(level)
+        agg, n_coarse = _aggregate(a, params, stream)
+        if agg is None:
+            break
+        dinv = _l1_dinv(a)
+        p = _smooth_prolongator(a, _tentative_prolongator(agg, n_coarse), dinv)
+        levels.append(AggregationLevel(a, agg, p, dinv))
+        a = _galerkin(a, p)
     return levels, a
 
 
@@ -279,8 +263,8 @@ def build_native_vcycle(
 ) -> NativeVCycle:
     """Build the fp32 V-cycle preconditioner: aggregate, then upload each level's operators.
 
-    P and R = P^T both go up as CSR. ``sort_indices`` on each is what fixes the summation order
-    inside the prolongate and restrict kernels, which walk their rows in index order.
+    P and R = P^T both go up as sorted CSR, which is what fixes the summation order inside the
+    prolongate and restrict kernels: they walk their rows in index order.
 
     The V-cycle copies every level into memory of its own, so no CuPy array outlives the build and
     all of it runs in an arena: a rebuild inside a caller's scratch allocator leaves nothing there.
@@ -309,7 +293,12 @@ def ground_node_of(nodes_mm: cp.ndarray) -> int:
 
 
 def grounded_index(n: int, ground_node: int) -> cp.ndarray:
-    """Row/column index that drops ``ground_node`` from an ``n``-DOF system."""
+    """Row/column index that drops ``ground_node`` from an ``n``-DOF system.
+
+    The rows inherit the mesh's spatial order (see :func:`spatial_order`), which is what keeps
+    the SpMV gather over ``x`` local: on a head mesh 92% of the reduced operator's nonzeros sit
+    within a 4096-column window.
+    """
     idx = cp.arange(n - 1, dtype=cp.int32)
     idx[ground_node:] += 1
     return idx
@@ -372,16 +361,6 @@ def spatial_order(
     return node_perm, inverse, tet_perm
 
 
-def solve_ordering(nodes_mm: cp.ndarray, ground_node: int) -> cp.ndarray:
-    """Reduced-system row index: the mesh nodes bar the grounded one.
-
-    The rows inherit the mesh's spatial order (see :func:`spatial_order`), which is what keeps
-    the SpMV gather over ``x`` local: on a head mesh 92% of the reduced operator's nonzeros sit
-    within a 4096-column window.
-    """
-    return grounded_index(int(nodes_mm.shape[0]), ground_node)
-
-
 def reduce_matrix(a: csp.csr_matrix, idx: cp.ndarray) -> csp.csr_matrix:
     """Remove the grounded DOF and canonicalise the reduced CSR."""
     a_red = a[idx][:, idx].tocsr()
@@ -426,19 +405,11 @@ class ColumnTelemetry(NamedTuple):
     """How the linear solve went for one right-hand side.
 
     ``iterations`` is that column's own count, the iteration at which its residual first met
-    tolerance and it froze, not the block's. A retried column is charged both passes, since the
-    retry restarts from the failed iterate rather than from zero.
+    tolerance and it froze, not the block's. A retried column is charged both passes.
     """
 
     iterations: int
     relative_residual: float
-
-
-@dataclass
-class PreconditionerSlot:
-    """The V-cycle every solver over one matrix applies, held where all of them read it."""
-
-    vcycle: NativeVCycle
 
 
 @dataclass
@@ -449,29 +420,18 @@ class GroundedSolver:
     ``E = -grad(v) - dA/dt``.
 
     The reduced matrix lives in ``pcg`` alone; :meth:`matrix` exports it for a caller that needs
-    it as a CSR. A copy made with :func:`dataclasses.replace` to change the stopping rule shares
-    the matrix, the solver and ``slot``, so a preconditioner rebuilt through either copy is the
-    one both use.
+    it as a CSR. ``tolerance`` and ``max_iters`` are the stopping rule a solve uses unless it is
+    given its own.
     """
 
     n: int
     idx: cp.ndarray
     # The fp32 apply inside solve_mixed. Mutable: a solve that misses tolerance rebuilds it
     # from the current values (see rebuild_preconditioner).
-    slot: PreconditionerSlot
+    precond: NativeVCycle
     pcg: PcgAmgSolver
     tolerance: float
     max_iters: int
-    last_iterations: int = 0
-    last_relative_residual: float = 0.0
-
-    @property
-    def precond(self) -> NativeVCycle:
-        return self.slot.vcycle
-
-    @precond.setter
-    def precond(self, vcycle: NativeVCycle) -> None:
-        self.slot.vcycle = vcycle
 
     def matrix(self, values: bool = True) -> csp.csr_matrix:
         """The reduced matrix as an fp64 CSR with int32 indices, a fresh copy on every call.
@@ -502,7 +462,6 @@ class GroundedSolver:
 
 def prepare_grounded_solver(
     a: csp.csr_matrix,
-    nodes_mm: cp.ndarray,
     ground_node: int,
     tolerance: float = DEFAULT_TOLERANCE,
     max_iters: int = DEFAULT_MAX_ITERS,
@@ -511,7 +470,7 @@ def prepare_grounded_solver(
     n = a.shape[0]
     with build_arena() as arena:
         with arena.resident():
-            idx = solve_ordering(nodes_mm, ground_node)
+            idx = grounded_index(n, ground_node)
         a_red = reduce_matrix(a, idx)
         row_ptr = a_red.indptr.astype(cp.int32, copy=False)
         col_idx = a_red.indices.astype(cp.int32, copy=False)
@@ -521,48 +480,59 @@ def prepare_grounded_solver(
     return GroundedSolver(
         n=n,
         idx=idx,
-        slot=PreconditionerSlot(precond),
+        precond=precond,
         pcg=pcg,
         tolerance=tolerance,
         max_iters=max_iters,
     )
 
 
-def solve_grounded(solver: GroundedSolver, b: cp.ndarray) -> cp.ndarray:
-    """Solve one RHS on the prepared hierarchy.
+def solve_grounded(
+    solver: GroundedSolver,
+    b: cp.ndarray,
+    *,
+    tolerance: float | None = None,
+    max_iters: int | None = None,
+) -> tuple[cp.ndarray, ColumnTelemetry]:
+    """Solve one RHS on the prepared hierarchy; returns ``v`` and how the solve went.
+
+    ``b`` has one entry per mesh node. ``tolerance`` and ``max_iters`` default to the solver's.
 
     A miss rebuilds the preconditioner and restarts from the failed iterate, so the second
     attempt runs against a single fixed operator and CG's short recurrence stays valid.
     """
+    tolerance = solver.tolerance if tolerance is None else tolerance
+    max_iters = solver.max_iters if max_iters is None else max_iters
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
     x_red = cp.empty(int(solver.idx.shape[0]), dtype=cp.float64)
     stream = cp.cuda.get_current_stream().ptr
     iters, rel = solver.pcg.solve_mixed(
-        solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream
+        solver.precond, b_red, x_red, tolerance, max_iters, stream
     )
-    if not float(rel) <= solver.tolerance:
+    if not float(rel) <= tolerance:
         solver.rebuild_preconditioner()
-        iters, rel = solver.pcg.solve_mixed(
-            solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
+        retry_iters, rel = solver.pcg.solve_mixed(
+            solver.precond, b_red, x_red, tolerance, max_iters, stream, x_red
         )
-        if not float(rel) <= solver.tolerance:
-            raise SolverConvergenceError(int(iters), float(rel), solver.tolerance)
-    solver.last_iterations = int(iters)
-    solver.last_relative_residual = float(rel)
+        if not float(rel) <= tolerance:
+            raise SolverConvergenceError(int(retry_iters), float(rel), tolerance)
+        iters += retry_iters
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x_red
-    return v
+    return v, ColumnTelemetry(int(iters), float(rel))
 
 
-# Compiled block widths of the k-RHS solve kernels; smaller batches pad up by replicating the
-# last column, which costs bandwidth but no extra matrix reads. Read from the extension rather
-# than restated, so adding a width is a one-place change.
-BLOCK_SIZES = _BLOCK_SIZES
 MAX_BLOCK = BLOCK_SIZES[-1]
 
 
 def _solve_grounded_block_mat(
-    solver: GroundedSolver, B: cp.ndarray, k: int, X0: cp.ndarray | None = None
+    solver: GroundedSolver,
+    B: cp.ndarray,
+    k: int,
+    X0: cp.ndarray | None = None,
+    *,
+    tolerance: float | None = None,
+    max_iters: int | None = None,
 ) -> tuple[cp.ndarray, list[ColumnTelemetry]]:
     """Block-solve a padded (n_red, k_pad) RHS matrix; returns X and the k columns' telemetry.
 
@@ -570,47 +540,42 @@ def _solve_grounded_block_mat(
     reaches tolerance freezes rather than being carried along to the block's slowest one, so it
     stops exactly where it would have solved alone. They share only the stiffness and hierarchy
     reads. If any column misses tolerance the preconditioner is rebuilt once, then only the
-    offending columns are re-solved singly.
+    offending columns are re-solved singly. ``tolerance`` and ``max_iters`` default to the
+    solver's.
     """
+    tolerance = solver.tolerance if tolerance is None else tolerance
+    max_iters = solver.max_iters if max_iters is None else max_iters
     X = cp.empty_like(B)
     stream = cp.cuda.get_current_stream().ptr
-    iters, rels, col_iters = solver.pcg.solve_mixed_block(
-        solver.precond, B, X, solver.tolerance, solver.max_iters, stream, X0
+    _, rels, col_iters = solver.pcg.solve_mixed_block(
+        solver.precond, B, X, tolerance, max_iters, stream, X0
     )
     telemetry = [ColumnTelemetry(int(col_iters[c]), float(rels[c])) for c in range(k)]
-    solver.last_iterations = int(iters)
-    solver.last_relative_residual = float(max(rels[:k]))
 
     # Written so that a NaN residual, from a field too small or large for fp32, counts as missed.
-    missed = [c for c in range(k) if not rels[c] <= solver.tolerance]
+    missed = [c for c in range(k) if not rels[c] <= tolerance]
     if missed:
         solver.rebuild_preconditioner()
-        worst = 0.0
         for c in missed:
             b_red = cp.ascontiguousarray(B[:, c])
             x_red = cp.ascontiguousarray(X[:, c])
             retry_iters, rel = solver.pcg.solve_mixed(
-                solver.precond, b_red, x_red, solver.tolerance, solver.max_iters, stream, x_red
+                solver.precond, b_red, x_red, tolerance, max_iters, stream, x_red
             )
-            if not float(rel) <= solver.tolerance:
-                raise SolverConvergenceError(
-                    int(retry_iters), float(rel), solver.tolerance, column=c
-                )
+            if not float(rel) <= tolerance:
+                raise SolverConvergenceError(int(retry_iters), float(rel), tolerance, column=c)
             X[:, c] = x_red
             telemetry[c] = ColumnTelemetry(
                 telemetry[c].iterations + int(retry_iters), float(rel)
             )
-            solver.last_iterations = max(solver.last_iterations, int(retry_iters))
-            worst = max(worst, float(rel))
-        # The retried columns now bound the block: every other column already met tolerance.
-        solver.last_relative_residual = max(
-            worst, max((rels[c] for c in range(k) if c not in missed), default=0.0)
-        )
     return X, telemetry
 
 
 def _pad_block(B: cp.ndarray, k: int) -> cp.ndarray:
-    """Pad the (n_red, k) RHS matrix to a compiled block width by replicating a column."""
+    """Pad the (n_red, k) RHS matrix to a compiled block width by replicating a column.
+
+    A replicated column costs bandwidth but no extra matrix reads.
+    """
     k_pad = next(s for s in BLOCK_SIZES if s >= k)
     if k_pad == k:
         return cp.ascontiguousarray(B)
@@ -672,32 +637,6 @@ def build_rhs_operator(
     return op
 
 
-def _reconstruct_e_kernel(
-    v: cp.ndarray,
-    tet_nodes: cp.ndarray,
-    g: cp.ndarray,
-    dadt_elm: cp.ndarray,
-) -> tuple[cp.ndarray, cp.ndarray]:
-    """Reconstruct E and its magnitude for each tetrahedron.
-
-    The potential's differences across each element are taken in float64, because a grounded
-    potential is large against its change across one element. See reconstruct.cu.
-    """
-    n_tet = int(tet_nodes.shape[0])
-    e = cp.empty((n_tet, 3), dtype=cp.float32)
-    magn = cp.empty(n_tet, dtype=cp.float32)
-    reconstruct_e(
-        cp.ascontiguousarray(v, dtype=cp.float64),
-        tet_nodes,
-        g,
-        cp.ascontiguousarray(dadt_elm),
-        e,
-        magn,
-        cp.cuda.get_current_stream().ptr,
-    )
-    return e, magn
-
-
 @dataclass
 class SolverContext:
     """GPU state shared by all placements for one mesh."""
@@ -728,9 +667,6 @@ class SolverContext:
     # Filled on first use by ensure_recovery, never by build_context, so a run that asks for no
     # recovery pays neither the build nor the memory. Subject populates it under its own lock.
     recovery: dict[Recovery, RecoveryOperator] = field(default_factory=dict)
-    # Same discipline for the reciprocity adjoint solver, keyed by (tolerance, max_iters): the
-    # forward solver with a tighter stopping rule, which does not depend on the target.
-    adjoint: dict[tuple[float, int], GroundedSolver] = field(default_factory=dict)
     # Set only by ensure_sweep_basis. While present, every placement block solve starts from its
     # Galerkin seed rather than from zero.
     sweep_basis: SweepBasis | None = None
@@ -844,12 +780,12 @@ def build_context(mesh: HeadMesh) -> SolverContext:
         )
         rhs_indptr = arena.keep(stiffness.indptr)
         with arena.resident():
-            g32 = g.astype(RESIDENT_G_DTYPE)
+            g32 = g.astype(cp.float32)
             vols32 = vols.astype(cp.float32)
         neg_vc = arena.keep(-(vols32 * cond.astype(cp.float32)))
         del g, vols, cond
         with arena.resident():
-            solver = prepare_grounded_solver(stiffness, nodes_mm, ground_node_of(nodes_mm))
+            solver = prepare_grounded_solver(stiffness, ground_node_of(nodes_mm))
         del stiffness
 
         with arena.resident():

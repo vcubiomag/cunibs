@@ -90,13 +90,6 @@ def depth_to_surface_mm(
     return _depth_to_tag(ctx, origins, inward, region_tag(region) + _SURFACE_TAG_OFFSET)
 
 
-def scalp_to_cortex_mm(
-    subject: Subject | SolverContext, points_mm: npt.ArrayLike
-) -> npt.NDArray[np.float64]:
-    """Scalp-to-cortex distance in mm: :func:`depth_to_surface_mm` at the gray-matter surface."""
-    return depth_to_surface_mm(subject, points_mm, "gray_matter")
-
-
 def tissue_depths_mm(
     subject: Subject | SolverContext, points_mm: npt.ArrayLike, regions: Sequence[Region]
 ) -> dict[str, npt.NDArray[np.float64]]:

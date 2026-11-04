@@ -105,15 +105,15 @@ def test_scalp_to_cortex_at_real_electrode_sites(reference_mesh_path):
     than scalp-to-cortex distance. Needs the full mesh; the cropped patch has only the scalp.
     """
     from cunibs import Subject
-    from cunibs.head import find_cap, read_cap, scalp_to_cortex_mm
+    from cunibs.head import depth_to_surface_mm, find_cap, read_cap
 
     cap = read_cap(find_cap(reference_mesh_path.parent))
     lateral = [cap[k] for k in ("C3", "C4", "F3", "P3")]
 
     with Subject.from_mesh(reference_mesh_path) as subject:
         assert 1002 in subject.context.mesh.surface_tags
-        scd = scalp_to_cortex_mm(subject.context, np.array(lateral))
-        midline = scalp_to_cortex_mm(subject.context, np.array([cap["Cz"]]))
+        scd = depth_to_surface_mm(subject.context, np.array(lateral))
+        midline = depth_to_surface_mm(subject.context, np.array([cap["Cz"]]))
 
     assert np.isfinite(scd).all()
     assert (scd > 8.0).all() and (scd < 25.0).all(), scd
@@ -125,12 +125,12 @@ def test_scalp_to_cortex_at_real_electrode_sites(reference_mesh_path):
 @pytest.mark.realmesh
 def test_a_mesh_without_the_surface_says_so(patch_subject):
     """The cropped patch carries only the scalp, and the error has to name what is there."""
-    from cunibs.head import scalp_to_cortex_mm
+    from cunibs.head import depth_to_surface_mm
 
     ctx = patch_subject.context
     assert ctx.mesh.surface_tags == (1005,)
     with pytest.raises(KeyError, match="no surface with tag 1002"):
-        scalp_to_cortex_mm(ctx, np.array([[0.0, 0.0, 0.0]]))
+        depth_to_surface_mm(ctx, np.array([[0.0, 0.0, 0.0]]))
 
 
 # --- EEG cap ----------------------------------------------------------------------------------

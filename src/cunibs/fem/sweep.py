@@ -18,11 +18,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import cupy as cp
+import cupyx.scipy.sparse as csp
 import numpy as np
 
 from cunibs._memory import build_arena
 from cunibs.fem.assembly import csr_matmul
 from cunibs.fem.placement import coil_dadt_block, compute_coil_transforms
+from cunibs.fem.solve import MAX_BLOCK, _assemble_rhs, _pad_block, _solve_grounded_block_mat
 from cunibs.solver import sweep_seed, sweep_seed_work_size
 
 if TYPE_CHECKING:
@@ -83,9 +85,9 @@ def _basis_transforms(ctx: SolverContext, size: int) -> np.ndarray:
     (cos t, sin t), so a pair of orthogonal handles at each point spans the rotations there.
     """
     count = (size + 1) // 2
-    points = _cap_points(ctx, count)
-    dist = np.full(count, _BASIS_DISTANCE_MM, dtype=np.float64)
-    base = cp.asnumpy(compute_coil_transforms(ctx, points, None, dist))
+    base = cp.asnumpy(
+        compute_coil_transforms(ctx, _cap_points(ctx, count), None, _BASIS_DISTANCE_MM)
+    )
     frames = np.repeat(base, 2, axis=0)
     # The same frame turned a quarter about its normal.
     frames[0::2, :3, 0] = -base[:, :3, 1]
@@ -101,13 +103,10 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
     basis twice (classical Gram-Schmidt run twice keeps it orthogonal in finite precision), then
     within itself through its own Gram matrix, dropping any direction the basis already holds.
     """
-    from cunibs.fem.solve import MAX_BLOCK, SolverConvergenceError, _assemble_rhs, _pad_block
-
     if size < 1:
         raise ValueError(f"build_sweep_basis: size must be positive, got {size}")
     with build_arena() as arena:
         solver = ctx.solver
-        stream = cp.cuda.get_current_stream().ptr
         n = int(solver.idx.shape[0])
         a = _stiffness(ctx)
         transforms = _basis_transforms(ctx, size)
@@ -120,13 +119,7 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
             b = _pad_block(_assemble_rhs(ctx, dadt)[solver.idx, :].astype(cp.float64), k)
             del dadt
             x0 = SweepBasis(q).seed(b) if q.shape[1] else None
-            x = cp.empty_like(b)
-            iters, rels, _ = solver.pcg.solve_mixed_block(
-                solver.precond, b, x, solver.tolerance, solver.max_iters, stream, x0
-            )
-            # A column short of tolerance still seeds well, and NaN would poison the whole basis.
-            if not np.isfinite(rels).all():
-                raise SolverConvergenceError(int(iters), max(rels), solver.tolerance)
+            x, _ = _solve_grounded_block_mat(solver, b, k, x0)
             x = x[:, :k].astype(cp.float32)
             for _ in range(2):
                 if q.shape[1]:
@@ -148,10 +141,8 @@ def coil_digest(coil: Coil) -> str:
     return h.hexdigest()
 
 
-def _stiffness(ctx: SolverContext):
+def _stiffness(ctx: SolverContext) -> csp.csr_matrix:
     """The reduced stiffness as an fp32 CSR, for the basis's energy inner products."""
-    import cupyx.scipy.sparse as csp
-
     a = ctx.solver.matrix()
     return csp.csr_matrix((a.data.astype(cp.float32), a.indices, a.indptr), shape=a.shape)
 

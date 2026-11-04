@@ -186,7 +186,7 @@ def test_patch_multilevel_solve_true_residual(
     b = _assemble_rhs(ctx, dadt_nodes.reshape(ctx.n_nodes, 1, 3)).ravel()
 
     solver = ctx.solver
-    v = solve_grounded(solver, b)
+    v, _ = solve_grounded(solver, b)
 
     a_red = solver.matrix()
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)

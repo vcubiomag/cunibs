@@ -141,9 +141,6 @@ def coil_dadt_block(
     transforms: npt.NDArray[np.float64] | cp.ndarray,
     didt: float,
     target_nodes_mm: cp.ndarray,
-    *,
-    out: cp.ndarray | None = None,
-    column: int = 0,
 ) -> cp.ndarray:
     """Compute dA/dt at each target node for ``k`` placements of one coil.
 
@@ -155,29 +152,25 @@ def coil_dadt_block(
     to moments. The kernel places the dipoles itself, in float64, and sums them in float32 about
     each placement's coil origin.
 
-    ``out`` is an optional C-contiguous ``(n_nodes, m, 3)`` float32 block with ``m >= column + k``,
-    of which placements fill columns ``column`` onwards; the block solve stages its placements this
-    way so that a node's values sit together for the RHS gather. Returns the ``(n_nodes, k, 3)``
-    view written.
+    Returns ``(n_nodes, k, 3)`` float32, interleaved so that a node's values sit together for the
+    RHS gather.
     """
     tf = cp.ascontiguousarray(cp.asarray(transforms, dtype=cp.float64).reshape(-1, 4, 4))
     k = int(tf.shape[0])
     nodes = cp.ascontiguousarray(target_nodes_mm, dtype=cp.float64)
     n = int(nodes.shape[0])
-    if out is None:
-        out = cp.empty((n, k, 3), dtype=cp.float32)
+    out = cp.empty((n, k, 3), dtype=cp.float32)
     dadt_block(
         cp.ascontiguousarray(cp.asarray(dip_pos_m, dtype=cp.float64)),
         cp.ascontiguousarray(cp.asarray(dip_moment, dtype=cp.float64)),
         tf,
         nodes,
-        out.reshape(n, -1),
+        out.reshape(n, 3 * k),
         float(didt),
         MU0_OVER_4PI,
         cp.cuda.get_current_stream().ptr,
-        column,
     )
-    return out[:, column : column + k, :]
+    return out
 
 
 def coil_dadt_at_nodes(
@@ -186,16 +179,7 @@ def coil_dadt_at_nodes(
     transform: npt.NDArray[np.float64] | cp.ndarray,
     didt: float,
     target_nodes_mm: cp.ndarray,
-    *,
-    out: cp.ndarray | None = None,
-    column: int = 0,
 ) -> cp.ndarray:
-    """dA/dt at each target node for one placement: :func:`coil_dadt_block` at ``k = 1``.
-
-    Returns ``(n_nodes, 3)``. With ``out``, an ``(n_nodes, m, 3)`` block, it fills placement
-    ``column`` and returns that view.
-    """
-    block = coil_dadt_block(
-        dip_pos_m, dip_moment, transform, didt, target_nodes_mm, out=out, column=column
-    )
-    return block[:, 0, :]
+    """dA/dt at each target node for one placement, ``(n_nodes, 3)``: :func:`coil_dadt_block` at
+    ``k = 1``."""
+    return coil_dadt_block(dip_pos_m, dip_moment, transform, didt, target_nodes_mm)[:, 0, :]

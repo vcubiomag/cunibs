@@ -89,7 +89,7 @@ def gradient_operator(
 
 def as_int32_tets(tet_nodes: cp.ndarray) -> cp.ndarray:
     """Contiguous int32 connectivity, the layout the solver kernels index with."""
-    return cp.ascontiguousarray(tet_nodes.astype(cp.int32, copy=False))
+    return cp.ascontiguousarray(tet_nodes, dtype=cp.int32)
 
 
 def assemble_stiffness(
@@ -116,6 +116,24 @@ def assemble_stiffness(
     return a
 
 
+def incident_node_csr(
+    tet_nodes: cp.ndarray, ptr: cp.ndarray, idx: cp.ndarray
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """The distinct nodes of each segment's tetrahedra, as a CSR over the segments of ``ptr``/``idx``.
+
+    Sizing the rows takes a pass of its own, because nothing knows how many distinct columns a row
+    has until its candidates are sorted, so the column index is allocated at exactly its own
+    length. A row's candidates stay in shared memory unless its node's valence is far past a head
+    mesh's, which is the only case that materialises them.
+    """
+    stream = cp.cuda.get_current_stream().ptr
+    indptr = cp.empty(int(ptr.shape[0]), dtype=cp.int32)
+    nnz = count_incident_node_csr(tet_nodes, ptr, idx, indptr, stream)
+    indices = cp.empty(nnz, dtype=cp.int32)
+    fill_incident_node_csr(tet_nodes, ptr, idx, indptr, indices, stream)
+    return indptr, indices
+
+
 def stiffness_pattern(
     tet_nodes: cp.ndarray, n_nodes: int, ptr: cp.ndarray, idx: cp.ndarray
 ) -> csp.csr_matrix:
@@ -124,19 +142,11 @@ def stiffness_pattern(
     The pattern depends only on connectivity, so a caller assembling several matrices over one
     mesh builds it once and refills ``.data`` per conductivity with ``fill_stiffness_values``.
     ``ptr``/``idx`` is the mesh's node2corner CSR.
-
-    Sizing the rows takes a pass of its own, because nothing knows how many distinct columns a row
-    has until its candidates are sorted, so the column index is allocated at exactly its own
-    length. A row's candidates stay in shared memory unless its node's valence is far past a head
-    mesh's, which is the only case that materialises them.
     """
-    stream = cp.cuda.get_current_stream().ptr
-    indptr = cp.empty(n_nodes + 1, dtype=cp.int32)
-    nnz = count_incident_node_csr(tet_nodes, ptr, idx, indptr, stream)
-    indices = cp.empty(nnz, dtype=cp.int32)
-    fill_incident_node_csr(tet_nodes, ptr, idx, indptr, indices, stream)
+    indptr, indices = incident_node_csr(tet_nodes, ptr, idx)
     return csp.csr_matrix(
-        (cp.empty(nnz, dtype=cp.float64), indices, indptr), shape=(n_nodes, n_nodes)
+        (cp.empty(int(indices.shape[0]), dtype=cp.float64), indices, indptr),
+        shape=(n_nodes, n_nodes),
     )
 
 

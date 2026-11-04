@@ -15,7 +15,6 @@ from cunibs.head.eeg import (
 from cunibs.head.geometry import (
     depth_to_surface_mm,
     project_to_scalp,
-    scalp_to_cortex_mm,
     tissue_depths_mm,
     tissue_thickness_mm,
 )
@@ -30,7 +29,6 @@ __all__ = [
     "read_fiducials",
     "read_subject_cap",
     "scalp_grid",
-    "scalp_to_cortex_mm",
     "tissue_depths_mm",
     "tissue_thickness_mm",
 ]

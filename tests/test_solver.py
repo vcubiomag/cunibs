@@ -170,7 +170,7 @@ def test_solve_grounded_matches_dense_solve(cp, cube_subject):
     rng = np.random.default_rng(0)
     b = cp.asarray(rng.standard_normal(solver.n))
 
-    v = solve_grounded(solver, b)
+    v, _ = solve_grounded(solver, b)
     assert float(v[int(np.argmin(cp.asnumpy(cube_subject.mesh.nodes_mm)[:, 2]))]) == 0.0
 
     x_ref = np.linalg.solve(
@@ -218,11 +218,12 @@ def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degre
         a_red.data.astype(cp.float32),
         smoother=SmootherParams(degree=degree),
     )
-    got = cp.asnumpy(solve_grounded(solver, b)[solver.idx])
+    v, telemetry = solve_grounded(solver, b)
+    got = cp.asnumpy(v[solver.idx])
 
     assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
     # A broken sweep still converges eventually on a problem this small, so gate the rate too.
-    assert solver.last_iterations < solver.max_iters // 4
+    assert telemetry.iterations < solver.max_iters // 4
 
     # Every compiled block width, not just the scalar path. The aliasing between a step's
     # output and its x_prev is per-column, so a K-wide bug can leave some columns exact and

@@ -20,6 +20,7 @@ from cunibs.fem.recovery import (
 )
 from cunibs.fem.solve import (
     MAX_BLOCK,
+    ColumnTelemetry,
     PlacementResult,
     SolverContext,
     SolverConvergenceError,
@@ -35,6 +36,7 @@ __all__ = [
     "RECOVERY_MODES",
     "TISSUE_CONDUCTIVITY",
     "TISSUE_SLOT_MODES",
+    "ColumnTelemetry",
     "PlacementResult",
     "Recovery",
     "RecoveryOperator",

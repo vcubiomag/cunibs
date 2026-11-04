@@ -56,11 +56,9 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 import cupy as cp
 
 from cunibs._memory import build_arena
-from cunibs.fem.assembly import build_node2corner
+from cunibs.fem.assembly import build_node2corner, incident_node_csr
 from cunibs.solver import (
-    count_incident_node_csr,
     count_patch_csr,
-    fill_incident_node_csr,
     fill_patch_csr,
     hpr_grad,
     hpr_grad_work_size,
@@ -106,12 +104,9 @@ RECOVERY_MODES: tuple[Recovery, ...] = get_args(Recovery.__value__)
 #: Modes whose slots are (node, tissue) pairs rather than plain nodes.
 TISSUE_SLOT_MODES: tuple[Recovery, ...] = ("spr_tissue", "harmonic")
 
-#: Modes that consume the nodal potential rather than the per-element field.
-POTENTIAL_MODES: tuple[Recovery, ...] = ("harmonic",)
-
 
 def validate_recovery(recovery: str) -> Recovery:
-    """Normalise and check a recovery mode."""
+    """Check a recovery mode."""
     if recovery not in RECOVERY_MODES:
         raise ValueError(
             f"Unknown recovery {recovery!r}; use one of {', '.join(map(repr, RECOVERY_MODES))}."
@@ -217,7 +212,7 @@ def tissue_slots(tet_nodes: cp.ndarray, tet_tags: cp.ndarray) -> TissueSlots:
     ptr = cp.zeros(n_slots + 1, dtype=cp.int32)
     ptr[:-1] = starts.astype(cp.int32)
     ptr[-1] = cp.int32(sorted_key.shape[0])
-    idx = cp.ascontiguousarray(cp.arange(4 * n_tet, dtype=cp.int32)[order])
+    idx = order.astype(cp.int32)
 
     slot_of_corner = cp.empty(4 * n_tet, dtype=cp.int32)
     slot_of_corner[order] = slot_of_sorted
@@ -236,18 +231,6 @@ def tissue_slots(tet_nodes: cp.ndarray, tet_tags: cp.ndarray) -> TissueSlots:
 # leaves the great majority of a head mesh's slots on the cubic rung, which wants 20 nodes for its
 # 16 terms.
 _MIN_PATCH_NODES = 16
-
-
-def _first_ring(
-    tet_nodes: cp.ndarray, ptr: cp.ndarray, idx: cp.ndarray, n_slots: int
-) -> tuple[cp.ndarray, cp.ndarray]:
-    """The distinct nodes of each slot's own tetrahedra, as a CSR over slots."""
-    stream = cp.cuda.get_current_stream().ptr
-    r1_ptr = cp.empty(n_slots + 1, dtype=cp.int32)
-    nnz = count_incident_node_csr(tet_nodes, ptr, idx, r1_ptr, stream)
-    r1_idx = cp.empty(nnz, dtype=cp.int32)
-    fill_incident_node_csr(tet_nodes, ptr, idx, r1_ptr, r1_idx, stream)
-    return r1_ptr, r1_idx
 
 
 def _neighbour_slots(
@@ -283,7 +266,7 @@ def node_patches(ctx: SolverContext, slots: TissueSlots) -> tuple[cp.ndarray, cp
     if n_slots == 0:
         return cp.zeros(1, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
 
-    r1_ptr, r1_idx = _first_ring(ctx.tet_nodes, slots.ptr, slots.idx, n_slots)
+    r1_ptr, r1_idx = incident_node_csr(ctx.tet_nodes, slots.ptr, slots.idx)
     stride = int(slots.slot_tag.max()) + 1
     slot_key = slots.slot_node.astype(cp.int64) * stride + slots.slot_tag.astype(cp.int64)
     neighbour = _neighbour_slots(r1_ptr, r1_idx, slot_key, slots.slot_tag, stride)
@@ -381,7 +364,7 @@ class RecoveryOperator:
     @property
     def on_potential(self) -> bool:
         """Whether the operator consumes the nodal potential rather than the per-element field."""
-        return self.mode in POTENTIAL_MODES
+        return self.mode == "harmonic"
 
 
 def _build_harmonic_operator(
@@ -508,7 +491,7 @@ def build_recovery_operator(
     mode = validate_recovery(mode)
     if mode == "raw":
         raise ValueError("The raw mode has no recovery operator to build.")
-    if mode in POTENTIAL_MODES:
+    if mode == "harmonic":
         return _build_harmonic_operator(ctx, tissues)
     return _build_spr_operator(ctx, mode)
 
@@ -525,7 +508,6 @@ def ensure_recovery(
     Callers that hold a :class:`~cunibs.simulation.Subject` should go through it instead, so the
     build is serialised by its lock and lands outside any scratch allocator.
     """
-    mode = validate_recovery(mode)
     cached = ctx.recovery.get(mode)
     if cached is None:
         cached = build_recovery_operator(ctx, mode, tissues)

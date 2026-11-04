@@ -10,7 +10,6 @@ with ``W_n = ¼ Σ_{e∋n} w_e``, evaluable as a node-sourced N-body with no ext
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -25,7 +24,6 @@ from cunibs.fem.assembly import csr_offsets
 from cunibs.fem.placement import compute_coil_transforms
 from cunibs.fem.solve import (
     DEFAULT_TOLERANCE,
-    GroundedSolver,
     SolverContext,
     _pad_block,
     _solve_grounded_block_mat,
@@ -130,44 +128,6 @@ _pack_entries = cp.ElementwiseKernel(
 )
 
 
-def build_adjoint_solver(
-    ctx: SolverContext,
-    tolerance: float = ADJOINT_TOLERANCE,
-    max_iters: int = ADJOINT_MAX_ITERS,
-) -> GroundedSolver:
-    """A tight-tolerance grounded solver for the adjoint (reciprocity) solves.
-
-    The adjoint system is the forward one: the context's stiffness is already assembled in
-    float64 from float64 gradients and grounds the same DOF, so its operator and hierarchy are
-    shared and only the stopping rule differs.
-    """
-    return dataclasses.replace(
-        ctx.solver,
-        tolerance=tolerance,
-        max_iters=max_iters,
-        last_iterations=0,
-        last_relative_residual=0.0,
-    )
-
-
-def ensure_adjoint_solver(
-    ctx: SolverContext,
-    tolerance: float = ADJOINT_TOLERANCE,
-    max_iters: int = ADJOINT_MAX_ITERS,
-) -> GroundedSolver:
-    """Return ``ctx``'s adjoint solver, building and caching it on first use.
-
-    The solver depends on the mesh and the tolerance, never on the target, so a sweep over targets
-    or a second ``optimize`` call on the same subject shares one.
-    """
-    key = (float(tolerance), int(max_iters))
-    cached = ctx.adjoint.get(key)
-    if cached is None:
-        cached = build_adjoint_solver(ctx, tolerance, max_iters)
-        ctx.adjoint[key] = cached
-    return cached
-
-
 def _sorted_roi(target: ResolvedTarget) -> tuple[cp.ndarray, cp.ndarray]:
     """The ROI elements in ascending order as int32, and where each sits in ``target.elem_idx``."""
     order = cp.argsort(target.elem_idx)
@@ -220,23 +180,27 @@ class AdjointField:
 
 
 def solve_adjoint(
-    ctx: SolverContext, target: ResolvedTarget, solver: GroundedSolver | None = None
+    ctx: SolverContext,
+    target: ResolvedTarget,
+    *,
+    tolerance: float = ADJOINT_TOLERANCE,
+    max_iters: int = ADJOINT_MAX_ITERS,
 ) -> AdjointField:
     """Run the adjoint solves, every direction in one block, and return the nodal weights ``W_n``.
 
     The directions share the operator, so they go through the block solver as columns sharing each
     stiffness and hierarchy read. A column's result does not depend on the block it was solved in,
-    so this is the same answer one solve per direction gives. ``solver`` defaults to the context's
-    cached tight-tolerance solver (:func:`ensure_adjoint_solver`), so targets on the same mesh
-    share one setup.
+    so this is the same answer one solve per direction gives. The system is the forward one, so
+    its operator and hierarchy are ``ctx.solver``'s and only the stopping rule is the adjoint's.
     """
-    if solver is None:
-        solver = ensure_adjoint_solver(ctx)
+    solver = ctx.solver
     n_dir = int(target.directions.shape[0])
     roi, roi_order = _sorted_roi(target)
     reduced = _adjoint_rhs(ctx, target, roi, roi_order)[solver.idx]
     # A direction the target cannot see has a zero right-hand side and solves to zero.
-    x, _ = _solve_grounded_block_mat(solver, _pad_block(reduced, n_dir), n_dir)
+    x, _ = _solve_grounded_block_mat(
+        solver, _pad_block(reduced, n_dir), n_dir, tolerance=tolerance, max_iters=max_iters
+    )
     del reduced
     lams = cp.zeros((n_dir, ctx.n_nodes), dtype=cp.float64)
     lams[:, solver.idx] = x[:, :n_dir].T
@@ -605,8 +569,7 @@ def build_reciprocity(
     ``centers_mm`` are the scalp positions the coil may occupy, at ``distance_mm`` from the scalp;
     the grid is sized to contain every coil dipole over those positions at any rotation, and the
     field remembers both so :func:`~cunibs.adm.optimize_placement` can default to them.
-    ``tolerance`` is the adjoint solves' relative residual; the solver for it is cached on the
-    subject and shared by every target.
+    ``tolerance`` is the adjoint solves' relative residual.
     """
     if not (math.isfinite(distance_mm) and distance_mm >= 0.0):
         raise ValueError(f"distance_mm must be non-negative and finite, got {distance_mm!r}.")
@@ -621,7 +584,7 @@ def build_reciprocity(
             resolved = resolve_target(ctx, target)
             grid = _coverage_grid(ctx, coil, centers, distance_mm, spacing_mm, margin_mm)
         points = _reach_points(grid)
-        adjoint = solve_adjoint(ctx, resolved, ensure_adjoint_solver(ctx, tolerance))
+        adjoint = solve_adjoint(ctx, resolved, tolerance=tolerance)
         binned = tuple(arena.keep(a) for a in _binned_sources(adjoint, grid))
         # The float64 node weights are spent once binned, so they go before q is allocated.
         del adjoint

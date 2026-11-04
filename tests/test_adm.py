@@ -640,25 +640,14 @@ def test_optimize_matches_brute_force_on_patch(
     assert delta <= 2 * np.pi / 360 * 1.5
 
 
-def test_adjoint_solver_is_cached_on_the_context(
+def test_a_reciprocity_build_reuses_the_forward_hierarchy(
     patch_subject, d70_coil, patch_target, patch_top_mm
 ):
-    """A second search on the same subject must not rebuild the float64 stiffness and hierarchy.
-
-    build_adjoint_solver reassembles the stiffness in float64 and builds its own tight-tolerance
-    AMG hierarchy. Neither depends on the target, so a sweep has to share one setup.
-    """
+    """The adjoint system is the forward one, so a second target must not rebuild its V-cycle."""
     from cunibs.adm import Target, build_reciprocity
-    from cunibs.adm.reciprocity import ensure_adjoint_solver
 
     ctx = patch_subject.context
-    ctx.adjoint.clear()
-
-    first = ensure_adjoint_solver(ctx)
-    assert len(ctx.adjoint) == 1
-    assert ensure_adjoint_solver(ctx) is first
-
-    # build_reciprocity must go through the cache too, or optimize pays per call.
+    before = ctx.solver.precond
     build_reciprocity(
         ctx,
         d70_coil,
@@ -666,13 +655,7 @@ def test_adjoint_solver_is_cached_on_the_context(
         patch_top_mm[None],
         spacing_mm=4.0,
     )
-    assert len(ctx.adjoint) == 1
-    assert ctx.adjoint[next(iter(ctx.adjoint))] is first
-
-    # A different tolerance is a different solver, not a silent reuse of the cached one.
-    assert ensure_adjoint_solver(ctx, tolerance=1e-7) is not first
-    assert len(ctx.adjoint) == 2
-    ctx.adjoint.clear()
+    assert ctx.solver.precond is before
 
 
 @pytest.mark.realmesh
