@@ -10,32 +10,6 @@ import numpy.typing as npt
 from cunibs._common import plain
 
 _COILS_ROOT = Path(__file__).resolve().parent / "coils"
-DEYMED_50BF = _COILS_ROOT / "Deymed_50BF.h5"
-DEYMED_70BF = _COILS_ROOT / "Deymed_70BF.h5"
-DEYMED_120BFV = _COILS_ROOT / "Deymed_120BFV.h5"
-MAGMORE_PMD25_DECENTRAL = _COILS_ROOT / "MagMore_PMD25-decentral.h5"
-MAGMORE_PMD45_EEG = _COILS_ROOT / "MagMore_PMD45-EEG.h5"
-MAGMORE_PMD70 = _COILS_ROOT / "MagMore_PMD70.h5"
-MAGSTIM_D70 = _COILS_ROOT / "MagStim_D70.h5"
-MAGSTIM_DCC = _COILS_ROOT / "MagStim_DCC.h5"
-MAGVENTURE_C_100 = _COILS_ROOT / "MagVenture_C-100.h5"
-MAGVENTURE_C_B60 = _COILS_ROOT / "MagVenture_C-B60.h5"
-MAGVENTURE_C_B70 = _COILS_ROOT / "MagVenture_C-B70.h5"
-MAGVENTURE_COOL_B35 = _COILS_ROOT / "MagVenture_Cool-B35.h5"
-MAGVENTURE_COOL_B65 = _COILS_ROOT / "MagVenture_Cool-B65.h5"
-MAGVENTURE_COOL_B70 = _COILS_ROOT / "MagVenture_Cool-B70.h5"
-MAGVENTURE_COOL_D_B80 = _COILS_ROOT / "MagVenture_Cool-D-B80.h5"
-MAGVENTURE_MC_125 = _COILS_ROOT / "MagVenture_MC-125.h5"
-MAGVENTURE_MC_125_NEW = _COILS_ROOT / "MagVenture_MC-125_new.h5"
-MAGVENTURE_MC_B70 = _COILS_ROOT / "MagVenture_MC-B70.h5"
-MAGVENTURE_MCF_75 = _COILS_ROOT / "MagVenture_MCF-75.h5"
-MAGVENTURE_MCF_B65 = _COILS_ROOT / "MagVenture_MCF-B65.h5"
-MAGVENTURE_MCF_B65_NEW = _COILS_ROOT / "MagVenture_MCF-B65_new.h5"
-MAGVENTURE_MC_B65_HO8 = _COILS_ROOT / "MagVenture_MC_B65_HO8.h5"
-MAGVENTURE_MMC_140_II = _COILS_ROOT / "MagVenture_MMC-140-II.h5"
-MAGVENTURE_MRI_B91 = _COILS_ROOT / "MagVenture_MRI-B91.h5"
-MAGVENTURE_MST_TWIN = _COILS_ROOT / "MagVenture_MST_Twin.h5"
-
 
 # The .ccd header states dIdtmax in A/us, we want A/s.
 _CCD_DIDTMAX_TO_A_PER_S = 1e6
@@ -82,9 +56,8 @@ class Coil:
     def load(cls, source: str | Path) -> Coil:
         """Load a coil from a bundled model's name, an HDF5 dipole file, or a SimNIBS ``.ccd``.
 
-        A name is a key of :func:`bundled_coils`, such as ``"MagStim_D70"``; the module constants
-        are the same models as paths. A ``.ccd`` file is read directly; :func:`encode_ccd`
-        converts one to the HDF5 format.
+        A name is a key of :func:`bundled_coils`, such as ``"MagStim_D70"``. A ``.ccd`` file is
+        read directly; :func:`encode_ccd` converts one to the HDF5 format.
         """
         path = Path(source)
         if not path.is_file():
@@ -125,9 +98,8 @@ class Coil:
 def bundled_coils() -> dict[str, Path]:
     """Every bundled coil model, by file stem.
 
-    The stem is the name to pass :meth:`Coil.load`, and matches the module constants above. Reads
-    the directory, so it is the whole set even where a constant is missing. Load one for its
-    metadata: ``brand``, ``stimulator`` and the rest of the header live in :attr:`Coil.metadata`.
+    The stem is the name to pass :meth:`Coil.load`. Load one for its metadata: ``brand``,
+    ``stimulator`` and the rest of the header live in :attr:`Coil.metadata`.
     """
     return {p.stem: p for p in sorted(_COILS_ROOT.glob("*.h5"))}
 

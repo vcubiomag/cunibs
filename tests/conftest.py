@@ -321,9 +321,9 @@ def figure8_coil():
 
 @pytest.fixture(scope="session")
 def d70_coil():
-    from cunibs.coil import MAGSTIM_D70, Coil
+    from cunibs.coil import Coil
 
-    return Coil.load(MAGSTIM_D70)
+    return Coil.load("MagStim_D70")
 
 
 @pytest.fixture(scope="session")

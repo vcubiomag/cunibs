@@ -1,25 +1,15 @@
 from __future__ import annotations
 
 import dataclasses
-from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
 
-from cunibs import coil as coil_registry
 from cunibs._common import plain
 from cunibs.coil import Coil, bundled_coils, encode_ccd
 
 BUNDLED = sorted(bundled_coils().items())
-
-# The module constants are the documented way to name a coil, so they have to agree with what the
-# directory holds; a renamed file would leave a constant pointing at nothing.
-_CONSTANTS = sorted(
-    (name, value)
-    for name, value in vars(coil_registry).items()
-    if not name.startswith("_") and name.isupper() and isinstance(value, Path)
-)
 
 _CCD = """\
 # brand=Test;coilname=Synth;dIdtmax=100.0
@@ -46,18 +36,8 @@ def test_encode_ccd_roundtrips_to_coil(tmp_path):
     assert c.positions_m.shape == (2, 3) and c.moments.shape == (2, 3)
 
 
-def test_registry_constants_resolve_to_files():
-    paths = [
-        coil_registry.MAGSTIM_D70,
-        coil_registry.MAGVENTURE_MCF_B65,
-        coil_registry.DEYMED_70BF,
-    ]
-    for p in paths:
-        assert p.exists(), p
-
-
 def test_load_bundled_coil():
-    c = Coil.load(coil_registry.MAGSTIM_D70)
+    c = Coil.load("MagStim_D70")
     assert c.positions_m.shape[1] == 3
     assert c.moments.shape == c.positions_m.shape
     assert c.name
@@ -65,18 +45,13 @@ def test_load_bundled_coil():
 
 def test_bundled_didt_max_is_in_a_per_s():
     """dIdtmax is stored in A/us and exposed in A/s, so didt=coil.didt_max is a real pulse."""
-    c = Coil.load(coil_registry.MAGSTIM_D70)
+    c = Coil.load("MagStim_D70")
     assert c.metadata is not None and c.metadata["dIdtmax"] == "114.73"
     assert c.didt_max == pytest.approx(114.73e6)
 
 
 def test_registry_is_not_empty():
     assert len(BUNDLED) >= 25
-
-
-def test_registry_and_module_constants_agree():
-    """Both name the same set, so neither can drift without the other."""
-    assert {p for _, p in _CONSTANTS} == set(bundled_coils().values())
 
 
 def test_bundled_coils_is_reachable_from_the_top_level():
@@ -89,7 +64,7 @@ def test_bundled_coils_is_reachable_from_the_top_level():
 
 def test_repr_names_the_coil_rather_than_dumping_its_dipoles():
     """A dataclass repr prints both tables in full, which is what enumerating the set would show."""
-    c = Coil.load(coil_registry.MAGSTIM_D70)
+    c = Coil.load("MagStim_D70")
     text = repr(c)
     assert text == f"Coil(name={c.name!r}, n_dipoles={c.n_dipoles}, didt_max={c.didt_max!r})"
     assert c.n_dipoles == c.positions_m.shape[0]
@@ -115,7 +90,7 @@ def test_all_bundled_coils_load(path):
 
 
 def test_coil_is_frozen():
-    c = Coil.load(coil_registry.MAGSTIM_D70)
+    c = Coil.load("MagStim_D70")
     with pytest.raises(dataclasses.FrozenInstanceError):
         c.name = "other"  # ty:ignore[invalid-assignment]
 
@@ -194,7 +169,7 @@ def test_plain_handles_bytes_and_np_scalars(raw, expected):
 
 def test_load_takes_a_bundled_name():
     by_name = Coil.load("MagStim_D70")
-    by_path = Coil.load(coil_registry.MAGSTIM_D70)
+    by_path = Coil.load(bundled_coils()["MagStim_D70"])
     np.testing.assert_array_equal(by_name.positions_m, by_path.positions_m)
     assert by_name.name == by_path.name
 

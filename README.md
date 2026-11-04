@@ -35,11 +35,10 @@ installs its own CUDA libraries, so a separate CUDA toolkit is not needed.
 ## Quick start
 
 ```python
-from cunibs import Placement, Subject
-from cunibs.coil import Coil, MAGSTIM_D70
+from cunibs import Coil, Placement, Subject
 
 subject = Subject.from_mesh("subject.msh")
-coil = Coil.load(MAGSTIM_D70)
+coil = Coil.load("MagStim_D70")
 
 placement = Placement(
     center_mm=[0.0, 20.0, 80.0],
@@ -96,8 +95,8 @@ c3 = read_cap("subject_id.h5")["C3"]
 ### Coils
 
 cuNIBS includes the 25 validated coil models from Drakaki et al. (2022). Load
-one by constant or by name, and call `bundled_coils()` to list them. SimNIBS
-`.ccd` files load directly.
+one by name, and call `bundled_coils()` to list them. SimNIBS `.ccd` files load
+directly.
 
 ```python
 coil = Coil.load("MagStim_D70")
