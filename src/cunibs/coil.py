@@ -63,6 +63,10 @@ class Coil:
     didt_max: float | None = None
     metadata: dict[str, str | int | float] | None = None
 
+    def __post_init__(self) -> None:
+        if not (np.isfinite(self.positions_m).all() and np.isfinite(self.moments).all()):
+            raise ValueError("Coil positions and moments must be finite.")
+
     @property
     def n_dipoles(self) -> int:
         return int(self.positions_m.shape[0])

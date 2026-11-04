@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import cupy as cp
 import numpy as np
 
+from cunibs._common import check_didt
 from cunibs.adm.grid import Grid, build_grid
 from cunibs.adm.place import place_coil_dipoles_batch
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
@@ -114,6 +115,7 @@ def _evaluate_native(
     and the call re-run, so a frame outside the coverage costs its own sampling once and is never
     answered from zeros.
     """
+    check_didt(didt)
     grid = recip.grid
     frames = cp.ascontiguousarray(frames, dtype=cp.float64).reshape(-1, 4, 4)
     pos = cp.ascontiguousarray(cp.asarray(coil.positions_m, dtype=cp.float32))

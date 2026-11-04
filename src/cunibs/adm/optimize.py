@@ -213,9 +213,10 @@ def optimize(
 def _check_angle_sampling(n_samples: int, resolution: int) -> None:
     if n_samples < 1 or n_samples % 2 == 0:
         raise ValueError("n_samples must be odd for symmetric Fourier interpolation.")
-    if resolution < n_samples:
+    if resolution < max(n_samples, 2):
         raise ValueError(
-            f"resolution must be at least n_samples ({n_samples}), got {resolution}."
+            f"resolution must be at least 2 and at least n_samples ({n_samples}), "
+            f"got {resolution}."
         )
 
 

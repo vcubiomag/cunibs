@@ -13,7 +13,7 @@ import weakref
 import numpy as np
 import pytest
 
-from cunibs import Placement, Subject
+from cunibs import ConductivityUQConfig, Placement, ResolvedTarget, Subject, resolve_target
 from cunibs._memory import build_arena, scratch_pool, unpooled
 from cunibs.fem.solve import SolverConvergenceError
 from cunibs.mesh import load_mesh
@@ -336,3 +336,37 @@ def test_a_field_outside_fp32_range_raises(
     with pytest.raises(SolverConvergenceError):
         subj.simulate(d70_coil, patch_placement, 1e-12)
     assert np.isfinite(subj.simulate(d70_coil, patch_placement, 1e6).peak_magnE())
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("didt", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_didt_is_rejected(
+    fresh_subject, patch_mesh, d70_coil, patch_placement, didt
+):
+    subj = fresh_subject(patch_mesh)
+    with pytest.raises(ValueError, match="didt must be finite"):
+        subj.simulate(d70_coil, patch_placement, didt)
+    with pytest.raises(ValueError, match="didt must be finite"):
+        subj.simulate_conductivity_uq(
+            d70_coil, patch_placement, ConductivityUQConfig(n_samples=2), didt
+        )
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("element", [-5, 10**8])
+def test_a_roi_outside_the_mesh_is_rejected(
+    cp, fresh_subject, patch_mesh, d70_coil, patch_placement, element
+):
+    """Its elements index device arrays with no bounds check, and another subject's can overrun."""
+    roi = ResolvedTarget(
+        cp.asarray(np.array([element], dtype=np.int32)),
+        cp.ones(1),
+        cp.eye(3),
+        True,
+        cp.zeros(3),
+    )
+    subj = fresh_subject(patch_mesh)
+    with pytest.raises(ValueError, match="outside this mesh"):
+        subj.simulate(d70_coil, patch_placement, 1e6, record_rois={"a": roi})
+    with pytest.raises(ValueError, match="outside this mesh"):
+        resolve_target(subj, roi)

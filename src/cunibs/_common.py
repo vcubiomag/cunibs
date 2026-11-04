@@ -99,6 +99,11 @@ def opt_array(h5f: h5py.File, name: str) -> npt.NDArray[Any] | None:
     return np.asarray(h5f[name]) if name in h5f else None
 
 
+def check_didt(didt: float) -> None:
+    if not np.isfinite(didt):
+        raise ValueError(f"didt must be finite, got {didt!r}.")
+
+
 def as_point(value: npt.ArrayLike) -> npt.NDArray[np.float64]:
     p = np.array(value, dtype=np.float64).reshape(-1)
     if p.shape != (3,):

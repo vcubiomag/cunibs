@@ -793,3 +793,31 @@ def test_reach_profile_matches_the_broadcast_distance(cp):
         _reach_profile(rc, hc, prof, int(prof.shape[0]), int(hc.size), reach_sq, got)
         assert 0 < int(expected.sum()) < expected.size
         np.testing.assert_array_equal(cp.asnumpy(got), cp.asnumpy(expected))
+
+
+@pytest.mark.parametrize("tolerance", [0.0, -1.0, float("nan"), float("inf")])
+def test_build_reciprocity_rejects_a_bad_tolerance(cube_subject, coil, tolerance):
+    from cunibs.adm import build_reciprocity
+    from cunibs.adm.target import Target
+
+    with pytest.raises(ValueError, match="tolerance must be"):
+        build_reciprocity(
+            cube_subject,
+            coil,
+            Target([50, 50, 60]),
+            np.array([[50.0, 50.0, 100.0]]),
+            tolerance=tolerance,
+        )
+
+
+def test_evaluate_and_optimize_reject_what_they_cannot_answer(cube_subject, coil):
+    from cunibs.adm import build_reciprocity, evaluate, optimize_placement
+    from cunibs.adm.target import Target
+    from cunibs.simulation import Placement
+
+    center = np.array([50.0, 50.0, 100.0])
+    recip = build_reciprocity(cube_subject, coil, Target([50, 50, 60]), center[None])
+    with pytest.raises(ValueError, match="didt must be finite"):
+        evaluate(recip, coil, Placement(center, center + [0, 40.0, 0]), float("nan"))
+    with pytest.raises(ValueError, match="resolution must be"):
+        optimize_placement(recip, coil, n_samples=1, resolution=1)

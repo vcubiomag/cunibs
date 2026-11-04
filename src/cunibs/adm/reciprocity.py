@@ -612,6 +612,8 @@ def build_reciprocity(
     """
     if not (math.isfinite(distance_mm) and distance_mm >= 0.0):
         raise ValueError(f"distance_mm must be non-negative and finite, got {distance_mm!r}.")
+    if not (math.isfinite(tolerance) and tolerance > 0.0):
+        raise ValueError(f"tolerance must be positive and finite, got {tolerance!r}.")
     ctx = context_of(subject)
     centers = np.ascontiguousarray(cp.asnumpy(centers_mm), dtype=np.float64).reshape(-1, 3)
     # The field and what it holds come from the caller's allocator; the adjoint solve, the binning

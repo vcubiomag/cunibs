@@ -9,6 +9,7 @@ import pytest
 
 import cunibs
 from cunibs import metrics
+from cunibs.adm import Target
 from cunibs.simulation import FieldResult, Placement
 
 
@@ -195,3 +196,19 @@ def test_simulate_conductivity_uq_rejects_a_sequence(cube_subject, synthetic_coi
     pl = Placement([50, 50, 100], [50, 100, 100])
     with pytest.raises(TypeError, match="iter_simulate_conductivity_uq"):
         cube_subject.simulate_conductivity_uq(synthetic_coil, [pl], cfg)
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [
+        (([float("nan"), 0.0, 0.0],), {}),
+        (([float("inf"), 0.0, 0.0],), {}),
+        (([0.0, 0.0, 0.0],), {"radius_mm": -1.0}),
+        (([0.0, 0.0, 0.0],), {"radius_mm": float("nan")}),
+        (([0.0, 0.0, 0.0], [float("nan"), 0.0, 0.0]), {}),
+        (([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]), {}),
+    ],
+)
+def test_target_rejects_what_would_select_an_arbitrary_element(args, kwargs):
+    with pytest.raises(ValueError, match="must be"):
+        Target(*args, **kwargs)

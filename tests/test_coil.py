@@ -192,3 +192,13 @@ def test_load_reads_a_ccd_as_its_encoding_would(tmp_path):
 def test_load_names_the_bundled_models_when_nothing_matches():
     with pytest.raises(FileNotFoundError, match="MagStim_D70"):
         Coil.load("MagStim_D71")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_coil_rejects_non_finite_dipoles(bad):
+    positions, moments = np.zeros((2, 3)), np.ones((2, 3))
+    positions[1, 0] = bad
+    with pytest.raises(ValueError, match="must be finite"):
+        Coil(positions, moments)
+    with pytest.raises(ValueError, match="must be finite"):
+        Coil(moments, positions)

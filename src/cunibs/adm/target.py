@@ -81,14 +81,19 @@ class Target:
         region: Region = "gray_matter",
         radius_mm: float = 0.0,
     ) -> None:
-        object.__setattr__(self, "position_mm", as_point(position_mm))
+        position = as_point(position_mm)
+        if not np.isfinite(position).all():
+            raise ValueError("position_mm must be finite.")
+        if not (np.isfinite(radius_mm) and radius_mm >= 0.0):
+            raise ValueError(f"radius_mm must be non-negative and finite, got {radius_mm!r}.")
+        object.__setattr__(self, "position_mm", position)
         if direction is None:
             object.__setattr__(self, "direction", None)
         else:
             d = as_point(direction)
             n = float(np.linalg.norm(d))
-            if n == 0.0:
-                raise ValueError("direction must be non-zero.")
+            if n == 0.0 or not np.isfinite(n):
+                raise ValueError("direction must be finite and non-zero.")
             object.__setattr__(self, "direction", d / n)
         object.__setattr__(self, "region", region)
         object.__setattr__(self, "radius_mm", float(radius_mm))
@@ -108,6 +113,16 @@ class ResolvedTarget:
     offset_mm: float = 0.0
 
 
+def check_elements(target: ResolvedTarget, n_elements: int) -> None:
+    """Reject elements past the mesh, which a target resolved on another subject can name."""
+    idx = target.elem_idx
+    if idx.size and not (int(idx.min()) >= 0 and int(idx.max()) < n_elements):
+        raise ValueError(
+            f"The target names elements outside this mesh's {n_elements}; "
+            "was it resolved on another subject?"
+        )
+
+
 def resolve_target(
     subject: Subject | SolverContext, target: Target | ResolvedTarget
 ) -> ResolvedTarget:
@@ -118,11 +133,12 @@ def resolve_target(
     ``offset_mm`` on the result says how far away that was. Past :data:`FAR_FROM_REGION_MM` it
     also warns, because the point was then most likely given in the wrong frame or region.
     """
-    if isinstance(target, ResolvedTarget):
-        return target
     from cunibs.fem.solve import context_of
 
     ctx = context_of(subject)
+    if isinstance(target, ResolvedTarget):
+        check_elements(target, int(ctx.tet_nodes.shape[0]))
+        return target
     barys = ctx.tet_barycenters_mm
     region_ids = cp.flatnonzero(region_mask(ctx.tet_tags, target.region)).astype(cp.int32)
     if region_ids.shape[0] == 0:

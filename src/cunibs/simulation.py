@@ -21,6 +21,7 @@ from cunibs._common import (
     DEFAULT_REGION,
     NO_ROIS,
     as_point,
+    check_didt,
     check_format_version,
     opt_array,
     read_metrics,
@@ -30,6 +31,7 @@ from cunibs._common import (
 )
 from cunibs._memory import release_scratch, scratch_pool, unpooled
 from cunibs._transfer import AsyncCopier
+from cunibs.adm.target import check_elements
 from cunibs.fem import (
     MAX_BLOCK,
     PlacementResult,
@@ -440,10 +442,12 @@ class Subject:
         A call that keeps no full-volume array reads only its summary region and its ROIs, so the
         recovery can skip the rest of the head.
         """
+        tet_tags = self.context.tet_tags
+        for target in record_rois.values():
+            check_elements(target, int(tet_tags.shape[0]))
         if full_volume:
             return None
         tags = {metrics.region_tag(DEFAULT_REGION)}
-        tet_tags = self.context.tet_tags
         for target in record_rois.values():
             tags.update(int(t) for t in cp.asnumpy(cp.unique(tet_tags[target.elem_idx])))
         return frozenset(tags)
@@ -735,6 +739,7 @@ class Subject:
         # error at the consumption site instead of where the bad argument was passed.
         sites = _sites(placements, "iter_simulate")
         recovery = validate_recovery(recovery)
+        check_didt(didt)
         if nodal and recovery == "raw":
             raise ValueError(
                 "nodal=True needs a recovery mode: the raw per-tetrahedron field has no nodal "
@@ -880,6 +885,7 @@ class Subject:
         # at the consumption site instead of where the bad argument was passed.
         sites = _sites(placements, "iter_simulate_conductivity_uq")
         recovery = validate_recovery(recovery)
+        check_didt(didt)
         return self._iter_uq_reduced(coil, sites, config, didt, moments, record_rois, recovery)
 
     def simulate_conductivity_uq(
