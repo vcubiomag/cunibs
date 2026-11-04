@@ -52,7 +52,7 @@ def test_uq_precompute_matches_direct_nominal_assembly(cp, two_tissue_subject):
     forward solver the draws run on must hold that same matrix exactly.
     """
     from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
-    from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
+    from cunibs.uq.assembly import build_conductivity_uq_precompute
 
     ctx = two_tissue_subject.context
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
@@ -71,7 +71,7 @@ def test_uq_precompute_matches_direct_nominal_assembly(cp, two_tissue_subject):
 @pytest.mark.parametrize("sigma", [(0.4, 2.1), (1e-3, 5.0), (1.0, 1.0)])
 def test_uq_combine_matches_direct_assembly_at_nonnominal_sigma(cp, two_tissue_subject, sigma):
     """``values`` away from nominal — the point the library's internal gate never checks."""
-    from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
+    from cunibs.uq.assembly import build_conductivity_uq_precompute
 
     ctx = two_tissue_subject.context
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
@@ -83,7 +83,7 @@ def test_uq_combine_matches_direct_assembly_at_nonnominal_sigma(cp, two_tissue_s
 
 def test_uq_values_are_affine_in_sigma(cp, two_tissue_subject):
     """K(σ) is affine, so values must satisfy K(a+b) - K(a) = K(b) - K(0)."""
-    from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
+    from cunibs.uq.assembly import build_conductivity_uq_precompute
 
     pre = build_conductivity_uq_precompute(two_tissue_subject.context, (2, 3))
     a = np.asarray([0.3, 1.7])
@@ -96,7 +96,7 @@ def test_uq_values_are_affine_in_sigma(cp, two_tissue_subject):
 
 def test_uq_precompute_gate_fires_on_corruption(monkeypatch, two_tissue_subject):
     """Corrupting one component must trip the built-in decomposition gate."""
-    import cunibs.uq.conductivity.assembly as uq_assembly
+    import cunibs.uq.assembly as uq_assembly
 
     real = uq_assembly.fill_stiffness_values
     calls = {"n": 0}
@@ -445,8 +445,8 @@ def test_uq_reduced_basis_guess_tracks_the_solution(cp, two_tissue_subject):
     is third order in the step and far below the step's own effect.
     """
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
-    from cunibs.uq.conductivity.assembly import build_conductivity_uq_precompute
-    from cunibs.uq.conductivity.run import _dadt_node_to_elm, _placement_rhs, _ReducedBasis
+    from cunibs.uq.assembly import build_conductivity_uq_precompute
+    from cunibs.uq.run import _dadt_node_to_elm, _placement_rhs, _ReducedBasis
 
     ctx = two_tissue_subject.context
     pre = build_conductivity_uq_precompute(ctx, (2, 3))
@@ -509,7 +509,7 @@ def test_uq_reduced_basis_guess_tracks_the_solution(cp, two_tissue_subject):
 
 def test_reduced_solve_does_not_depend_on_the_batch():
     """A draw's reduced coordinates must be bitwise the same whatever draws come with it."""
-    from cunibs.uq.conductivity.run import _cholesky_solve
+    from cunibs.uq.run import _cholesky_solve
 
     rng = np.random.default_rng(3)
     m, n = 12, 40
@@ -575,7 +575,7 @@ def test_uq_draw_preconditioner_solves_its_own_sample(cp, fresh_subject, two_tis
 
 def test_uq_result_save_load(tmp_path, two_tissue_cube):
     from cunibs import ConductivityUQConfig, Subject
-    from cunibs.uq.conductivity import ConductivityUQResult
+    from cunibs.uq import ConductivityUQResult
 
     subj = Subject(two_tissue_cube)
     r = subj.simulate_conductivity_uq(

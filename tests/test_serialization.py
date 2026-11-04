@@ -8,7 +8,7 @@ import pytest
 
 from cunibs import metrics
 from cunibs.simulation import FieldResult, Placement
-from cunibs.uq.conductivity import ConductivityUQResult
+from cunibs.uq import ConductivityUQResult
 
 
 def _make_uq_result(*, with_rois: bool) -> ConductivityUQResult:

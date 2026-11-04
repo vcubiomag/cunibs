@@ -26,8 +26,8 @@ from cunibs.solver import (
     rhs_assemble,
     row_dot,
 )
-from cunibs.uq.conductivity.config import ConductivityUQConfig, sample_conductivities
-from cunibs.uq.conductivity.result import ConductivityUQResult
+from cunibs.uq.config import ConductivityUQConfig, sample_conductivities
+from cunibs.uq.result import ConductivityUQResult
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from cunibs.coil import Coil
     from cunibs.fem.solve import SolverContext
     from cunibs.simulation import Placement
-    from cunibs.uq.conductivity.assembly import ConductivityUQPrecompute
+    from cunibs.uq.assembly import ConductivityUQPrecompute
 
 
 # Tolerance for the sensitivity solves that span the warm-start basis. Deliberately far looser

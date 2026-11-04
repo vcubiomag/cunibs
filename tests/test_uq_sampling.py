@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
-from cunibs.uq.conductivity.config import (
+from cunibs.uq.config import (
     DEFAULT_TISSUE_COV,
     ConductivityUQConfig,
     sample_conductivities,

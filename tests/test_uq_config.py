@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from cunibs.uq.conductivity.config import DEFAULT_TISSUE_COV, ConductivityUQConfig
+from cunibs.uq.config import DEFAULT_TISSUE_COV, ConductivityUQConfig
 
 MESH_TAGS = (1, 2, 3, 5, 7, 8)
 

@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from cunibs.simulation import Placement
-from cunibs.uq.conductivity import ConductivityUQResult
+from cunibs.uq import ConductivityUQResult
 
 
 def _result(sigma, y_peak=None, roi=None, focality=None) -> ConductivityUQResult:
