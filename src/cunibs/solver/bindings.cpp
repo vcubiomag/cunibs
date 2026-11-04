@@ -107,37 +107,26 @@ std::array<float*, kMaxStageBlock> optional_pack(const std::vector<Array>& array
     return pack<float*>(arrays, k, rows, what);
 }
 
-// A grid's origin and spacing (metres) and shape, as the ADM kernels take them.
-struct GridArgs {
-    double origin[3];
-    double spacing[3];
-    int shape[3];
-
-    std::int64_t points() const {
-        return static_cast<std::int64_t>(shape[0]) * shape[1] * shape[2];
-    }
-};
-
-GridArgs grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
+GridGeom grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
                    const std::vector<int>& shape) {
     require(origin.size() == 3 && spacing.size() == 3 && shape.size() == 3,
             "grid origin, spacing and shape must each have 3 entries");
-    GridArgs g;
+    GridGeom g;
     for (int i = 0; i < 3; ++i) {
         require(shape[i] >= 2 && spacing[i] > 0.0,
                 "grid needs at least 2 samples and a positive spacing");
         g.origin[i] = origin[i];
         g.spacing[i] = spacing[i];
-        g.shape[i] = shape[i];
+        g.n[i] = shape[i];
     }
     return g;
 }
 
 // The ADM sampling and near-source kernels work in grid index units and scale by 1 / spacing^2,
 // which needs the same spacing on every axis.
-GridArgs isotropic_grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
+GridGeom isotropic_grid_args(const std::vector<double>& origin, const std::vector<double>& spacing,
                              const std::vector<int>& shape, const char* what) {
-    const GridArgs g = grid_args(origin, spacing, shape);
+    const GridGeom g = grid_args(origin, spacing, shape);
     require(g.spacing[1] == g.spacing[0] && g.spacing[2] == g.spacing[0],
             (std::string(what) + ": the grid spacing must be equal on every axis").c_str());
     return g;
@@ -683,25 +672,27 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "spr_weights",
         [](const Rows3d& nodes_mm, const Tets& tet_nodes, const f32_1d& vols, const i32_1d& ptr,
-           const i32_1d& idx, const std::optional<i32_1d>& slot_node,
-           const std::optional<i32_1d>& is_boundary, const f32_1d& w,
-           const std::optional<i32_1d>& n_fallback, uintptr_t stream) {
+           const i32_1d& idx, const std::optional<i32_1d>& slot_node, const i32_1d& is_boundary,
+           const f32_1d& w, const i32_1d& n_fallback, uintptr_t stream) {
             const std::size_t n_slots = ptr.shape(0) - 1;
             require(w.shape(0) == idx.shape(0), "spr_weights: w must have one entry per corner");
             require(!slot_node || slot_node->shape(0) == n_slots,
                     "spr_weights: slot_node must have one entry per slot");
+            require(is_boundary.shape(0) == nodes_mm.shape(0),
+                    "spr_weights: is_boundary must have one entry per node");
+            require(n_fallback.shape(0) == 1, "spr_weights: n_fallback must hold one counter");
             launch_spr_weights(nodes_mm.data(), tet_nodes.data(), vols.data(), ptr.data(),
-                               idx.data(), data_or_null(slot_node), data_or_null(is_boundary),
-                               w.data(), data_or_null(n_fallback), static_cast<int>(n_slots),
-                               as_stream(stream));
+                               idx.data(), data_or_null(slot_node), is_boundary.data(), w.data(),
+                               n_fallback.data(), static_cast<int>(n_slots), as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
         nb::arg("nodes_mm").noconvert(), nb::arg("tet_nodes").noconvert(),
         nb::arg("vols").noconvert(), nb::arg("ptr").noconvert(), nb::arg("idx").noconvert(),
         nb::arg("slot_node").noconvert(), nb::arg("is_boundary").noconvert(),
         nb::arg("w").noconvert(), nb::arg("n_fallback").noconvert(), nb::arg("stream"),
-        "One scalar patch weight per corner. Pass slot_node=None when a slot is a node, "
-        "is_boundary=None to fit every slot, n_fallback=None to skip the counter.");
+        "One scalar patch weight per corner. Pass slot_node=None when a slot is a node. "
+        "is_boundary is one int per node, zero to fit it; n_fallback is one counter the kernel "
+        "adds to.");
 
     m.def(
         "skin_normals",
@@ -744,23 +735,24 @@ NB_MODULE(_solver_ext, m) {
 
     m.def(
         "hpr_weights",
-        [](const Rows3d& nodes_mm, const i32_1d& pptr, const i32_1d& pidx, const i32_1d& slot_node,
+        [](const Rows3d& nodes_m, const i32_1d& pptr, const i32_1d& pidx, const i32_1d& slot_node,
            const Rows3f& w, const i32_1d& status, uintptr_t stream,
            const std::optional<i32_1d>& active) {
             const std::size_t n_slots = pptr.shape(0) - 1;
             require(w.shape(0) == pidx.shape(0), "hpr_weights: w must be (nnz, 3)");
             require(slot_node.shape(0) == n_slots && status.shape(0) == n_slots,
                     "hpr_weights: slot_node/status must be per slot");
-            launch_hpr_weights(nodes_mm.data(), pptr.data(), pidx.data(), slot_node.data(),
+            launch_hpr_weights(nodes_m.data(), pptr.data(), pidx.data(), slot_node.data(),
                                w.data(), status.data(), data_or_null(active),
                                static_cast<int>(active ? active->shape(0) : n_slots),
                                as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
-        nb::arg("nodes_mm").noconvert(), nb::arg("pptr").noconvert(), nb::arg("pidx").noconvert(),
+        nb::arg("nodes_m").noconvert(), nb::arg("pptr").noconvert(), nb::arg("pidx").noconvert(),
         nb::arg("slot_node").noconvert(), nb::arg("w").noconvert(), nb::arg("status").noconvert(),
         nb::arg("stream"), nb::arg("active").noconvert() = nb::none(),
-        "Harmonic-constrained potential-recovery weights: grad_v[s] = sum_m w[s,m] v[m]. "
+        "Harmonic-constrained potential-recovery weights: grad_v[s] = sum_m w[s,m] v[m], with "
+        "nodes_m in metres so that the weights carry 1/m. "
         "status is the rung the fit took, counted down from the widest basis: 0 harmonic cubic, "
         "1 harmonic quadratic, 2 linear, 3 no gradient determined.");
 
@@ -896,11 +888,11 @@ NB_MODULE(_solver_ext, m) {
         "adm_evaluate",
         [](const Frames& frames, const Rows3f& coil_pos, const Rows3f& coil_mom, const f32_1d& q,
            const u8_1d& cell_ok, const i32_1d& cell_slot, const f32_1d& q_near,
-           const i32_1d& list_ptr, const f32_1d& entries, double mu0_4pi,
-           const std::vector<double>& origin, const std::vector<double>& spacing,
-           const std::vector<int>& shape, int n_dir, double didt, const f64_2d& out,
+           const i32_1d& list_ptr, const f32_1d& entries, const std::vector<double>& origin,
+           const std::vector<double>& spacing, const std::vector<int>& shape, int n_dir,
+           double didt, const f64_2d& out,
            const i32_1d& fault, uintptr_t stream) {
-            const GridArgs g = isotropic_grid_args(origin, spacing, shape, "adm_evaluate");
+            const GridGeom g = isotropic_grid_args(origin, spacing, shape, "adm_evaluate");
             const std::size_t n_frames = frames.shape(0);
             const std::int64_t n_cells =
                 static_cast<std::int64_t>(shape[0] - 1) * (shape[1] - 1) * (shape[2] - 1);
@@ -916,15 +908,15 @@ NB_MODULE(_solver_ext, m) {
             launch_adm_evaluate(frames.data(), static_cast<int>(n_frames), coil_pos.data(),
                                 coil_mom.data(), static_cast<int>(coil_pos.shape(0)), q.data(),
                                 cell_ok.data(), cell_slot.data(), q_near.data(), list_ptr.data(),
-                                entries.data(), mu0_4pi, g.origin, g.spacing, g.shape, n_dir,
-                                didt, out.data(), fault.data(), as_stream(stream));
+                                entries.data(), g, n_dir, didt, out.data(), fault.data(),
+                                as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(),
         nb::arg("coil_mom").noconvert(), nb::arg("q").noconvert(), nb::arg("cell_ok").noconvert(),
         nb::arg("cell_slot").noconvert(), nb::arg("q_near").noconvert(),
-        nb::arg("list_ptr").noconvert(), nb::arg("entries").noconvert(), nb::arg("mu0_4pi"),
-        nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("n_dir"),
+        nb::arg("list_ptr").noconvert(), nb::arg("entries").noconvert(), nb::arg("origin"),
+        nb::arg("spacing"), nb::arg("shape"), nb::arg("n_dir"),
         nb::arg("didt"), nb::arg("out").noconvert(), nb::arg("fault").noconvert(),
         nb::arg("stream"),
         "Target E-vectors (n_frames, n_dir) of coil frames against a sampled reciprocity field. "
@@ -937,10 +929,10 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "adm_sample",
         [](const Rows3f& src, const SetRows3f& src_w, const Dev<int32_t, -1, 6>& tile_box,
-           const i64_1d& points, double mu0_4pi, const std::vector<double>& origin,
+           const i64_1d& points, const std::vector<double>& origin,
            const std::vector<double>& spacing, const std::vector<int>& shape, const f32_1d& q,
            uintptr_t stream) {
-            const GridArgs g = isotropic_grid_args(origin, spacing, shape, "adm_sample");
+            const GridGeom g = isotropic_grid_args(origin, spacing, shape, "adm_sample");
             const int n_dir = static_cast<int>(src_w.shape(0));
             require(static_cast<std::int64_t>(q.shape(0)) == g.points() * n_dir * 3,
                     "adm_sample: q must be (nx * ny * nz * n_dir * 3,)");
@@ -950,12 +942,12 @@ NB_MODULE(_solver_ext, m) {
                     "adm_sample: tile_box must have one row per source tile");
             launch_adm_sample(src.data(), src_w.data(), static_cast<int>(src.shape(0)), n_dir,
                               tile_box.data(), points.data(), static_cast<int>(points.shape(0)),
-                              mu0_4pi, g.origin, g.spacing, g.shape, q.data(), as_stream(stream));
+                              g, q.data(), as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
         nb::arg("src").noconvert(), nb::arg("src_w").noconvert(),
-        nb::arg("tile_box").noconvert(), nb::arg("points").noconvert(), nb::arg("mu0_4pi"),
-        nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("q").noconvert(),
+        nb::arg("tile_box").noconvert(), nb::arg("points").noconvert(), nb::arg("origin"),
+        nb::arg("spacing"), nb::arg("shape"), nb::arg("q").noconvert(),
         nb::arg("stream"),
         "Samples the reciprocity field at the sorted flat grid indices points into q, each point "
         "from every source (grid index units, sorted by cell) outside its eight cells. tile_box "
@@ -985,24 +977,23 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "adm_slot_corners",
         [](const i64_1d& slot_cells, int first_slot, const i32_1d& list_ptr,
-           const f32_1d& entries, int n_dir, const f32_1d& q, double mu0_4pi,
-           const std::vector<double>& origin, const std::vector<double>& spacing,
+           const f32_1d& entries, int n_dir, const f32_1d& q, const std::vector<double>& origin,
+           const std::vector<double>& spacing,
            const std::vector<int>& shape, const f32_1d& q_near, uintptr_t stream) {
-            const GridArgs g = isotropic_grid_args(origin, spacing, shape, "adm_slot_corners");
+            const GridGeom g = isotropic_grid_args(origin, spacing, shape, "adm_slot_corners");
             const std::size_t n_slots = slot_cells.shape(0);
             require(static_cast<std::int64_t>(q.shape(0)) == g.points() * n_dir * 3 &&
                         first_slot >= 0 && static_cast<std::size_t>(first_slot) <= n_slots,
                     "adm_slot_corners: shape mismatch");
             require_slots(list_ptr, n_slots, q_near, entries, n_dir, "adm_slot_corners");
             launch_adm_slot_corners(slot_cells.data(), first_slot, static_cast<int>(n_slots),
-                                    list_ptr.data(), entries.data(), n_dir, q.data(), mu0_4pi,
-                                    g.origin, g.spacing, g.shape, q_near.data(),
-                                    as_stream(stream));
+                                    list_ptr.data(), entries.data(), n_dir, q.data(), g,
+                                    q_near.data(), as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
         nb::arg("slot_cells").noconvert(), nb::arg("first_slot"), nb::arg("list_ptr").noconvert(),
         nb::arg("entries").noconvert(), nb::arg("n_dir"), nb::arg("q").noconvert(),
-        nb::arg("mu0_4pi"), nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"),
+        nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"),
         nb::arg("q_near").noconvert(), nb::arg("stream"),
         "Fills q_near (n_slots, 8, n_dir, 3) from first_slot on: each slot cell's sampled corners "
         "less its entries' sources that the corner's own sample kept.");
@@ -1015,12 +1006,12 @@ NB_MODULE(_solver_ext, m) {
         [](const Frames& frames, const Rows3f& coil_pos, const std::vector<double>& origin,
            const std::vector<double>& spacing, const std::vector<int>& shape, const u8_1d& need,
            uintptr_t stream) {
-            const GridArgs g = grid_args(origin, spacing, shape);
+            const GridGeom g = grid_args(origin, spacing, shape);
             require(static_cast<std::int64_t>(need.shape(0)) == g.points(),
                     "adm_mark: need must have one byte per grid point");
             launch_adm_mark(frames.data(), static_cast<int>(frames.shape(0)), coil_pos.data(),
-                            static_cast<int>(coil_pos.shape(0)), g.origin, g.spacing, g.shape,
-                            need.data(), as_stream(stream));
+                            static_cast<int>(coil_pos.shape(0)), g, need.data(),
+                            as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
         nb::arg("frames").noconvert(), nb::arg("coil_pos").noconvert(), nb::arg("origin"),
@@ -1032,14 +1023,14 @@ NB_MODULE(_solver_ext, m) {
         [](const std::vector<double>& origin, const std::vector<double>& spacing,
            const std::vector<int>& shape, const Rows3d& origins, const Rows3d& axes,
            const u8_2d& profile, double h0, double cell, const u8_1d& mask, uintptr_t stream) {
-            const GridArgs g = grid_args(origin, spacing, shape);
+            const GridGeom g = grid_args(origin, spacing, shape);
             require(origins.shape(0) == axes.shape(0) &&
                         static_cast<std::int64_t>(mask.shape(0)) == g.points(),
                     "adm_reach: shape mismatch");
-            launch_adm_reach(g.origin, g.spacing, g.shape, origins.data(), axes.data(),
-                             static_cast<int>(origins.shape(0)), profile.data(),
-                             static_cast<int>(profile.shape(0)), static_cast<int>(profile.shape(1)),
-                             h0, cell, mask.data(), as_stream(stream));
+            launch_adm_reach(g, origins.data(), axes.data(), static_cast<int>(origins.shape(0)),
+                             profile.data(), static_cast<int>(profile.shape(0)),
+                             static_cast<int>(profile.shape(1)), h0, cell, mask.data(),
+                             as_stream(stream));
         },
         nb::call_guard<NativeCall>(),
         nb::arg("origin"), nb::arg("spacing"), nb::arg("shape"), nb::arg("origins").noconvert(),

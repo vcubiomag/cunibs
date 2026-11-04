@@ -85,8 +85,7 @@ void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int*
 
 // One scalar weight per corner, from a linear least-squares fit over each slot's patch.
 // slot_node may be null when a slot is a node. is_boundary is indexed by node, not by slot, and
-// is read through slot_node; it may be null to fit every slot. n_fallback may be null; when given
-// it counts slots that took the volume-weighted average.
+// is read through slot_node. n_fallback counts slots that took the volume-weighted average.
 void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const float* vols,
                         const int* ptr, const int* idx, const int* slot_node,
                         const int* is_boundary, float* w, int* n_fallback, int n_slots,
@@ -104,13 +103,15 @@ void launch_skin_normals(const double* nodes_mm, const int* tris, const int* nod
                          cudaStream_t stream);
 
 // Harmonic-constrained potential recovery. pptr/pidx is a CSR of patch NODES per slot, not
-// corners, and w carries a 3-vector per entry: grad_v[s] = sum_m w[s,m] * v[m].
+// corners, and w carries a 3-vector per entry: grad_v[s] = sum_m w[s,m] * v[m]. nodes_m is in
+// metres, unlike every other nodal input here: w differentiates, so it carries a length unit, and
+// E has to come out in V/m.
 //
 // The fit takes the widest basis its patch can carry and drops a rung where it cannot. status[s]
 // records which one it took, counted down from the widest: 0 harmonic cubic, 1 harmonic quadratic,
 // 2 linear, 3 no gradient determined.
 // The fitted slots are active[0, n), or every slot when active is null and n is the slot count.
-void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
+void launch_hpr_weights(const double* nodes_m, const int* pptr, const int* pidx,
                         const int* slot_node, float* w, int* status, const int* active, int n,
                         cudaStream_t stream);
 
@@ -152,8 +153,18 @@ void launch_node_weight(const double* lam, const int* tet_nodes, const float* g,
                         const double* direction, double* node_w, int n_nodes,
                         cudaStream_t stream);
 
-// Candidate evaluation against a sampled reciprocity field. The grid is origin/spacing (metres,
-// equal on every axis) and shape (3 ints, host arrays); q is (nx, ny, nz, n_dir, 3) and cell_ok
+// A regular grid, as the ADM kernels see it: index (i, j, k) sits at origin + (i, j, k) * spacing,
+// in metres, and a point's values are row-major over (i, j, k). The kernels that work in grid index
+// units need the spacing equal on every axis.
+struct GridGeom {
+    double origin[3];
+    double spacing[3];
+    int n[3];
+
+    std::int64_t points() const { return static_cast<std::int64_t>(n[0]) * n[1] * n[2]; }
+};
+
+// Candidate evaluation against a sampled reciprocity field. q is (nx, ny, nz, n_dir, 3) and cell_ok
 // one byte per cell, set when all eight of its corners were sampled. cell_slot is -1 or the cell's
 // slot: q_near (n_slots, 8, n_dir, 3) holds its corners without the sources in its 27 neighbours,
 // and list_ptr delimits those sources in entries, adm_entry_floats(n_dir) floats each: the
@@ -165,8 +176,7 @@ void launch_node_weight(const double* lam, const int* tet_nodes, const float* g,
 void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_pos,
                          const float* coil_mom, int n_dip, const float* q,
                          const unsigned char* cell_ok, const int* cell_slot, const float* q_near,
-                         const int* list_ptr, const float* entries, double mu0_4pi,
-                         const double* origin, const double* spacing, const int* shape, int n_dir,
+                         const int* list_ptr, const float* entries, const GridGeom& g, int n_dir,
                          double didt, double* out, int* fault, cudaStream_t stream);
 // Floats per packed slot entry.
 int adm_entry_floats(int n_dir);
@@ -178,8 +188,7 @@ int adm_sample_tile();
 // floor(src) bounding box as lo xyz then hi xyz. points must be sorted.
 void launch_adm_sample(const float* src, const float* src_w, int n_src, int n_dir,
                        const int* tile_box, const std::int64_t* points, int n_points,
-                       double mu0_4pi, const double* origin, const double* spacing,
-                       const int* shape, float* q, cudaStream_t stream);
+                       const GridGeom& g, float* q, cudaStream_t stream);
 // out (n_points, n_dir, 3) = scale * sum over every source of W x (p - s) / |p - s|^3, with src
 // (n_src, 3), src_w (n_dir, n_src, 3) and points (n_points, 3) in one frame and unit.
 void launch_adm_q_points(const float* src, const float* src_w, int n_src, int n_dir,
@@ -189,16 +198,13 @@ void launch_adm_q_points(const float* src, const float* src_w, int n_src, int n_
 // q and each slot's entries. The slots' corners must already be sampled.
 void launch_adm_slot_corners(const std::int64_t* slot_cells, int first_slot, int n_slots,
                              const int* list_ptr, const float* entries, int n_dir, const float* q,
-                             double mu0_4pi, const double* origin, const double* spacing,
-                             const int* shape, float* q_near, cudaStream_t stream);
+                             const GridGeom& g, float* q_near, cudaStream_t stream);
 // Sets need[p] = 1 for every grid point some dipole's interpolation reads.
 void launch_adm_mark(const double* frames, int n_frames, const float* coil_pos, int n_dip,
-                     const double* origin, const double* spacing, const int* shape,
-                     unsigned char* need, cudaStream_t stream);
+                     const GridGeom& g, unsigned char* need, cudaStream_t stream);
 // mask[p] = 1 where a grid point falls in the coil's swept (rho, h) profile about any centre's
 // axis. profile is (n_rho, n_h) over rho = ir * cell, h = h0 + ih * cell.
-void launch_adm_reach(const double* origin, const double* spacing, const int* shape,
-                      const double* origins, const double* axes, int n_centers,
+void launch_adm_reach(const GridGeom& g, const double* origins, const double* axes, int n_centers,
                       const unsigned char* profile, int n_rho, int n_h, double h0, double cell,
                       unsigned char* mask, cudaStream_t stream);
 

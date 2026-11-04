@@ -7,9 +7,6 @@
 
 #include <cstdint>
 
-// Recovery post-processing: turn the raw per-tetrahedron E into a smoothed field by fitting
-// local patches around each slot and interpolating back.
-//
 // A slot is the unit a patch is fitted around: a node for the global mode, a (node, tissue) pair
 // for the tissue-restricted ones. Either way the patch is a segment of a CSR, so one kernel
 // serves every mode and only the operator's contents differ. The SPR kernels walk a corner CSR
@@ -99,18 +96,13 @@ __global__ void mark_outer_boundary_kernel(const int* __restrict__ tet_nodes,
     is_boundary[q] = 1;
 }
 
-// Cholesky-solve A z = e_0 for an N x N SPD A held in registers. Returns false on a non-positive
-// pivot, which is how a coplanar or under-filled patch reports itself. Only the SPR modes use
-// this, at N = 4, where the factor is 16 doubles and stays in registers. The harmonic rungs go up
-// to N = 16, whose factor does not, and factor per warp instead; see fit_gradient_weights.
-template <int N>
-__device__ bool solve_spd_e0(const double a[N][N], double out[N]) {
+// Cholesky-solve A z = e_0 for a 4 x 4 SPD A held in registers, where the factor is 16 doubles and
+// stays there. Returns false on a non-positive pivot, which is how a coplanar or under-filled patch
+// reports itself. The harmonic rungs go up to 16 x 16, whose factor does not stay in registers, and
+// factor per warp instead; see fit_gradient_weights.
+__device__ bool solve_spd4_e0(const double a[4][4], double out[4]) {
+    constexpr int N = 4;
     double l[N][N];
-#pragma unroll
-    for (int i = 0; i < N; ++i) {
-#pragma unroll
-        for (int j = 0; j < N; ++j) l[i][j] = 0.0;
-    }
     // a[0][0] is the patch size (the constant basis row), so it sets the pivot scale.
     const double floor_pivot = 1e-12 * a[0][0];
     for (int j = 0; j < N; ++j) {
@@ -163,9 +155,6 @@ __device__ __forceinline__ double spr_corner_weight(const double z[4], const dou
            z[3] * (b[2] - xn[2]) * inv_h;
 }
 
-// One thread per slot. Four passes over the patch: the scaling radius, the normal matrix, the
-// Lebesgue constant, then the weights.
-//
 // Fitting in p~ rather than SimNIBS's absolute [1, x, y, z] is an affine change of basis, so the
 // value recovered at the node is unchanged in exact arithmetic, but the normal matrix is far
 // better conditioned on head-mesh coordinates. In that frame p~(x_n) = e_0, so only the first row
@@ -195,7 +184,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
     const auto tn = unsized<Tet4View<const int>>(tet_nodes);
     const double xn[3] = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
 
-    bool fit = (count >= 4) && !(is_boundary && is_boundary[node]);
+    bool fit = (count >= 4) && !is_boundary[node];
     double z[4] = {1.0, 0.0, 0.0, 0.0};
     double h = 1.0;
 
@@ -223,7 +212,7 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
                 for (int j = 0; j < 4; ++j) a[i][j] += q[i] * q[j];
             }
         }
-        fit = solve_spd_e0<4>(a, z);
+        fit = solve_spd4_e0(a, z);
     }
 
     // The weights sum to one, so sum|w|, the patch's Lebesgue constant, is how much the fit
@@ -243,10 +232,8 @@ __global__ void spr_weights_kernel(const double* __restrict__ nodes_mm,
 
     if (!fit) {
         // Diagnostic only, and read after the stream drains, so relaxed is the whole ordering.
-        if (n_fallback) {
-            cuda::atomic_ref<int, cuda::thread_scope_device> fallbacks(*n_fallback);
-            fallbacks.fetch_add(1, cuda::std::memory_order_relaxed);
-        }
+        cuda::atomic_ref<int, cuda::thread_scope_device> fallbacks(*n_fallback);
+        fallbacks.fetch_add(1, cuda::std::memory_order_relaxed);
         double total = 0.0;
         for (int p = begin; p < end; ++p) total += static_cast<double>(vols[idx[p] >> 2]);
         // A zero-volume patch cannot be averaged either; fall back once more to a plain mean so
@@ -334,27 +321,27 @@ struct LinearBasis {
 // frame where the offsets lie in [-1, 1] and the normal matrix is conditioned on shape rather than
 // on head-mesh coordinates. One warp walks the patch; fmax is exact, so splitting the walk across
 // lanes and folding the results reaches the same radius a single thread's walk would.
-__device__ __forceinline__ double patch_radius(Vec3View<const double> nodes_mm,
+__device__ __forceinline__ double patch_radius(Vec3View<const double> nodes_m,
                                                const int* __restrict__ pidx, int begin, int end,
                                                const Vec3& xn, int lane) {
     double h = 0.0;
     for (int p = begin + lane; p < end; p += kWarp) {
         const int m = pidx[p];
 #pragma unroll
-        for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_mm(m, c) - xn[c]));
+        for (int c = 0; c < 3; ++c) h = fmax(h, fabs(nodes_m(m, c) - xn[c]));
     }
 #pragma unroll
     for (int d = kWarp / 2; d; d >>= 1) h = fmax(h, __shfl_xor_sync(kFullWarp, h, d));
     return h;
 }
 
-// Per-warp scratch for one rung of the fit. Sized for the widest basis and reused by the narrower
-// rungs, since a warp runs them one after another and never needs two at once.
 // Row stride of a basis of N terms in the fit's shared arrays. Lanes that each take a row of their
 // own would otherwise sit N doubles apart, which at N = 16 is one bank group for every lane; two
-// doubles of padding give the rows distinct bank groups and keep them 16-byte aligned.
+// doubles of padding give the rows distinct bank groups. The first holds the row's 1 / l[i][i].
 __host__ __device__ constexpr int fit_stride(int n_terms) { return n_terms + 2; }
 
+// Per-warp scratch for one rung of the fit. Sized for the widest basis and reused by the narrower
+// rungs, since a warp runs them one after another and never needs two at once.
 struct FitScratch {
     double* q;     // kFitChunk rows, the staged basis of one chunk of patch entries
     double* a;     // N rows, the normal matrix, overwritten by its Cholesky factor
@@ -378,7 +365,7 @@ struct FitScratch {
 // reassociation of it. Only the Lebesgue sums are reassociated, and they decide a threshold rather
 // than enter a weight.
 template <typename Basis>
-__device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
+__device__ bool fit_gradient_weights(Vec3View<const double> nodes_m,
                                      const int* __restrict__ pidx, int begin, int end,
                                      const Vec3& xn, double h, Vec3View<float> wv,
                                      const FitScratch& s, int lane) {
@@ -412,8 +399,8 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
         const int n = min(kFitChunk, end - base);
         if (lane < n) {
             const int m = pidx[base + lane];
-            Basis::eval((nodes_mm(m, 0) - xn[0]) * inv_h, (nodes_mm(m, 1) - xn[1]) * inv_h,
-                        (nodes_mm(m, 2) - xn[2]) * inv_h, s.q + lane * Ld);
+            Basis::eval((nodes_m(m, 0) - xn[0]) * inv_h, (nodes_m(m, 1) - xn[1]) * inv_h,
+                        (nodes_m(m, 2) - xn[2]) * inv_h, s.q + lane * Ld);
         }
         __syncwarp();
         for (int p = 0; p < n; ++p) {
@@ -488,8 +475,8 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
     for (int p = begin + lane; p < end; p += kWarp) {
         const int m = pidx[p];
         double q[N];
-        Basis::eval((nodes_mm(m, 0) - xn[0]) * inv_h, (nodes_mm(m, 1) - xn[1]) * inv_h,
-                    (nodes_mm(m, 2) - xn[2]) * inv_h, q);
+        Basis::eval((nodes_m(m, 0) - xn[0]) * inv_h, (nodes_m(m, 1) - xn[1]) * inv_h,
+                    (nodes_m(m, 2) - xn[2]) * inv_h, q);
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             double grad = 0.0;
@@ -512,7 +499,7 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_mm,
 // the widest: 0 cubic, 1 quadratic, 2 linear, 3 no gradient determined. The slots are active[0,
 // n), or [0, n) when active is null; a slot's fit reads only its own patch.
 __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
-    const double* __restrict__ nodes_mm, const int* __restrict__ pptr,
+    const double* __restrict__ nodes_m, const int* __restrict__ pptr,
     const int* __restrict__ pidx, const int* __restrict__ slot_node, float* __restrict__ w,
     int* __restrict__ status, const int* __restrict__ active, int n) {
     constexpr int kMaxTerms = CubicHarmonicBasis::kTerms;
@@ -533,7 +520,7 @@ __global__ __launch_bounds__(kFitBlock) void hpr_weights_kernel(
 
     const int begin = pptr[s], end = pptr[s + 1];
     const int node = slot_node[s];
-    const auto nodes = unsized<Vec3View<const double>>(nodes_mm);
+    const auto nodes = unsized<Vec3View<const double>>(nodes_m);
     // One 3-vector per patch entry, so its rows are entries of pptr/pidx, not slots.
     const auto wv = unsized<Vec3View<float>>(w);
     const Vec3 xn = {nodes(node, 0), nodes(node, 1), nodes(node, 2)};
@@ -605,7 +592,7 @@ __device__ __forceinline__ float two_sum(float a, float b, float& e) {
 // kernel would move several times the bytes it reads.
 //
 // Every operation is an explicit round-to-nearest intrinsic. nvcc may otherwise fuse a multiply
-// into the add after it in one instantiation and not another, which made the result depend on K.
+// into the add after it in one instantiation and not another, and the result would depend on K.
 constexpr int kHprLanes = 8;
 template <int K>
 __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __restrict__ v_lo,
@@ -727,7 +714,6 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
     }
 }
 
-
 // One thread per tet: sample the recovered field at the barycentre, which for P1 is the mean of
 // the four corner slots. slot_of_corner is the identity on tet_nodes for the node-slot modes and
 // the (node, tissue) map for the tissue-restricted ones.
@@ -792,12 +778,12 @@ void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const floa
     }
 }
 
-void launch_hpr_weights(const double* nodes_mm, const int* pptr, const int* pidx,
+void launch_hpr_weights(const double* nodes_m, const int* pptr, const int* pidx,
                         const int* slot_node, float* w, int* status, const int* active, int n,
                         cudaStream_t stream) {
     // One warp per slot, so the grid is sized in slots per block rather than in threads.
     if (const unsigned blocks = grid_for(n, kFitWarps)) {
-        hpr_weights_kernel<<<blocks, kFitBlock, 0, stream>>>(nodes_mm, pptr, pidx, slot_node, w,
+        hpr_weights_kernel<<<blocks, kFitBlock, 0, stream>>>(nodes_m, pptr, pidx, slot_node, w,
                                                              status, active, n);
     }
 }

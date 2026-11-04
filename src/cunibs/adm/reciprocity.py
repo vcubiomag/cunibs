@@ -22,7 +22,7 @@ from cunibs._memory import build_arena
 from cunibs.adm.grid import Grid, SweptCoverage, build_grid
 from cunibs.adm.target import ResolvedTarget, Target, resolve_target
 from cunibs.fem.assembly import csr_offsets
-from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
+from cunibs.fem.placement import compute_coil_transforms
 from cunibs.fem.solve import (
     DEFAULT_TOLERANCE,
     GroundedSolver,
@@ -336,7 +336,6 @@ class ReciprocityField:
             self.src_w,
             self.tile_box,
             cp.ascontiguousarray(cp.sort(points), dtype=cp.int64),
-            MU0_OVER_4PI,
             *_grid_args(grid),
             self.q.reshape(-1),
             cp.cuda.get_current_stream().ptr,
@@ -402,7 +401,6 @@ class ReciprocityField:
             self.entries.reshape(-1),
             self.n_directions,
             self.q.reshape(-1),
-            MU0_OVER_4PI,
             *_grid_args(grid),
             self.q_near.reshape(-1),
             cp.cuda.get_current_stream().ptr,

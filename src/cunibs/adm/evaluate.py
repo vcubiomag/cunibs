@@ -141,7 +141,6 @@ def _evaluate_native(
             recip.q_near.reshape(-1),
             recip.list_ptr,
             recip.entries.reshape(-1),
-            MU0_OVER_4PI,
             origin,
             spacing,
             shape,
