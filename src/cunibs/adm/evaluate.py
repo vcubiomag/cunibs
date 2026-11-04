@@ -9,7 +9,6 @@ import numpy as np
 
 from cunibs._common import check_didt
 from cunibs.adm.grid import Grid, build_grid
-from cunibs.adm.place import place_coil_dipoles_batch
 from cunibs.fem.placement import MU0_OVER_4PI, compute_coil_transforms
 from cunibs.simulation import Placement
 from cunibs.solver import adm_evaluate, adm_mark, adm_q_points
@@ -32,6 +31,19 @@ def _placement_frames(ctx: SolverContext, placements: Sequence[Placement]) -> cp
     return compute_coil_transforms(ctx, centers, handles, dists)
 
 
+def place_coil_dipoles_batch(
+    transforms: cp.ndarray, positions_m: npt.ArrayLike, moments: npt.ArrayLike
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Apply ``(P,4,4)`` affines to coil dipoles: return positions ``(P,N,3)`` (m) and moments."""
+    rot = transforms[:, :3, :3]  # (P,3,3)
+    trans = transforms[:, :3, 3]  # (P,3)
+    pos = cp.asarray(positions_m) * 1e3  # (N,3) in mm
+    mom = cp.asarray(moments)
+    s = (cp.einsum("nj,pij->pni", pos, rot) + trans[:, None, :]) * 1e-3
+    m = cp.einsum("nj,pij->pni", mom, rot)
+    return s, m
+
+
 def _placed_dipoles(
     ctx: SolverContext, coil: Coil, placements: Sequence[Placement]
 ) -> tuple[cp.ndarray, cp.ndarray]:
@@ -52,11 +64,6 @@ def grid_for_placements(
     return build_grid(s.reshape(-1, 3), spacing_mm=spacing_mm, margin_mm=margin_mm)
 
 
-def _reduce(dipole_q: cp.ndarray, moments: cp.ndarray, didt: float) -> cp.ndarray:
-    """``E_{p,d} = didt · Σ_j m_{p,j} · Q_d(s_{p,j})`` from per-dipole Q samples ``(D,P,N,3)``."""
-    return didt * cp.einsum("dpnk,pnk->pd", dipole_q, moments)
-
-
 # Slack on the fractional index bounds. At a 3 mm spacing this is 3 nm (noise). The kernel's is
 # wider, since it rounds to fp32, so a dipole it faults on always fails this check too.
 _INDEX_TOL = 1e-6
@@ -65,14 +72,9 @@ _INDEX_TOL = 1e-6
 def _require_in_grid(
     grid: Grid, coords: cp.ndarray, offset: int, n_dip: int, n_total: int
 ) -> None:
-    """Raise if any sample falls outside ``grid``.
-
-    Interpolation runs with ``mode="nearest"``, so an out-of-grid dipole would be clamped to the
-    grid edge and yield a wrong field rather than an error.
-    """
-    # >= / <= rather than a negated < / >: a non-finite coordinate compares false either way, so
-    # it fails closed instead of reaching the interpolation.
-    ok = (coords >= -_INDEX_TOL) & (coords <= grid.max_index[:, None] + _INDEX_TOL)
+    """Raise if any sample falls outside ``grid``, naming the first one."""
+    # >= / <= so that a non-finite coordinate compares false and fails.
+    ok = (coords >= -_INDEX_TOL) & (coords <= cp.asarray(grid.shape)[:, None] - 1 + _INDEX_TOL)
     if bool(ok.all()):
         return
 
@@ -80,9 +82,9 @@ def _require_in_grid(
     axis = int(cp.argmax(bad.any(axis=1)))
     flat = int(cp.argmax(bad[axis]))
     sample = offset + flat // n_dip
-    origin_mm = float(grid.origin_m[axis]) * 1e3
-    upper_mm = float(grid.upper_m[axis]) * 1e3
-    pos_mm = origin_mm + float(coords[axis, flat]) * float(grid.spacing_m[axis]) * 1e3
+    origin_mm = grid.origin_m[axis] * 1e3
+    upper_mm = grid.upper_m[axis] * 1e3
+    pos_mm = origin_mm + float(coords[axis, flat]) * grid.spacing_m[axis] * 1e3
     outside_mm = origin_mm - pos_mm if pos_mm < origin_mm else pos_mm - upper_mm
     raise ValueError(
         f"A coil dipole falls outside the reciprocity grid: sample {sample} of {n_total} on "
@@ -120,9 +122,6 @@ def _evaluate_native(
     frames = cp.ascontiguousarray(frames, dtype=cp.float64).reshape(-1, 4, 4)
     pos = cp.ascontiguousarray(cp.asarray(coil.positions_m, dtype=cp.float32))
     mom = cp.ascontiguousarray(cp.asarray(coil.moments, dtype=cp.float32))
-    origin = [float(x) for x in cp.asnumpy(grid.origin_m)]
-    spacing = [float(x) for x in cp.asnumpy(grid.spacing_m)]
-    shape = list(grid.shape)
     stream = cp.cuda.get_current_stream().ptr
     n_dir = recip.n_directions
     n_frames = int(frames.shape[0])
@@ -141,9 +140,7 @@ def _evaluate_native(
             recip.q_near.reshape(-1),
             recip.list_ptr,
             recip.entries.reshape(-1),
-            origin,
-            spacing,
-            shape,
+            *grid.kernel_args,
             n_dir,
             float(didt),
             out,
@@ -157,7 +154,7 @@ def _evaluate_native(
             return out
         if attempt == 0:
             need = cp.zeros(grid.n_points, dtype=cp.uint8)
-            adm_mark(frames, pos, origin, spacing, shape, need, stream)
+            adm_mark(frames, pos, *grid.kernel_args, need, stream)
             recip.sample_points(cp.flatnonzero(need & (recip.sampled ^ 1)))
     raise AssertionError(
         "cells were still unsampled after sampling every point the frames need"
@@ -238,6 +235,6 @@ def evaluate_exact(
         out.reshape(p * n, -1),
         cp.cuda.get_current_stream().ptr,
     )
-    dipole_q = out.transpose(1, 0, 2).astype(cp.float64)
-    e = _reduce(dipole_q.reshape(n_dir, p, n, 3), m, didt)
+    dipole_q = out.transpose(1, 0, 2).astype(cp.float64).reshape(n_dir, p, n, 3)
+    e = didt * cp.einsum("dpnk,pnk->pd", dipole_q, m)
     return e[0] if single else e

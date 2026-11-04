@@ -40,8 +40,8 @@ _outside_reach = cp.ElementwiseKernel(
     "cunibs_outside_reach",
 )
 
-# Squared distance from element e's barycentre to pos. The squares go through pow, as CuPy's
-# ``** 2`` does, and pow(x, 2.0) is not always x * x to the last bit.
+# Squared distance from element e's barycentre to pos, each step rounded on its own so that no
+# contraction moves an element across an ROI's edge.
 _distance_sq = cp.ElementwiseKernel(
     "raw float64 barys, int32 e, raw float64 pos",
     "float64 d2",
@@ -49,7 +49,7 @@ _distance_sq = cp.ElementwiseKernel(
     const double dx = barys[3LL * e] - pos[0];
     const double dy = barys[3LL * e + 1] - pos[1];
     const double dz = barys[3LL * e + 2] - pos[2];
-    d2 = __dadd_rn(__dadd_rn(pow(dx, 2.0), pow(dy, 2.0)), pow(dz, 2.0));
+    d2 = __dadd_rn(__dadd_rn(__dmul_rn(dx, dx), __dmul_rn(dy, dy)), __dmul_rn(dz, dz));
     """,
     "cunibs_distance_sq",
 )

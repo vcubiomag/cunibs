@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 
 import cupy as cp
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -31,39 +32,32 @@ class Grid:
     ``shape`` the number of samples per axis.
     """
 
-    origin_m: cp.ndarray  # (3,) float64
-    spacing_m: cp.ndarray  # (3,) float64
+    origin_m: tuple[float, float, float]
+    spacing_m: tuple[float, float, float]
     shape: tuple[int, int, int]
     # When set, sampling covers only the points this region can reach rather than the whole box.
     coverage: SweptCoverage | None = None
 
     @property
     def n_points(self) -> int:
-        return int(self.shape[0] * self.shape[1] * self.shape[2])
+        return math.prod(self.shape)
 
     @property
-    def max_index(self) -> cp.ndarray:
-        """Largest valid fractional index per axis; anything beyond it is off the grid."""
-        return cp.asarray(self.shape, dtype=cp.float64) - 1.0
+    def kernel_args(self) -> tuple[tuple[float, ...], tuple[float, ...], tuple[int, ...]]:
+        """Origin, spacing and shape, as the ADM kernels take them."""
+        return self.origin_m, self.spacing_m, self.shape
 
     @property
-    def upper_m(self) -> cp.ndarray:
+    def upper_m(self) -> tuple[float, ...]:
         """Coordinate of the last sample on each axis (the inclusive upper corner)."""
-        return self.origin_m + self.spacing_m * self.max_index
-
-    def points_m(self) -> cp.ndarray:
-        """All grid points as ``(n_points, 3)`` in C order (matches ``reshape(shape+(3,))``)."""
-        ax = [
-            self.origin_m[i] + self.spacing_m[i] * cp.arange(self.shape[i], dtype=cp.float64)
-            for i in range(3)
-        ]
-        gx, gy, gz = cp.meshgrid(ax[0], ax[1], ax[2], indexing="ij")
-        return cp.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+        return tuple(
+            o + s * (n - 1)
+            for o, s, n in zip(self.origin_m, self.spacing_m, self.shape, strict=True)
+        )
 
     def world_to_index(self, points_m: cp.ndarray) -> cp.ndarray:
         """Fractional index coordinates ``(3, N)``, one row per axis in order."""
-        idx = (points_m - self.origin_m[None, :]) / self.spacing_m[None, :]
-        return cp.ascontiguousarray(idx.T)
+        return ((points_m - cp.asarray(self.origin_m)) / cp.asarray(self.spacing_m)).T
 
 
 def build_grid(dipole_positions_m: cp.ndarray, spacing_mm: float, margin_mm: float) -> Grid:
@@ -74,12 +68,11 @@ def build_grid(dipole_positions_m: cp.ndarray, spacing_mm: float, margin_mm: flo
         raise ValueError(f"margin_mm must be non-negative and finite, got {margin_mm!r}.")
     spacing_m = spacing_mm * 1e-3
     margin_m = margin_mm * 1e-3
-    lo = dipole_positions_m.min(0) - margin_m
-    hi = dipole_positions_m.max(0) + margin_m
-    span = hi - lo
-    nx, ny, nz = (int(cp.ceil(span[i] / spacing_m)) + 1 for i in range(3))
+    lo = cp.asnumpy(dipole_positions_m.min(0)) - margin_m
+    hi = cp.asnumpy(dipole_positions_m.max(0)) + margin_m
+    n = np.ceil((hi - lo) / spacing_m).astype(np.int64) + 1
     return Grid(
-        origin_m=cp.ascontiguousarray(lo),
-        spacing_m=cp.ascontiguousarray(cp.full(3, spacing_m, dtype=cp.float64)),
-        shape=(nx, ny, nz),
+        origin_m=tuple(lo.tolist()),
+        spacing_m=(spacing_m, spacing_m, spacing_m),
+        shape=tuple(n.tolist()),
     )

@@ -95,9 +95,8 @@ class ConductivityUQResult:
     ``None`` on a mesh with no gray matter.
 
     Results from :class:`~cunibs.Subject` are NumPy and carry a ``summary``, unless the mesh has
-    no gray matter. The
-    lower-level :func:`~cunibs.uq.run_conductivity_uq` returns device arrays and no
-    summary; call :meth:`compute_summary` and :meth:`to_numpy` yourself.
+    no gray matter. The lower-level :func:`~cunibs.uq.run_conductivity_uq` returns device arrays
+    and no summary; call :meth:`compute_summary` and :meth:`to_numpy` yourself.
     """
 
     mean_magnE: ArrayT | None

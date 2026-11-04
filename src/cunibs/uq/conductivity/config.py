@@ -155,7 +155,7 @@ def sample_conductivities(
 ) -> cp.ndarray:
     """Draw ``(n_samples, len(perturbed_tags))`` conductivities on the GPU.
 
-    Lognormal draws use the median parameterisation ``σ0·exp(s·z − s²/2)`` so ``E[σ] = σ0``.
+    Lognormal draws are ``σ0·exp(s·z − s²/2)``, which makes ``E[σ] = σ0``, the nominal value.
     """
     rng = cp.random.default_rng(config.seed)
     nominal = cp.asarray([TISSUE_CONDUCTIVITY[t] for t in perturbed_tags], dtype=cp.float64)

@@ -1,9 +1,8 @@
 """The ADM sampling grid and batched dipole placement, end to end.
 
-``adm/grid.py`` decides where the Q-field is sampled and how world coordinates map to
-``map_coordinates`` index space. An axis transposition between ``points_m`` and
-``world_to_index`` would silently corrupt every ADM evaluation while leaving shapes intact,
-so the load-bearing test here is interpolating a known linear field.
+``adm/grid.py`` decides where the Q-field is sampled and how world coordinates map to index
+space. An axis transposition in ``world_to_index`` would silently corrupt every ADM evaluation
+while leaving shapes intact, so the load-bearing test here is interpolating a known linear field.
 """
 
 from __future__ import annotations
@@ -11,10 +10,18 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from cunibs.adm.evaluate import place_coil_dipoles_batch
 from cunibs.adm.grid import Grid, build_grid
-from cunibs.adm.place import place_coil_dipoles_batch
 
 pytestmark = pytest.mark.gpu
+
+
+def _points_m(grid):
+    """All grid points as a device ``(n_points, 3)`` in C order, the order the kernels use."""
+    ijk = np.indices(grid.shape).reshape(3, -1).T
+    import cupy as cp
+
+    return cp.asarray(np.asarray(grid.origin_m) + np.asarray(grid.spacing_m) * ijk)
 
 
 @pytest.fixture
@@ -25,37 +32,23 @@ def dipole_cloud(cp):
 
 def test_build_grid_covers_points_with_margin(cp, dipole_cloud):
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
-    lo = cp.asnumpy(grid.origin_m)
-    hi = lo + cp.asnumpy(grid.spacing_m) * (np.asarray(grid.shape) - 1)
+    lo = np.asarray(grid.origin_m)
+    hi = lo + np.asarray(grid.spacing_m) * (np.asarray(grid.shape) - 1)
     pts = cp.asnumpy(dipole_cloud)
     assert np.all(lo <= pts.min(axis=0) - 8e-3 + 1e-15)
     assert np.all(hi >= pts.max(axis=0) + 8e-3 - 1e-15)
 
 
-def test_grid_shape_and_n_points_consistent(cp, dipole_cloud):
+def test_grid_shape_and_n_points_consistent(dipole_cloud):
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
     assert grid.n_points == int(np.prod(grid.shape))
-    assert grid.points_m().shape == (grid.n_points, 3)
-    np.testing.assert_allclose(cp.asnumpy(grid.spacing_m), 3e-3)
-
-
-def test_points_m_matches_c_order_reshape(cp, dipole_cloud):
-    """points_m() must enumerate in C order so it can be reshaped to ``shape + (3,)``."""
-    grid = build_grid(dipole_cloud, spacing_mm=6.0, margin_mm=4.0)
-    pts = cp.asnumpy(grid.points_m())
-    origin = cp.asnumpy(grid.origin_m)
-    spacing = cp.asnumpy(grid.spacing_m)
-    rng = np.random.default_rng(1)
-    for k in rng.integers(0, grid.n_points, size=200):
-        ijk = np.unravel_index(int(k), grid.shape)
-        np.testing.assert_allclose(pts[k], origin + spacing * np.asarray(ijk), atol=1e-15)
+    np.testing.assert_allclose(grid.spacing_m, 3e-3)
 
 
 def test_world_to_index_roundtrip_is_integral(cp, dipole_cloud):
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
-    idx = cp.asnumpy(grid.world_to_index(grid.points_m()))
+    idx = cp.asnumpy(grid.world_to_index(_points_m(grid)))
     assert idx.shape == (3, grid.n_points)
-    assert cp.ascontiguousarray(grid.world_to_index(grid.points_m())).flags.c_contiguous
 
     expected = np.stack(np.unravel_index(np.arange(grid.n_points), grid.shape))
     np.testing.assert_allclose(idx, expected, atol=1e-9)
@@ -66,20 +59,18 @@ def test_map_coordinates_on_linear_field_is_exact(cp):
     from cupyx.scipy.ndimage import map_coordinates
 
     grid = Grid(
-        origin_m=cp.asarray([-0.02, 0.05, 0.11]),
-        spacing_m=cp.asarray([2e-3, 3e-3, 5e-3]),
+        origin_m=(-0.02, 0.05, 0.11),
+        spacing_m=(2e-3, 3e-3, 5e-3),
         shape=(9, 7, 5),
     )
     a = np.array([3.0, -7.0, 11.0])
     b = 0.5
 
-    pts = cp.asnumpy(grid.points_m())
+    pts = cp.asnumpy(_points_m(grid))
     field = cp.asarray((pts @ a + b).reshape(grid.shape))
 
     rng = np.random.default_rng(2)
-    lo = cp.asnumpy(grid.origin_m)
-    hi = cp.asnumpy(grid.upper_m)
-    query = rng.uniform(lo, hi, size=(500, 3))
+    query = rng.uniform(grid.origin_m, grid.upper_m, size=(500, 3))
 
     got = cp.asnumpy(
         map_coordinates(field, grid.world_to_index(cp.asarray(query)), order=1, mode="nearest")
@@ -88,10 +79,10 @@ def test_map_coordinates_on_linear_field_is_exact(cp):
 
 
 def test_upper_m_is_the_last_sample_on_each_axis(cp, dipole_cloud):
-    """``max_index`` is the bound the evaluate check compares against, so it must be a real sample."""
+    """The last index is the bound the evaluate check compares against, so it must be a real sample."""
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
-    idx = grid.world_to_index(grid.upper_m[None, :])
-    np.testing.assert_allclose(cp.asnumpy(idx).ravel(), cp.asnumpy(grid.max_index), atol=1e-9)
+    idx = grid.world_to_index(cp.asarray([grid.upper_m]))
+    np.testing.assert_allclose(cp.asnumpy(idx).ravel(), np.asarray(grid.shape) - 1.0, atol=1e-9)
 
 
 def test_outside_grid_clamps_to_the_edge(cp):
@@ -99,12 +90,12 @@ def test_outside_grid_clamps_to_the_edge(cp):
     from cupyx.scipy.ndimage import map_coordinates
 
     grid = Grid(
-        origin_m=cp.asarray([0.0, 0.0, 0.0]),
-        spacing_m=cp.asarray([1e-3, 1e-3, 1e-3]),
+        origin_m=(0.0, 0.0, 0.0),
+        spacing_m=(1e-3, 1e-3, 1e-3),
         shape=(4, 4, 4),
     )
     field = cp.asarray(
-        (cp.asnumpy(grid.points_m()) @ np.array([1.0, 0.0, 0.0])).reshape(grid.shape)
+        (cp.asnumpy(_points_m(grid)) @ np.array([1.0, 0.0, 0.0])).reshape(grid.shape)
     )
     inside = cp.asarray([[3e-3, 0.0, 0.0]])
     outside = cp.asarray([[3e-3 + 3 * 1e-3, 0.0, 0.0]])
@@ -148,7 +139,7 @@ def test_place_batch_leaves_moments_alone_under_pure_translation(cp, synthetic_c
 
 
 def test_place_batch_agrees_with_the_dadt_placement_math(cp, cube_subject, synthetic_coil):
-    """``adm/place.py`` and the inline placement in ``coil_dadt_at_nodes`` must not drift apart."""
+    """``place_coil_dipoles_batch`` and the inline placement in ``coil_dadt_at_nodes`` must not drift apart."""
     from cunibs.fem.placement import compute_coil_transform
 
     tf = compute_coil_transform(cube_subject.context, [50, 50, 120], [50, 150, 100], 4.0)
@@ -180,10 +171,8 @@ def test_grid_for_placements_contains_every_dipole(cp, cube_subject, figure8_coi
     grid = grid_for_placements(ctx, figure8_coil, placements, spacing_mm=3.0, margin_mm=8.0)
     s, _ = _placed_dipoles(ctx, figure8_coil, placements)
 
-    lo = cp.asnumpy(grid.origin_m)
-    hi = cp.asnumpy(grid.upper_m)
     pts = cp.asnumpy(s).reshape(-1, 3)
-    assert np.all(pts >= lo) and np.all(pts <= hi)
+    assert np.all(pts >= grid.origin_m) and np.all(pts <= grid.upper_m)
 
 
 def test_coverage_grid_contains_all_rotations(cp, cube_subject, figure8_coil):
@@ -206,7 +195,5 @@ def test_coverage_grid_contains_all_rotations(cp, cube_subject, figure8_coil):
     ]
     s, _ = _placed_dipoles(ctx, figure8_coil, sweep)
 
-    lo = cp.asnumpy(grid.origin_m)
-    hi = cp.asnumpy(grid.upper_m)
     pts = cp.asnumpy(s).reshape(-1, 3)
-    assert np.all(pts >= lo) and np.all(pts <= hi)
+    assert np.all(pts >= grid.origin_m) and np.all(pts <= grid.upper_m)

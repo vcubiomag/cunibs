@@ -52,8 +52,7 @@ ADJOINT_TOLERANCE = DEFAULT_TOLERANCE
 ADJOINT_MAX_ITERS = 3000
 
 # One byte per (rho, h) raster cell: whether some profile entry lies within reach of its centre.
-# The squares go through pow, as CuPy's ``** 2`` does, and pow(x, 2.0) is not always x * x to the
-# last bit; the sum is rounded on its own so that no contraction moves a cell on the edge.
+# Each step is rounded on its own so that no contraction moves a cell on the edge.
 _reach_profile = cp.ElementwiseKernel(
     "raw float64 rc, raw float64 hc, raw float64 prof, int32 n_prof, int32 n_h, float64 reach_sq",
     "uint8 hit",
@@ -64,7 +63,7 @@ _reach_profile = cp.ElementwiseKernel(
     for (int j = 0; j < n_prof; ++j) {
         const double dr = r - prof[2 * j];
         const double dh = h - prof[2 * j + 1];
-        if (__dadd_rn(pow(dr, 2.0), pow(dh, 2.0)) <= reach_sq) {
+        if (__dadd_rn(__dmul_rn(dr, dr), __dmul_rn(dh, dh)) <= reach_sq) {
             hit = 1;
             break;
         }
@@ -300,7 +299,7 @@ class ReciprocityField:
             self.src_w,
             self.tile_box,
             cp.ascontiguousarray(cp.sort(points), dtype=cp.int64),
-            *_grid_args(grid),
+            *grid.kernel_args,
             self.q.reshape(-1),
             cp.cuda.get_current_stream().ptr,
         )
@@ -365,29 +364,19 @@ class ReciprocityField:
             self.entries.reshape(-1),
             self.n_directions,
             self.q.reshape(-1),
-            *_grid_args(grid),
+            *grid.kernel_args,
             self.q_near.reshape(-1),
             cp.cuda.get_current_stream().ptr,
         )
 
 
-def _grid_args(grid: Grid) -> tuple[list[float], list[float], list[int]]:
-    return (
-        [float(x) for x in cp.asnumpy(grid.origin_m)],
-        [float(x) for x in cp.asnumpy(grid.spacing_m)],
-        list(grid.shape),
-    )
-
-
 def _cells_ok(sampled: cp.ndarray, shape: tuple[int, int, int]) -> cp.ndarray:
     """One byte per cell: whether all eight of its corners are sampled."""
-    s = sampled.reshape(shape).astype(cp.bool_)
-    ok = s[:-1, :-1, :-1].copy()
-    for dx in (0, 1):
-        for dy in (0, 1):
-            for dz in (0, 1):
-                ok &= s[dx : dx + shape[0] - 1, dy : dy + shape[1] - 1, dz : dz + shape[2] - 1]
-    return cp.ascontiguousarray(ok.astype(cp.uint8).ravel())
+    ok = sampled.reshape(shape).astype(cp.bool_)
+    ok = ok[:-1] & ok[1:]
+    ok = ok[:, :-1] & ok[:, 1:]
+    ok = ok[:, :, :-1] & ok[:, :, 1:]
+    return ok.astype(cp.uint8).ravel()
 
 
 def _reachable(grid: Grid, coverage: SweptCoverage) -> cp.ndarray:
@@ -398,7 +387,7 @@ def _reachable(grid: Grid, coverage: SweptCoverage) -> cp.ndarray:
     diagonal, so the raster never misses a point the margin covers. Every grid point then looks
     its cylindrical coordinates up against each centre's axis.
     """
-    cell = float(cp.min(grid.spacing_m)) / 4.0
+    cell = min(grid.spacing_m) / 4.0
     margin = coverage.margin_m
     prof = coverage.profile_m
     rho_hi = float(prof[:, 0].max()) + margin + cell
@@ -420,9 +409,7 @@ def _reachable(grid: Grid, coverage: SweptCoverage) -> cp.ndarray:
 
     mask = cp.empty(grid.n_points, dtype=cp.uint8)
     adm_reach(
-        [float(x) for x in cp.asnumpy(grid.origin_m)],
-        [float(x) for x in cp.asnumpy(grid.spacing_m)],
-        list(grid.shape),
+        *grid.kernel_args,
         cp.ascontiguousarray(coverage.origins_m, dtype=cp.float64),
         cp.ascontiguousarray(coverage.axes, dtype=cp.float64),
         profile,
@@ -450,7 +437,7 @@ def _binned_sources(
     src = cp.empty((n_src, 3), dtype=cp.float32)
     # Binned from the float32 coordinates the kernels read, so both sides agree on every cell.
     flat = cp.empty(n_src, dtype=cp.int32 if n_cells < np.iinfo(np.int32).max else cp.int64)
-    _grid_cells(nodes, grid.origin_m, grid.spacing_m, *n_ext, src, flat)
+    _grid_cells(nodes, cp.asarray(grid.origin_m), cp.asarray(grid.spacing_m), *n_ext, src, flat)
     order = cp.argsort(flat, kind="stable")
     cell_ptr = csr_offsets(flat[order], n_cells)
 
@@ -535,8 +522,8 @@ def _coverage_grid(
 ) -> Grid:
     """Grid covering every coil dipole for the coil placed at any rotation on each center."""
     centers = cp.ascontiguousarray(cp.asarray(centers_mm, dtype=cp.float64).reshape(-1, 3))
-    # No handle: only the translation is read, and the reach dilation below is rotation-invariant.
-    base = compute_coil_transforms(ctx, centers, None, cp.full(centers.shape[0], distance_mm))
+    # No handle: only the translation and coil axis are read, which a rotation about it keeps.
+    base = compute_coil_transforms(ctx, centers, None, distance_mm)
     origins_m = base[:, :3, 3] * 1e-3
     # A dipole stays within max|position| of the coil origin at any rotation; dilate by that + margin.
     pos = cp.asarray(coil.positions_m, dtype=cp.float64)

@@ -2,8 +2,8 @@
 
 Each candidate position is projected onto the scalp once. The in-plane rotation is a rigid rotation
 of the whole coil, so every target E-component ``E_d(θ)`` is band-limited in the angle. The optimum
-rotation is found in closed form by sampling ``E_d(θ)`` at a few angles, trigonometrically
-interpolating, and maximizing ``|E(θ)|²`` analytically, without any FEM solve.
+rotation comes from sampling ``E_d(θ)`` at a few angles, interpolating them trigonometrically to a
+fine grid and refining that grid's maximum with a parabola, without any FEM solve.
 """
 
 from __future__ import annotations
@@ -125,24 +125,6 @@ def _frames(
     return m.reshape(-1, 4, 4)
 
 
-def _sample_objective(
-    recip: ReciprocityField,
-    coil: Coil,
-    proj: cp.ndarray,
-    normal: cp.ndarray,
-    u: cp.ndarray,
-    v: cp.ndarray,
-    angles: cp.ndarray,
-    distance_mm: float,
-    didt: float,
-) -> cp.ndarray:
-    """Target E-vectors ``(C, A, D)`` for every position at each shared angle in ``angles`` (A,)."""
-    c = proj.shape[0]
-    a = angles.shape[0]
-    frames = _frames(proj, normal, u, v, angles, distance_mm)
-    return _evaluate_native(recip, coil, frames, didt).reshape(c, a, -1)
-
-
 def _parabolic_refine(
     obj_grid: cp.ndarray, a_best: cp.ndarray, thetas: cp.ndarray
 ) -> cp.ndarray:
@@ -162,10 +144,9 @@ def _project(
     ctx: SolverContext, centers: cp.ndarray, distance_mm: float
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Scalp contact point, outward normal, and in-plane rotation basis for each center."""
-    dist = cp.full(centers.shape[0], distance_mm, dtype=cp.float64)
     # No handle: only the normal and translation are read, and the rotation basis comes from
     # _inplane_basis below.
-    base = compute_coil_transforms(ctx, centers, None, dist)
+    base = compute_coil_transforms(ctx, centers, None, distance_mm)
     normal = -base[:, :3, 2]
     proj = base[:, :3, 3] - distance_mm * normal
     u, v = _inplane_basis(normal)
@@ -234,8 +215,9 @@ def optimize_placement(
 
     ``centers_mm`` is a set of candidate scalp targets ``(C,3)`` (each is projected onto the scalp),
     and ``distance_mm`` the coil's offset from it. Both default to what ``recip`` was built for.
-    The rotation is optimized in closed form: ``E_d(θ)`` is sampled at ``n_samples`` (odd) angles,
-    Fourier-interpolated to ``resolution`` points, and ``|E(θ)|²`` is maximized on that fine grid.
+    ``E_d(θ)`` is sampled at ``n_samples`` (odd) angles and Fourier-interpolated to ``resolution``
+    points. A parabola refines the objective's maximum on those points, and the field is evaluated
+    again at that angle.
 
     ``didt`` is the coil current's rate of change in A/s. It scales ``best_E`` linearly and
     leaves the chosen placement unchanged.
@@ -261,9 +243,8 @@ def optimize_placement(
     # Sample E_d(θ) at n_samples angles, then trigonometrically interpolate to a fine θ grid.
     order = (n_samples - 1) // 2
     theta_s = cp.linspace(0.0, 2.0 * cp.pi, n_samples, endpoint=False)
-    e_s = _sample_objective(
-        recip, coil, proj, normal, u, v, theta_s, distance_mm, didt
-    )  # (C,K,D)
+    frames = _frames(proj, normal, u, v, theta_s, distance_mm)
+    e_s = _evaluate_native(recip, coil, frames, didt).reshape(centers.shape[0], n_samples, -1)
 
     theta_f = cp.linspace(0.0, 2.0 * cp.pi, resolution, endpoint=False)
     d = theta_f[:, None] - theta_s[None, :]  # (F,K)
@@ -285,12 +266,11 @@ def optimize_placement(
     obj_f = _objective(cp.moveaxis(e_f, 1, 2), recip.magnitude)  # (C,F)
     theta = _parabolic_refine(obj_f, cp.argmax(obj_f, axis=1), theta_f)
 
-    # Exact final evaluation at each position's own optimum angle (one field eval per position).
-    e = _eval_per_position(recip, coil, proj, normal, u, v, theta, distance_mm, didt)  # (C,D)
+    # The field itself at each position's own optimum angle.
+    y = cp.cos(theta)[:, None] * u + cp.sin(theta)[:, None] * v
+    e = _evaluate_native(recip, coil, _assemble_frames(proj, normal, y, distance_mm), didt)
     obj = cp.asnumpy(_objective(e, recip.magnitude))  # (C,)
-    handle = cp.asnumpy(
-        proj + _HANDLE_MM * (cp.cos(theta)[:, None] * u + cp.sin(theta)[:, None] * v)
-    )
+    handle = cp.asnumpy(proj + _HANDLE_MM * y)
     proj_h = cp.asnumpy(proj)
 
     gi = int(np.argmax(obj))
@@ -305,19 +285,3 @@ def optimize_placement(
         center_objective=obj,
         center_handle_mm=handle,
     )
-
-
-def _eval_per_position(
-    recip: ReciprocityField,
-    coil: Coil,
-    proj: cp.ndarray,
-    normal: cp.ndarray,
-    u: cp.ndarray,
-    v: cp.ndarray,
-    theta: cp.ndarray,
-    distance_mm: float,
-    didt: float,
-) -> cp.ndarray:
-    """Target E-vectors ``(C, D)`` with one angle ``theta[c]`` per position."""
-    y = cp.cos(theta)[:, None] * u + cp.sin(theta)[:, None] * v
-    return _evaluate_native(recip, coil, _assemble_frames(proj, normal, y, distance_mm), didt)

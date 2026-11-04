@@ -56,9 +56,8 @@ _BASIS_RTOL = 1e-12
 
 _GRAM_CHUNKS = 64
 
-# The per-tetrahedron moments of |E| from the running sums, in one pass and straight to float32.
-# Each step is the float64 array expression it replaces, rounded where that rounded, so the
-# outputs are its bits: (q - s^2/n) / dof clipped at zero keeps a negative zero, as clip does.
+# The per-tetrahedron moments of |E| from the running sums, in one pass and straight to float32,
+# each step rounded on its own so that no contraction moves a digit.
 _moments = cp.ElementwiseKernel(
     "float64 s, float64 q, float64 n, float64 dof, float64 floor",
     "float32 mean_out, float32 std_out, float32 cov_out",
@@ -334,7 +333,7 @@ def run_conductivity_uq(
     tolerance falls back to a per-draw preconditioner rebuild, so accuracy never depends on the
     preconditioner tracking the sample.
 
-    Every draw's gray-matter peak ``|E|``, focality, and peak location are recorded — the
+    Every draw's gray-matter peak ``|E|``, focality, and peak location are recorded: the
     distributional quantities a metric of the mean field cannot provide. ``record_rois``, a
     ``{name: ResolvedTarget}`` mapping, adds each draw's volume-weighted mean ``|E|`` per named
     ROI. The reductions run in-place into device-resident per-sample arrays, so they add no
@@ -386,10 +385,9 @@ def run_conductivity_uq(
     n_red = int(pre.idx.shape[0])
     stream = cp.cuda.get_current_stream().ptr
 
-    # Warm-start seed: solve the nominal (ensemble-centre) problem once and reuse x_nominal as the
-    # initial guess for every draw. solve_mixed measures convergence against ‖b‖ rather than the
-    # initial residual, so a warm-started draw still reaches the same accuracy criterion. The
-    # nominal operator is the forward one, whose values the solver holds.
+    # The nominal (ensemble-centre) solution is the reduced basis's first direction. Solves measure
+    # convergence against ‖b‖, not the initial residual, so a warm-started draw still meets the same
+    # accuracy criterion. The nominal operator is the forward one, whose values the solver holds.
     x_nominal = cp.empty(n_red, dtype=cp.float64)
     b_nom = cp.ascontiguousarray(
         (b_base + pre.nominal_sigma.astype(cp.float32) @ b_tissue)[pre.idx], dtype=cp.float64

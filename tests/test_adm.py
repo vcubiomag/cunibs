@@ -439,7 +439,7 @@ def test_evaluate_accepts_a_dipole_on_the_grid_corner(cp, cube_reciprocity):
     from cunibs.adm.evaluate import _require_in_grid
 
     grid = cube_reciprocity.grid
-    corners = cp.stack([grid.origin_m, grid.upper_m])
+    corners = cp.asarray([grid.origin_m, grid.upper_m])
     _require_in_grid(grid, grid.world_to_index(corners), offset=0, n_dip=1, n_total=2)
 
 
@@ -574,10 +574,9 @@ def test_dipoles_beside_the_scalp_with_a_grid_point_on_a_node(
     adj = solve_adjoint(ctx, resolve_target(ctx, Target(patch_target, region="gray_matter")))
     node_m = cp.asarray(patch_top_mm * 1e-3)
     grid = build_grid(node_m[None], spacing_mm=3.0, margin_mm=8.0)
-    nearest = (
-        grid.origin_m + cp.rint((node_m - grid.origin_m) / grid.spacing_m) * grid.spacing_m
-    )
-    grid.origin_m = grid.origin_m + (node_m - nearest) + 1e-8
+    origin, spacing = cp.asarray(grid.origin_m), cp.asarray(grid.spacing_m)
+    nearest = origin + cp.rint((node_m - origin) / spacing) * spacing
+    grid.origin_m = tuple(cp.asnumpy(origin + (node_m - nearest) + 1e-8).tolist())
     recip = sample_qfield(adj, grid)
 
     coil = Coil(
