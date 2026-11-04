@@ -23,6 +23,9 @@ from cunibs._common import (
     as_point,
     check_didt,
     check_format_version,
+    check_roi_names,
+    check_same_length,
+    corrupt_as_value_error,
     opt_array,
     read_metrics,
     read_provenance,
@@ -956,6 +959,7 @@ class Subject:
         sites = _sites(placements, "iter_simulate_conductivity_uq")
         recovery = validate_recovery(recovery)
         check_didt(didt)
+        check_roi_names(record_rois)
         return self._iter_uq_reduced(coil, sites, config, didt, moments, record_rois, recovery)
 
     def simulate_conductivity_uq(
@@ -1197,8 +1201,9 @@ class FieldResult:
     @classmethod
     def load(cls, path: str | Path) -> FieldResult:
         """Read a saved result into NumPy arrays."""
-        with h5py.File(Path(path), "r") as h5f:
+        with corrupt_as_value_error(path), h5py.File(Path(path), "r") as h5f:
             check_format_version(h5f, path, _FORMAT_VERSION)
+            check_same_length(h5f, path, ("magnE", "E", "vols", "tet_tags", "barycenters_mm"))
             return cls(
                 summary=read_metrics(h5f["summary"]) if "summary" in h5f else None,
                 magnE=opt_array(h5f, "magnE"),

@@ -15,6 +15,9 @@ from cunibs import metrics
 from cunibs._common import (
     DEFAULT_REGION,
     check_format_version,
+    check_roi_names,
+    check_same_length,
+    corrupt_as_value_error,
     opt_array,
     read_metrics,
     read_provenance,
@@ -189,6 +192,7 @@ class ConductivityUQResult:
         Moment arrays the run did not retain are absent from the file and load back as
         ``None``.
         """
+        check_roi_names(self.roi_samples)
         if self.summary is None and self.peak_samples is not None:
             raise ValueError(
                 "This result has no summary to save; call compute_summary() first "
@@ -234,8 +238,9 @@ class ConductivityUQResult:
     @classmethod
     def load(cls, path: str | Path) -> ConductivityUQResult:
         """Read a saved conductivity-UQ result into NumPy arrays."""
-        with h5py.File(Path(path), "r") as h5f:
+        with corrupt_as_value_error(path), h5py.File(Path(path), "r") as h5f:
             check_format_version(h5f, path, _FORMAT_VERSION)
+            check_same_length(h5f, path, ("sigma_samples", "peak_samples", "focality_samples"))
             # HDF5 stores a name holding a slash as nested groups, so walk them.
             roi_samples: dict[str, npt.NDArray[np.float64]] = {}
 

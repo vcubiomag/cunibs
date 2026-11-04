@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import h5py
 import numpy as np
 import pytest
 
@@ -140,3 +141,23 @@ def test_result_peak_and_cov_are_region_masked():
         mask = metrics.region_mask(r.tet_tags, region)
         assert r.peak_mean_magnE(region) == r.mean_magnE[mask].max()
         assert r.max_local_cov(region) == r.cov_magnE[mask].max()
+
+
+@pytest.mark.parametrize("name", ["/abs", "a/", ".", "a//b", ""])
+def test_a_roi_name_hdf5_would_move_is_rejected_on_save(tmp_path, name):
+    r = _result(_lognormal_draws(8, 2), roi={name: np.arange(8.0)})
+    r = dataclasses.replace(r, summary=r.compute_summary())
+    with pytest.raises(ValueError, match="ROI name"):
+        r.save(tmp_path / "uq.h5")
+
+
+def test_a_result_with_short_per_draw_samples_is_reported_as_corrupt(tmp_path):
+    r = _result(_lognormal_draws(8, 2))
+    r = dataclasses.replace(r, summary=r.compute_summary())
+    r.save(tmp_path / "uq.h5")
+    with h5py.File(tmp_path / "uq.h5", "r+") as f:
+        data = f["peak_samples"][:-1]
+        del f["peak_samples"]
+        f["peak_samples"] = data
+    with pytest.raises(ValueError, match="corrupt"):
+        ConductivityUQResult.load(tmp_path / "uq.h5")

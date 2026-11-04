@@ -68,7 +68,7 @@ class ConductivityUQConfig:
 
     n_samples: int = 500
     seed: int = 0
-    tissue_cov: dict[int, float] = field(default_factory=dict)
+    tissue_cov: dict[int, float] = field(default_factory=dict, hash=False)
     perturbed_tags: tuple[int, ...] | None = None
     distribution: Distribution = "lognormal"
 

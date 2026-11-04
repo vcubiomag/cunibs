@@ -73,3 +73,8 @@ def test_invalid_configs_raise(kwargs, match):
 def test_a_single_draw_and_a_zero_cov_stay_valid():
     cfg = ConductivityUQConfig(n_samples=1, tissue_cov={2: 0.0})
     assert cfg.n_samples == 1 and cfg.cov_for(2) == 0.0
+
+
+def test_equal_configs_hash_alike():
+    one = ConductivityUQConfig(n_samples=8, tissue_cov={2: 0.1})
+    assert hash(one) == hash(ConductivityUQConfig(n_samples=8, tissue_cov={2: 0.1}))

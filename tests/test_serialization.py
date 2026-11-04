@@ -232,6 +232,22 @@ def test_uq_result_roundtrip_with_record_rois(tmp_path):
         np.testing.assert_array_equal(getattr(loaded, name), getattr(r, name), err_msg=name)
 
 
+def test_roi_names_with_a_slash_survive_a_roundtrip(tmp_path):
+    """HDF5 reads a slash as a group, which must not cost the ROI its name or its data."""
+    path = tmp_path / "result.h5"
+    field = dataclasses.replace(_make_result(), roi_means={"m1/left": 0.5, "sma": 0.25})
+    field.save(path)
+    assert FieldResult.load(path).roi_means == field.roi_means
+
+    samples = {"m1/left": np.arange(4.0), "m1/right": np.arange(4.0) + 1.0, "sma": np.ones(4)}
+    uq = dataclasses.replace(_make_uq_result(with_rois=False), roi_samples=samples)
+    uq.save(path)
+    loaded = ConductivityUQResult.load(path).roi_samples
+    assert set(loaded) == set(samples)
+    for name, values in samples.items():
+        np.testing.assert_array_equal(loaded[name], values, err_msg=name)
+
+
 def test_uq_result_format_version_mismatch_raises(tmp_path):
     """The UQ format version is tracked independently of the FieldResult one."""
     path = tmp_path / "uq.h5"
@@ -339,3 +355,23 @@ def test_a_file_without_provenance_still_loads(
     assert loaded.provenance is None
     assert loaded.iterations is None and loaded.relative_residual is None
     assert loaded.coil_name and loaded.summary["peak_magnE"] > 0.0
+
+
+def test_field_result_with_a_missing_group_is_reported_as_corrupt(tmp_path):
+    path = tmp_path / "result.h5"
+    _make_result().save(path)
+    with h5py.File(path, "r+") as f:
+        del f["summary"]["focality_m3"]
+    with pytest.raises(ValueError, match="corrupt"):
+        FieldResult.load(path)
+
+
+def test_field_result_whose_arrays_disagree_is_reported_as_corrupt(tmp_path):
+    path = tmp_path / "result.h5"
+    _make_result().save(path)
+    with h5py.File(path, "r+") as f:
+        data = f["vols"][:-1]
+        del f["vols"]
+        f["vols"] = data
+    with pytest.raises(ValueError, match="dataset lengths differ"):
+        FieldResult.load(path)

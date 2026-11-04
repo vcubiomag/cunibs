@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -11,7 +12,7 @@ import numpy.typing as npt
 from cunibs import metrics
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
     import h5py
@@ -94,6 +95,33 @@ def check_format_version(h5f: h5py.File, path: str | Path, expected: int) -> Non
             f"{path}: file format version {stored} is not readable by this version of "
             f"cuNIBS (expected {expected})."
         )
+
+
+@contextmanager
+def corrupt_as_value_error(path: str | Path) -> Iterator[None]:
+    """Report damage inside a valid HDF5 file as a ValueError.
+
+    h5py raises whichever of these its failing step happens to.
+    """
+    try:
+        yield
+    except (RuntimeError, KeyError, TypeError, IndexError) as exc:
+        raise ValueError(f"{path}: corrupt HDF5 file: {exc}") from exc
+
+
+def check_same_length(h5f: h5py.File, path: str | Path, names: Iterable[str]) -> None:
+    """Require the datasets among ``names`` that the file holds to agree in their first axis."""
+    lengths = {name: h5f[name].shape[0] for name in names if name in h5f}
+    if len(set(lengths.values())) > 1:
+        raise ValueError(f"{path}: corrupt HDF5 file: dataset lengths differ: {lengths}")
+
+
+def check_roi_names(names: Iterable[str]) -> None:
+    """Reject ROI names HDF5 would resolve to another path, and so lose on a round trip."""
+    for name in names:
+        parts = name.split("/")
+        if not all(parts) or "." in parts or ".." in parts:
+            raise ValueError(f"ROI name {name!r} is not a usable HDF5 path.")
 
 
 def opt_array(h5f: h5py.File, name: str) -> npt.NDArray[Any] | None:
