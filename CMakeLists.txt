@@ -116,9 +116,11 @@ else()
   # covered by this and still have to be caught by hand.
   set(_warn_flags -Wall -Wextra)
   list(JOIN _warn_flags "," _warn_flags_nvcc)
+  # nanobind hides the C++ sources' symbols only. Exported, a .cu file's would include CCCL's unique
+  # globals, which bind across every library in the process.
   target_compile_options(_solver_ext PRIVATE
     "$<$<COMPILE_LANGUAGE:CXX>:${_warn_flags}>"
-    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_warn_flags_nvcc}>")
+    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_warn_flags_nvcc},-fvisibility=hidden>")
 endif()
 
 target_link_libraries(
@@ -166,11 +168,9 @@ nanobind_add_stub(
   DEPENDS _solver_ext
 )
 
-# The stub is copied into src/ (gitignored) rather than installed from the build tree.
-# Type checkers resolve cunibs to src/ and cannot follow the editable install's import
-# hook, so a stub that exists only in site-packages is invisible to them.
-# scikit-build-core copies package files after the CMake install, so the wheel ships this
-# copy.
+# Type checkers resolve cunibs to src/ and cannot follow the editable install's import hook, so a
+# stub that exists only in site-packages is invisible to them. The copy in src/ is gitignored, and
+# scikit-build-core leaves ignored files out of the wheel, so the wheel takes the stub from install.
 add_custom_target(_solver_ext_stub_sync ALL
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
           "${CMAKE_CURRENT_BINARY_DIR}/solver/_solver_ext.pyi"
@@ -178,3 +178,4 @@ add_custom_target(_solver_ext_stub_sync ALL
   VERBATIM
 )
 add_dependencies(_solver_ext_stub_sync _solver_ext_stub)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/solver/_solver_ext.pyi" DESTINATION cunibs/solver)
