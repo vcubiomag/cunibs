@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from cunibs import Placement, Subject
-from cunibs._memory import scratch_pool
+from cunibs._memory import build_arena, scratch_pool, unpooled
 from cunibs.mesh import load_mesh
 
 pytestmark = pytest.mark.gpu
@@ -313,3 +313,14 @@ def test_roi_means_round_trip_through_hdf5(patch_subject, d70_coil, patch_placem
     plain.save(path)
     assert plain.roi_means is None
     assert FieldResult.load(path).roi_means is None
+
+
+def test_out_of_memory_is_a_memory_error_from_every_allocator(cp):
+    """The retries catch MemoryError, and CUDA's allocators report through a runtime error."""
+    huge = 1 << 46
+    with build_arena(), pytest.raises(MemoryError):
+        cp.empty(huge, dtype=cp.uint8)
+    with pytest.raises(MemoryError):
+        unpooled(huge)
+    with pytest.raises(MemoryError), cp.cuda.using_allocator(scratch_pool().malloc):
+        cp.empty(huge, dtype=cp.uint8)

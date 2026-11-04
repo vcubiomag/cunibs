@@ -37,6 +37,8 @@ class Arena:
             return a.copy()
 
 
+_CUDA_ERROR_MEMORY_ALLOCATION = 2
+
 _scratch: cp.cuda.MemoryPool | None = None
 _scratch_lock = threading.Lock()
 
@@ -62,13 +64,30 @@ def release_scratch() -> None:
             _scratch.free_all_blocks()
 
 
+def _as_memory_error(error: cp.cuda.runtime.CUDARuntimeError, size: int) -> Exception:
+    """What to raise for a failed allocation: only CuPy's pools raise a MemoryError themselves."""
+    if error.status == _CUDA_ERROR_MEMORY_ALLOCATION:
+        return cp.cuda.memory.OutOfMemoryError(size, 0)
+    return error
+
+
 def unpooled(size: int) -> cp.cuda.MemoryPointer:
     """An allocator giving each array its own device allocation, released when the array dies.
 
     For state that can outlive whatever built it: a block from a pool that has since been dropped
     strands the chunk it came from.
     """
-    return cp.cuda.MemoryPointer(cp.cuda.Memory(size), 0)
+    try:
+        return cp.cuda.MemoryPointer(cp.cuda.Memory(size), 0)
+    except cp.cuda.runtime.CUDARuntimeError as error:
+        raise _as_memory_error(error, size) from error
+
+
+def _stream_ordered(size: int) -> cp.cuda.MemoryPointer:
+    try:
+        return cp.cuda.malloc_async(size)
+    except cp.cuda.runtime.CUDARuntimeError as error:
+        raise _as_memory_error(error, size) from error
 
 
 @contextmanager
@@ -86,5 +105,5 @@ def build_arena() -> Iterator[Arena]:
     the device at the next synchronisation. Nothing a build keeps shares a chunk with them.
     """
     arena = Arena(cp.cuda.get_allocator())
-    with cp.cuda.using_allocator(cp.cuda.malloc_async):
+    with cp.cuda.using_allocator(_stream_ordered):
         yield arena
