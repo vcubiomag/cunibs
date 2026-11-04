@@ -1105,3 +1105,20 @@ def test_a_partly_fitted_operator_refuses_a_full_apply(cp, fresh_subject, patch_
     with pytest.raises(ValueError, match="fitted for tissues"):
         apply_recovery_into(op, out, potential=potential, dadt_nodes=dadt)
     apply_recovery_into(op, out, potential=potential, dadt_nodes=dadt, tissues={2})
+
+
+def test_apply_recovery_takes_the_potential_solve_grounded_returns(cp, cube_subject):
+    """solve_grounded returns a vector, so that is what a caller has to hand."""
+    from cunibs.fem import ensure_recovery, solve_grounded
+    from cunibs.fem.recovery import apply_recovery
+
+    ctx = cube_subject.context
+    op = ensure_recovery(ctx, "harmonic")
+    v, _ = solve_grounded(ctx.solver, cp.asarray(np.arange(ctx.n_nodes, dtype=np.float64)))
+    dadt = cp.zeros((ctx.n_nodes, 3), dtype=cp.float32)
+    n_tet = int(ctx.tet_nodes.shape[0])
+
+    one = apply_recovery(op, n_tet, potential=v, dadt_nodes=dadt)
+    column = apply_recovery(op, n_tet, potential=v[:, None], dadt_nodes=dadt)
+    assert len(one.magnE) == 1
+    np.testing.assert_array_equal(cp.asnumpy(one.magnE[0]), cp.asnumpy(column.magnE[0]))

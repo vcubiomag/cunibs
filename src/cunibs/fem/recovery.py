@@ -279,7 +279,7 @@ def node_patches(ctx: SolverContext, slots: TissueSlots) -> tuple[cp.ndarray, cp
     return pptr, pidx
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class RecoveryOperator:
     """The precomputed patch weights for one mesh and one recovery mode.
 
@@ -333,7 +333,7 @@ class RecoveryOperator:
     tags: frozenset[int] = frozenset()
     # The slots and elements of each tissue set an apply was restricted to, keyed by the set.
     active: dict[frozenset[int], tuple[cp.ndarray, cp.ndarray]] = field(
-        default_factory=dict, repr=False, compare=False
+        default_factory=dict, repr=False
     )
 
     @property
@@ -650,10 +650,13 @@ def apply_recovery(
     """Recover a block of placements, allocating the outputs.
 
     The allocating form of :func:`apply_recovery_into`; see it for which inputs an operator
-    reads. A potential-consuming operator recovers one placement per column of ``potential``.
+    reads. A potential-consuming operator recovers one placement per column of ``potential``, and
+    a one-dimensional ``potential``, as :func:`~cunibs.fem.solve_grounded` returns, is one.
     """
     if op.on_potential:
-        k = 0 if potential is None else int(potential.reshape(potential.shape[0], -1).shape[1])
+        if potential is not None:
+            potential = potential.reshape(potential.shape[0], -1)
+        k = 0 if potential is None else int(potential.shape[1])
     else:
         k = len(elements or ())
     out = RecoveredField.allocate(op, n_tet, k)

@@ -44,7 +44,7 @@ _CAP_RADIUS_MM = 150.0
 _SPAN_RTOL = 1e-6
 
 
-@dataclass
+@dataclass(eq=False)
 class SweepBasis:
     """An A-orthonormal basis ``q`` (n_red, m), fp32, of forward solutions on one subject.
 

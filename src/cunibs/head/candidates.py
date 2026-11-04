@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from cunibs.simulation import Subject
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class ScalpGrid:
     """Candidate positions on the scalp, and what the mesh actually supported.
 
@@ -137,7 +137,7 @@ def scalp_grid(
     ``center_mm`` is projected onto the scalp first, so the disc is centred on the surface rather
     than on wherever the caller's point happened to be.
     """
-    if radius_mm <= 0.0 or spacing_mm <= 0.0:
+    if not (radius_mm > 0.0 and spacing_mm > 0.0):
         raise ValueError("radius_mm and spacing_mm must be positive.")
     ctx = context_of(subject)
 

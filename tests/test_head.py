@@ -312,3 +312,32 @@ def test_read_subject_cap_rejects_a_binary_mesh_with_a_clear_error(tmp_path):
     path.write_bytes(bytes(range(256)))
     with pytest.raises(ValueError, match="cannot read EEG positions"):
         eeg.read_subject_cap(path)
+
+
+@pytest.mark.gpu
+def test_scalp_grids_compare_by_identity(cube_subject):
+    """Generated equality would compare the arrays, which raises for two different grids."""
+    from cunibs.head import scalp_grid
+
+    a = scalp_grid(cube_subject, [50.0, 50.0, 100.0], 30.0, 10.0)
+    b = scalp_grid(cube_subject, [50.0, 50.0, 100.0], 30.0, 20.0)
+    assert a != b
+    assert len({a, b}) == 2
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("shape", [(3, 4), (6,)])
+def test_points_of_the_wrong_shape_are_rejected(cube_subject, shape):
+    """Reshaping them into rows of three would read every coordinate as part of another point."""
+    from cunibs.head import project_to_scalp
+
+    with pytest.raises(ValueError, match="must be"):
+        project_to_scalp(cube_subject, np.ones(shape))
+
+
+@pytest.mark.gpu
+def test_a_nan_spacing_is_rejected_by_name(cube_subject):
+    from cunibs.head import scalp_grid
+
+    with pytest.raises(ValueError, match="must be positive"):
+        scalp_grid(cube_subject, [50.0, 50.0, 100.0], spacing_mm=float("nan"))

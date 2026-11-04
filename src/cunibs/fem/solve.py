@@ -412,7 +412,7 @@ class ColumnTelemetry(NamedTuple):
     relative_residual: float
 
 
-@dataclass
+@dataclass(eq=False)
 class GroundedSolver:
     """Reduced SPD system with one grounded potential.
 
@@ -652,7 +652,7 @@ def build_rhs_operator(
     return op
 
 
-@dataclass
+@dataclass(eq=False)
 class SolverContext:
     """GPU state shared by all placements for one mesh."""
 

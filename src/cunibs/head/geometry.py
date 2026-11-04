@@ -67,8 +67,8 @@ def _project_to_scalp(
     ctx: SolverContext, points_mm: npt.ArrayLike
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """:func:`project_to_scalp` on the device, for callers that go on computing there."""
-    pts = cp.ascontiguousarray(cp.asarray(points_mm, dtype=cp.float64).reshape(-1, 3))
-    transforms = compute_coil_transforms(ctx, pts, None, cp.zeros(pts.shape[0]))
+    pts = cp.atleast_2d(cp.asarray(points_mm, dtype=cp.float64))
+    transforms = compute_coil_transforms(ctx, pts, None, 0.0)
     # Column 2 is the coil's z axis, which the kernel sets to the inward scalp normal; the
     # translation is the projection itself, distance being zero.
     origins = cp.ascontiguousarray(transforms[:, :3, 3])
