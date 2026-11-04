@@ -120,7 +120,7 @@ def _placement_rhs(
 
 
 def _solve_columns(
-    pre: ConductivityUQPrecompute, rhs: cp.ndarray, tolerance: float, stream: int
+    pre: ConductivityUQPrecompute, rhs: cp.ndarray, tolerance: float, stream: int, width: int
 ) -> cp.ndarray:
     """Solve the frozen nominal system against each column of ``rhs``, in block widths.
 
@@ -129,13 +129,13 @@ def _solve_columns(
     """
     n, k = rhs.shape
     out = cp.empty((n, k), dtype=cp.float64)
-    for start in range(0, k, MAX_BLOCK):
-        width = min(MAX_BLOCK, k - start)
-        b = _pad_block(cp.ascontiguousarray(rhs[:, start : start + width]), width)
+    for start in range(0, k, width):
+        columns = min(width, k - start)
+        b = _pad_block(cp.ascontiguousarray(rhs[:, start : start + columns]), columns)
         x = cp.empty_like(b)
         solver = pre.solver
         solver.pcg.solve_mixed_block(solver.precond, b, x, tolerance, pre.max_iters, stream)
-        out[:, start : start + width] = x[:, :width]
+        out[:, start : start + columns] = x[:, :columns]
     return out
 
 
@@ -204,12 +204,13 @@ class _ReducedBasis:
         x_nominal: cp.ndarray,
         spreads: np.ndarray,
         stream: int,
+        solve_width: int = MAX_BLOCK,
     ) -> None:
         idx = pre.idx
         p = len(pre.perturbed_tags)
         ax = cp.stack([pre.apply_part(x_nominal, t) for t in range(p)], axis=1)  # (n_red, P)
         rhs1 = cp.ascontiguousarray(b_tissue[:, idx].astype(cp.float64).T - ax)
-        sens = _solve_columns(pre, rhs1, _SENSITIVITY_TOL, stream)
+        sens = _solve_columns(pre, rhs1, _SENSITIVITY_TOL, stream, solve_width)
         a_sens = [pre.apply_part(sens, t) for t in range(p)]
 
         pairs = [(s, t) for s in range(p) for t in range(s, p)]
@@ -233,7 +234,7 @@ class _ReducedBasis:
                 axis=1,
             )
         )
-        sens2 = _solve_columns(pre, rhs2, _SENSITIVITY_TOL, stream)
+        sens2 = _solve_columns(pre, rhs2, _SENSITIVITY_TOL, stream, solve_width)
         del rhs1, rhs2
         n, p2 = int(sens.shape[0]), int(sens2.shape[1])
         m = 1 + p + p2
@@ -320,6 +321,7 @@ def run_conductivity_uq(
     recovery: RecoveryOperator | None = None,
     tissues: Collection[int] | None = None,
     region: metrics.RegionSlice | None = None,
+    width: int = MAX_BLOCK,
 ) -> ConductivityUQResult:
     """Solve one placement across ``config.n_samples`` conductivity draws; return |E| moments.
 
@@ -346,6 +348,9 @@ def run_conductivity_uq(
 
     ``region`` is the gray-matter slice the per-draw scalars are taken over, built here when not
     given. On a mesh with no gray matter those scalars are skipped and come back as ``None``.
+
+    ``width`` is how many draws solve at once, a power of two up to ``MAX_BLOCK``. It sets the
+    device memory a block takes and changes no result.
     """
     _check_operator(ctx, recovery, False, "run_conductivity_uq")
     wanted = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
@@ -393,17 +398,16 @@ def run_conductivity_uq(
     del b_nom
 
     spreads = np.array([config.cov_for(t) for t in pre.perturbed_tags], dtype=np.float64)
-    basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream)
+    basis = _ReducedBasis(pre, b_base, b_tissue, x_nominal, spreads, stream, width)
     del x_nominal
 
-    # Draws are solved MAX_BLOCK at a time as columns of one affine block solve: column c's matrix
+    # Draws are solved width at a time as columns of one affine block solve: column c's matrix
     # is A(sigma_c), applied from the per-tissue parts without ever being assembled, and every
     # part's read is shared across the block. A short last block repeats its final draw, which
     # costs a column and changes nothing, since columns are independent and the repeat is never
     # read back. The loop's buffers are allocated after the basis, whose build is the larger
     # peak, and rewritten in place per block. Each block's guess goes into x_blk, which the solve
     # takes as its start before it writes the answer there.
-    width = MAX_BLOCK
     b_blk = cp.empty((n_red, width), dtype=cp.float64)
     x_blk = cp.empty((n_red, width), dtype=cp.float64)
     v_blk = cp.zeros((ctx.n_nodes, width), dtype=cp.float64)

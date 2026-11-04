@@ -713,3 +713,95 @@ def test_block_moments_and_row_dot_match_their_serial_forms(cp):
         alone = cp.empty((1000, 1))
         row_dot(a, cp.ascontiguousarray(s[c : c + 1]), alone, stream)
         np.testing.assert_array_equal(cp.asnumpy(alone[:, 0]), cp.asnumpy(out[:, c]))
+
+
+def _uq_arrays(result):
+    return (
+        result.mean_magnE.tobytes(),
+        result.std_magnE.tobytes(),
+        result.peak_samples.tobytes(),
+        result.focality_samples.tobytes(),
+    )
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("recovery", ["raw", "harmonic"])
+def test_uq_does_not_depend_on_the_block_width(
+    fresh_subject, patch_mesh, d70_coil, patch_placement, recovery
+):
+    from cunibs import ConductivityUQConfig
+    from cunibs.simulation import _block_width
+
+    config = ConductivityUQConfig(n_samples=19, seed=3)
+    results = []
+    for width in (8, 4, 2, 1):
+        with _block_width(width):
+            results.append(
+                _uq_arrays(
+                    fresh_subject(patch_mesh).simulate_conductivity_uq(
+                        d70_coil, patch_placement, config, 1e6, moments=True, recovery=recovery
+                    )
+                )
+            )
+    assert all(r == results[0] for r in results)
+
+
+@pytest.mark.realmesh
+def test_uq_halves_its_width_when_memory_runs_out(
+    monkeypatch, fresh_subject, patch_mesh, d70_coil, patch_placement
+):
+    import cunibs.uq
+    from cunibs import ConductivityUQConfig
+
+    config = ConductivityUQConfig(n_samples=9, seed=0)
+    placements = [patch_placement, patch_placement]
+    subject = fresh_subject(patch_mesh)
+    want = [
+        _uq_arrays(r)
+        for r in subject.iter_simulate_conductivity_uq(
+            d70_coil, placements, config, 1e6, moments=True
+        )
+    ]
+
+    real = cunibs.uq.run_conductivity_uq
+    widths = []
+
+    def out_of_memory_above_two(*args, **kwargs):
+        widths.append(kwargs["width"])
+        if kwargs["width"] > 2:
+            raise MemoryError
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cunibs.uq, "run_conductivity_uq", out_of_memory_above_two)
+    got = [
+        _uq_arrays(r)
+        for r in subject.iter_simulate_conductivity_uq(
+            d70_coil, placements, config, 1e6, moments=True
+        )
+    ]
+    # The second placement starts at the width the first one settled on.
+    assert widths == [8, 4, 2, 2]
+    assert got == want
+
+
+@pytest.mark.realmesh
+def test_uq_raises_when_even_one_draw_at_a_time_does_not_fit(
+    monkeypatch, fresh_subject, patch_mesh, d70_coil, patch_placement
+):
+    import cunibs.uq
+    from cunibs import ConductivityUQConfig
+
+    widths = []
+
+    def always_out_of_memory(*args, **kwargs):  # noqa: ARG001
+        widths.append(kwargs["width"])
+        raise MemoryError
+
+    subject = fresh_subject(patch_mesh)
+    assert subject.context is not None
+    monkeypatch.setattr(cunibs.uq, "run_conductivity_uq", always_out_of_memory)
+    with pytest.raises(MemoryError):
+        subject.simulate_conductivity_uq(
+            d70_coil, patch_placement, ConductivityUQConfig(n_samples=4), 1e6
+        )
+    assert widths == [8, 4, 2, 1]

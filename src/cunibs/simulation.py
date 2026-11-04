@@ -807,8 +807,8 @@ class Subject:
     ) -> Iterator[ConductivityUQResult]:
         """One Monte Carlo per placement, reduced inside a scratch pool and yielded outside.
 
-        Unlike the deterministic path there is no block solve, so the chunk is a single
-        placement; the pool scoping is otherwise identical.
+        The chunk is a single placement, whose draws are the block solve's columns; the pool
+        scoping is otherwise identical.
         """
         from cunibs.uq import run_conductivity_uq
 
@@ -822,7 +822,7 @@ class Subject:
         provenance = self._provenance(coil, seeded=False)
         host = self._host_metric_inputs if moments else None
 
-        def reduce(site: Placement) -> ConductivityUQResult:
+        def reduce(site: Placement, width: int) -> ConductivityUQResult:
             with library_memory_errors(), cp.cuda.using_allocator(temp_pool.malloc):
                 result = run_conductivity_uq(
                     ctx,
@@ -835,6 +835,7 @@ class Subject:
                     recovery=op,
                     tissues=tissues,
                     region=gray_matter,
+                    width=width,
                 )
                 # Summarised on the device before anything is copied back.
                 return replace(
@@ -853,14 +854,22 @@ class Subject:
                     provenance=provenance,
                 )
 
+        # Draws solve as wide as the block kernels go, and the width halves when the device runs
+        # out of memory for it. A draw's arithmetic is the same at any width and does not depend on
+        # anything a failed attempt left behind, so the rerun gives the same result.
+        width = _widest_block
         for site in sites:
-            # A placement's draws do not depend on anything a failed attempt left behind, so a
-            # rerun after the pools hand back their free blocks gives the same result.
-            try:
-                reduced = reduce(site)
-            except MemoryError:
-                self._release_free_blocks()
-                reduced = reduce(site)
+            reduced = None
+            while reduced is None:
+                try:
+                    reduced = reduce(site, width)
+                except MemoryError:
+                    if width == 1:
+                        raise
+                if reduced is None:
+                    # Outside the handler, whose traceback keeps the failed attempt's arrays alive.
+                    width //= 2
+                    self._release_free_blocks()
             yield reduced
 
     def iter_simulate_conductivity_uq(
