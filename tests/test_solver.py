@@ -182,6 +182,18 @@ def test_solve_grounded_matches_dense_solve(cp, cube_subject):
     assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
 
 
+@pytest.mark.parametrize("n_entries", [-1, 1])
+def test_solve_grounded_rejects_a_right_hand_side_of_the_wrong_length(
+    cp, cube_subject, n_entries
+):
+    """Indexing with the grounded row map wraps on the device, so a short b would solve silently."""
+    from cunibs.fem.solve import solve_grounded
+
+    solver = cube_subject.context.solver
+    with pytest.raises(ValueError, match="one entry per mesh node"):
+        solve_grounded(solver, cp.ones(solver.n + n_entries))
+
+
 @pytest.mark.parametrize("degree", [1, 2, 3, 4])
 def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degree):
     """Every Chebyshev degree must converge, and to the same place.

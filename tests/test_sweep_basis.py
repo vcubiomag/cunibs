@@ -70,6 +70,33 @@ def test_basis_handle_pairs_are_right_angles(fresh_subject, patch_mesh):
     np.testing.assert_allclose(np.linalg.det(frames[:, :3, :3]), 1.0, atol=1e-12)
 
 
+def test_a_basis_stops_at_the_directions_the_mesh_has(cp, cube_subject, d70_coil):
+    """Past the system's rank a new block is rounding noise, which must not become columns."""
+    from cunibs.fem.sweep import build_sweep_basis
+
+    ctx = cube_subject.context
+    basis = build_sweep_basis(ctx, d70_coil, 32)
+    assert basis.size <= ctx.solver.n - 1
+    q = basis.q.astype(cp.float64)
+    gram = cp.asnumpy(q.T @ (ctx.solver.matrix() @ q))
+    np.testing.assert_allclose(gram, np.eye(gram.shape[0]), atol=1e-3)
+
+
+@pytest.mark.realmesh
+def test_a_basis_past_the_fields_rank_stays_a_orthonormal(
+    cp, fresh_subject, patch_mesh, d70_coil
+):
+    """The patch's fields span far fewer directions than it has rows, so size 128 runs out."""
+    from cunibs.fem.sweep import build_sweep_basis
+
+    ctx = fresh_subject(patch_mesh).context
+    basis = build_sweep_basis(ctx, d70_coil, 128)
+    assert basis.size < 128
+    q = basis.q.astype(cp.float64)
+    gram = cp.asnumpy(q.T @ (ctx.solver.matrix() @ q))
+    np.testing.assert_allclose(gram, np.eye(gram.shape[0]), atol=1e-2)
+
+
 @pytest.mark.realmesh
 def test_a_seeded_sweep_keeps_its_answers_and_its_invariance(
     cp, fresh_subject, patch_mesh, d70_coil

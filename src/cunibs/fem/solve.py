@@ -487,6 +487,27 @@ def prepare_grounded_solver(
     )
 
 
+def _retry_column(
+    solver: GroundedSolver,
+    b: cp.ndarray,
+    x: cp.ndarray,
+    tolerance: float,
+    max_iters: int,
+    stream: int,
+    column: int | None = None,
+) -> tuple[int, float]:
+    """Solve one column again on a rebuilt preconditioner, in place from its failed iterate ``x``.
+
+    A NaN iterate would keep every later residual NaN whatever the preconditioner, so it restarts
+    from zero.
+    """
+    x0 = x if bool(cp.isfinite(x).all()) else None
+    iters, rel = solver.pcg.solve_mixed(solver.precond, b, x, tolerance, max_iters, stream, x0)
+    if not float(rel) <= tolerance:
+        raise SolverConvergenceError(int(iters), float(rel), tolerance, column=column)
+    return int(iters), float(rel)
+
+
 def solve_grounded(
     solver: GroundedSolver,
     b: cp.ndarray,
@@ -501,6 +522,8 @@ def solve_grounded(
     A miss rebuilds the preconditioner and restarts from the failed iterate, so the second
     attempt runs against a single fixed operator and CG's short recurrence stays valid.
     """
+    if b.shape != (solver.n,):
+        raise ValueError(f"b must be ({solver.n},), one entry per mesh node, got {b.shape}.")
     tolerance = solver.tolerance if tolerance is None else tolerance
     max_iters = solver.max_iters if max_iters is None else max_iters
     b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
@@ -511,11 +534,7 @@ def solve_grounded(
     )
     if not float(rel) <= tolerance:
         solver.rebuild_preconditioner()
-        retry_iters, rel = solver.pcg.solve_mixed(
-            solver.precond, b_red, x_red, tolerance, max_iters, stream, x_red
-        )
-        if not float(rel) <= tolerance:
-            raise SolverConvergenceError(int(retry_iters), float(rel), tolerance)
+        retry_iters, rel = _retry_column(solver, b_red, x_red, tolerance, max_iters, stream)
         iters += retry_iters
     v = cp.zeros(solver.n, dtype=cp.float64)
     v[solver.idx] = x_red
@@ -559,15 +578,11 @@ def _solve_grounded_block_mat(
         for c in missed:
             b_red = cp.ascontiguousarray(B[:, c])
             x_red = cp.ascontiguousarray(X[:, c])
-            retry_iters, rel = solver.pcg.solve_mixed(
-                solver.precond, b_red, x_red, tolerance, max_iters, stream, x_red
+            retry_iters, rel = _retry_column(
+                solver, b_red, x_red, tolerance, max_iters, stream, c
             )
-            if not float(rel) <= tolerance:
-                raise SolverConvergenceError(int(retry_iters), float(rel), tolerance, column=c)
             X[:, c] = x_red
-            telemetry[c] = ColumnTelemetry(
-                telemetry[c].iterations + int(retry_iters), float(rel)
-            )
+            telemetry[c] = ColumnTelemetry(telemetry[c].iterations + retry_iters, rel)
     return X, telemetry
 
 
@@ -945,9 +960,9 @@ def solve_placements_block(
     """
     k = len(sites)
     solver = ctx.solver
-    if k > MAX_BLOCK:
-        raise ValueError(f"solve_placements_block: k={k} exceeds MAX_BLOCK={MAX_BLOCK}")
     _check_operator(ctx, recovery, nodal, "solve_placements_block")
+    if not 1 <= k <= MAX_BLOCK:
+        raise ValueError(f"solve_placements_block: k={k} is outside [1, MAX_BLOCK={MAX_BLOCK}]")
     on_potential = recovery is not None and recovery.on_potential
     stream = cp.cuda.get_current_stream().ptr
     n_tet = int(ctx.tet_nodes.shape[0])

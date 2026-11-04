@@ -490,6 +490,27 @@ def test_unreachable_tolerance_rebuilds_then_raises_serial(
 
 
 @pytest.mark.realmesh
+def test_a_rebuild_recovers_from_a_preconditioner_that_gave_nan(
+    cp, fresh_subject, patch_mesh, d70_coil, patch_sites
+):
+    """The rebuilt V-cycle is the whole remedy, so a NaN iterate must not reach the retry."""
+    from cunibs.fem.solve import build_native_vcycle
+
+    ctx = fresh_subject(patch_mesh).context
+    sites = patch_sites[:2]
+    a = ctx.solver.matrix()
+    poison = cp.full(a.data.shape, cp.nan, dtype=cp.float32)
+
+    ctx.solver.precond = build_native_vcycle(a.indptr, a.indices, poison)
+    for r in serial(ctx, d70_coil, sites[:1]):
+        assert r["relative_residual"] <= ctx.solver.tolerance
+
+    ctx.solver.precond = build_native_vcycle(a.indptr, a.indices, poison)
+    for r in block(ctx, d70_coil, sites):
+        assert r["relative_residual"] <= ctx.solver.tolerance
+
+
+@pytest.mark.realmesh
 def test_rebuild_preconditioner_restores_the_full_hierarchy(
     cp, fresh_subject, patch_mesh, d70_coil, patch_sites
 ):

@@ -38,8 +38,10 @@ _BASIS_DISTANCE_MM = 4.0
 _CAP_BOTTOM = -0.3
 # Radius of that sphere: outside any head, so every point projects onto the scalp beneath it.
 _CAP_RADIUS_MM = 150.0
-# Relative eigenvalue below which a new direction counts as already spanned.
-_SPAN_RTOL = 1e-10
+# Energy below which a new direction counts as already spanned, as a fraction of the energy the
+# block held before projection. The fp32 Gram eigenvalues carry noise of about 1e-7 of that energy,
+# and normalising a direction this small would blow its rounding error up.
+_SPAN_RTOL = 1e-6
 
 
 @dataclass
@@ -121,12 +123,15 @@ def build_sweep_basis(ctx: SolverContext, coil: Coil, size: int = 128) -> SweepB
             x0 = SweepBasis(q).seed(b) if q.shape[1] else None
             x, _ = _solve_grounded_block_mat(solver, b, k, x0)
             x = x[:, :k].astype(cp.float32)
-            for _ in range(2):
-                if q.shape[1]:
-                    x -= q @ (q.T @ csr_matmul(a, x))
+            spanned = 0.0
+            if q.shape[1]:
+                c = q.T @ csr_matmul(a, x)
+                x -= q @ c
+                x -= q @ (q.T @ csr_matmul(a, x))
+                spanned = float((c * c).sum(axis=0).max())
             g = x.T @ csr_matmul(a, x)
             w, u = cp.linalg.eigh(0.5 * (g + g.T))
-            keep = w > _SPAN_RTOL * float(w[-1])
+            keep = w > _SPAN_RTOL * (spanned + float(w[-1]))
             if bool(keep.any()):
                 new = x @ (u[:, keep] / cp.sqrt(w[keep]))
                 q = cp.ascontiguousarray(cp.concatenate([q, new.astype(cp.float32)], axis=1))
