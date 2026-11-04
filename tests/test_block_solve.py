@@ -630,3 +630,45 @@ def test_block_solve_keeps_a_column_x0_solves_exactly(cp):
         vcycle, cp.asarray(b[:, 1:]), alone, 1e-6, 200, stream, cp.asarray(x0[:, 1:])
     )
     np.testing.assert_array_equal(cp.asnumpy(x[:, 1]), cp.asnumpy(alone[:, 0]))
+
+
+def test_a_column_settled_above_its_recurrence_stops_moving(cp):
+    """A column can meet tolerance on its true residual while its recurrence sits just above it.
+
+    The device freezes on the recurrence alone, so such a column has to be frozen by the host, or
+    it goes on stepping for as long as a slower block-mate runs.
+    """
+    pcg, vcycle, matmul = _integer_laplacian(cp, 16)
+    stream = cp.cuda.get_current_stream().ptr
+    rng = np.random.default_rng(0)
+    b = np.zeros((pcg.n, 2))
+    b[pcg.n // 3, 0] = 1.0
+    b[2 * pcg.n // 3, 0] = -1.0
+    b[:, 1] = rng.standard_normal(pcg.n)
+    x0 = np.zeros_like(b)
+    x0[:, 1] = 1e4 * rng.standard_normal(pcg.n)
+
+    def solve(tolerance, width):
+        x = cp.empty((pcg.n, width), dtype=cp.float64)
+        _, rels, col_iters = pcg.solve_mixed_block(
+            vcycle,
+            cp.asarray(b[:, :width]),
+            x,
+            tolerance,
+            200,
+            stream,
+            cp.asarray(x0[:, :width]),
+        )
+        return cp.asnumpy(x), rels, col_iters
+
+    _, first_below, _ = solve(1e-6, 1)
+    for factor in (1.0, 1.0005, 1.001):
+        tolerance = float(first_below[0]) * factor
+        alone, _, _ = solve(tolerance, 1)
+        block, rels, col_iters = solve(tolerance, 2)
+        assert col_iters[1] > col_iters[0], "the companion must actually take longer"
+        np.testing.assert_array_equal(block[:, 0], alone[:, 0])
+        actual = np.linalg.norm(b[:, 0] - matmul(block[:, :1]).ravel()) / np.linalg.norm(
+            b[:, 0]
+        )
+        assert actual == pytest.approx(rels[0], rel=1e-3)

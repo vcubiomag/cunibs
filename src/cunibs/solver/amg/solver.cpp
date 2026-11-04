@@ -44,6 +44,8 @@ constexpr double kStageDrop = 1e-6;
 constexpr int kMaxRestarts = 8;
 
 constexpr double kUnfrozen = 0.0;
+constexpr double kFrozen = 1.0;
+constexpr double kInfiniteRef = std::numeric_limits<double>::infinity();
 
 }  // namespace
 
@@ -337,7 +339,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
         norm_ref[c] = std::sqrt(h_ref[c]);
         if (norm_ref[c] != 0.0) continue;
         frozen[c] = 1.0;
-        h_ref[c] = std::numeric_limits<double>::infinity();
+        h_ref[c] = kInfiniteRef;
         ++n_zero;
     }
     if (n_zero == k) {
@@ -479,6 +481,18 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                     rel[c] = true_rel;
                     col_iters[c] = true_rel <= tolerance ? ran[c] : max_iters;
                     done[c] = true;
+                    // The body freezes only on the recurrence, which can still be above tolerance
+                    // here. Left running, x would leave the residual just reported and depend on
+                    // the block's other columns. An infinite reference holds it as it does a zero
+                    // column.
+                    if (!waiting[c]) {
+                        check_cuda(cudaMemcpyAsync(d_ref_sq + c, &kInfiniteRef, sizeof(double),
+                                                   cudaMemcpyHostToDevice, s),
+                                   "block:copy(settled ref)");
+                        check_cuda(cudaMemcpyAsync(d_converged + c, &kFrozen, sizeof(double),
+                                                   cudaMemcpyHostToDevice, s),
+                                   "block:copy(settled)");
+                    }
                     continue;
                 }
                 write[c] = 1.0;
