@@ -102,6 +102,8 @@ class Coil:
                 dset = h5f["dipoles"]
                 data = np.asarray(dset, dtype=np.float64)
                 attrs = {k: _decode_attr(v) for k, v in dset.attrs.items()}
+        if data.ndim != 2 or data.shape[1] != 6:
+            raise ValueError(f"{path}: dipoles must be (n, 6), got shape {data.shape}.")
         didt_raw = attrs.get("dIdtmax")
         return cls(
             positions_m=np.ascontiguousarray(data[:, 0:3]),

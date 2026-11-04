@@ -202,3 +202,11 @@ def test_coil_rejects_non_finite_dipoles(bad):
         Coil(positions, moments)
     with pytest.raises(ValueError, match="must be finite"):
         Coil(moments, positions)
+
+
+def test_coil_load_rejects_malformed_dipoles(tmp_path):
+    path = tmp_path / "bad.h5"
+    with h5py.File(path, "w") as f:
+        f["dipoles"] = np.zeros(6)
+    with pytest.raises(ValueError, match=r"must be \(n, 6\)"):
+        Coil.load(path)
