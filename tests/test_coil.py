@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from cunibs import coil as coil_registry
-from cunibs.coil import Coil, _decode_attr, bundled_coils, encode_ccd
+from cunibs._common import plain
+from cunibs.coil import Coil, bundled_coils, encode_ccd
 
 BUNDLED = sorted(bundled_coils().items())
 
@@ -127,6 +128,26 @@ def test_encode_ccd_keeps_every_dipole_without_a_comment_line(tmp_path):
     assert Coil.load(h5).n_dipoles == 2
 
 
+def test_load_reads_a_ccd_with_a_comment_where_the_count_would_be(tmp_path):
+    """Older SimNIBS files state the count only in the header's prose."""
+    ccd = tmp_path / "legacy.ccd"
+    ccd.write_text("".join(line for line in _CCD.splitlines(True) if line.strip() != "2"))
+    assert Coil.load(ccd).n_dipoles == 2
+
+
+def test_load_reads_a_ccd_that_rates_no_didt(tmp_path):
+    ccd = tmp_path / "unrated.ccd"
+    ccd.write_text(_CCD.replace("dIdtmax=100.0", "dIdtmax=none"))
+    assert Coil.load(ccd).didt_max is None
+
+
+def test_load_rejects_more_dipoles_than_the_ccd_declares(tmp_path):
+    ccd = tmp_path / "long.ccd"
+    ccd.write_text(_CCD + "0.02 0.0 0.0 0.0 0.0 1.0\n")
+    with pytest.raises(ValueError, match="header says 2 dipoles, found 3"):
+        Coil.load(ccd)
+
+
 def test_encode_ccd_rejects_a_dipole_count_the_file_does_not_hold(tmp_path):
     ccd = tmp_path / "synth.ccd"
     ccd.write_text(_CCD.replace("\n2\n", "\n3\n", 1))
@@ -143,7 +164,7 @@ def test_encode_ccd_preserves_metadata(tmp_path):
         attrs = dict(f["dipoles"].attrs)
         assert f["dipoles"].shape == (2, 6)
     assert int(attrs["num_elements"]) == 2
-    assert _decode_attr(attrs["brand"]) == "Test"
+    assert plain(attrs["brand"]) == "Test"
     assert Coil.load(h5).metadata["brand"] == "Test"
 
 
@@ -167,8 +188,8 @@ def test_coil_load_without_didtmax(tmp_path):
         (np.array([1, 2]), "[1 2]"),
     ],
 )
-def test_decode_attr_handles_bytes_and_np_scalars(raw, expected):
-    assert _decode_attr(raw) == expected
+def test_plain_handles_bytes_and_np_scalars(raw, expected):
+    assert plain(raw) == expected
 
 
 def test_load_takes_a_bundled_name():
@@ -204,9 +225,49 @@ def test_coil_rejects_non_finite_dipoles(bad):
         Coil(moments, positions)
 
 
+@pytest.mark.parametrize(
+    ("positions", "moments"),
+    [
+        (np.zeros((2, 3)), np.ones((3, 3))),
+        (np.zeros((2, 2)), np.ones((2, 2))),
+        (np.zeros(3), np.ones(3)),
+    ],
+)
+def test_coil_rejects_dipoles_that_are_not_paired_three_vectors(positions, moments):
+    with pytest.raises(ValueError, match=r"must both be \(n, 3\)"):
+        Coil(positions, moments)
+
+
+def test_coil_takes_any_array_like_as_float64():
+    c = Coil([[0, 0, 0]], np.ones((1, 3), np.float32))
+    assert c.positions_m.dtype == c.moments.dtype == np.float64
+    assert c.n_dipoles == 1
+
+
+def test_load_rejects_an_hdf5_file_with_no_dipoles(tmp_path):
+    path = tmp_path / "other.h5"
+    with h5py.File(path, "w") as f:
+        f["x"] = 1
+    with pytest.raises(ValueError, match="no dipoles dataset"):
+        Coil.load(path)
+
+
+def test_load_finds_a_bundled_name_despite_a_directory_called_that(tmp_path, monkeypatch):
+    (tmp_path / "MagStim_D70").mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert Coil.load("MagStim_D70").n_dipoles > 0
+
+
 def test_coil_load_rejects_malformed_dipoles(tmp_path):
     path = tmp_path / "bad.h5"
     with h5py.File(path, "w") as f:
         f["dipoles"] = np.zeros(6)
     with pytest.raises(ValueError, match=r"must be \(n, 6\)"):
         Coil.load(path)
+
+
+def test_encode_ccd_rejects_rows_that_are_not_six_columns(tmp_path):
+    ccd = tmp_path / "short.ccd"
+    ccd.write_text("# name=Bad\n1\n0.0 0.0 0.0 1.0 0.0\n")
+    with pytest.raises(ValueError, match="6 columns"):
+        encode_ccd(ccd, tmp_path / "short.h5")

@@ -53,7 +53,9 @@ def plain(value: Any) -> Any:
     """An HDF5 attribute as a plain Python value."""
     if isinstance(value, bytes):
         return value.decode()
-    return value.item() if hasattr(value, "item") else value
+    if isinstance(value, np.generic):
+        value = value.item()
+    return value if isinstance(value, str | int | float) else str(value)
 
 
 def read_provenance(h5f: h5py.File) -> dict[str, Any] | None:

@@ -7,6 +7,8 @@ import h5py
 import numpy as np
 import numpy.typing as npt
 
+from cunibs._common import plain
+
 _COILS_ROOT = Path(__file__).resolve().parent / "coils"
 DEYMED_50BF = _COILS_ROOT / "Deymed_50BF.h5"
 DEYMED_70BF = _COILS_ROOT / "Deymed_70BF.h5"
@@ -35,16 +37,6 @@ MAGVENTURE_MRI_B91 = _COILS_ROOT / "MagVenture_MRI-B91.h5"
 MAGVENTURE_MST_TWIN = _COILS_ROOT / "MagVenture_MST_Twin.h5"
 
 
-def _decode_attr(value: object) -> str | int | float:
-    if isinstance(value, bytes):
-        return value.decode()
-    if isinstance(value, np.generic):
-        value = value.item()
-    if isinstance(value, str | int | float):
-        return value
-    return str(value)
-
-
 # The .ccd header states dIdtmax in A/us, we want A/s.
 _CCD_DIDTMAX_TO_A_PER_S = 1e6
 
@@ -53,8 +45,9 @@ _CCD_DIDTMAX_TO_A_PER_S = 1e6
 class Coil:
     """Store magnetic dipoles and coil metadata.
 
-    Positions use metres and moments A·m². ``didt_max`` records the stimulator's rated peak
-    dI/dt in A/s, or ``None`` when the source file gives none; it is metadata.
+    Positions use metres and moments A·m², as ``(n, 3)`` arrays of float64. ``didt_max`` records
+    the stimulator's rated peak dI/dt in A/s, or ``None`` when the source file gives none; it is
+    metadata.
     """
 
     positions_m: npt.NDArray[np.float64]
@@ -64,6 +57,15 @@ class Coil:
     metadata: dict[str, str | int | float] | None = None
 
     def __post_init__(self) -> None:
+        positions = np.asarray(self.positions_m, dtype=np.float64)
+        moments = np.asarray(self.moments, dtype=np.float64)
+        if positions.ndim != 2 or positions.shape[1] != 3 or moments.shape != positions.shape:
+            raise ValueError(
+                f"Coil positions and moments must both be (n, 3), got {positions.shape} and "
+                f"{moments.shape}."
+            )
+        object.__setattr__(self, "positions_m", positions)
+        object.__setattr__(self, "moments", moments)
         if not (np.isfinite(self.positions_m).all() and np.isfinite(self.moments).all()):
             raise ValueError("Coil positions and moments must be finite.")
 
@@ -85,7 +87,7 @@ class Coil:
         converts one to the HDF5 format.
         """
         path = Path(source)
-        if not path.exists():
+        if not path.is_file():
             bundled = bundled_coils()
             if isinstance(source, str) and source in bundled:
                 path = bundled[source]
@@ -99,9 +101,11 @@ class Coil:
             attrs: dict[str, str | int | float] = dict(ccd_attrs)
         else:
             with h5py.File(path, "r") as h5f:
+                if "dipoles" not in h5f:
+                    raise ValueError(f"{path}: no dipoles dataset.")
                 dset = h5f["dipoles"]
                 data = np.asarray(dset, dtype=np.float64)
-                attrs = {k: _decode_attr(v) for k, v in dset.attrs.items()}
+                attrs = {k: plain(v) for k, v in dset.attrs.items()}
         if data.ndim != 2 or data.shape[1] != 6:
             raise ValueError(f"{path}: dipoles must be (n, 6), got shape {data.shape}.")
         didt_raw = attrs.get("dIdtmax")
@@ -109,7 +113,11 @@ class Coil:
             positions_m=np.ascontiguousarray(data[:, 0:3]),
             moments=np.ascontiguousarray(data[:, 3:6]),
             name=str(attrs.get("coilname", path.stem)),
-            didt_max=None if didt_raw is None else float(didt_raw) * _CCD_DIDTMAX_TO_A_PER_S,
+            didt_max=(
+                None
+                if didt_raw is None or str(didt_raw).lower() == "none"
+                else float(didt_raw) * _CCD_DIDTMAX_TO_A_PER_S
+            ),
             metadata=attrs,
         )
 
@@ -125,25 +133,30 @@ def bundled_coils() -> dict[str, Path]:
 
 
 def _read_ccd(ccd_file: Path) -> tuple[npt.NDArray[np.float64], dict[str, str | int]]:
-    """Dipoles ``(N, 6)`` and header fields of a SimNIBS ``.ccd`` file."""
-    with Path.open(ccd_file) as f:
+    """Dipoles ``(N, 6)`` and header fields of a SimNIBS ``.ccd`` file.
+
+    Line 2 holds the dipole count in most files and a comment in older ones, which SimNIBS also
+    reads, so the count is only checked where the file states one.
+    """
+    with ccd_file.open() as f:
         meta_line = f.readline().strip().lstrip("#").strip()
-        num_elements = int(f.readline().strip())
-        data = np.loadtxt(f, dtype=np.float64, max_rows=num_elements, ndmin=2)
-    if data.shape[0] != num_elements:
-        raise ValueError(
-            f"{ccd_file}: header says {num_elements} dipoles, found {data.shape[0]}"
-        )
+        second = f.readline().strip()
+        declared = None if second.startswith("#") else int(second)
+        data = np.loadtxt(f, dtype=np.float64, ndmin=2)
+    if data.size and data.shape[1] != 6:
+        raise ValueError(f"{ccd_file}: expected 6 columns per dipole, found {data.shape[1]}")
+    if declared is not None and data.shape[0] != declared:
+        raise ValueError(f"{ccd_file}: header says {declared} dipoles, found {data.shape[0]}")
 
     parts = (p.split("=", 1) for p in meta_line.split(";") if "=" in p)
     metadata: dict[str, str | int] = {k.strip(): v.strip() for k, v in parts}
-    metadata["num_elements"] = num_elements
+    metadata["num_elements"] = data.shape[0]
     return data, metadata
 
 
-def encode_ccd(ccd_file: Path, output_h5: Path) -> None:
+def encode_ccd(ccd_file: str | Path, output_h5: str | Path) -> None:
     """Convert a SimNIBS ``.ccd`` coil to the HDF5 dipole format :meth:`Coil.load` reads."""
-    data, metadata = _read_ccd(ccd_file)
+    data, metadata = _read_ccd(Path(ccd_file))
     with h5py.File(output_h5, "w") as h5f:
         dset = h5f.create_dataset("dipoles", data=data, compression="gzip")
         dset.attrs.update(metadata)
