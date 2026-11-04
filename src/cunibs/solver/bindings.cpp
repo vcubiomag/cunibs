@@ -412,7 +412,7 @@ NB_MODULE(_solver_ext, m) {
             require(mom.shape(0) == pos_m.shape(0),
                     "dadt_block: pos_m and mom must have one row per dipole");
             require(out.shape(0) == n_nodes && stride % 3 == 0 && column >= 0 &&
-                        3 * (column + k) <= stride,
+                        3 * (static_cast<std::int64_t>(column) + k) <= stride,
                     "dadt_block: out must be (n_nodes, 3m) with room for k columns from column");
             launch_dadt_block(pos_m.data(), mom.data(), transforms.data(),
                               static_cast<int>(pos_m.shape(0)), k, nodes_mm.data(),
@@ -618,6 +618,7 @@ NB_MODULE(_solver_ext, m) {
                         (kd == static_cast<std::size_t>(k) || kd == 1),
                     "reconstruct_e_nodal_block: dadt_nodes must be (n_nodes, k or 1, 3)");
             const std::size_t n_tet = tet_nodes.shape(0);
+            require(g.shape(0) == n_tet, "reconstruct_e_nodal_block: g must have one row per tet");
             const char* bad = "reconstruct_e_nodal_block: e_out and magn_out must be k arrays";
             const auto eo = optional_pack(e_out, k, n_tet, bad);
             const auto mo = optional_pack(magn_out, k, n_tet, bad);
@@ -638,9 +639,9 @@ NB_MODULE(_solver_ext, m) {
         [](const f64_1d& v, const Tets& tet_nodes, const TetGradf& g, const Rows3f& dadt_elm,
            const Rows3f& e_out, const f32_1d& magn_out, uintptr_t stream) {
             const std::size_t n_tet = tet_nodes.shape(0);
-            require(dadt_elm.shape(0) == n_tet && e_out.shape(0) == n_tet &&
+            require(g.shape(0) == n_tet && dadt_elm.shape(0) == n_tet && e_out.shape(0) == n_tet &&
                         magn_out.shape(0) == n_tet,
-                    "reconstruct_e: dadt_elm, e_out and magn_out must have one row per tet");
+                    "reconstruct_e: g, dadt_elm, e_out and magn_out must have one row per tet");
             launch_reconstruct(v.data(), tet_nodes.data(), g.data(), dadt_elm.data(), e_out.data(),
                                magn_out.data(), static_cast<int>(n_tet), as_stream(stream));
         },

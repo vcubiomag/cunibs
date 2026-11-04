@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -398,7 +399,6 @@ void summarize(const void* const* fields, int k, int n, const int* index, const 
             keys_sorted, w_sorted, within, tile_offset, n, probes,
             out + static_cast<std::int64_t>(c) * n_out);
     }
-    check_cuda(cudaGetLastError(), "summary", "launch");
 }
 
 }  // namespace
@@ -413,9 +413,14 @@ void launch_region_summary(const void* const* fields, bool f64, int k, int n, co
                            std::size_t work_bytes, double* out, cudaStream_t stream) {
     if (k < 1 || k > kMaxStageBlock) throw std::invalid_argument("region_summary: bad k");
     if (n < 1) throw std::invalid_argument("region_summary: the region holds no elements");
-    if (n_q < 1 || n_q > kMaxSummaryQuantiles || n_f < 0 || n_f > kMaxSummaryQuantiles ||
-        anchor < 0 || anchor >= n_q) {
-        throw std::invalid_argument("region_summary: bad quantiles");
+    if (n_q > kMaxSummaryQuantiles || n_f > kMaxSummaryQuantiles) {
+        throw std::invalid_argument(
+            "region_summary: a device summary takes at most " +
+            std::to_string(kMaxSummaryQuantiles) +
+            " quantiles, counting the focality anchor, and as many focality fractions");
+    }
+    if (n_q < 1 || anchor < 0 || anchor >= n_q) {
+        throw std::invalid_argument("region_summary: anchor must name one of the quantiles");
     }
     Probes probes{};
     for (int i = 0; i < n_q; ++i) probes.q[i] = qs[i];

@@ -337,6 +337,16 @@ def test_out_of_memory_is_a_memory_error_from_every_allocator(cp):
         cp.empty(huge, dtype=cp.uint8)
 
 
+def test_another_allocator_failure_is_raised_as_it_is(cp, monkeypatch):
+    def fails(_size):
+        raise cp.cuda.runtime.CUDARuntimeError(1)
+
+    monkeypatch.setattr(cp.cuda, "Memory", fails)
+    with pytest.raises(cp.cuda.runtime.CUDARuntimeError) as raised:
+        unpooled(8)
+    assert raised.value.__cause__ is None
+
+
 @pytest.mark.realmesh
 def test_a_field_outside_fp32_range_raises(
     fresh_subject, patch_mesh, d70_coil, patch_placement

@@ -322,3 +322,16 @@ def test_a_percentile_of_no_elements_is_rejected():
     values, vols = np.ones(4), np.ones(4)
     with pytest.raises(ValueError, match="no elements"):
         metrics.percentile_magnitude(values, vols, np.zeros(4, dtype=bool), 50.0)
+
+
+def test_device_summary_names_its_probe_limit(cp):
+    magn, vols, bary = np.ones(8), np.ones(8), np.zeros((8, 3))
+    tags = np.full(8, 2, dtype=np.int32)
+    with pytest.raises(ValueError, match="at most 16 quantiles"):
+        metrics.compute_metrics(
+            cp.asarray(magn),
+            cp.asarray(vols),
+            cp.asarray(bary),
+            cp.asarray(tags),
+            percentiles=tuple(float(p) for p in range(1, 21)),
+        )

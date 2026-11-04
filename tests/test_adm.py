@@ -821,3 +821,36 @@ def test_evaluate_and_optimize_reject_what_they_cannot_answer(cube_subject, coil
         evaluate(recip, coil, Placement(center, center + [0, 40.0, 0]), float("nan"))
     with pytest.raises(ValueError, match="resolution must be"):
         optimize_placement(recip, coil, n_samples=1, resolution=1)
+
+
+def test_evaluate_when_dipoles_sit_on_the_grid_faces(cp, cube_mesh):
+    """A grid with no margin has the coil's outermost dipoles on its faces, which are in the grid."""
+    from cunibs.adm import evaluate
+    from cunibs.adm.evaluate import evaluate_exact, grid_for_placements
+    from cunibs.adm.reciprocity import sample_qfield, solve_adjoint
+    from cunibs.adm.target import Target, resolve_target
+    from cunibs.coil import Coil
+    from cunibs.fem import build_context
+    from cunibs.simulation import Placement
+
+    angle = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+    layers = [
+        np.stack([0.03 * np.cos(angle), 0.03 * np.sin(angle), np.full(24, z)], axis=1)
+        for z in (0.0, 0.002, 0.004)
+    ]
+    coil = Coil(
+        positions_m=np.concatenate(layers),
+        moments=np.tile([0.0, 0.0, 1.0], (72, 1)),
+        name="layers",
+        didt_max=150e6,
+    )
+    ctx = build_context(cube_mesh)
+    target = resolve_target(ctx, Target([50.0, 50.0, 80.0], region="gray_matter"))
+    adjoint = solve_adjoint(ctx, target)
+    for turn in np.linspace(0.1, 3.0, 8):
+        handle = [50.0 + 100.0 * np.sin(turn), 50.0 + 100.0 * np.cos(turn), 100.0]
+        pl = Placement([50.0, 50.0, 100.0], handle, 4.0)
+        grid = grid_for_placements(ctx, coil, [pl], spacing_mm=0.5, margin_mm=0.0)
+        got = evaluate(sample_qfield(adjoint, grid), coil, pl, DIDT)
+        exact = cp.asnumpy(evaluate_exact(adjoint, coil, pl, DIDT))
+        np.testing.assert_allclose(got, exact, rtol=5e-3, atol=5e-3)

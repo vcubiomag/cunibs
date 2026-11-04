@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, NoReturn, TypeVar
 
 import cupy as cp
 import cupyx.scipy.sparse as csp
@@ -69,11 +69,11 @@ def release_scratch() -> None:
             _scratch.free_all_blocks()
 
 
-def _as_memory_error(error: cp.cuda.runtime.CUDARuntimeError, size: int) -> Exception:
-    """What to raise for a failed allocation: only CuPy's pools raise a MemoryError themselves."""
+def _reraise(error: cp.cuda.runtime.CUDARuntimeError, size: int) -> NoReturn:
+    """Raise a failed allocation: only CuPy's pools raise a MemoryError themselves."""
     if error.status == _CUDA_ERROR_MEMORY_ALLOCATION:
-        return cp.cuda.memory.OutOfMemoryError(size, 0)
-    return error
+        raise cp.cuda.memory.OutOfMemoryError(size, 0) from error
+    raise error
 
 
 def unpooled(size: int) -> cp.cuda.MemoryPointer:
@@ -85,14 +85,14 @@ def unpooled(size: int) -> cp.cuda.MemoryPointer:
     try:
         return cp.cuda.MemoryPointer(cp.cuda.Memory(size), 0)
     except cp.cuda.runtime.CUDARuntimeError as error:
-        raise _as_memory_error(error, size) from error
+        _reraise(error, size)
 
 
 def _stream_ordered(size: int) -> cp.cuda.MemoryPointer:
     try:
         return cp.cuda.malloc_async(size)
     except cp.cuda.runtime.CUDARuntimeError as error:
-        raise _as_memory_error(error, size) from error
+        _reraise(error, size)
 
 
 @contextmanager

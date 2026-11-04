@@ -57,8 +57,8 @@ def _reduce(dipole_q: cp.ndarray, moments: cp.ndarray, didt: float) -> cp.ndarra
     return didt * cp.einsum("dpnk,pnk->pd", dipole_q, moments)
 
 
-# Slack on the fractional index bounds. At a 3 mm spacing this is 3 nm (noise). The kernel applies
-# the same slack.
+# Slack on the fractional index bounds. At a 3 mm spacing this is 3 nm (noise). The kernel's is
+# wider, since it rounds to fp32, so a dipole it faults on always fails this check too.
 _INDEX_TOL = 1e-6
 
 

@@ -468,7 +468,10 @@ void launch_wide(Gather g, const int* out_ptr, int* out_idx, int* counts, const 
 // length the caller allocates the column index at.
 template <typename Gather>
 int count_rows(Gather g, int* out_ptr, int n_seg, cudaStream_t stream) {
-    if (n_seg <= 0) return 0;
+    if (n_seg <= 0) {
+        check_cuda(cudaMemsetAsync(out_ptr, 0, (n_seg + 1) * sizeof(int), stream), "empty offsets");
+        return 0;
+    }
     const SegmentPlan plan = plan_segments(g, n_seg, stream);
     const ScratchBuffer<int> counts =
         scratch_alloc<int>(static_cast<std::size_t>(n_seg) + 1, stream, "pattern", "row counts");

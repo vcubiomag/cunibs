@@ -801,6 +801,42 @@ def test_native_call_ignores_an_error_left_by_a_failed_allocation(cp):
     )
 
 
+def test_dadt_block_rejects_a_column_that_overflows_int(cp):
+    from cunibs.fem.placement import MU0_OVER_4PI
+    from cunibs.solver import dadt_block
+
+    with pytest.raises(ValueError, match="room for k columns"):
+        dadt_block(
+            cp.zeros((1, 3), dtype=cp.float64),
+            cp.asarray([[0.0, 0.0, 1.0]]),
+            cp.eye(4, dtype=cp.float64)[None],
+            cp.ones((4, 3), dtype=cp.float64),
+            cp.empty((4, 3), dtype=cp.float32),
+            1e6,
+            MU0_OVER_4PI,
+            cp.cuda.get_current_stream().ptr,
+            2**31 - 1,
+        )
+
+
+def test_reconstruct_rejects_gradients_for_too_few_tets(cp):
+    """The kernels would otherwise read a short ``g`` past its end and return plausible fields."""
+    from cunibs.solver import reconstruct_e, reconstruct_e_nodal_block
+
+    stream = cp.cuda.get_current_stream().ptr
+    tets = cp.zeros((8, 4), dtype=cp.int32)
+    short_g = cp.zeros((7, 4, 3), dtype=cp.float32)
+    e = cp.empty((8, 3), dtype=cp.float32)
+    magn = cp.empty(8, dtype=cp.float32)
+    with pytest.raises(ValueError, match="one row per tet"):
+        v = cp.zeros(4, dtype=cp.float64)
+        reconstruct_e(v, tets, short_g, cp.zeros((8, 3), dtype=cp.float32), e, magn, stream)
+    with pytest.raises(ValueError, match="one row per tet"):
+        v = cp.zeros((4, 1), dtype=cp.float64)
+        dadt = cp.zeros((4, 1, 3), dtype=cp.float32)
+        reconstruct_e_nodal_block(v, tets, short_g, dadt, [e], [magn], stream)
+
+
 def test_solve_mixed_rejects_a_wrong_row_count(cp, cube_subject):
     solver = cube_subject.context.solver
     n = solver.pcg.n
@@ -928,6 +964,21 @@ def test_pattern_wide_segment_does_not_widen_the_narrow_ones(cp):
     """
     nodes, tets = _fan_mesh(6000, extra_tets=64)
     _assert_pattern_matches_numpy(cp, nodes, tets)
+
+
+def test_counting_no_segments_still_writes_the_one_offset(cp):
+    """A CSR over nothing has offsets [0], and a caller allocates them uninitialised."""
+    from cunibs.solver import count_incident_node_csr, count_patch_csr
+
+    stream = cp.cuda.get_current_stream().ptr
+    none = cp.empty(0, dtype=cp.int32)
+    zero = cp.zeros(1, dtype=cp.int32)
+    out = cp.full(1, -1, dtype=cp.int32)
+    assert count_incident_node_csr(cp.empty((0, 4), dtype=cp.int32), zero, none, out, stream) == 0
+    assert int(out[0]) == 0
+    out = cp.full(1, -1, dtype=cp.int32)
+    assert count_patch_csr(zero, none, none, 16, out, stream) == 0
+    assert int(out[0]) == 0
 
 
 def test_patch_csr_builds_a_wide_segment(cp):

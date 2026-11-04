@@ -122,9 +122,10 @@ __device__ __forceinline__ CandidateMap candidate_map(const double* __restrict__
     return c;
 }
 
-// Slack on the fractional index bounds, 1e-6 of a cell, the same as evaluate.py's _INDEX_TOL so the
-// host's off-grid message agrees with the kernel's verdict.
-constexpr float kIndexTol = 1e-6f;
+// Slack on the fractional index bounds, in cells. It sits above the fp32 rounding of a fractional
+// index, or a dipole on a grid face could read as off the grid, and above evaluate.py's _INDEX_TOL,
+// so every dipole faulted here is also one the host's fp64 check can name.
+constexpr float kIndexTol = 1e-3f;
 
 // mu0 / 4 pi in T m / A.
 constexpr double kMu0Over4Pi = 1e-7;
