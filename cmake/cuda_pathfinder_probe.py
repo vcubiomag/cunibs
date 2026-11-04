@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
@@ -16,10 +15,6 @@ def emit_path(key: str, value: str | Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--libs", required=True, help="comma-separated, in dependency order")
-    args = parser.parse_args()
-
     try:
         from cuda.pathfinder import (
             find_nvidia_binary_utility,
@@ -47,18 +42,17 @@ def main() -> int:
         return 4
     emit_path("INCLUDE_DIR", headers.abs_path)
 
-    for libname in (name for name in args.libs.split(",") if name):
-        loaded = load_nvidia_dynamic_lib(libname)
-        emit(f"FOUND_VIA_{libname}", loaded.found_via)
-        if not loaded.abs_path:
-            print(
-                f"{libname} was loaded but reports no path on disk "
-                f"(found_via={loaded.found_via}, "
-                f"already_loaded={loaded.was_already_loaded_from_elsewhere}).",
-                file=sys.stderr,
-            )
-            return 5
-        emit_path(f"LIB_{libname}", loaded.abs_path)
+    loaded = load_nvidia_dynamic_lib("cudart")
+    emit("FOUND_VIA_cudart", loaded.found_via)
+    if not loaded.abs_path:
+        print(
+            "cudart was loaded but reports no path on disk "
+            f"(found_via={loaded.found_via}, "
+            f"already_loaded={loaded.was_already_loaded_from_elsewhere}).",
+            file=sys.stderr,
+        )
+        return 5
+    emit_path("LIB_cudart", loaded.abs_path)
 
     return 0
 

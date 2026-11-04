@@ -40,8 +40,6 @@ jobs:
 
       - uses: pypa/cibuildwheel@v4.1.0
         env:
-          CIBW_ARCHS_LINUX: x86_64
-          CIBW_ARCHS_WINDOWS: AMD64
           CIBW_BUILD: ${{ matrix.python }}-${{ matrix.platform.tag }}
           CIBW_ENVIRONMENT: CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCHS }}"
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-

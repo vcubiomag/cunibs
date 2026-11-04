@@ -209,11 +209,7 @@ def test_parser_filters_unknown_surface_tags(tmp_path):
 
 
 def test_parser_rejects_orphan_surface_node(tmp_path):
-    """A skin triangle standing on nodes no tetrahedron uses is a hard error.
-
-    ``tools/make_test_patch.py`` depends on this: it may only keep triangles whose three
-    nodes all survive the tet subset.
-    """
+    """A skin triangle standing on nodes no tetrahedron uses is a hard error."""
     nodes, tets, _ = _disjoint_mesh(3, [2, 5, 9])
     orphan_tri = tets[2][:3] + 1
     path = tmp_path / "orphan.msh"

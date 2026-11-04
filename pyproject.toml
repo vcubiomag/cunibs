@@ -21,7 +21,7 @@ dependencies = [
     "cuda-toolkit[cudart]>=13.0,<14",
     "cupy-cuda13x[ctk]>=14.0.0",
     "h5py>=3.10.0",
-    "numpy>=1.26.0",
+    "numpy>=2.0",
 ]
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
@@ -36,7 +36,8 @@ requires = [
     "cuda-pathfinder>=1.5,<2",
     # cccl carries nv/target, which cuda_fp16.h includes; vcycle.hpp stores its operator
     # as __half.
-    "cuda-toolkit[nvcc,cudart,cccl]==13.2.*"
+    "cuda-toolkit[nvcc,cudart,cccl]==13.2.*",
+    "pefile; sys_platform == 'win32'",
 ]
 build-backend = "scikit_build_core.build"
 

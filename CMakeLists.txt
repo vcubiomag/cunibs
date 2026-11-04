@@ -2,31 +2,16 @@ cmake_minimum_required(VERSION 3.21)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type")
-endif()
-
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
 
 option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the CUDA wheels" OFF)
 
-set(CUNIBS_CUDA_LIBS cudart)
-
 if(NOT CUNIBS_USE_SYSTEM_CUDA)
   include(CunibsCudaPathfinder)
-  cunibs_probe_cuda(LIBS ${CUNIBS_CUDA_LIBS})
+  cunibs_probe_cuda()
 
-  # CMakeDetermineCUDACompiler is skipped entirely once CMakeCUDACompiler.cmake exists,
-  # so a stale compiler would otherwise survive a moved venv or a toolkit switch.
-  if(CMAKE_CUDA_COMPILER AND NOT CMAKE_CUDA_COMPILER STREQUAL CUNIBS_CUDA_NVCC)
-    message(FATAL_ERROR
-      "The cached CUDA compiler no longer matches the one cuda.pathfinder resolves.\n"
-      "  cached: ${CMAKE_CUDA_COMPILER}\n"
-      "  probed: ${CUNIBS_CUDA_NVCC}\n"
-      "Delete ${CMAKE_BINARY_DIR} and reconfigure.")
-  endif()
   set(CMAKE_CUDA_COMPILER "${CUNIBS_CUDA_NVCC}")
 endif()
 
@@ -42,18 +27,22 @@ endif()
 
 enable_language(CUDA)
 
-if(NOT CUNIBS_USE_SYSTEM_CUDA)
+if(CUNIBS_USE_SYSTEM_CUDA)
+  find_package(CUDAToolkit 12.9 REQUIRED)
+else()
+  # FindCUDAToolkit cannot locate the wheels' cudart, which has only a versioned SONAME on Linux and
+  # a bare DLL on Windows. Windows links against an import library synthesized from that DLL.
+  set(_cudart "${CUNIBS_CUDA_LIB_cudart}")
   if(WIN32)
     include(CunibsWindowsImplib)
-    cunibs_generate_cuda_implibs(LIBS ${CUNIBS_CUDA_LIBS})
+    cunibs_generate_cuda_implibs(LIBS cudart)
+    set(_cudart "${CUNIBS_CUDA_IMPLIB_cudart}")
   endif()
-  cunibs_seed_cuda_toolkit(
-    LIBS ${CUNIBS_CUDA_LIBS}
-    INCLUDE_DIR "${CUNIBS_CUDA_INCLUDE_DIR}"
-    FINGERPRINT "${CUNIBS_CUDA_FINGERPRINT}")
+  add_library(CUDA::cudart UNKNOWN IMPORTED)
+  set_target_properties(CUDA::cudart PROPERTIES
+    IMPORTED_LOCATION "${_cudart}"
+    INTERFACE_INCLUDE_DIRECTORIES "${CUNIBS_CUDA_INCLUDE_DIR}")
 endif()
-
-find_package(CUDAToolkit 12.9 REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

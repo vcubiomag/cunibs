@@ -80,7 +80,7 @@ requires-dist = [
     { name = "cuda-toolkit", extras = ["cudart"], specifier = ">=13.0,<14" },
     { name = "cupy-cuda13x", extras = ["ctk"], specifier = ">=14.0.0" },
     { name = "h5py", specifier = ">=3.10.0" },
-    { name = "numpy", specifier = ">=1.26.0" },
+    { name = "numpy", specifier = ">=2.0" },
 ]
 
 [package.metadata.requires-dev]

@@ -4,7 +4,7 @@ Everything else in the GPU suite runs on a 6-tetrahedron single-tissue cube, whi
 construction cannot exercise seven-tissue conductivity contrasts, a curved non-convex scalp,
 sliver tetrahedra, or an AMG hierarchy deeper than one level. These tests run on
 ``tests/data/head_patch_r25.msh.gz`` — a 25 mm ball cropped out of a SimNIBS CHARM head mesh
-around the vertex (see ``tools/make_test_patch.py``).
+around the vertex (see ``tests/data/head_patch_r25.json``).
 
 Marked ``reference`` tests need the full 184 MB mesh via ``CUNIBS_REFERENCE_MESH``.
 """
