@@ -110,7 +110,7 @@ def test_non_default_region_needs_the_magnitude(region):
     # With magnE retained the same call is computed on demand.
     full = _field_result()
     mask = metrics.region_mask(full.tet_tags, region)
-    assert full.peak_magnE(region) == metrics.peak_magnitude(full.magnE, mask)
+    assert full.peak_magnE(region) == full.magnE[mask].max()
 
 
 def test_non_default_focality_fraction_needs_the_magnitude():
@@ -130,9 +130,9 @@ def test_field_result_focality_matches_metrics(frac):
 def test_field_result_peak_matches_metrics():
     r = _field_result()
     mask = metrics.region_mask(r.tet_tags, "csf")
-    assert r.peak_magnE("csf") == metrics.peak_magnitude(r.magnE, mask)
+    assert r.peak_magnE("csf") == r.magnE[mask].max()
     np.testing.assert_array_equal(
-        r.peak_location_mm("csf"), metrics.peak_location_mm(r.magnE, r.barycenters_mm, mask)
+        r.peak_location_mm("csf"), r.barycenters_mm[mask][np.argmax(r.magnE[mask])]
     )
 
 

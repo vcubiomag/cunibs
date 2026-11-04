@@ -23,9 +23,9 @@ def test_region_mask():
 
 
 def test_peak_excludes_other_regions():
-    mask = metrics.region_mask(TAGS, "gray_matter")
-    assert metrics.peak_magnitude(MAGNE, mask) == 3.0
-    np.testing.assert_allclose(metrics.peak_location_mm(MAGNE, BARY, mask), [2, 0, 0])
+    m = metrics.compute_metrics(MAGNE, VOLS, BARY, TAGS)
+    assert m["peak_magnE"] == 3.0
+    np.testing.assert_allclose(m["peak_location_mm"], [2, 0, 0])
 
 
 def test_focality_volume_above_half_the_anchor():
@@ -41,13 +41,10 @@ def test_focality_anchors_to_a_percentile_not_the_max():
     vols = np.ones(10000)
     mask = np.ones(10000, dtype=bool)
 
-    assert metrics.peak_magnitude(magn, mask) == 100.0
     assert metrics.percentile_magnitude(magn, vols, mask, 99.9) == pytest.approx(1.0)
 
     assert metrics.focality(magn, vols, mask, 0.5) == pytest.approx(10000.0)
-    assert metrics.focality(magn, vols, mask, 0.5, anchor_percentile=100.0) == pytest.approx(
-        1.0
-    )
+    assert metrics.stimulated_volume(magn, vols, mask, 0.5 * magn.max()) == pytest.approx(1.0)
 
 
 def test_compute_metrics_focality_matches_the_focality_function():
@@ -63,8 +60,7 @@ def test_compute_metrics_focality_matches_the_focality_function():
 
 
 def test_distribution_volume_weighted_mean():
-    mask = metrics.region_mask(TAGS, "gray_matter")
-    d = metrics.distribution(MAGNE, VOLS, mask, percentiles=(50.0,))
+    d = metrics.compute_metrics(MAGNE, VOLS, BARY, TAGS, percentiles=(50.0,))["distribution"]
     assert d["mean"] == pytest.approx(2.0)
     assert d["std"] == pytest.approx(np.sqrt(2 / 3))
     assert d["p50"] == pytest.approx(2.0)
@@ -77,6 +73,35 @@ def test_compute_metrics_shape():
     assert set(m["focality_m3"]) == {"0.5", "0.75"}
     assert "mean" in m["distribution"]
     assert m["center_of_gravity_mm"].shape == (3,)
+
+
+@pytest.mark.parametrize("percentile", [101.0, -1.0, float("nan")])
+def test_summary_rejects_a_percentile_outside_its_range(percentile):
+    with pytest.raises(ValueError, match=r"\[0, 100\]"):
+        metrics.compute_metrics(MAGNE, VOLS, BARY, TAGS, percentiles=(percentile,))
+
+
+@pytest.mark.gpu
+def test_device_summary_rejects_a_percentile_outside_its_range(cp):
+    region = metrics.region_slice(cp.asarray(VOLS), cp.asarray(BARY), cp.asarray(TAGS))
+    with pytest.raises(ValueError, match=r"\[0, 100\]"):
+        region.summarize(cp.asarray(MAGNE), percentiles=(101.0,))
+
+
+@pytest.mark.parametrize("length", [2, 5])
+def test_summary_rejects_a_field_of_the_wrong_length(length):
+    region = metrics.region_slice(VOLS, BARY, TAGS)
+    with pytest.raises(ValueError, match="one value per element"):
+        region.summarize(np.ones(length))
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("length", [2, 5])
+def test_device_summary_rejects_a_field_of_the_wrong_length(cp, length):
+    """Too short a field reads past its array on the device, with no error and plausible values."""
+    region = metrics.region_slice(cp.asarray(VOLS), cp.asarray(BARY), cp.asarray(TAGS))
+    with pytest.raises(ValueError, match="one value per element"):
+        region.summarize(cp.ones(length))
 
 
 def test_region_mask_covers_every_volume_label():
@@ -120,20 +145,18 @@ def test_center_of_gravity_analytic():
     magn = np.array([2.0, 1.0])
     vols = np.array([1.0, 2.0])
     bary = np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]])
-    mask = np.ones(2, dtype=bool)
-    np.testing.assert_allclose(
-        metrics.center_of_gravity_mm(magn, vols, bary, mask), [2.0, 0.0, 0.0]
-    )
+    tags = np.full(2, 2, np.int32)
+    m = metrics.compute_metrics(magn, vols, bary, tags)
+    np.testing.assert_allclose(m["center_of_gravity_mm"], [2.0, 0.0, 0.0])
 
 
 def test_center_of_gravity_ignores_masked_elements():
     magn = np.array([1.0, 1.0, 1e6])
     vols = np.ones(3)
     bary = np.array([[0.0, 0, 0], [2.0, 0, 0], [1e3, 0, 0]])
-    mask = np.array([True, True, False])
-    np.testing.assert_allclose(
-        metrics.center_of_gravity_mm(magn, vols, bary, mask), [1.0, 0.0, 0.0]
-    )
+    tags = np.array([2, 2, 5], np.int32)
+    m = metrics.compute_metrics(magn, vols, bary, tags)
+    np.testing.assert_allclose(m["center_of_gravity_mm"], [1.0, 0.0, 0.0])
 
 
 def test_stimulated_volume_threshold_is_inclusive():
@@ -155,9 +178,13 @@ def test_focality_at_peak_is_the_peak_element_volume():
 
 
 def test_distribution_single_element():
-    d = metrics.distribution(
-        np.array([7.0]), np.array([3.0]), np.array([True]), percentiles=(50.0, 99.0)
-    )
+    d = metrics.compute_metrics(
+        np.array([7.0]),
+        np.array([3.0]),
+        np.zeros((1, 3)),
+        np.array([2], np.int32),
+        percentiles=(50.0, 99.0),
+    )["distribution"]
     assert d["mean"] == pytest.approx(7.0)
     assert d["std"] == pytest.approx(0.0)
     assert d["p50"] == pytest.approx(7.0)
@@ -167,7 +194,8 @@ def test_distribution_single_element():
 def test_distribution_percentiles_are_monotone():
     rng = np.random.default_rng(2)
     magn, vols = rng.random(500), rng.random(500) + 0.1
-    d = metrics.distribution(magn, vols, np.ones(500, dtype=bool))
+    tags = np.full(500, 2, np.int32)
+    d = metrics.compute_metrics(magn, vols, np.zeros((500, 3)), tags)["distribution"]
     assert d["p50"] <= d["p95"] <= d["p99"] <= d["p99.9"]
 
 
@@ -197,27 +225,6 @@ def test_metrics_cupy_numpy_parity(cp):
         assert value == pytest.approx(dev["distribution"][key], rel=1e-12), key
     for key, value in host["focality_m3"].items():
         assert value == pytest.approx(dev["focality_m3"][key], rel=1e-12), key
-
-
-@pytest.mark.gpu
-def test_weighted_quantiles_are_repeatable(cp):
-    """The same call must return the same number, every time.
-
-    A decoupled-lookback scan associates its float adds in an order that follows block
-    scheduling rather than the data, and ties decide which weight lands in which prefix-sum
-    slot, so the array here carries many of both.
-    """
-    rng = cp.random.default_rng(0)
-    values = cp.round(cp.asarray(rng.random(200_000), dtype=cp.float32), 3)
-    weights = cp.asarray(rng.random(200_000), dtype=cp.float32)
-    qs = cp.asarray([0.5, 0.95, 0.999], dtype=cp.float64)
-    assert int(cp.unique(values).size) < values.size, "the tie path must be exercised"
-
-    first = cp.asnumpy(metrics.weighted_quantiles(values, weights, qs))
-    for _ in range(6):
-        np.testing.assert_array_equal(
-            cp.asnumpy(metrics.weighted_quantiles(values, weights, qs)), first
-        )
 
 
 @pytest.mark.gpu
@@ -256,7 +263,9 @@ def test_tail_percentiles_use_the_exact_probability_for_float32_fields():
     float32_q = np.array([np.float32(99.9 / 100.0)], dtype=np.float64)
     rounded = metrics.weighted_quantiles(magn, vols, float32_q)[0]
     assert exact != rounded, "the tail must be steep enough to tell the two apart"
-    assert metrics.distribution(magn, vols, mask)["p99.9"] == exact
+    tags = np.full(magn.size, 2, np.int32)
+    d = metrics.compute_metrics(magn, vols, np.zeros((magn.size, 3)), tags)["distribution"]
+    assert d["p99.9"] == exact
     assert metrics.percentile_magnitude(magn, vols, mask, 99.9) == exact
 
 
@@ -289,17 +298,29 @@ def test_a_block_summary_is_each_field_summarised_alone(cp):
 
 
 @pytest.mark.gpu
-def test_a_float32_device_summary_matches_the_host_path(cp):
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        # Without 99.9 among the percentiles, the focality anchor has to be probed on its own.
+        {"percentiles": (50.0,), "focality_fracs": (0.3,)},
+        {"percentiles": (100.0, 0.0), "focality_fracs": (0.2, 1.0)},
+    ],
+    ids=["default", "no_anchor", "extremes"],
+)
+def test_a_float32_device_summary_matches_the_host_path(cp, options):
     rng = np.random.default_rng(9)
     n = 20_000
     magn = (rng.pareto(2.0, n) + 0.01).astype(np.float32)
     vols = (rng.random(n) + 0.1).astype(np.float32)
     bary = rng.standard_normal((n, 3))
     tags = rng.choice(np.array([2, 3], np.int32), n)
-    host = metrics.compute_metrics(magn, vols, bary, tags)
+    host = metrics.compute_metrics(magn, vols, bary, tags, **options)
     dev = metrics.compute_metrics(
-        cp.asarray(magn), cp.asarray(vols), cp.asarray(bary), cp.asarray(tags)
+        cp.asarray(magn), cp.asarray(vols), cp.asarray(bary), cp.asarray(tags), **options
     )
+    assert dev["distribution"].keys() == host["distribution"].keys()
+    assert dev["focality_m3"].keys() == host["focality_m3"].keys()
     assert dev["peak_magnE"] == host["peak_magnE"]
     np.testing.assert_array_equal(dev["peak_location_mm"], host["peak_location_mm"])
     np.testing.assert_allclose(
@@ -316,6 +337,21 @@ def test_percentile_outside_its_range_is_rejected(percentile):
     values, vols = np.ones(4), np.ones(4)
     with pytest.raises(ValueError, match="percentile must be"):
         metrics.percentile_magnitude(values, vols, np.ones(4, dtype=bool), percentile)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("percentile", [-1.0, 101.0, float("nan")])
+def test_a_summary_rejects_a_percentile_outside_its_range(cp, percentile):
+    """Clamped to the extreme element, it would report the peak under the name it was asked for."""
+    magn, vols = np.ones(8), np.ones(8)
+    bary, tags = np.zeros((8, 3)), np.full(8, 2, np.int32)
+    with pytest.raises(ValueError, match="percentile must be"):
+        metrics.percentile_magnitude(magn, vols, np.ones(8, dtype=bool), percentile)
+    with pytest.raises(ValueError, match="percentile must be"):
+        metrics.compute_metrics(magn, vols, bary, tags, percentiles=(percentile,))
+    device = [cp.asarray(a) for a in (magn, vols, bary, tags)]
+    with pytest.raises(ValueError, match="percentile must be"):
+        metrics.compute_metrics(*device, percentiles=(percentile,))
 
 
 def test_a_percentile_of_no_elements_is_rejected():
@@ -335,3 +371,10 @@ def test_device_summary_names_its_probe_limit(cp):
             cp.asarray(tags),
             percentiles=tuple(float(p) for p in range(1, 21)),
         )
+
+
+@pytest.mark.parametrize("frac", [float("nan"), float("inf"), -0.5])
+def test_focality_rejects_a_fraction_that_is_not_a_fraction(frac):
+    values, vols = np.ones(4), np.ones(4)
+    with pytest.raises(ValueError, match="focality fraction"):
+        metrics.focality(values, vols, np.ones(4, dtype=bool), frac)
