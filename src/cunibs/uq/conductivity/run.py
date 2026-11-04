@@ -345,7 +345,7 @@ def run_conductivity_uq(
     there, and zero elsewhere.
 
     ``region`` is the gray-matter slice the per-draw scalars are taken over, built here when not
-    given.
+    given. On a mesh with no gray matter those scalars are skipped and come back as ``None``.
     """
     _check_operator(ctx, recovery, False, "run_conductivity_uq")
     wanted = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
@@ -453,6 +453,7 @@ def run_conductivity_uq(
     del log_ratio
     schedule = [int(k) for k in np.argsort(log_dist, kind="stable")]
     schedule_dev = cp.asarray(schedule)
+    table = None
     for start in range(0, config.n_samples, width):
         draws = schedule[start : start + width]
         cols = draws + [draws[-1]] * (width - len(draws))
@@ -512,13 +513,14 @@ def run_conductivity_uq(
             )
 
         accumulate_moments_block(magn_stat[: len(draws)], sum_e, sumsq_e, stream)
-        # The summary's own kernel, so a per-draw peak and focality are the summary's
-        # definitions. The table stays on the device.
-        table = gm.summary_table(magn_stat[: len(draws)], anchor_q, 0, [focality_frac])
-        drawn = schedule_dev[start : start + len(draws)]
-        peak_s[drawn] = table[:, peak_col]
-        peakloc_s[drawn] = table[:, loc_col : loc_col + 3]
-        foc_s[drawn] = table[:, q0 + 1]
+        if not gm.empty:
+            # The summary's own kernel, so a per-draw peak and focality are the summary's
+            # definitions. The table stays on the device.
+            table = gm.summary_table(magn_stat[: len(draws)], anchor_q, 0, [focality_frac])
+            drawn = schedule_dev[start : start + len(draws)]
+            peak_s[drawn] = table[:, peak_col]
+            peakloc_s[drawn] = table[:, loc_col : loc_col + 3]
+            foc_s[drawn] = table[:, q0 + 1]
         for c, k in enumerate(draws):
             for j, name in enumerate(roi_names):
                 roi = record_rois[name]
@@ -547,8 +549,8 @@ def run_conductivity_uq(
         coil_name=coil.name,
         didt=didt,
         recovery=recovery.mode if recovery is not None else "raw",
-        peak_samples=cp.asnumpy(peak_s),
-        focality_samples=cp.asnumpy(foc_s),
-        peak_location_samples=cp.asnumpy(peakloc_s),
+        peak_samples=None if gm.empty else cp.asnumpy(peak_s),
+        focality_samples=None if gm.empty else cp.asnumpy(foc_s),
+        peak_location_samples=None if gm.empty else cp.asnumpy(peakloc_s),
         roi_samples={name: cp.asnumpy(roi_s[:, j]) for j, name in enumerate(roi_names)},
     )

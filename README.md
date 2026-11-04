@@ -133,8 +133,10 @@ for mesh_file in Path("subjects").glob("m2m_*/*.msh"):
 ## Results
 
 Each result carries summary metrics for gray matter: peak field and its
-location, focality, centre of gravity, and distribution statistics. Results stay
-small because full-volume arrays are kept only when you ask for them:
+location, focality, centre of gravity, and distribution statistics. On a mesh
+with no gray matter, such as a phantom, `result.summary` is `None` and everything
+else works as usual. Results stay small because full-volume arrays are kept only
+when you ask for them:
 
 ```python
 result = subject.simulate(

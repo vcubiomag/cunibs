@@ -243,6 +243,11 @@ class RegionSlice:
     def on_device(self) -> bool:
         return isinstance(self.index, cp.ndarray)
 
+    @property
+    def empty(self) -> bool:
+        """Whether the mesh holds no element of this region."""
+        return self.index.size == 0
+
     def summarize(
         self,
         magnE: ArrayT,
@@ -255,6 +260,8 @@ class RegionSlice:
         ``peak_magnE`` is the true maximum; the focality volumes are measured against
         :data:`FOCALITY_ANCHOR_PERCENTILE` of |E| instead (see :func:`focality`).
         """
+        if self.empty:
+            raise ValueError(f"Region {self.region!r} holds no elements in this mesh.")
         if self.on_device:
             (summary,) = self.summarize_block(
                 [magnE], focality_fracs=focality_fracs, percentiles=percentiles

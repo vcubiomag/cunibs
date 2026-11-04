@@ -13,7 +13,17 @@ import weakref
 import numpy as np
 import pytest
 
-from cunibs import ConductivityUQConfig, Placement, ResolvedTarget, Subject, resolve_target
+from cunibs import (
+    RECOVERY_MODES,
+    ConductivityUQConfig,
+    ConductivityUQResult,
+    FieldResult,
+    HeadMesh,
+    Placement,
+    ResolvedTarget,
+    Subject,
+    resolve_target,
+)
 from cunibs._memory import build_arena, scratch_pool, unpooled
 from cunibs.fem.solve import SolverConvergenceError
 from cunibs.mesh import load_mesh
@@ -370,6 +380,78 @@ def test_a_roi_outside_the_mesh_is_rejected(
         subj.simulate(d70_coil, patch_placement, 1e6, record_rois={"a": roi})
     with pytest.raises(ValueError, match="outside this mesh"):
         resolve_target(subj, roi)
+
+
+@pytest.fixture
+def no_gray_matter(patch_mesh):
+    """The patch with its gray matter relabelled, so the default summary region is absent."""
+    tags = np.where(patch_mesh.tet_tags == 2, 1, patch_mesh.tet_tags)
+    return HeadMesh(
+        patch_mesh.nodes_mm,
+        patch_mesh.tet_nodes,
+        tags,
+        patch_mesh.surf_tris,
+        patch_mesh.surf_tags,
+    )
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("recovery", RECOVERY_MODES)
+def test_a_mesh_with_no_gray_matter_skips_the_summary(
+    no_gray_matter, d70_coil, patch_placement, recovery
+):
+    with Subject(no_gray_matter) as subj:
+        bare = subj.simulate(d70_coil, patch_placement, 1e6, recovery=recovery)
+        assert bare.summary is None
+        kept = subj.simulate(d70_coil, patch_placement, 1e6, recovery=recovery, magnitude=True)
+        assert kept.summary is None
+        assert np.isfinite(kept.magnE).all()
+        assert kept.peak_magnE("all") == float(kept.magnE.max())
+        with pytest.raises(ValueError, match="holds no elements"):
+            kept.peak_magnE()
+        swept = list(
+            subj.iter_simulate(d70_coil, [patch_placement] * 9, 1e6, recovery=recovery)
+        )
+        assert all(r.summary is None for r in swept)
+
+
+@pytest.mark.realmesh
+def test_a_mesh_with_no_gray_matter_still_reads_rois_and_saves(
+    tmp_path, no_gray_matter, d70_coil, patch_placement
+):
+    with Subject(no_gray_matter) as subj:
+        roi = subj.roi(patch_placement.center_mm - [0.0, 0.0, 6.0], 4.0, "white_matter")
+        result = subj.simulate(d70_coil, patch_placement, 1e6, record_rois={"a": roi})
+        assert result.summary is None
+        assert result.roi_means["a"] > 0.0
+        result.save(tmp_path / "r.h5")
+        loaded = FieldResult.load(tmp_path / "r.h5")
+        assert loaded.summary is None
+        assert loaded.roi_means["a"] == result.roi_means["a"]
+
+
+@pytest.mark.realmesh
+def test_uq_on_a_mesh_with_no_gray_matter_skips_its_scalars(
+    tmp_path, no_gray_matter, d70_coil, patch_placement
+):
+    config = ConductivityUQConfig(n_samples=9, seed=0)
+    with Subject(no_gray_matter) as subj:
+        roi = subj.roi(patch_placement.center_mm - [0.0, 0.0, 6.0], 4.0, "white_matter")
+        uq = subj.simulate_conductivity_uq(
+            d70_coil, patch_placement, config, 1e6, moments=True, record_rois={"a": roi}
+        )
+    assert uq.summary is None
+    assert uq.peak_samples is None
+    assert np.isfinite(uq.mean_magnE).all()
+    assert uq.roi_samples["a"].shape == (9,)
+    assert set(uq.tissue_sensitivity("a")) == set(uq.perturbed_tags)
+    with pytest.raises(ValueError, match="no gray matter"):
+        uq.tissue_sensitivity("peak")
+    uq.save(tmp_path / "u.h5")
+    loaded = ConductivityUQResult.load(tmp_path / "u.h5")
+    assert loaded.summary is None
+    assert loaded.peak_samples is None
+    np.testing.assert_array_equal(loaded.mean_magnE, uq.mean_magnE)
 
 
 @pytest.mark.realmesh

@@ -428,7 +428,8 @@ class Subject:
         operator outlives the chunk that first asked for it. ``tissues`` is what the call reads;
         see :meth:`_needed_tissues`.
         """
-        if recovery == "raw":
+        # A call reading no tissue has no field to recover.
+        if recovery == "raw" or (tissues is not None and not tissues):
             return None
         with self._lock:
             ctx = self.context
@@ -447,7 +448,9 @@ class Subject:
             check_elements(target, int(tet_tags.shape[0]))
         if full_volume:
             return None
-        tags = {metrics.region_tag(DEFAULT_REGION)}
+        tags = set()
+        if not self._region_slice(DEFAULT_REGION).empty:
+            tags.add(metrics.region_tag(DEFAULT_REGION))
         for target in record_rois.values():
             tags.update(int(t) for t in cp.asnumpy(cp.unique(tet_tags[target.elem_idx])))
         return frozenset(tags)
@@ -495,7 +498,7 @@ class Subject:
         tet_nodes = self._host_tet_nodes if retain.nodal and slot_tag is None else None
         n_nodes = int(self.context.n_nodes) if retain.nodal else None
         fields = [out["magnE"] for out in outs]
-        summaries = region.summarize_block(fields)
+        summaries = [None] * len(chunk) if region.empty else region.summarize_block(fields)
         roi_means = _roi_means(fields, record_rois)
         return [
             FieldResult(
@@ -829,7 +832,11 @@ class Subject:
                 # Summarised on the device before anything is copied back.
                 return replace(
                     result,
-                    summary=result.compute_summary(region_slice=gray_matter),
+                    summary=(
+                        None
+                        if gray_matter.empty
+                        else result.compute_summary(region_slice=gray_matter)
+                    ),
                     mean_magnE=cp.asnumpy(result.mean_magnE) if moments else None,
                     std_magnE=cp.asnumpy(result.std_magnE) if moments else None,
                     cov_magnE=cp.asnumpy(result.cov_magnE) if moments else None,
@@ -926,9 +933,9 @@ class Subject:
 class FieldResult:
     """Metrics for one placement, plus whichever full-volume arrays were retained.
 
-    ``summary`` holds the gray-matter metrics and is always present. ``magnE``, ``E`` and
-    ``v`` are ``None`` unless the run asked for them with ``magnitude=``, ``vectors=`` or
-    ``potential=``. All arrays are NumPy.
+    ``summary`` holds the gray-matter metrics, and is ``None`` on a mesh with no gray matter.
+    ``magnE``, ``E`` and ``v`` are ``None`` unless the run asked for them with ``magnitude=``,
+    ``vectors=`` or ``potential=``. All arrays are NumPy.
 
     ``vols``, ``tet_tags`` and ``barycenters_mm`` accompany ``magnE``, since they are what the
     on-demand metrics need. Results from one subject share them, so treat them as
@@ -956,7 +963,7 @@ class FieldResult:
     which resolves all of that.
     """
 
-    summary: metrics.FieldMetrics
+    summary: metrics.FieldMetrics | None
     magnE: npt.NDArray[np.float32] | None
     E: npt.NDArray[np.float32] | None
     v: npt.NDArray[np.float64] | None
@@ -1062,9 +1069,9 @@ class FieldResult:
         """Metrics for a tissue region, cached.
 
         ``summary``'s own region is free; any other needs ``magnE``, so the run has to have
-        passed ``magnitude=True``.
+        passed ``magnitude=True``. A region the mesh does not hold raises ``ValueError``.
         """
-        if region == self.summary["region"]:
+        if self.summary is not None and region == self.summary["region"]:
             return self.summary
         if region not in self._summaries:
             magnE = self._require_magnitude(f"metrics for region {region!r}")
@@ -1098,7 +1105,8 @@ class FieldResult:
                     continue
                 h5f.create_dataset(name, data=arr, compression="gzip")
             h5f.create_dataset("transform", data=self.transform)
-            write_metrics(h5f.create_group("summary"), self.summary)
+            if self.summary is not None:
+                write_metrics(h5f.create_group("summary"), self.summary)
             h5f.attrs["format_version"] = _FORMAT_VERSION
             h5f.attrs["recovery"] = self.recovery
             if self.n_nodes is not None:
@@ -1125,7 +1133,7 @@ class FieldResult:
         with h5py.File(Path(path), "r") as h5f:
             check_format_version(h5f, path, _FORMAT_VERSION)
             return cls(
-                summary=read_metrics(h5f["summary"]),
+                summary=read_metrics(h5f["summary"]) if "summary" in h5f else None,
                 magnE=opt_array(h5f, "magnE"),
                 E=opt_array(h5f, "E"),
                 v=opt_array(h5f, "v"),

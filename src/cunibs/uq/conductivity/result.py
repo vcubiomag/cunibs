@@ -39,6 +39,11 @@ def _tissue_sensitivity(result, output: str) -> dict[int, float]:
     observed log-output variance. It is not a Sobol estimator and captures neither interactions nor
     departures from log-linearity.
     """
+    if output in ("peak", "focality") and result.peak_samples is None:
+        raise ValueError(
+            f"This mesh has no gray matter, so no per-draw {output} was recorded. Name a "
+            "recorded ROI instead."
+        )
     if output == "peak":
         y = result.peak_samples
     elif output == "focality":
@@ -85,10 +90,12 @@ class ConductivityUQResult:
     ``|E|`` over the ensemble, ``cov`` being the coefficient of variation (std / mean).
     They are ``None`` unless the run asked for them with ``moments=True``.
 
-    The ``*_samples`` arrays hold one entry per conductivity draw and are always present:
-    kilobytes against moment arrays in the tens of megabytes.
+    The ``*_samples`` arrays hold one entry per conductivity draw and are always present,
+    kilobytes against moment arrays in the tens of megabytes, except that the gray-matter ones are
+    ``None`` on a mesh with no gray matter.
 
-    Results from :class:`~cunibs.Subject` are NumPy and always carry a ``summary``. The
+    Results from :class:`~cunibs.Subject` are NumPy and carry a ``summary``, unless the mesh has
+    no gray matter. The
     lower-level :func:`~cunibs.uq.run_conductivity_uq` returns device arrays and no
     summary; call :meth:`compute_summary` and :meth:`to_numpy` yourself.
     """
@@ -105,9 +112,9 @@ class ConductivityUQResult:
     placement: Placement
     coil_name: str
     didt: float
-    peak_samples: npt.NDArray[np.float64]  # (n_samples,) gray-matter peak |E|
-    focality_samples: npt.NDArray[np.float64]  # (n_samples,) stimulated volume (m^3)
-    peak_location_samples: npt.NDArray[np.float64]  # (n_samples, 3) peak location (mm)
+    peak_samples: npt.NDArray[np.float64] | None  # (n_samples,) gray-matter peak |E|
+    focality_samples: npt.NDArray[np.float64] | None  # (n_samples,) stimulated volume (m^3)
+    peak_location_samples: npt.NDArray[np.float64] | None  # (n_samples, 3) peak location (mm)
     roi_samples: dict[str, npt.NDArray[np.float64]]  # name -> (n_samples,) ROI mean |E|
     summary: ConductivityUQSummary | None = None
     # Which post-processing every array above describes. Provenance, not a switch.
@@ -193,7 +200,7 @@ class ConductivityUQResult:
         Moment arrays the run did not retain are absent from the file and load back as
         ``None``.
         """
-        if self.summary is None:
+        if self.summary is None and self.peak_samples is not None:
             raise ValueError(
                 "This result has no summary to save; call compute_summary() first "
                 "(results from Subject already carry one)."
@@ -212,14 +219,17 @@ class ConductivityUQResult:
                     continue
                 h5f.create_dataset(name, data=cp.asnumpy(arr), compression="gzip")
             h5f.create_dataset("sigma_samples", data=np.asarray(self.sigma_samples))
-            grp = h5f.create_group("summary")
-            write_metrics(grp.create_group("mean_field"), self.summary.mean_field)
-            grp.attrs["max_local_cov"] = self.summary.max_local_cov
+            if self.summary is not None:
+                grp = h5f.create_group("summary")
+                write_metrics(grp.create_group("mean_field"), self.summary.mean_field)
+                grp.attrs["max_local_cov"] = self.summary.max_local_cov
             roi = h5f.create_group("roi_samples")
             for roi_name, arr in self.roi_samples.items():
                 roi.create_dataset(roi_name, data=np.asarray(arr))
             for name in ("peak_samples", "focality_samples", "peak_location_samples"):
-                h5f.create_dataset(name, data=np.asarray(getattr(self, name)))
+                arr = getattr(self, name)
+                if arr is not None:
+                    h5f.create_dataset(name, data=np.asarray(arr))
             h5f.attrs["format_version"] = _FORMAT_VERSION
             h5f.attrs["recovery"] = self.recovery
             h5f.attrs["n_samples"] = self.n_samples
@@ -256,12 +266,16 @@ class ConductivityUQResult:
                 didt=float(h5f.attrs["didt"]),
                 recovery=cast("Recovery", str(h5f.attrs.get("recovery", "raw"))),
                 provenance=read_provenance(h5f),
-                summary=ConductivityUQSummary(
-                    mean_field=read_metrics(h5f["summary"]["mean_field"]),
-                    max_local_cov=float(h5f["summary"].attrs["max_local_cov"]),
+                summary=(
+                    ConductivityUQSummary(
+                        mean_field=read_metrics(h5f["summary"]["mean_field"]),
+                        max_local_cov=float(h5f["summary"].attrs["max_local_cov"]),
+                    )
+                    if "summary" in h5f
+                    else None
                 ),
                 roi_samples={k: np.asarray(v) for k, v in h5f["roi_samples"].items()},
-                peak_samples=np.asarray(h5f["peak_samples"]),
-                focality_samples=np.asarray(h5f["focality_samples"]),
-                peak_location_samples=np.asarray(h5f["peak_location_samples"]),
+                peak_samples=opt_array(h5f, "peak_samples"),
+                focality_samples=opt_array(h5f, "focality_samples"),
+                peak_location_samples=opt_array(h5f, "peak_location_samples"),
             )
