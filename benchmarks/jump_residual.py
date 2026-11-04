@@ -28,6 +28,7 @@ from itertools import combinations
 import numpy as np
 
 from benchmarks import _data, _exact, _measure, _run
+from benchmarks.recovery_in_practice import median_ci
 
 NODAL = ("harmonic", "spr_tissue", "spr_global")
 DEFICIT_EDGES = (1e-3, 1e-2, 1e-1)
@@ -36,10 +37,11 @@ _FACES = np.array([[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]])
 _TAGS = 64
 
 
-def _geometry(nodes, tets, tags, on_surface, slot_node, slot_tag) -> dict:
-    """Interface faces, and per (node, tissue pair) the normal, deficit and tissue count."""
-    faces = np.sort(tets[:, _FACES].reshape(-1, 3), axis=1).astype(np.int64)
-    key = (faces[:, 0] << 42) | (faces[:, 1] << 21) | faces[:, 2]
+def interface_faces(nodes, tets, tags) -> tuple[np.ndarray, ...]:
+    """Faces between tissues: their sorted nodes, the elements on the lower and the higher tag,
+    and each face's normal, from the lower tag to the higher, with twice its area as length."""
+    faces = np.sort(tets[:, _FACES].reshape(-1, 3), axis=1)
+    key = np.ravel_multi_index(faces.T, (len(nodes),) * 3)
     order = np.argsort(key, kind="stable")
     shared = np.flatnonzero(key[order][1:] == key[order][:-1])
     a, b = order[shared] // 4, order[shared + 1] // 4
@@ -47,11 +49,17 @@ def _geometry(nodes, tets, tags, on_surface, slot_node, slot_tag) -> dict:
     a, b, tri = a[mixed], b[mixed], faces[order[shared[mixed]]]
     lo, hi = np.where(tags[a] < tags[b], a, b), np.where(tags[a] < tags[b], b, a)
     p = nodes[tri]
-    cross = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
-    area = np.linalg.norm(cross, axis=1)
-    normal = cross / area[:, None]
+    normal = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
     step = nodes[tets[hi]].mean(1) - nodes[tets[lo]].mean(1)
     normal *= np.sign(np.einsum("ij,ij->i", normal, step))[:, None]
+    return tri, lo, hi, normal
+
+
+def _geometry(nodes, tets, tags, on_surface, slot_node, slot_tag) -> dict:
+    """Interface faces, and per (node, tissue pair) the normal, deficit and tissue count."""
+    tri, lo, hi, doubled = interface_faces(nodes, tets, tags)
+    area = np.linalg.norm(doubled, axis=1)
+    normal = doubled / area[:, None]
 
     corner = tri.ravel() * _TAGS**2 + np.repeat(tags[lo] * _TAGS + tags[hi], 3)
     pair, inverse = np.unique(corner, return_inverse=True)
@@ -207,19 +215,6 @@ def _surface(subject) -> np.ndarray:
     return cp.asnumpy(outer_boundary_nodes(ctx.tet_nodes, ctx.n_nodes)).astype(bool)
 
 
-def _subject_ci(values: np.ndarray, groups: np.ndarray, n: int = 10_000) -> list[float]:
-    """95% bootstrap interval of the median, resampling subjects rather than cases."""
-    rng = np.random.default_rng(0)
-    by_group = [values[groups == g] for g in np.unique(groups)]
-    medians = [
-        np.median(
-            np.concatenate([by_group[i] for i in rng.integers(0, len(by_group), len(by_group))])
-        )
-        for _ in range(n)
-    ]
-    return [float(v) for v in np.percentile(medians, [2.5, 97.5])]
-
-
 def _cohort(cases: list[dict]) -> dict:
     groups = np.array([c["subject"] for c in cases])
 
@@ -236,8 +231,7 @@ def _cohort(cases: list[dict]) -> dict:
     for field in ("normal_current", "tangential_field"):
         out[field] = {}
         for mode in (*NODAL, "raw"):
-            v = column(mode, field)
-            out[field][mode] = {"median": float(np.median(v)), "ci95": _subject_ci(v, groups)}
+            out[field][mode] = median_ci(column(mode, field), groups)
     harmonic = column("harmonic", "normal_current")
     out["ratio_to_harmonic"] = {
         m: dict(

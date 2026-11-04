@@ -1,7 +1,7 @@
 """Speed per placement at matched accuracy, with each code in turn supplying the reference.
 
 Backs the matched-accuracy speedups of the cuNIBS paper (abstract and the cost section). The two
-codes stop at different residuals: cuNIBS at 1e-6 by default, SimNIBS's ``hypre`` at a fixed 1e-10,
+codes stop at different residuals: cuNIBS at 1e-5 by default, SimNIBS's ``hypre`` at a fixed 1e-10,
 and its three direct backends at none. So cuNIBS sweeps its tolerance and SimNIBS contributes one
 point per backend, each a time per placement and a distance from a reference field.
 

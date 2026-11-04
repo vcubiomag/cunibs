@@ -27,24 +27,22 @@ N_DRAWS = 500
 
 def _bounding_tet(tris: np.ndarray, tets: np.ndarray) -> np.ndarray:
     """For each triangle, the index into ``tets`` of the tetrahedron that has it as a face."""
-    # Three node indices packed into one int64 key, 21 bits each.
-    if max(int(tris.max()), int(tets.max())) >= 1 << 21:
-        raise ValueError("node indices exceed the 21-bit face key")
+    n = max(int(tris.max()), int(tets.max())) + 1
     faces = np.sort(
         np.concatenate(
             [tets[:, [1, 2, 3]], tets[:, [0, 2, 3]], tets[:, [0, 1, 3]], tets[:, [0, 1, 2]]]
         ),
         axis=1,
-    ).astype(np.int64)
+    )
     owner = np.tile(np.arange(len(tets)), 4)
 
     def key(f: np.ndarray) -> np.ndarray:
-        return (f[:, 0] << 42) | (f[:, 1] << 21) | f[:, 2]
+        return np.ravel_multi_index(f.T, (n, n, n))
 
     k = key(faces)
     order = np.argsort(k, kind="stable")
     k, owner = k[order], owner[order]
-    q = key(np.sort(tris, axis=1).astype(np.int64))
+    q = key(np.sort(tris, axis=1))
     at = np.searchsorted(k, q)
     found = (at < len(k)) & (k[np.minimum(at, len(k) - 1)] == q)
     if not found.all():
@@ -55,8 +53,6 @@ def _bounding_tet(tris: np.ndarray, tets: np.ndarray) -> np.ndarray:
 
 
 def run(ctx: _run.Context) -> dict | None:
-    import cupy as cp
-
     from cunibs import Coil, Subject
     from cunibs.uq import ConductivityUQConfig
 
@@ -119,7 +115,6 @@ def run(ctx: _run.Context) -> dict | None:
         **{k: np.asarray(v, np.float32) for k, v in maps.items()},
     )
     subject.free()
-    cp.get_default_memory_pool().free_all_blocks()
     return {
         "subject": sid,
         "target": "C3",

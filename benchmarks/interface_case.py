@@ -1,11 +1,10 @@
 """What each recovery rule does at a gray-matter/CSF interface, in one typical subject-target pair.
 
-Backs the recovery paper's interface figure and the numbers around it: at gray-matter/CSF nodes
-``spr_tissue`` reports the gray-matter normal field at a median 1.03 times the ``harmonic`` value,
-and ``spr_global``, which holds one value per node, at 0.64 of the gray-matter value and 2.03 of
-the CSF value (the figure's dashed slope); interface tetrahedra are 90.2% of gray matter; and the
-5th to 95th percentile of each rule's |E| difference from ``harmonic`` in interface and interior
-gray-matter tetrahedra.
+Backs the recovery paper's interface figure and the numbers around it: the median ratio of each
+rule's normal field to ``harmonic``'s on each side of gray-matter/CSF nodes, which for
+``spr_global``, holding one value per node, is the figure's dashed slope; the share of gray matter
+in interface tetrahedra; and the 5th to 95th percentile of each rule's |E| difference from
+``harmonic`` in interface and interior gray-matter tetrahedra.
 
 The pair is the one from ``recovery_in_practice`` whose ``spr_global``-to-``harmonic`` peak
 displacement is nearest the cohort median, so the case is typical rather than chosen to make the
@@ -23,11 +22,11 @@ from __future__ import annotations
 import numpy as np
 
 from benchmarks import _data, _run
+from benchmarks.jump_residual import interface_faces
+from cunibs import RECOVERY_MODES as MODES
 
-MODES = ("raw", "spr_global", "spr_tissue", "harmonic")
 NODAL = MODES[1:]
 GRAY_MATTER, CSF = 2, 3
-FACES = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
 N_SCATTER = 700
 
 
@@ -46,23 +45,9 @@ def _case(payoff: dict) -> dict:
 
 def _interface_normals(nodes, tets, tags) -> tuple[np.ndarray, np.ndarray]:
     """Nodes on a gray-matter/CSF face and their area-weighted normals, gray matter to CSF."""
-    cells = np.flatnonzero((tags == GRAY_MATTER) | (tags == CSF))
-    faces = np.sort(tets[cells][:, FACES].reshape(-1, 3), axis=1)
-    owner = np.repeat(cells, 4)
-    n = np.int64(len(nodes))
-    key = (faces[:, 0] * n + faces[:, 1]) * n + faces[:, 2]
-    order = np.argsort(key, kind="stable")
-    shared = np.flatnonzero(key[order][1:] == key[order][:-1])
-    a, b = owner[order[shared]], owner[order[shared + 1]]
-    keep = tags[a] != tags[b]
-    tri = faces[order[shared[keep]]]
-    gm = np.where(tags[a[keep]] == GRAY_MATTER, a[keep], b[keep])
-    csf = np.where(tags[a[keep]] == GRAY_MATTER, b[keep], a[keep])
-    p = nodes[tri]
-    # Twice the face area times its unit normal, so summing them weights by area.
-    normal = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
-    step = nodes[tets[csf]].mean(axis=1) - nodes[tets[gm]].mean(axis=1)
-    normal *= np.sign(np.einsum("ij,ij->i", normal, step))[:, None]
+    tri, lo, hi, normal = interface_faces(nodes, tets, tags)
+    pair = (tags[lo] == GRAY_MATTER) & (tags[hi] == CSF)
+    tri, normal = tri[pair], normal[pair]
     total = np.zeros_like(nodes)
     np.add.at(total, tri.ravel(), np.repeat(normal, 3, axis=0))
     on = np.unique(tri)

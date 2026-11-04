@@ -2,11 +2,9 @@
 
 Backs the recovery paper's payoff table and the results around it. Every subject-target pair is
 solved under each of the four rules, and each rule is compared with ``harmonic``: the median
-change in peak |E|, the 99th and 99.9th percentiles, the ROI mean and focality (+11.1% peak for
-raw, -2.31% for spr_global, ...); the median peak displacement (5.13, 1.84 and 0.69 mm) with 95%
-bootstrap intervals ([2.88, 7.02] mm for raw); the share of pairs whose peak stays in the same
-element (8% to 34%) and the largest displacement (38.6 to 73.5 mm). Every pair of rules is
-reported, not only pairs with ``harmonic``.
+change in peak |E|, the 99th and 99.9th percentiles, the ROI mean and focality; the median peak
+displacement with 95% bootstrap intervals; the share of pairs whose peak stays in the same element
+and the largest displacement. Every pair of rules is reported, not only pairs with ``harmonic``.
 
 All quantities are over gray matter, volume weighted. The center of gravity is the volume- and
 |E|-weighted centroid of elements above half the 99.9th percentile, and focality the volume above
@@ -17,8 +15,7 @@ target. Intervals resample subjects, not pairs, because a subject's four targets
 error-in-context table places beside the cross-code, mesh and conductivity terms.
 
 ``coils`` repeats the displacement comparison with each of the 25 bundled coils (skipped in quick
-mode). A coil's footprint is the larger in-plane extent of its dipole set (65 to 222 mm). A coil
-dependence is only shown when the interquartile range of the per-coil medians exceeds the width
+mode). A coil's footprint is the larger in-plane extent of its dipole set. A coil dependence is only shown when the interquartile range of the per-coil medians exceeds the width
 of one coil's own bootstrap interval, which ``iqr_over_ci_width`` measures.
 
 ``ladder`` is how each rule's peak and percentiles move across the resolution ladder, with the
@@ -32,12 +29,10 @@ from itertools import combinations
 import numpy as np
 
 from benchmarks import _data, _fields, _measure, _run
+from cunibs import RECOVERY_MODES as MODES
 
-MODES = ("raw", "spr_global", "spr_tissue", "harmonic")
 PAIRS = tuple(combinations(MODES, 2))
 QUANTITIES = ("peak", "p99", "p99.9", "roi_mean", "focality")
-ROI_DEPTH_MM = 20.0
-ROI_RADIUS_MM = 10.0
 GRAY_MATTER = 2
 
 
@@ -65,15 +60,10 @@ def _dist(a, b) -> float:
 
 def _subject(sid, path, coils):
     from cunibs import Subject
-    from cunibs.head import project_to_scalp
 
     subject = Subject.from_mesh(path)
     placements = _data.placements(subject, path)
-    origins, inward = project_to_scalp(subject, [p.center_mm for p in placements])
-    rois = {
-        t: subject.roi(o + ROI_DEPTH_MM * n, ROI_RADIUS_MM)
-        for t, o, n in zip(_data.TARGETS, origins, inward, strict=True)
-    }
+    rois = dict(zip(_data.TARGETS, _data.rois(subject, placements), strict=True))
     primary = coils[_data.COIL]
     cases = [{"subject": sid, "target": t, "modes": {}} for t in _data.TARGETS]
     for mode in MODES:
@@ -98,7 +88,7 @@ def _subject(sid, path, coils):
     return cases, sweep
 
 
-def _median_ci(values, groups, n: int = 10_000) -> dict:
+def median_ci(values, groups, n: int = 10_000) -> dict:
     """Median, with a 95% interval from resampling whole groups."""
     by = {}
     for g, v in zip(groups, values, strict=True):
@@ -117,9 +107,9 @@ def _displacements(cases, groups) -> dict:
         )
         cog = np.array([_dist(c["modes"][a]["cog_mm"], c["modes"][b]["cog_mm"]) for c in cases])
         out[f"{a}__vs__{b}"] = {
-            "peak_shift_mm": _fields.quantiles(peak) | _median_ci(peak, groups),
+            "peak_shift_mm": _fields.quantiles(peak) | median_ci(peak, groups),
             "frac_same_element": float(np.mean(peak == 0)),
-            "cog_shift_mm": _fields.quantiles(cog) | _median_ci(cog, groups),
+            "cog_shift_mm": _fields.quantiles(cog) | median_ci(cog, groups),
         }
     return out
 
@@ -128,7 +118,7 @@ def _coil_invariance(sweep, groups, footprints) -> dict:
     pairs = {}
     for a, b in PAIRS:
         stats = {
-            coil: _median_ci([_dist(p[a], p[b]) for p in peaks], groups)
+            coil: median_ci([_dist(p[a], p[b]) for p in peaks], groups)
             for coil, peaks in sweep.items()
         }
         medians = np.array([s["median"] for s in stats.values()])
@@ -186,6 +176,8 @@ def _ladder_rung(rung, coil, cap_path, pose) -> tuple[dict, tuple]:
                 _data.DIDT,
                 recovery=op,
                 transforms=frame[None],
+                vectors=False,
+                potential=False,
             )
             s = gm.summarize(out["magnE"])
             row[mode] = {"peak": s["peak_magnE"]} | {

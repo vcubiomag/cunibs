@@ -45,6 +45,8 @@ def _rung(rung: _data.Rung, placement, frame: np.ndarray, center: np.ndarray) ->
             _data.DIDT,
             recovery=ensure_recovery(subject.context, "harmonic"),
             transforms=frame[None],
+            vectors=False,
+            potential=False,
         )
         magn = cp.asnumpy(result["magnE"])
         del result
@@ -64,14 +66,12 @@ def _rung(rung: _data.Rung, placement, frame: np.ndarray, center: np.ndarray) ->
 
 def _mesh_resolution(ctx: _run.Context) -> dict | None:
     from cunibs import Subject
-    from cunibs.head import project_to_scalp
 
     path = ctx.data.mesh(ctx.data.ladder[0].subject)
     subject = Subject.from_mesh(path)
     (placement,) = _data.placements(subject, path, labels=("C3",))
     (frame,) = _data.frames(subject, [placement])
-    origin, inward = project_to_scalp(subject, placement.center_mm[None])
-    center = origin[0] + _data.ROI_DEPTH_MM * inward[0]
+    (center,) = _data.roi_centers(subject, [placement])
     subject.free()
 
     rungs = ctx.data.ladder[:2] if ctx.quick else ctx.data.ladder

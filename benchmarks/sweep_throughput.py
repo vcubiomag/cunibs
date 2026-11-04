@@ -96,16 +96,11 @@ def run(ctx: _run.Context) -> dict:
 
     timing = ctx.latest("simnibs_timing")
     if timing and timing.get("configs"):
-        winner = timing["best"]["sweep"]
-        config = next(
-            c
-            for c in timing["configs"]
-            if c["solver"] == winner["solver"] and c["threads"] == winner["threads"]
-        )
+        config = min(timing["configs"], key=lambda c: c["steady_placement_s"])
         values["simnibs"] = {
             "machine": timing["machine"],
-            "solver": winner["solver"],
-            "threads": winner["threads"],
+            "solver": config["solver"],
+            "threads": config["threads"],
             "steady_placement_s": config["steady_placement_s"],
         }
         values["speedup"] = config["steady_placement_s"] * 1e3 / ms

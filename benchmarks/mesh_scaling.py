@@ -93,7 +93,7 @@ def run(ctx: _run.Context) -> dict:
 
     total_bytes = cp.cuda.runtime.memGetInfo()[1]
     values = {
-        "subject": ctx.data.ladder[0].subject if ctx.data.ladder else None,
+        "subject": rungs[0].subject,
         "coil": _data.COIL,
         "placements": PLACEMENTS,
         "block_width": PLACEMENTS,

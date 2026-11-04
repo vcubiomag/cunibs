@@ -1,10 +1,9 @@
 """How much of a head mesh sits at a tissue interface, and how often each rule stops fitting there.
 
-Backs the recovery-paper results that over the cohort a median 62.6% of nodes belong to more than
-one tissue, 93.3% of gray-matter tetrahedra have at least one such node, 1.1% of nodes belong to
-three or more tissues, ``spr_tissue`` uses its one-sided average for 81.4% of slots and
-``harmonic`` falls back to a lower rung for 1.5e-4 of slots. Each value is the median over subjects
-of a per-subject fraction.
+Backs the recovery-paper results on the share of nodes that belong to more than one tissue, of
+gray-matter tetrahedra with at least one such node, of nodes in three or more tissues, of slots
+where ``spr_tissue`` uses its one-sided average and of slots where ``harmonic`` falls back to the
+linear rung or to no fit. Each value is the median over subjects of a per-subject fraction.
 
 A slot is a (node, tissue) pair, and a node's tissue count is how many slots it has. ``spr_tissue``
 replaces the fit with the tissue's volume-weighted average at every slot on the boundary of its

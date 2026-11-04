@@ -76,16 +76,8 @@ def run(ctx: _run.Context) -> dict:
 
     simnibs = ctx.latest("simnibs_timing")
     if simnibs and simnibs.get("configs"):
-
-        def config(case):
-            best = simnibs["best"][case]
-            return next(
-                c
-                for c in simnibs["configs"]
-                if c["solver"] == best["solver"] and c["threads"] == best["threads"]
-            )
-
-        cold, sweep = config("cold"), config("sweep")
+        cold = min(simnibs["configs"], key=lambda c: c["cold_s"])
+        sweep = min(simnibs["configs"], key=lambda c: c["steady_placement_s"])
         s = {k: v * 1e3 for k, v in cold["setup_s"].items()}
         warm_ms = values["placement_ms"]["simulate"]["median"]
         values["simnibs"] = {

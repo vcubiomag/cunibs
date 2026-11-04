@@ -1,9 +1,8 @@
 """Self-convergence of the four recovery rules at tissue interfaces, over the resolution ladder.
 
-Backs the recovery-paper result that over an eight-rung ladder with 400 interface and 400 interior
-probes the interface orders were 2.35 (raw), 1.96 (spr_global), 2.26 (spr_tissue) and 2.38
-(harmonic), with interior orders in the same range. Also backs the cuNIBS-paper result that
-deriving the pose on each rung from the same scalp target tilts the coil by 0.69 to 1.29 degrees.
+Backs the recovery-paper interface and interior orders over the ladder, with 400 probes of each,
+and the cuNIBS-paper result on how far deriving the pose on each rung from the same scalp target
+tilts the coil.
 
 Rungs have different elements, so each field is reduced to mesh-independent functionals: the
 volume-weighted mean of gray-matter |E| in a 2.5 mm ball around a fixed point. The points are
@@ -24,8 +23,8 @@ from __future__ import annotations
 import numpy as np
 
 from benchmarks import _data, _fields, _measure, _run
+from cunibs import RECOVERY_MODES as MODES
 
-MODES = ("raw", "spr_global", "spr_tissue", "harmonic")
 FAMILIES = ("interface", "interior")
 PROBE_RADIUS_MM = 2.5
 N_PROBES = 400
@@ -78,6 +77,8 @@ def _measure_rung(subject, coil, placement, frame, probes) -> dict:
             _data.DIDT,
             recovery=op,
             transforms=frame[None],
+            vectors=False,
+            potential=False,
         )
         functionals[mode] = cp.asnumpy(
             cp.stack([roi_mean(out["magnE"], r.elem_idx, r.weights) for r in rois])

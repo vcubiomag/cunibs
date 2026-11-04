@@ -81,18 +81,8 @@ def _cholesky(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def _gradient_rows(low: np.ndarray) -> np.ndarray:
     """Rows 1 to 3 of the inverse normal matrix, the gradient in the scaled frame."""
-    n, size, _ = low.shape
-    z = np.zeros((n, 3, size))
-    for c in range(3):
-        y = np.zeros((n, size))
-        for i in range(size):
-            y[:, i] = (
-                float(i == c + 1) - np.einsum("bk,bk->b", low[:, i, :i], y[:, :i])
-            ) / low[:, i, i]
-        for i in reversed(range(size)):
-            rest = np.einsum("bk,bk->b", low[:, i + 1 :, i], z[:, c, i + 1 :])
-            z[:, c, i] = (y[:, i] - rest) / low[:, i, i]
-    return z
+    inv = np.linalg.inv(low)
+    return inv.transpose(0, 2, 1)[:, 1:4] @ inv
 
 
 def _fit(nodes_m, ptr, idx, slot_node, ladder):

@@ -13,8 +13,6 @@ gyri, so the hotspot distance is reported only as quantiles across pairs and nev
 
 from __future__ import annotations
 
-from typing import get_args
-
 import numpy as np
 
 from benchmarks import _data, _fields, _objective, _run
@@ -43,10 +41,9 @@ def _by_tissue(pairs) -> dict[str, list[float]]:
 def run(ctx: _run.Context) -> dict:
     from cunibs import Coil, Subject
     from cunibs.adm import resolve_target
-    from cunibs.mesh import TissueLabel
+    from cunibs.mesh import VOLUME_KEY_TO_LABEL
     from cunibs.uq import DEFAULT_TISSUE_COV, ConductivityUQConfig
 
-    names = dict(enumerate(get_args(TissueLabel.__value__), start=1))
     coil = Coil.load(_data.COIL)
     subjects = ctx.data.subjects
     if ctx.quick:
@@ -78,7 +75,8 @@ def run(ctx: _run.Context) -> dict:
                     "hotspot_max_mm": float(np.linalg.norm(loc - loc.mean(0), axis=1).max()),
                     "peak_unique": len(np.unique(loc, axis=0)) == 1,
                     "tissue_share": {
-                        names[t]: s for t, s in r.tissue_sensitivity("peak").items()
+                        VOLUME_KEY_TO_LABEL[t]: s
+                        for t, s in r.tissue_sensitivity("peak").items()
                     },
                 }
             )
@@ -88,7 +86,7 @@ def run(ctx: _run.Context) -> dict:
     return {
         "coil": _data.COIL,
         "n_draws": n,
-        "prior_cov": {names[t]: c for t, c in DEFAULT_TISSUE_COV.items()},
+        "prior_cov": {VOLUME_KEY_TO_LABEL[t]: c for t, c in DEFAULT_TISSUE_COV.items()},
         "pairs": pairs,
         "cohort": {
             "n_pairs": len(pairs),

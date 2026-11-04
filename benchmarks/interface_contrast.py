@@ -1,9 +1,9 @@
 """The conductivity contrast at a head mesh's interfaces, and at the reported peak.
 
-Backs the recovery-paper results that the median contrast at mixed nodes is 6.015 (CSF over gray
-matter); that 93.0% of gray-matter tetrahedra have a contrast above 2 and 55% one in (5, 20]; that
-152 of the 160 ``harmonic`` peaks sit at a contrast in (5, 20] and none inside a single tissue;
-and that stratifying the peak displacements by that contrast moves them by at most 0.15 mm.
+Backs the recovery-paper results on the median contrast at mixed nodes; the share of gray-matter
+tetrahedra with a contrast above 2 and in (5, 20]; how many ``harmonic`` peaks sit in each contrast
+bin and whether any sits inside a single tissue; and how far stratifying the peak displacements by
+that contrast moves them.
 
 A node's contrast is the largest over the smallest conductivity among its incident tetrahedra,
 the factor by which the normal component of E jumps there; 1 means the node is inside one tissue.

@@ -22,9 +22,9 @@ import numpy as np
 
 from benchmarks import _data, _exact, _fields, _measure, _run
 from benchmarks._simnibs import mesh_arrays
+from cunibs import RECOVERY_MODES as MODES
 
 SUBDIVISIONS = (2, 3, 4, 5)
-MODES = ("raw", "spr_global", "spr_tissue", "harmonic")
 DISTANCE_MM = 10.0
 TIGHT_TOLERANCE = 1e-10
 
