@@ -21,8 +21,6 @@ import numpy as np
 
 from benchmarks import _data, _run
 
-GRAY_MATTER = 2
-
 
 def _diff(a: np.ndarray, b: np.ndarray) -> dict:
     return {
@@ -34,7 +32,9 @@ def _diff(a: np.ndarray, b: np.ndarray) -> dict:
 
 
 def _gm_digest(result) -> str:
-    return hashlib.sha256(result.magnE[result.tet_tags == GRAY_MATTER].tobytes()).hexdigest()
+    return hashlib.sha256(
+        result.magnE[result.tet_tags == _data.GRAY_MATTER].tobytes()
+    ).hexdigest()
 
 
 def _probe(mesh_path):

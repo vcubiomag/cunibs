@@ -34,12 +34,11 @@ from cunibs import RECOVERY_MODES as MODES
 
 PAIRS = tuple(combinations(MODES, 2))
 QUANTITIES = ("peak", "p99", "p99.9", "roi_mean", "focality")
-GRAY_MATTER = 2
 
 
 def _metrics(result, roi: str) -> dict:
     s = result.summary
-    gm = np.flatnonzero(result.tet_tags == GRAY_MATTER)
+    gm = np.flatnonzero(result.tet_tags == _data.GRAY_MATTER)
     m = result.magnE[gm].astype(np.float64)
     above = m >= 0.5 * s["distribution"]["p99.9"]
     w = (m * result.vols[gm])[above]
@@ -164,7 +163,7 @@ def _ladder_rung(rung, coil, cap_path, pose) -> tuple[dict, tuple]:
         placement, frame = pose
         c = subject.context
         gm = region_slice(c.vols, c.tet_barycenters_mm, c.tet_tags, "gray_matter")
-        site = [(placement.center_mm, placement.handle_mm, placement.distance_mm)]
+        site = _data.sites([placement])
         row = {}
         for mode in MODES:
             # Built uncached, so one operator at a time is resident on the finest rungs.

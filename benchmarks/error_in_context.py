@@ -32,7 +32,6 @@ def _rung(rung: _data.Rung, placement, frame: np.ndarray, center: np.ndarray) ->
 
     from cunibs import Coil, Subject
     from cunibs.fem import ensure_recovery, solve_placements_block
-    from cunibs.metrics import region_tag
 
     subject = Subject.from_mesh(rung.path)
     try:
@@ -41,7 +40,7 @@ def _rung(rung: _data.Rung, placement, frame: np.ndarray, center: np.ndarray) ->
             subject.context,
             coil.positions_m,
             coil.moments,
-            [(placement.center_mm, placement.handle_mm, placement.distance_mm)],
+            _data.sites([placement]),
             _data.DIDT,
             recovery=ensure_recovery(subject.context, "harmonic"),
             transforms=frame[None],
@@ -51,7 +50,7 @@ def _rung(rung: _data.Rung, placement, frame: np.ndarray, center: np.ndarray) ->
         magn = cp.asnumpy(result["magnE"])
         del result
         mesh = subject.mesh
-        gm = mesh.tet_tags == region_tag("gray_matter")
+        gm = mesh.tet_tags == _data.GRAY_MATTER
         w = _fields.tet_volumes(mesh.nodes_mm, mesh.tet_nodes)
         roi = cp.asnumpy(subject.roi(center, radius_mm=_data.ROI_RADIUS_MM).elem_idx)
         return {

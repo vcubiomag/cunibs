@@ -81,11 +81,9 @@ def _coil(ctx, subject, name, frame, sample, mesh) -> dict:
 
 
 def run(ctx: _run.Context) -> dict:
-    from cunibs import Subject, bundled_coils
+    from cunibs import bundled_coils
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     frame = _data.frames(subject, _data.placements(subject, path, labels=("C3",)))[0]
     rng = np.random.default_rng(0)
     sample = rng.choice(subject.mesh.n_nodes, SAMPLED_NODES, replace=False)

@@ -19,12 +19,10 @@ from benchmarks import _data, _fields, _measure, _run
 def run(ctx: _run.Context) -> dict:
     import cupy as cp
 
-    from cunibs import Coil, Subject, bundled_coils
+    from cunibs import Coil, bundled_coils
     from cunibs.fem import coil_dadt_at_nodes
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     (placement,) = _data.placements(subject, path, labels=("C3",))
     frame = cp.asarray(_data.frames(subject, [placement])[0])
     nodes = subject.context.nodes_mm

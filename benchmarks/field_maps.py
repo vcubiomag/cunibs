@@ -20,7 +20,6 @@ from benchmarks._simnibs import mesh_arrays
 
 FILENAME = "field_maps.npz"
 GM_SURFACE = 1002
-GRAY_MATTER = 2
 RADIUS_MM = 40.0
 N_DRAWS = 500
 
@@ -53,12 +52,10 @@ def _bounding_tet(tris: np.ndarray, tets: np.ndarray) -> np.ndarray:
 
 
 def run(ctx: _run.Context) -> dict | None:
-    from cunibs import Coil, Subject
+    from cunibs import Coil
     from cunibs.uq import ConductivityUQConfig
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     mesh = subject.mesh
     placements = _data.placements(subject, path)
     frames = _data.frames(subject, placements)
@@ -90,7 +87,7 @@ def run(ctx: _run.Context) -> dict | None:
 
     (center,) = _data.roi_centers(subject, [placement])
     nodes = mesh.nodes_mm
-    gm_tets = np.flatnonzero(mesh.tet_tags == GRAY_MATTER)
+    gm_tets = np.flatnonzero(mesh.tet_tags == _data.GRAY_MATTER)
     tris = mesh.surf_tris[mesh.surf_tags == GM_SURFACE]
     near = np.linalg.norm(nodes[tris].mean(axis=1) - center, axis=1) <= RADIUS_MM
     tris = tris[near]

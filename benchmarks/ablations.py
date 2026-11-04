@@ -115,20 +115,17 @@ def _ds_cg(subject, coil, placement, gm, w) -> dict:
 def run(ctx: _run.Context) -> dict:
     import cupy as cp
 
-    from cunibs import Coil, Subject
+    from cunibs import Coil
     from cunibs.fem import ensure_recovery, solve_placements_block
     from cunibs.fem.solve import AggregationParams, aggregation_levels
-    from cunibs.metrics import region_tag
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     coil = Coil.load(_data.COIL)
     angles = _data.HANDLE_ANGLE_DEG + 360.0 * np.arange(max(WIDTHS)) / max(WIDTHS)
     placements = _data.placements(subject, path, labels=("C3",), angles_deg=angles)
     placement = placements[0]
     mesh = subject.mesh
-    gm = mesh.tet_tags == region_tag("gray_matter")
+    gm = mesh.tet_tags == _data.GRAY_MATTER
     w = _fields.tet_volumes(mesh.nodes_mm, mesh.tet_nodes)[gm]
     context = subject.context
     solver = context.solver
@@ -156,7 +153,7 @@ def run(ctx: _run.Context) -> dict:
         }
 
     operator = ensure_recovery(context, "harmonic")
-    sites = [(p.center_mm, p.handle_mm, p.distance_mm) for p in placements]
+    sites = _data.sites(placements)
     widths = {}
     for k in WIDTHS:
 

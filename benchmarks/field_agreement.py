@@ -36,7 +36,6 @@ def _subject(ctx: _run.Context, sid: str) -> list[dict] | None:
     import cupy as cp
 
     from cunibs import RECOVERY_MODES, Coil, Subject
-    from cunibs.metrics import region_tag
 
     path = ctx.data.mesh(sid)
     subject = Subject.from_mesh(path)
@@ -57,7 +56,7 @@ def _subject(ctx: _run.Context, sid: str) -> list[dict] | None:
     if response is None:
         subject.free()
         return None
-    gm = mesh.tet_tags == region_tag("gray_matter")
+    gm = mesh.tet_tags == _data.GRAY_MATTER
     # Only gray matter is compared, so only gray matter is held; ROIs are gray matter too.
     simnibs = {out: response[1][out][:, gm] for out in OUTPUTS}
     del response

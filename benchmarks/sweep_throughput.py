@@ -25,12 +25,10 @@ WIDTHS = (1, 2, 4, 8)
 
 
 def run(ctx: _run.Context) -> dict:
-    from cunibs import Coil, Subject
+    from cunibs import Coil
     from cunibs.fem import ensure_recovery, solve_placements_block
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     coil = Coil.load(_data.COIL)
     sizes = (1, 4, 16) if ctx.quick else SIZES
     repeats = 2 if ctx.quick else 5
@@ -38,7 +36,7 @@ def run(ctx: _run.Context) -> dict:
     angles = _data.HANDLE_ANGLE_DEG + 360.0 * np.arange(n) / n
     placements = _data.placements(subject, path, labels=("C3",), angles_deg=angles)
     transforms = _data.frames(subject, placements)
-    sites = [(p.center_mm, p.handle_mm, p.distance_mm) for p in placements]
+    sites = _data.sites(placements)
     operator = ensure_recovery(subject.context, "harmonic")
 
     def sweep(m: int) -> None:

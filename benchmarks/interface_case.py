@@ -26,7 +26,7 @@ from benchmarks.jump_residual import interface_faces
 from cunibs import RECOVERY_MODES as MODES
 
 NODAL = MODES[1:]
-GRAY_MATTER, CSF = 2, 3
+CSF = 3
 N_SCATTER = 700
 
 
@@ -46,7 +46,7 @@ def _case(payoff: dict) -> dict:
 def _interface_normals(nodes, tets, tags) -> tuple[np.ndarray, np.ndarray]:
     """Nodes on a gray-matter/CSF face and their area-weighted normals, gray matter to CSF."""
     tri, lo, hi, normal = interface_faces(nodes, tets, tags)
-    pair = (tags[lo] == GRAY_MATTER) & (tags[hi] == CSF)
+    pair = (tags[lo] == _data.GRAY_MATTER) & (tags[hi] == CSF)
     tri, normal = tri[pair], normal[pair]
     total = np.zeros_like(nodes)
     np.add.at(total, tri.ravel(), np.repeat(normal, 3, axis=0))
@@ -75,7 +75,7 @@ def run(ctx: _run.Context) -> dict:
     tets, tags = mesh.tet_nodes.astype(np.int64), mesh.tet_tags
     node, normal = _interface_normals(mesh.nodes_mm, tets, tags)
     surface = cp.asnumpy(outer_boundary_nodes(subject.context.tet_nodes, mesh.n_nodes)) > 0
-    gm = tags == GRAY_MATTER
+    gm = tags == _data.GRAY_MATTER
 
     coil = Coil.load(_data.COIL)
     magn, side = {}, {}
@@ -119,7 +119,7 @@ def run(ctx: _run.Context) -> dict:
             row += [f"{v:.6g}" for v in (med, q1, q3, p5, p95)]
         rows.append(" ".join(row))
 
-    contrast = TISSUE_CONDUCTIVITY[CSF] / TISSUE_CONDUCTIVITY[GRAY_MATTER]
+    contrast = TISSUE_CONDUCTIVITY[CSF] / TISSUE_CONDUCTIVITY[_data.GRAY_MATTER]
     where = f"case: {case['subject']} {case['target']}"
     _write(
         ctx.artifact("interface_effect.dat"),

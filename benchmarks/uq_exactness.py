@@ -43,7 +43,7 @@ def _paired(fast: np.ndarray, ref: np.ndarray) -> dict:
 def run(ctx: _run.Context) -> dict:
     import cupy as cp
 
-    from cunibs import Coil, Subject
+    from cunibs import Coil
     from cunibs.adm import resolve_target
     from cunibs.fem import ensure_recovery
     from cunibs.uq import (
@@ -52,9 +52,7 @@ def run(ctx: _run.Context) -> dict:
         run_conductivity_uq,
     )
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     coil = Coil.load(_data.COIL)
     (placement,) = _data.placements(subject, path, labels=("C3",))
     roi = resolve_target(subject, _objective.cortical_target(subject, placement))

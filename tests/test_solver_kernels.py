@@ -943,7 +943,9 @@ def test_counting_no_segments_still_writes_the_one_offset(cp):
     none = cp.empty(0, dtype=cp.int32)
     zero = cp.zeros(1, dtype=cp.int32)
     out = cp.full(1, -1, dtype=cp.int32)
-    assert count_incident_node_csr(cp.empty((0, 4), dtype=cp.int32), zero, none, out, stream) == 0
+    assert (
+        count_incident_node_csr(cp.empty((0, 4), dtype=cp.int32), zero, none, out, stream) == 0
+    )
     assert int(out[0]) == 0
     out = cp.full(1, -1, dtype=cp.int32)
     assert count_patch_csr(zero, none, none, 16, out, stream) == 0

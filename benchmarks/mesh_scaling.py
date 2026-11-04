@@ -39,7 +39,7 @@ def _rung(ctx: _run.Context, rung: _data.Rung) -> dict:
                 subject, ctx.data.mesh(rung.subject), labels=("C3",), angles_deg=angles
             )
             transforms = _data.frames(subject, placements)
-            sites = [(p.center_mm, p.handle_mm, p.distance_mm) for p in placements]
+            sites = _data.sites(placements)
 
             def sweep():
                 return solve_placements_block(

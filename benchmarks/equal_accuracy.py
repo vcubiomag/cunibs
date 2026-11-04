@@ -60,17 +60,14 @@ def _matched(cunibs: list[dict], simnibs: dict[str, dict], score: str) -> dict:
 
 
 def run(ctx: _run.Context) -> dict:
-    from cunibs import Coil, Subject
-    from cunibs.metrics import region_tag
+    from cunibs import Coil
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     coil = Coil.load(_data.COIL)
     (placement,) = _data.placements(subject, path, labels=("C3",))
     frame = _data.frames(subject, [placement])
     mesh = subject.mesh
-    gm = mesh.tet_tags == region_tag("gray_matter")
+    gm = mesh.tet_tags == _data.GRAY_MATTER
     w = _fields.tet_volumes(mesh.nodes_mm, mesh.tet_nodes)[gm]
 
     def field():

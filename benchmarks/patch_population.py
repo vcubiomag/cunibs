@@ -17,9 +17,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from benchmarks import _fields, _measure, _run
-
-GRAY_MATTER = 2
+from benchmarks import _data, _fields, _measure, _run
 
 
 def _subject(path) -> dict:
@@ -35,7 +33,7 @@ def _subject(path) -> dict:
     tags_per_node = np.bincount(cp.asnumpy(tissue.slot_node), minlength=ctx.n_nodes)
     boundary = cp.asnumpy(tissue_boundary_nodes(ctx.tet_nodes, ctx.n_nodes, tissue.slot_node))
     tet_nodes, tet_tags = subject.mesh.tet_nodes, subject.mesh.tet_tags
-    gm = tet_tags == GRAY_MATTER
+    gm = tet_tags == _data.GRAY_MATTER
     row = {
         "n_nodes": int(ctx.n_nodes),
         "n_tets": int(tet_tags.size),

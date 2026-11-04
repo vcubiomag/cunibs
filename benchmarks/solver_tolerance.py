@@ -18,24 +18,21 @@ from benchmarks import _data, _fields, _run
 
 TOLERANCES = (1e-4, 1e-5, 1e-6, 1e-8, 1e-10)
 REFERENCE = 1e-12
-GRAY_MATTER = 2
 
 
 def run(ctx: _run.Context) -> dict:
     import cupy as cp
 
-    from cunibs import Coil, Subject
+    from cunibs import Coil
     from cunibs.fem import coil_dadt_at_nodes, solve_placement
     from cunibs.fem.solve import _assemble_rhs
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     coil = Coil.load(_data.COIL)
     (placement,) = _data.placements(subject, path, labels=("C3",))
     solver = subject.context.solver
     mesh = subject.mesh
-    gm = mesh.tet_tags == GRAY_MATTER
+    gm = mesh.tet_tags == _data.GRAY_MATTER
     vols = _fields.tet_volumes(mesh.nodes_mm, mesh.tet_nodes)[gm]
 
     def solve(tolerance: float) -> dict:
