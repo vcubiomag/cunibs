@@ -24,7 +24,9 @@
 // hundred candidates get a warp each and sort in shared memory, which a device-wide segmented sort
 // cannot match at that segment count. A handful of segments of tens of thousands materialise their
 // candidates and go through cub::DeviceSegmentedSort, which a warp per segment over global memory
-// cannot match at that width. Neither class caps how wide a segment may be.
+// cannot match at that width. Neither class caps how wide a segment may be. The shared class runs
+// in up to two launches of its own, for the same reason, since its pad sets every block's share of
+// shared memory.
 //
 // Sorting a multiset has one answer and duplicates are dropped by keeping the first of each equal
 // run, so no segment's output depends on how the work was scheduled or on which class handled it.
@@ -44,6 +46,10 @@ constexpr int kFastPad = 2048;
 static_assert(static_cast<std::size_t>(kFastPad) * sizeof(int) * kSortWarps <= kMaxSharedBytes);
 static_assert(std::has_single_bit(static_cast<unsigned>(kFastPad)),
               "the pad is rounded to a power of two, so the class boundary must be one");
+// The widest pad that leaves occupancy to registers rather than to shared memory. A rare node past
+// it would otherwise slow every other segment of the mesh, so those sort in a launch of their own.
+constexpr int kCommonPad = 512;
+static_assert(std::has_single_bit(static_cast<unsigned>(kCommonPad)) && kCommonPad < kFastPad);
 
 // The warp's index across the grid, for the kernels that put one segment on each.
 __device__ __forceinline__ int warp_in_grid() {
@@ -164,19 +170,22 @@ struct PatchGather {
     }
 };
 
-// The shared class's width, and how many segments fall outside it. Max and add are both
-// order-independent, so the atomics cost nothing in reproducibility. Values across a warp are
-// near-identical, which is the case the hardware's atomic coalescing handles well.
+// stats is the widest common segment, the widest tall one past kCommonPad, and how many segments
+// fall outside the shared class. Max and add are both order-independent, so the atomics cost
+// nothing in reproducibility. Values across a warp are near-identical, which is the case the
+// hardware's atomic coalescing handles well.
 //
-// kFastPad is a power of two, so `bit_ceil(n) > kFastPad` is just `n > kFastPad`. Both passes
-// classify from the same `size`, so both reach the same split from the same input.
+// Both boundaries are powers of two, so `bit_ceil(n) > boundary` is just `n > boundary`. Both
+// passes classify from the same `size`, so both reach the same split from the same input.
 template <typename Gather>
 __global__ void plan_kernel(Gather g, int* __restrict__ stats, int n_seg) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_seg) return;
     const int n = g.size(s);
     if (n > kFastPad) {
-        atomicAdd(stats + 1, 1);
+        atomicAdd(stats + 2, 1);
+    } else if (n > kCommonPad) {
+        atomicMax(stats + 1, n);
     } else {
         atomicMax(stats + 0, n);
     }
@@ -197,12 +206,13 @@ __global__ void compact_wide_kernel(Gather g, int* __restrict__ cursor, int* __r
     sizes[slot] = n;
 }
 
-// How the segments split: the shared class's padded width, and the wide segments with the candidate
-// offsets a segmented sort needs. The width is a max over a class and the membership test is per
-// segment, both order-independent, so the sizing and filling passes reach the same plan from the
-// same input.
+// How the segments split: the shared class's padded widths, tall_pad being 0 with no segment past
+// kCommonPad, and the wide segments with the candidate offsets a segmented sort needs. A width is
+// a max over a class and the membership test is per segment, both order-independent, so the sizing
+// and filling passes reach the same plan from the same input.
 struct SegmentPlan {
     int fast_pad = 1;
+    int tall_pad = 0;
     int n_wide = 0;
     int n_cand = 0;
     ScratchBuffer<int> wide_ids;
@@ -211,19 +221,20 @@ struct SegmentPlan {
 
 template <typename Gather>
 SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
-    const ScratchBuffer<int> stats = scratch_alloc<int>(2, stream, "pattern", "segment plan");
-    check_cuda(cudaMemsetAsync(stats.get(), 0, 2 * sizeof(int), stream), "memset(segment plan)");
+    const ScratchBuffer<int> stats = scratch_alloc<int>(3, stream, "pattern", "segment plan");
+    check_cuda(cudaMemsetAsync(stats.get(), 0, 3 * sizeof(int), stream), "memset(segment plan)");
     plan_kernel<<<grid_for(n_seg), kBlock, 0, stream>>>(g, stats.get(), n_seg);
     check_cuda(cudaGetLastError(), "segment plan launch");
 
-    int host[2] = {0, 0};
+    int host[3] = {0, 0, 0};
     check_cuda(cudaMemcpyAsync(host, stats.get(), sizeof(host), cudaMemcpyDeviceToHost, stream),
                "copy(segment plan)");
     check_cuda(cudaStreamSynchronize(stream), "sync(segment plan)");
 
     SegmentPlan plan;
     plan.fast_pad = static_cast<int>(std::bit_ceil(static_cast<unsigned>(host[0])));
-    plan.n_wide = host[1];
+    plan.tall_pad = host[1] ? static_cast<int>(std::bit_ceil(static_cast<unsigned>(host[1]))) : 0;
+    plan.n_wide = host[2];
     // A mesh of ordinary valence stops here, and none of the wide class runs at all.
     if (!plan.n_wide) return plan;
 
@@ -357,31 +368,38 @@ __device__ __forceinline__ void segment_unique_one(Gather g, const int* __restri
     if (lane == 0 && !Fill) counts[s] = kept;
 }
 
-// One warp per segment over the whole segment range, skipping what the wide class owns. With Fill
-// the distinct values go to out_idx at the row start the sizing pass scanned; without it only the
-// row's length is recorded.
+// One warp per segment over the whole segment range, taking those of more than `above` candidates
+// and at most `pad`. With Fill the distinct values go to out_idx at the row start the sizing pass
+// scanned; without it only the row's length is recorded.
 template <typename Gather, bool Fill>
 __global__ __launch_bounds__(kWarp * kSortWarps) void segment_unique_kernel(
     Gather g, const int* __restrict__ out_ptr, int* __restrict__ out_idx,
-    int* __restrict__ counts, int n_seg, int pad) {
+    int* __restrict__ counts, int n_seg, int above, int pad) {
     extern __shared__ int scratch[];
 
     const int lane = threadIdx.x % kWarp;
     const int s = warp_in_grid();
-    if (s >= n_seg || g.size(s) > kFastPad) return;
+    if (s >= n_seg) return;
+    const int n = g.size(s);
+    if (n <= above || n > pad) return;
     int* const b = scratch + (threadIdx.x / kWarp) * pad;
     segment_unique_one<Gather, Fill>(g, out_ptr, out_idx, counts, s, b, lane);
 }
 
 // kSortWarps warps a block, one segment each, over the whole segment range. kFastPad is chosen so
-// this allocation always fits, so occupancy here never depends on what the widest segment in the
-// mesh happens to be.
+// the tall launch's allocation always fits, so occupancy never depends on what the widest segment
+// in the mesh happens to be.
 template <bool Fill, typename Gather>
-void launch_fast(Gather g, const int* out_ptr, int* out_idx, int* counts, int n_seg, int pad,
-                 cudaStream_t stream) {
-    const std::size_t shared = static_cast<std::size_t>(pad) * sizeof(int) * kSortWarps;
-    segment_unique_kernel<Gather, Fill><<<grid_for(n_seg, kSortWarps), kWarp * kSortWarps, shared,
-                                          stream>>>(g, out_ptr, out_idx, counts, n_seg, pad);
+void launch_fast(Gather g, const int* out_ptr, int* out_idx, int* counts, int n_seg,
+                 const SegmentPlan& plan, cudaStream_t stream) {
+    const auto launch = [&](int above, int pad) {
+        const std::size_t shared = static_cast<std::size_t>(pad) * sizeof(int) * kSortWarps;
+        segment_unique_kernel<Gather, Fill><<<grid_for(n_seg, kSortWarps), kWarp * kSortWarps,
+                                              shared, stream>>>(g, out_ptr, out_idx, counts, n_seg,
+                                                                above, pad);
+    };
+    launch(-1, plan.fast_pad);
+    if (plan.tall_pad) launch(kCommonPad, plan.tall_pad);
     check_cuda(cudaGetLastError(), "segment unique launch");
 }
 
@@ -454,7 +472,7 @@ int count_rows(Gather g, int* out_ptr, int n_seg, cudaStream_t stream) {
     const SegmentPlan plan = plan_segments(g, n_seg, stream);
     const ScratchBuffer<int> counts =
         scratch_alloc<int>(static_cast<std::size_t>(n_seg) + 1, stream, "pattern", "row counts");
-    launch_fast<false>(g, nullptr, nullptr, counts.get(), n_seg, plan.fast_pad, stream);
+    launch_fast<false>(g, nullptr, nullptr, counts.get(), n_seg, plan, stream);
     launch_wide<false>(g, nullptr, nullptr, counts.get(), plan, stream);
     return scan_counts(n_seg, counts.get(), out_ptr, stream, "pattern");
 }
@@ -463,7 +481,7 @@ template <typename Gather>
 void fill_rows(Gather g, const int* out_ptr, int* out_idx, int n_seg, cudaStream_t stream) {
     if (n_seg <= 0) return;
     const SegmentPlan plan = plan_segments(g, n_seg, stream);
-    launch_fast<true>(g, out_ptr, out_idx, nullptr, n_seg, plan.fast_pad, stream);
+    launch_fast<true>(g, out_ptr, out_idx, nullptr, n_seg, plan, stream);
     launch_wide<true>(g, out_ptr, out_idx, nullptr, plan, stream);
 }
 
