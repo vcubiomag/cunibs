@@ -306,6 +306,8 @@ __device__ __forceinline__ void segment_unique_one(Gather g, const int* __restri
                                                    int* __restrict__ counts, int s, int* b,
                                                    int lane) {
     const int n = g.load(s, b, lane);
+    // A lane loads its corners into slots that other lanes read back, and its loop can end first.
+    __syncwarp();
     if (n == 0) {
         if (lane == 0 && !Fill) counts[s] = 0;
         return;
