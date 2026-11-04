@@ -107,7 +107,7 @@ def library_memory_errors() -> Iterator[None]:
         yield
     except RuntimeError as error:
         if str(error) in _LIBRARY_OUT_OF_MEMORY:
-            raise cp.cuda.memory.OutOfMemoryError(0, 0) from error
+            raise MemoryError(f"the device ran out of memory: {error}") from error
         raise
 
 

@@ -8,7 +8,7 @@
 //   w_j = |r - s_j|^-3 = (|r|^2 + |s_j|^2 - 2 r·s_j)^-3/2
 //   W = Σ_j w_j m_j
 //   P = Σ_j w_j (m_j × s_j)
-//   dA/dt = didt · mu0_4pi · (W × r - P)
+//   dA/dt = didt · kMu0Over4Pi · (W × r - P)
 //
 // Offsets are spelled flat here: this translation unit alone compiles with --use_fast_math, so it
 // must not include device_math.cuh, whose fp64 bodies would pick up contraction rules no other
@@ -231,7 +231,7 @@ __global__ void dadt_block_kernel(const double* __restrict__ nodes_mm,
 
 void launch_dadt_block(const double* pos_m, const double* mom, const double* transforms,
                        int n_dip, int k, const double* nodes_mm, int n_nodes, float* out,
-                       int out_stride, float didt, float mu0_4pi, cudaStream_t stream) {
+                       int out_stride, float didt, cudaStream_t stream) {
     if (k <= 0 || n_nodes <= 0) return;
     const std::int64_t placed = static_cast<std::int64_t>(k) * std::max(n_dip, 1);
     const ScratchBuffer<int> planar = scratch_alloc<int>(1, stream, "dadt", "planar");
@@ -253,5 +253,5 @@ void launch_dadt_block(const double* pos_m, const double* mom, const double* tra
     const dim3 grid(grid_for(threads, kDadtBlock), k);
     dadt_block_kernel<<<grid, kDadtBlock, 0, stream>>>(
         nodes_mm, s4.get(), m4.get(), m2.get(), origin.get(), axis.get(), planar.get(), out,
-        out_stride, n_dip, n_nodes, didt * mu0_4pi);
+        out_stride, n_dip, n_nodes, didt * static_cast<float>(kMu0Over4Pi));
 }

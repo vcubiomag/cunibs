@@ -17,6 +17,9 @@
 // out here. Library calls are confined to integer work (scans, sorts, compaction) and to minima
 // over a total order, which no order of combination can change.
 
+// mu0 / 4 pi in T m / A.
+constexpr double kMu0Over4Pi = 1e-7;
+
 constexpr int kBlock = 256;
 constexpr int kWarp = 32;
 

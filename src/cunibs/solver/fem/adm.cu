@@ -127,8 +127,6 @@ __device__ __forceinline__ CandidateMap candidate_map(const double* __restrict__
 // so every dipole faulted here is also one the host's fp64 check can name.
 constexpr float kIndexTol = 1e-3f;
 
-// mu0 / 4 pi in T m / A.
-constexpr double kMu0Over4Pi = 1e-7;
 
 // Slots of the fault array: the lowest candidate with a dipole off the grid, and the lowest with
 // one in an unsampled cell.

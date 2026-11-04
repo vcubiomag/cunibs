@@ -9,7 +9,7 @@
 // n lands at out[n * out_stride + 3 c], so out_stride = 3k fills an interleaved (n, k, 3) block.
 void launch_dadt_block(const double* pos_m, const double* mom, const double* transforms,
                        int n_dip, int k, const double* nodes_mm, int n_nodes, float* out,
-                       int out_stride, float didt, float mu0_4pi, cudaStream_t stream);
+                       int out_stride, float didt, cudaStream_t stream);
 
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
                                  int n_tet, cudaStream_t stream);

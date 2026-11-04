@@ -167,7 +167,6 @@ def coil_dadt_block(
         nodes,
         out.reshape(n, 3 * k),
         float(didt),
-        MU0_OVER_4PI,
         cp.cuda.get_current_stream().ptr,
     )
     return out
@@ -182,4 +181,9 @@ def coil_dadt_at_nodes(
 ) -> cp.ndarray:
     """dA/dt at each target node for one placement, ``(n_nodes, 3)``: :func:`coil_dadt_block` at
     ``k = 1``."""
+    if transform.ndim == 3 and transform.shape[0] != 1:
+        raise ValueError(
+            f"coil_dadt_at_nodes takes one transform, got {transform.shape[0]}. "
+            "Use coil_dadt_block for several."
+        )
     return coil_dadt_block(dip_pos_m, dip_moment, transform, didt, target_nodes_mm)[:, 0, :]

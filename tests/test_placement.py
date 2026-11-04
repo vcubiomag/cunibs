@@ -488,3 +488,37 @@ def test_a_non_finite_placement_input_is_rejected(cp, cube_subject, bad, on_devi
     to = cp.asarray if on_device else np.asarray
     with pytest.raises(ValueError, match="must be finite"):
         compute_coil_transforms(cube_subject.context, to(centers), to(handles), to(dists))
+
+
+def test_a_triangle_with_no_normal_is_reported_rather_than_framed(cp, cube_subject):
+    """A singular frame would otherwise pass as a valid placement."""
+    from cunibs.solver import place_transforms
+
+    ctx = cube_subject.context
+    out = cp.empty((1, 4, 4), dtype=cp.float64)
+    degenerate = cp.empty(1, dtype=cp.int32)
+    place_transforms(
+        cp.asarray([[50.0, 50.0, 120.0]]),
+        cp.asarray([[50.0, 150.0, 120.0]]),
+        cp.asarray([4.0]),
+        ctx.skin_verts,
+        cp.zeros_like(ctx.skin_tri_normals),
+        out,
+        degenerate,
+        cp.cuda.get_current_stream().ptr,
+    )
+    assert int(degenerate[0]) == 1
+    assert bool(cp.isnan(out).all())
+
+
+def test_coil_dadt_at_nodes_refuses_several_transforms(cube_subject, synthetic_coil):
+    from cunibs.fem.placement import coil_dadt_at_nodes
+
+    with pytest.raises(ValueError, match="one transform"):
+        coil_dadt_at_nodes(
+            synthetic_coil.positions_m,
+            synthetic_coil.moments,
+            np.eye(4)[None].repeat(2, axis=0),
+            1e6,
+            cube_subject.context.nodes_mm,
+        )

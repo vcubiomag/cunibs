@@ -449,7 +449,6 @@ def test_dadt_block_matches_analytic_dipoles(cp, stream, planar):
         cp.asarray(r_mm),
         out,
         didt,
-        MU0_OVER_4PI,
         stream,
     )
     got = cp.asnumpy(out).reshape(40, len(angles), 3)
@@ -673,7 +672,6 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
 
 def test_dadt_of_a_coil_with_no_dipoles_is_zero(cp):
     """The flat-coil path reads an axis no dipole set, from whatever the mempool held."""
-    from cunibs.fem.placement import MU0_OVER_4PI
     from cunibs.solver import dadt_block
 
     stream = cp.cuda.get_current_stream().ptr
@@ -689,7 +687,6 @@ def test_dadt_of_a_coil_with_no_dipoles_is_zero(cp):
             cp.ones((64, 3), dtype=cp.float64),
             out,
             1e6,
-            MU0_OVER_4PI,
             stream,
         )
         np.testing.assert_array_equal(cp.asnumpy(out), 0.0)
@@ -755,7 +752,6 @@ def test_affine_values_rejects_a_short_output(cp, cube_subject):
 
 def test_native_call_ignores_an_error_left_by_a_failed_allocation(cp):
     """A failed allocation sets the last CUDA error, which is not the next launch's failure."""
-    from cunibs.fem.placement import MU0_OVER_4PI
     from cunibs.solver import dadt_block
 
     with pytest.raises(MemoryError):
@@ -769,13 +765,11 @@ def test_native_call_ignores_an_error_left_by_a_failed_allocation(cp):
         cp.ones((4, 3), dtype=cp.float64),
         out,
         1e6,
-        MU0_OVER_4PI,
         cp.cuda.get_current_stream().ptr,
     )
 
 
 def test_dadt_block_rejects_a_column_that_overflows_int(cp):
-    from cunibs.fem.placement import MU0_OVER_4PI
     from cunibs.solver import dadt_block
 
     with pytest.raises(ValueError, match="room for k columns"):
@@ -786,7 +780,6 @@ def test_dadt_block_rejects_a_column_that_overflows_int(cp):
             cp.ones((4, 3), dtype=cp.float64),
             cp.empty((4, 3), dtype=cp.float32),
             1e6,
-            MU0_OVER_4PI,
             cp.cuda.get_current_stream().ptr,
             2**31 - 1,
         )
@@ -1056,3 +1049,46 @@ def test_tet_lowest_node_matches_a_numpy_gather(cp):
         cp.asarray(inverse), cp.asarray(tets), lowest, cp.cuda.get_current_stream().ptr
     )
     np.testing.assert_array_equal(cp.asnumpy(lowest), inverse[tets].min(axis=1))
+
+
+@pytest.mark.parametrize("tolerance", [float("nan"), -1e-6])
+def test_solve_mixed_rejects_a_tolerance_it_cannot_stop_on(cp, cube_subject, tolerance):
+    solver = cube_subject.context.solver
+    n = solver.pcg.n
+    b = cp.zeros(n, dtype=cp.float64)
+    x = cp.empty(n, dtype=cp.float64)
+    with pytest.raises(ValueError, match="tolerance must be"):
+        solver.pcg.solve_mixed(
+            solver.precond, b, x, tolerance, 10, cp.cuda.get_current_stream().ptr
+        )
+
+
+def test_rhs_assemble_rejects_gradients_for_too_few_tets(cp, cube_subject):
+    """The kernel would otherwise read a short ``g`` past its end."""
+    from cunibs.solver import rhs_assemble
+
+    ctx = cube_subject.context
+    n_tet = int(ctx.tet_nodes.shape[0])
+    with pytest.raises(ValueError, match="per tetrahedron"):
+        rhs_assemble(
+            cp.zeros((n_tet, 3), dtype=cp.float32),
+            ctx.g[:-1].astype(cp.float32),
+            ctx.neg_vc,
+            ctx.node2corner_ptr,
+            ctx.node2corner_idx,
+            cp.empty(ctx.n_nodes, dtype=cp.float32),
+            cp.cuda.get_current_stream().ptr,
+        )
+
+
+def test_recover_elements_rejects_a_corner_map_of_partial_tets(cp):
+    from cunibs.solver import recover_elements
+
+    with pytest.raises(ValueError, match="4 \\* n_tet"):
+        recover_elements(
+            [cp.zeros((4, 3), dtype=cp.float32)],
+            cp.zeros(6, dtype=cp.int32),
+            [cp.empty((1, 3), dtype=cp.float32)],
+            [cp.empty(1, dtype=cp.float32)],
+            cp.cuda.get_current_stream().ptr,
+        )

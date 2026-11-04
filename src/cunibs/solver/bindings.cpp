@@ -104,6 +104,11 @@ std::array<Ptr, kMaxStageBlock> pack(const std::vector<Array>& arrays, int k, st
     return out;
 }
 
+// NaN compares false, so a NaN tolerance would otherwise run every solve to its iteration limit.
+void require_tolerance(double tolerance) {
+    require(tolerance >= 0.0, "tolerance must be non-negative");
+}
+
 // The same for an output a caller may skip: an empty list leaves every pointer null.
 template <typename Array>
 std::array<float*, kMaxStageBlock> optional_pack(const std::vector<Array>& arrays, int k,
@@ -275,6 +280,7 @@ NB_MODULE(_solver_ext, m) {
             "solve_mixed",
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_1d& b, const f64_1d& x,
                double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_1d>& x0) {
+                require_tolerance(tolerance);
                 const std::size_t n = self.n();
                 require(b.shape(0) == n && x.shape(0) == n && (!x0 || x0->shape(0) == n),
                         "b, x and x0 must have one entry per row");
@@ -290,6 +296,7 @@ NB_MODULE(_solver_ext, m) {
             "solve_mixed_block",
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_2d& B, const f64_2d& X,
                double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_2d>& X0) {
+                require_tolerance(tolerance);
                 const std::size_t n = self.n();
                 const std::size_t k = B.shape(1);
                 require(B.shape(0) == n && X.shape(0) == n && X.shape(1) == k &&
@@ -311,6 +318,7 @@ NB_MODULE(_solver_ext, m) {
                const f64_2d& B, const f64_2d& X,
                const nb::ndarray<double, nb::ndim<2>, nb::c_contig, nb::device::cpu>& sigma,
                double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_2d>& X0) {
+                require_tolerance(tolerance);
                 const std::size_t n = self.n();
                 const std::size_t k = B.shape(1);
                 require(B.shape(0) == n && X.shape(0) == n && X.shape(1) == k &&
@@ -389,8 +397,8 @@ NB_MODULE(_solver_ext, m) {
     m.def(
         "dadt_block",
         [](const Rows3d& pos_m, const Rows3d& mom, const Frames& transforms,
-           const Rows3d& nodes_mm, const f32_2d& out, float didt, float mu0_4pi,
-           uintptr_t stream, int column) {
+           const Rows3d& nodes_mm, const f32_2d& out, float didt, uintptr_t stream,
+           int column) {
             const std::size_t n_nodes = nodes_mm.shape(0);
             const int k = static_cast<int>(transforms.shape(0));
             const int stride = static_cast<int>(out.shape(1));
@@ -402,10 +410,10 @@ NB_MODULE(_solver_ext, m) {
             launch_dadt_block(pos_m.data(), mom.data(), transforms.data(),
                               static_cast<int>(pos_m.shape(0)), k, nodes_mm.data(),
                               static_cast<int>(n_nodes), out.data() + 3 * column, stride, didt,
-                              mu0_4pi, as_stream(stream));
+                              as_stream(stream));
         },
         native_call, dev("pos_m"), dev("mom"), dev("transforms"), dev("nodes_mm"), dev("out"),
-        nb::arg("didt"), nb::arg("mu0_4pi"), nb::arg("stream"), nb::arg("column") = 0,
+        nb::arg("didt"), nb::arg("stream"), nb::arg("column") = 0,
         "dA/dt at nodes (mm) for k placements of one coil: coil-frame dipoles (m) and moments, "
         "and (k, 4, 4) coil-to-head affines in mm. out is (n_nodes, 3m), an interleaved "
         "(n_nodes, m, 3) block, and placement i fills column column + i.");
@@ -415,7 +423,8 @@ NB_MODULE(_solver_ext, m) {
         [](const TetGradd& g, const f64_1d& scale, const Tets& tet_nodes, const i32_1d& ptr,
            const i32_1d& idx, const i32_1d& indptr, const i32_1d& indices,
            const Dev<float, -1, 4>& op, uintptr_t stream) {
-            require(op.shape(0) == indices.shape(0) && ptr.shape(0) == indptr.shape(0),
+            require(op.shape(0) == indices.shape(0) && ptr.shape(0) == indptr.shape(0) &&
+                        scale.shape(0) == g.shape(0) && tet_nodes.shape(0) == g.shape(0),
                     "rhs_operator_fill: shape mismatch");
             launch_rhs_operator_fill(g.data(), scale.data(), tet_nodes.data(), ptr.data(),
                                      idx.data(), indptr.data(), indices.data(), op.data(),
@@ -458,6 +467,8 @@ NB_MODULE(_solver_ext, m) {
         [](const Rows3f& dadt_elm, const TetGradf& g, const f32_1d& neg_vc, const i32_1d& ptr,
            const i32_1d& idx, const f32_1d& b, uintptr_t stream) {
             require(ptr.shape(0) == b.shape(0) + 1, "rhs_assemble: ptr must be n_nodes + 1");
+            require(dadt_elm.shape(0) == g.shape(0) && neg_vc.shape(0) == g.shape(0),
+                    "rhs_assemble: dadt_elm, g and neg_vc must be per tetrahedron");
             launch_rhs(dadt_elm.data(), g.data(), neg_vc.data(), ptr.data(), idx.data(), b.data(),
                        static_cast<int>(b.shape(0)), as_stream(stream));
         },
@@ -716,6 +727,8 @@ NB_MODULE(_solver_ext, m) {
             const std::size_t n_nodes = v_block.shape(0);
             const std::size_t n_slots = pptr.shape(0) - 1;
             const std::size_t kd = dadt_nodes.shape(1);
+            require(w.shape(0) == pidx.shape(0), "hpr_grad: w must be (nnz, 3)");
+            require(slot_node.shape(0) == n_slots, "hpr_grad: slot_node must be per slot");
             require(dadt_nodes.shape(0) == n_nodes &&
                         (kd == static_cast<std::size_t>(k) || kd == 1),
                     "hpr_grad: dadt_nodes must be (n_nodes, k or 1, 3)");
@@ -748,6 +761,7 @@ NB_MODULE(_solver_ext, m) {
            const std::vector<Rows3f>& e_slots, uintptr_t stream) {
             const int k = block_width(e_in.size(), "recover_nodes: bad list sizes");
             const std::size_t n_slots = ptr.shape(0) - 1;
+            require(w.shape(0) == idx.shape(0), "recover_nodes: w must match idx");
             const auto in = pack<const float*>(e_in, k, e_in[0].shape(0),
                                                "recover_nodes: e_in must be k (n_tet, 3)");
             const auto out = pack<float*>(e_slots, k, n_slots,
@@ -767,6 +781,8 @@ NB_MODULE(_solver_ext, m) {
            const std::optional<i32_1d>& active) {
             const int k = block_width(e_slots.size(), "recover_elements: bad list sizes");
             const std::size_t n_tet = slot_of_corner.shape(0) / 4;
+            require(slot_of_corner.shape(0) % 4 == 0,
+                    "recover_elements: slot_of_corner must be (4 * n_tet,)");
             require(reinterpret_cast<std::uintptr_t>(slot_of_corner.data()) % 16 == 0,
                     "recover_elements: slot_of_corner must start 16-byte aligned");
             const char* bad = "recover_elements: e_out and magn_out must be k arrays of n_tet";

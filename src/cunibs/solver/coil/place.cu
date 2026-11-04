@@ -157,8 +157,10 @@ __global__ void place_frame_kernel(const double* __restrict__ centers,
     }
     const int tri = best.tri;
     const TransformView o(out, n_pl);
-    // Only a non-finite centre finds no triangle, since every distance to it compares false.
-    if (tri == kNoTri) {
+    // Only a non-finite centre finds no triangle, since every distance to it compares false. A
+    // triangle whose smoothed normal cancelled gives no z axis to build a frame from.
+    if (tri == kNoTri || (scalp.normals(tri, 0) == 0.0 && scalp.normals(tri, 1) == 0.0 &&
+                          scalp.normals(tri, 2) == 0.0)) {
         for (int r = 0; r < 4; ++r) {
             for (int col = 0; col < 4; ++col) o(p, r, col) = CUDART_NAN;
         }
