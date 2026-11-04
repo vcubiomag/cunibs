@@ -152,18 +152,18 @@ __global__ void __launch_bounds__(kBlock)
     const int c = blockIdx.y;
     const T* __restrict__ m = fields.p[c];
     const double mean = scratch[2 * c];
-    double s = 0.0;
+    cuda::std::array<double, 1> s{0.0};
     const int stride = gridDim.x * blockDim.x;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 #pragma unroll
     for (int t = 0; t < kRowsPerThread; ++t, i += stride) {
         if (i >= n) break;
         const double d = static_cast<double>(m[index[i]]) - mean;
-        s += w[i] * (d * d);
+        s[0] += w[i] * (d * d);
     }
-    s = warp_reduce_sum<kWarp>(s);
+    warp_reduce_sum<kWarp>(s);
     __shared__ double ws[kWarps];
-    if (threadIdx.x % kWarp == 0) ws[threadIdx.x / kWarp] = s;
+    if (threadIdx.x % kWarp == 0) ws[threadIdx.x / kWarp] = s[0];
     __syncthreads();
     if (threadIdx.x == 0) {
         double v = 0.0;

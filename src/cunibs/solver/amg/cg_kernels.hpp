@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include "amg/slot_csr.hpp"
 #include "core/common.hpp"
 
 // Launchers for the mixed-precision CG kernels (block_cg.cu), for k in {1, 2, 4, 8}. All dense
@@ -21,24 +22,13 @@ void launch_bcsrmv_diff_block(int n, int k, const int* row_ptr, const std::int16
 // tol times its l1 norm, and zero elsewhere.
 void launch_diff_values(int n_segs, const int* bounds, const std::int16_t* cols,
                         const double* vals, double tol, float* out, cudaStream_t stream);
-// An operator affine in per-column coefficients, A(sigma) = sum_t sigma_t A_t, stored as per-row
-// segments, one per part touching the row: segments [seg_ptr[i], seg_ptr[i+1]) of row i, segment
-// g holding slots [seg_start[g], seg_start[g+1]) of part seg_term[g].
-struct AffineOperator {
-    int n_terms = 0;
-    const int* order = nullptr;  // the order rows are taken in; any permutation gives the same y
-    const int* seg_ptr = nullptr;
-    const int* seg_start = nullptr;
-    const std::uint8_t* seg_term = nullptr;
-    const std::int16_t* cols = nullptr;
-    const double* vals = nullptr;
-};
-// sigma is [column][term] for kMaxStageBlock columns.
-void launch_affine_spmv_block(int n, int k, const AffineOperator& op, const double* sigma,
+// y = A(sigma_c) x_c for an operator affine in per-column coefficients. sigma is [column][term] for
+// kMaxStageBlock columns.
+void launch_affine_spmv_block(int n, int k, const AffineSlots& op, const double* sigma,
                               const double* x, double* y, cudaStream_t stream);
 // The affine operator in difference form, vals being op's in launch_diff_values' form and sigma
 // fp32 [column][term].
-void launch_affine_diff_block(int n, int k, const AffineOperator& op, const float* vals,
+void launch_affine_diff_block(int n, int k, const AffineSlots& op, const float* vals,
                               const float* sigma, const float* x, float* y, cudaStream_t stream);
 void launch_bcg_dot(int n, int k, const float* x, const float* y, double* partials, double* out,
                     cudaStream_t stream);
@@ -80,12 +70,12 @@ void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const float
                               double* partials, double* norms_sums, cudaStream_t stream);
 // The preconditioned residual is z = zf + shift per column; these write that shift and the
 // deflated r . z, and the init form also sets p0 = z0.
-void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const float* r, Deflation defl,
-                              const double* converged, const double* rsum, double* partials,
-                              double* rz, double* beta, double* shift, cudaStream_t stream);
-void launch_bcg_cast_dot_init(int n, int k, const float* zf, const float* r, Deflation defl,
-                              const double* rsum, double* partials, double* rz, double* shift,
-                              float* p, cudaStream_t stream);
+void launch_bcg_dot_beta(int n, int k, const float* zf, const float* r, Deflation defl,
+                         const double* converged, const double* rsum, double* partials,
+                         double* rz, double* beta, double* shift, cudaStream_t stream);
+void launch_bcg_dot_init(int n, int k, const float* zf, const float* r, Deflation defl,
+                         const double* rsum, double* partials, double* rz, double* shift,
+                         float* p, cudaStream_t stream);
 // Restarts the columns `mask` marks from the residual already in r and its preconditioned zf:
 // their sum(r), r . z, shift and p = z, as at the start of a solve. Other columns are untouched.
 void launch_bcg_restart(int n, int k, const float* zf, const float* r, Deflation defl,

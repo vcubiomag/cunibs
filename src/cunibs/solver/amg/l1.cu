@@ -1,14 +1,12 @@
 #include "amg/l1.hpp"
 
-// One thread per row, the same shape rhs.cu uses for the node gather and for the same reason:
-// it fixes the summation order.
+// One thread per row, which fixes the summation order.
 //   d[i]    = sign(a_ii) · Σ_j |a_ij|,  the diagonal included
 //   dinv[i] = 1 / d[i]
 //
-// An SpMV of |A| against a vector of ones computes the same sum, but splits a row across a thread
-// count cuSPARSE picks at runtime, so the last bits vary between processes. dinv scales every
-// entry of the smoothed prolongator and reaches every V-cycle level, so any drift in it reaches
-// the whole hierarchy.
+// A cuSPARSE SpMV of |A| against ones splits a row across a thread count it picks at runtime, so
+// its last bits vary between processes. dinv scales every entry of the smoothed prolongator, so any
+// drift in it reaches the whole hierarchy.
 
 namespace {
 

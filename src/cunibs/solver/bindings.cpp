@@ -289,15 +289,6 @@ NB_MODULE(_solver_ext, m) {
             nb::arg("values").noconvert().none(), nb::arg("stream"),
             "Write the matrix's entry CSR into caller arrays; col_idx or values may be None.")
         .def(
-            "update_values",
-            [](PcgAmgSolver& self, const f64_1d& values, uintptr_t stream) {
-                require(static_cast<int>(values.shape(0)) == self.nnz(),
-                        "values must have one entry per nonzero");
-                self.update_values(values.data(), as_stream(stream));
-            },
-            nb::call_guard<NativeCall>(),
-            nb::arg("values").noconvert(), nb::arg("stream"))
-        .def(
             "solve_mixed",
             [](PcgAmgSolver& self, NativeVCycle& preconditioner, const f64_1d& b, const f64_1d& x,
                double tolerance, int max_iters, uintptr_t stream, const std::optional<f64_1d>& x0) {

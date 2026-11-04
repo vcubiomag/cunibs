@@ -41,7 +41,7 @@ __device__ __forceinline__ void store_vec3(Vec3View<double> rows, int r, const V
 // One thread per triangle: the unnormalised face normal, whose length carries twice the area and
 // so weights the smoothing that follows.
 __global__ void face_normals_kernel(const double* __restrict__ nodes_mm,
-                                    Tri3View<const int> tris, double* __restrict__ out,
+                                    Vec3View<const int> tris, double* __restrict__ out,
                                     int n_tri) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tri) return;
@@ -85,7 +85,7 @@ __global__ void spread_to_nodes_kernel(const double* __restrict__ face, const in
 // than averaged: on the final pass the mean and the sum differ only by a factor of three, which
 // normalising removes.
 __global__ void gather_to_faces_kernel(const double* __restrict__ node_vec,
-                                       Tri3View<const int> tris, double* __restrict__ out,
+                                       Vec3View<const int> tris, double* __restrict__ out,
                                        int n_tri) {
     const int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= n_tri) return;
@@ -124,7 +124,7 @@ void launch_skin_normals(const double* nodes_mm, const int* tris_ptr, const int*
     const ScratchBuffer<double> node = scratch_alloc<double>(static_cast<std::size_t>(n_nodes) * 3,
                                                              stream, "skin", "node normals");
 
-    const Tri3View<const int> tris(tris_ptr, n_tri);
+    const Vec3View<const int> tris(tris_ptr, n_tri);
     const unsigned tri_blocks = grid_for(n_tri);
     const unsigned node_blocks = grid_for(n_nodes);
     face_normals_kernel<<<tri_blocks, kBlock, 0, stream>>>(nodes_mm, tris, face.get(), n_tri);

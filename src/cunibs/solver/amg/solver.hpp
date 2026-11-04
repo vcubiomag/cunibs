@@ -28,12 +28,11 @@ struct PcgBlockResult {
 
 // A captured CG iteration body, replayed until the preconditioner it was captured against
 // changes. The body only touches solver-owned buffers, so a graph captured in an earlier
-// solve stays valid across solves; `key` is what identifies "the same body": the
-// preconditioner's address and generation, plus the block width.
+// solve stays valid across solves; `key` is what identifies "the same body".
 class GraphCache {
 public:
     struct Key {
-        const NativeVCycle* precond = nullptr;
+        // The preconditioner's generation, which no other cycle's ever equals.
         int generation = 0;
         int k = 0;
         // The solver's block buffers the body reads, which ensure_block_buffers replaces.
@@ -48,11 +47,10 @@ public:
 
     // Runs `body` once on `stream`, replaying the cached graph when there is one.
     //
-    // `iteration` is the caller's 1-based loop counter: the first iteration always runs
-    // uncaptured so it can warm allocation pools and lazy buffers, which capture forbids.
-    // Capture is attempted on the second, and abandoned for the rest of the solve if it
-    // fails: an invalidated capture records without executing, which PcgAmgSolver has to
-    // survive rather than propagate.
+    // `iteration` is the caller's 1-based loop counter. Capture is attempted on the second, so a
+    // solve that stops after one pays for no graph, and abandoned for the rest of the solve if it
+    // fails: an invalidated capture records without executing, which PcgAmgSolver has to survive
+    // rather than propagate.
     template <typename Body>
     void run(cudaStream_t stream, const Key& key, int iteration, Body&& body);
 
@@ -107,7 +105,6 @@ void GraphCache::run(cudaStream_t stream, const Key& key, int iteration, Body&& 
         return;
     }
     clear();
-    // Iteration 1 warms pools and lazy buffers so capture sees no allocation.
     if (iteration == 1 || capture_failed_) {
         body();
         return;
@@ -177,9 +174,8 @@ public:
     int n() const { return n_; }
     int nnz() const { return nnz_; }
 
-    void update_values(const double* values, cudaStream_t stream);
-    // The block solve at k = 1, bit for bit, except that a zero b returns a zero x and an x0
-    // already within tolerance is returned as it is.
+    // The block solve at k = 1, bit for bit, except that an x0 already within tolerance is returned
+    // as it is.
     PcgResult solve_mixed(NativeVCycle& preconditioner, const double* b, double* x,
                           double tolerance, int max_iters, cudaStream_t stream,
                           const double* x0 = nullptr);
@@ -194,7 +190,7 @@ public:
 
     // A block solve in which column c's operator is A(sigma[c]) from `terms`, sigma host
     // (k, n_terms): every column a different matrix, sharing each part's reads and the
-    // preconditioner. The values update_values sets are left as they are.
+    // preconditioner. The solver's own values are left as they are.
     PcgBlockResult solve_affine_block(NativeVCycle& preconditioner, AffineTerms& terms,
                                       const double* B, double* X, int k, const double* sigma,
                                       double tolerance, int max_iters, cudaStream_t stream,
@@ -207,8 +203,7 @@ public:
 private:
     friend class AffineTerms;
     void ensure_block_buffers(int k);
-    Deflation deflation() const;
-    // Sets the deflation state from values_, unless it already holds it.
+    // Sets the deflation state from values_.
     void deflation_from_values(cudaStream_t stream);
     // `terms` is the affine operator to apply, or null for values_: in fp64, and in the fp32
     // difference form the iteration uses.
@@ -216,10 +211,10 @@ private:
                         cudaStream_t stream);
     void apply_operator(int k, const AffineTerms* terms, const float* x, float* y,
                         cudaStream_t stream);
-    enum class Path { kSingle, kBlock, kAffine };
+    // `single` is solve_mixed's path: its own graph, and an X0 within tolerance returned as it is.
     PcgBlockResult solve_block(NativeVCycle& preconditioner, const double* B, double* X, int k,
                                double tolerance, int max_iters, cudaStream_t stream,
-                               const double* X0, Path path, AffineTerms* terms = nullptr);
+                               const double* X0, bool single, AffineTerms* terms = nullptr);
 
     // Serialises every call that touches the solver's buffers, since the bindings release the GIL.
     std::mutex mutex_;
@@ -232,9 +227,9 @@ private:
     DeviceBuffer<double> values_;
     // values_ in the fp32 difference form the CG iterates with (launch_diff_values).
     DeviceBuffer<float> values32_;
-    // Deflation of the constant vector (block_cg.cu): the rows where A 1 is nonzero, chosen once
-    // from the pattern's values, then Aw on them per column and 1/E per column. It holds either
-    // values_' state or one affine block's; the flag says which.
+    // Deflation of the constant vector (block_cg.cu): the rows where A 1 is nonzero, then Aw on them
+    // per column and 1/E per column. It holds either values_' state or one affine block's; the flag
+    // says which.
     int defl_n_ = 0;
     DeviceBuffer<int> defl_rows_;
     DeviceBuffer<double> defl_aw_;

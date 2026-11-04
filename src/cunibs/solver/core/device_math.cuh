@@ -23,10 +23,6 @@ template <typename T, typename Index = int>
 using Vec3View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3>>;
 template <typename T, typename Index = int>
 using Tet4View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 4>>;
-// (n_tri, 3) surface connectivity. Same shape as a Vec3View, spelled apart from it because its
-// entries are node ids rather than components of one vector.
-template <typename T, typename Index = int>
-using Tri3View = cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 3>>;
 // (n_tri, 3, 3): the three corner coordinates of each triangle of a surface.
 template <typename T, typename Index = int>
 using TriVertView =
@@ -36,7 +32,7 @@ using TriVertView =
 template <typename T, typename Index = int>
 using TetGradView =
     cuda::std::mdspan<T, cuda::std::extents<Index, cuda::std::dynamic_extent, 4, 3>>;
-// Dense row-major with both extents known only at run time; the (n, k) block operands are these.
+// Dense row-major with both extents known only at run time.
 template <typename T>
 using Mat2View = cuda::std::mdspan<T, cuda::std::dextents<std::int64_t, 2>>;
 // (n, K) row-major with K a compiled width. The CG and V-cycle operands are these.
@@ -120,14 +116,6 @@ __device__ __forceinline__ void warp_reduce_sum(cuda::std::array<T, K>& sum) {
     }
 }
 
-// The same tree over one value per lane.
-template <int WIDTH>
-__device__ __forceinline__ double warp_reduce_sum(double v) {
-    cuda::std::array<double, 1> a{v};
-    warp_reduce_sum<WIDTH>(a);
-    return a[0];
-}
-
 // Move the K contiguous values of one row of a (n, K) row-major operand as vector accesses.
 //
 // This is what keeps a wide block off the L1 request limit: scalar accesses ask for K separate
@@ -140,10 +128,10 @@ __device__ __forceinline__ double warp_reduce_sum(double v) {
 // reads at the row being written, and __restrict__ there would be a promise that call pattern
 // breaks.
 
-template <int K>
-__device__ __forceinline__ void load_row(const float* __restrict__ p,
-                                         cuda::std::array<float, K>& v) {
-    if constexpr (K % 4 == 0) {
+template <int K, typename T>
+__device__ __forceinline__ void load_row(const T* __restrict__ p, cuda::std::array<T, K>& v) {
+    constexpr bool kFp32 = cuda::std::is_same_v<T, float>;
+    if constexpr (kFp32 && K % 4 == 0) {
 #pragma unroll
         for (int b = 0; b < K / 4; ++b) {
             const float4 t = *reinterpret_cast<const float4*>(p + b * 4);
@@ -153,9 +141,10 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p,
             v[b * 4 + 3] = t.w;
         }
     } else if constexpr (K % 2 == 0) {
+        using Pair = cuda::std::conditional_t<kFp32, float2, double2>;
 #pragma unroll
         for (int b = 0; b < K / 2; ++b) {
-            const float2 t = *reinterpret_cast<const float2*>(p + b * 2);
+            const Pair t = *reinterpret_cast<const Pair*>(p + b * 2);
             v[b * 2 + 0] = t.x;
             v[b * 2 + 1] = t.y;
         }
@@ -165,47 +154,20 @@ __device__ __forceinline__ void load_row(const float* __restrict__ p,
     }
 }
 
-template <int K>
-__device__ __forceinline__ void load_row(const double* __restrict__ p,
-                                         cuda::std::array<double, K>& v) {
-    if constexpr (K % 2 == 0) {
-#pragma unroll
-        for (int b = 0; b < K / 2; ++b) {
-            const double2 t = *reinterpret_cast<const double2*>(p + b * 2);
-            v[b * 2 + 0] = t.x;
-            v[b * 2 + 1] = t.y;
-        }
-    } else {
-#pragma unroll
-        for (int c = 0; c < K; ++c) v[c] = __ldg(p + c);
-    }
-}
-
-template <int K>
-__device__ __forceinline__ void store_row(float* p, const cuda::std::array<float, K>& v) {
-    if constexpr (K % 4 == 0) {
+template <int K, typename T>
+__device__ __forceinline__ void store_row(T* p, const cuda::std::array<T, K>& v) {
+    constexpr bool kFp32 = cuda::std::is_same_v<T, float>;
+    if constexpr (kFp32 && K % 4 == 0) {
 #pragma unroll
         for (int b = 0; b < K / 4; ++b) {
             *reinterpret_cast<float4*>(p + b * 4) =
                 make_float4(v[b * 4 + 0], v[b * 4 + 1], v[b * 4 + 2], v[b * 4 + 3]);
         }
     } else if constexpr (K % 2 == 0) {
+        using Pair = cuda::std::conditional_t<kFp32, float2, double2>;
 #pragma unroll
         for (int b = 0; b < K / 2; ++b) {
-            *reinterpret_cast<float2*>(p + b * 2) = make_float2(v[b * 2 + 0], v[b * 2 + 1]);
-        }
-    } else {
-#pragma unroll
-        for (int c = 0; c < K; ++c) p[c] = v[c];
-    }
-}
-
-template <int K>
-__device__ __forceinline__ void store_row(double* p, const cuda::std::array<double, K>& v) {
-    if constexpr (K % 2 == 0) {
-#pragma unroll
-        for (int b = 0; b < K / 2; ++b) {
-            *reinterpret_cast<double2*>(p + b * 2) = make_double2(v[b * 2 + 0], v[b * 2 + 1]);
+            *reinterpret_cast<Pair*>(p + b * 2) = Pair{v[b * 2 + 0], v[b * 2 + 1]};
         }
     } else {
 #pragma unroll

@@ -801,14 +801,6 @@ def test_native_call_ignores_an_error_left_by_a_failed_allocation(cp):
     )
 
 
-def test_update_values_rejects_a_wrong_nonzero_count(cp, cube_subject):
-    """A short ``values`` would otherwise be read past its end on the device."""
-    pcg = cube_subject.context.solver.pcg
-    short = cp.ascontiguousarray(cube_subject.context.solver.matrix().data[:-1])
-    with pytest.raises(ValueError, match="one entry per nonzero"):
-        pcg.update_values(short, cp.cuda.get_current_stream().ptr)
-
-
 def test_solve_mixed_rejects_a_wrong_row_count(cp, cube_subject):
     solver = cube_subject.context.solver
     n = solver.pcg.n

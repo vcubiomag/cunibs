@@ -112,11 +112,11 @@ void dispatch_k(int k, const char* what, F&& f) {
     if (!matched) throw std::invalid_argument(what);
 }
 
-// Owners for the four CUDA resources this directory allocates. Setup takes a dozen of them in a
-// row, so wrapping them keeps a failure part way through from leaking the earlier ones and keeps
-// every destructor implicit.
+// Owners for the CUDA resources this directory allocates. Setup takes a dozen of them in a row, so
+// wrapping them keeps a failure part way through from leaking the earlier ones and keeps every
+// destructor implicit.
 //
-// All four release without checking: a free during interpreter teardown, after the context is
+// All release without checking: a free during interpreter teardown, after the context is
 // gone, reports an error there is nothing useful to do with.
 namespace detail {
 struct FreeDevice {

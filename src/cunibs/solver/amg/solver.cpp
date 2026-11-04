@@ -32,12 +32,9 @@ constexpr double kSupportTol = 1e-10;
 // How far a column's fp32 recurrence may fall below the true residual it last restarted from before
 // it is checked against the fp64 operator. The recurrence tracks the true residual to a few percent
 // over six decades, so at the default tolerance a solve is one stage with one check. A tighter
-// tolerance is reached in stages, each restarted from the true residual.
-//
-// Restarting rather than replacing r and keeping p (the reliable update of van der Vorst and Ye) is
-// deliberate. The reliable update matches the fp64 iteration count at 1e-9 and 1e-12 where restarts
-// cost 5-30% more, but it needs checkpoints every few decades, which cost a fp64 SpMV each at the
-// default tolerance too, and it diverges once a small system's fp32 Krylov space is exhausted.
+// tolerance is reached in stages, each restarted from the true residual. A stage drops p as well:
+// keeping it (van der Vorst and Ye's reliable update) diverges once a small system's fp32 Krylov
+// space is exhausted.
 constexpr double kStageDrop = 1e-6;
 
 // Restarts a column may take before its true residual is reported as it stands.
@@ -75,8 +72,7 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     join_event_.reset(event);
 
     // The deflation support: rows whose sum is more than a rounding residue of their l1 norm. On a
-    // grounded conductivity operator that is the ground node's neighbours. Chosen once, from the
-    // values this was built with: it is a property of the pattern, and update_values keeps it.
+    // grounded conductivity operator that is the ground node's neighbours.
     // Everything here is on the caller's stream, which a non-blocking solve_stream_ does not
     // wait for, so it is drained before any solve can start.
     {
@@ -91,34 +87,16 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     }
     defl_aw_ = alloc<double>(std::max<size_t>(defl_n_, 1) * kMaxStageBlock, "deflation aw");
     defl_inv_e_ = alloc<double>(kMaxStageBlock, "deflation inv_e");
-    defl_affine_ = true;
     deflation_from_values(stream);
     check_cuda(cudaStreamSynchronize(stream), "sync(deflation setup)");
 }
 
-Deflation PcgAmgSolver::deflation() const {
-    return Deflation{defl_n_, defl_rows_.get(), defl_aw_.get(), defl_inv_e_.get()};
-}
-
 void PcgAmgSolver::deflation_from_values(cudaStream_t stream) {
-    if (!defl_affine_) return;
     // A low-half slot's value is zero, so a row sum over slots is the row sum over entries.
     launch_bcg_defl_from_values(defl_n_, defl_rows_.get(), slots_.ptr.get(), values_.get(),
                                 defl_aw_.get(), defl_inv_e_.get(), stream);
     check_cuda(cudaGetLastError(), "deflation");
     defl_affine_ = false;
-}
-
-void PcgAmgSolver::update_values(const double* values, cudaStream_t stream) {
-    const std::lock_guard lock(mutex_);
-    launch_slot_scatter(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values,
-                        values_.get(), stream);
-    launch_diff_values(n_, slots_.ptr.get(), slots_.cols.get(), values_.get(), kSupportTol,
-                       values32_.get(), stream);
-    check_cuda(cudaGetLastError(), "scatter(values)");
-    // A solve then waits on its caller's stream, which is this one, before touching either.
-    defl_affine_ = true;
-    deflation_from_values(stream);
 }
 
 // The solver's pattern and deflation rows are fixed at construction, so the parts built here stay
@@ -184,11 +162,7 @@ void PcgAmgSolver::export_csr(int* row_ptr, int* col_idx, double* values, cudaSt
 void PcgAmgSolver::apply_operator(int k, const AffineTerms* terms, const double* x, double* y,
                                   cudaStream_t stream) {
     if (terms != nullptr) {
-        const AffineSlots& a = terms->slots_;
-        const AffineOperator op{a.n_terms,          a.order.get(),     a.seg_ptr.get(),
-                                a.seg_start.get(),  a.seg_term.get(),  a.cols.get(),
-                                a.vals.get()};
-        launch_affine_spmv_block(n_, k, op, terms->sigma_.get(), x, y, stream);
+        launch_affine_spmv_block(n_, k, terms->slots_, terms->sigma_.get(), x, y, stream);
     } else {
         launch_bcsrmv_f64_block(n_, k, slots_.ptr.get(), slots_.cols.get(), values_.get(), x, y,
                                 stream);
@@ -198,12 +172,8 @@ void PcgAmgSolver::apply_operator(int k, const AffineTerms* terms, const double*
 void PcgAmgSolver::apply_operator(int k, const AffineTerms* terms, const float* x, float* y,
                                   cudaStream_t stream) {
     if (terms != nullptr) {
-        const AffineSlots& a = terms->slots_;
-        const AffineOperator op{a.n_terms,          a.order.get(),     a.seg_ptr.get(),
-                                a.seg_start.get(),  a.seg_term.get(),  a.cols.get(),
-                                a.vals.get()};
-        launch_affine_diff_block(n_, k, op, terms->vals32_.get(), terms->sigma32_.get(), x, y,
-                                 stream);
+        launch_affine_diff_block(n_, k, terms->slots_, terms->vals32_.get(),
+                                 terms->sigma32_.get(), x, y, stream);
     } else {
         launch_bcsrmv_diff_block(n_, k, slots_.ptr.get(), slots_.cols.get(), values32_.get(), x,
                                  y, stream);
@@ -212,8 +182,8 @@ void PcgAmgSolver::apply_operator(int k, const AffineTerms* terms, const float* 
 
 void PcgAmgSolver::ensure_block_buffers(int k) {
     if (block_k_ >= k) return;
-    // Drop the width before reallocating: if an allocation below throws, the old buffers are
-    // already released and a retry at the same k must not take the early-out above.
+    // Drop the width before reallocating: if an allocation below throws, some old buffers are
+    // already gone and a retry at the same k must not take the early-out above.
     block_k_ = 0;
     const size_t nk = static_cast<size_t>(n_) * k;
     r_blk_ = alloc<float>(nk, "R_blk");
@@ -235,7 +205,7 @@ PcgBlockResult PcgAmgSolver::solve_mixed_block(NativeVCycle& preconditioner, con
                                                int max_iters, cudaStream_t stream,
                                                const double* X0) {
     const std::scoped_lock lock(mutex_, preconditioner.mutex());
-    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kBlock);
+    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, false);
 }
 
 PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, AffineTerms& terms,
@@ -269,22 +239,19 @@ PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, Af
                            defl_inv_e_.get(), stream);
     check_cuda(cudaGetLastError(), "affine deflation");
     defl_affine_ = true;
-    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, Path::kAffine,
-                       &terms);
+    return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, false, &terms);
 }
 
 PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const double* B,
                                          double* X, int k, double tolerance, int max_iters,
-                                         cudaStream_t stream, const double* X0, Path path,
+                                         cudaStream_t stream, const double* X0, bool single,
                                          AffineTerms* terms) {
     if (max_iters <= 0) throw std::invalid_argument("solve_mixed_block: max_iters must be > 0");
     if (!is_block_width(k)) {
         throw std::invalid_argument("solve_mixed_block supports k in {1, 2, 4, 8}");
     }
-    const bool affine = path == Path::kAffine;
-    const bool single = path == Path::kSingle;
     ensure_block_buffers(k);
-    if (!affine) deflation_from_values(stream);
+    if (terms == nullptr && defl_affine_) deflation_from_values(stream);
     cudaStream_t s = solve_stream_.get();
     check_cuda(cudaEventRecord(join_event_.get(), stream), "block:record_in");
     check_cuda(cudaStreamWaitEvent(s, join_event_.get(), 0), "block:wait_in");
@@ -304,7 +271,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     double* const d_true_sq = scalars + 10 * k;
     double* const d_write = scalars + 11 * k;
     double* const d_tolerance = scalars + 12 * k;
-    const Deflation defl = deflation();
+    const Deflation defl{defl_n_, defl_rows_.get(), defl_aw_.get(), defl_inv_e_.get()};
     double* const h_norm = h_norms_blk_.get();
     double* const h_ref = h_norms_blk_.get() + k;
     double* const h_true = h_norms_blk_.get() + 2 * k;
@@ -400,7 +367,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
 
     launch_bcg_deflate_start(n_, k, defl, X_int, R, partials, d_rsum, s);
     preconditioner.apply_block(n_, k, R, ZF, s);
-    launch_bcg_cast_dot_init(n_, k, ZF, R, defl, d_rsum, partials, d_rz, d_shift, P, s);
+    launch_bcg_dot_init(n_, k, ZF, R, defl, d_rsum, partials, d_rz, d_shift, P, s);
 
     auto run_body = [&]() {
         apply_operator(k, terms, P, AP, s);
@@ -412,12 +379,13 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                                    cudaMemcpyDeviceToHost, s),
                    "block:copy(norms)");
         preconditioner.apply_block(n_, k, R, ZF, s);
-        launch_bcg_cast_dot_beta(n_, k, ZF, R, defl, d_converged, d_rsum, partials, d_rz, d_beta,
-                                 d_shift, s);
+        launch_bcg_dot_beta(n_, k, ZF, R, defl, d_converged, d_rsum, partials, d_rz, d_beta,
+                            d_shift, s);
         launch_bcg_update_p(n_, k, d_alpha, d_beta, d_shift, ZF, P, X_int, s);
     };
 
-    const GraphCache::Key key{&preconditioner, preconditioner.generation(), k, block_buffers_};
+    GraphCache& graph = terms ? terms->graph_ : single ? single_graph_ : block_graph_;
+    const GraphCache::Key key{preconditioner.generation(), k, block_buffers_};
     std::vector<double> rel(k, 0.0);
     // max_iters for a column that never reaches tolerance.
     std::vector<int> col_iters(k, max_iters);
@@ -440,7 +408,6 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     std::vector<double> write(k);
     int result_iters = max_iters;
     for (int it = 1; it <= max_iters; ++it) {
-        GraphCache& graph = affine ? terms->graph_ : single ? single_graph_ : block_graph_;
         graph.run(s, key, it, run_body);
         check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
         // A column whose recurrence met tolerance is frozen on the device, so its x cannot move
@@ -465,7 +432,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
         if (check_now || all_waiting) {
             // A column whose fp32 recurrence reaches its checkpoint is checked on the fp64
             // operator. It is done if that meets tolerance; otherwise it restarts from the true
-            // residual, the same start a solve makes, and its next stage is measured from there.
+            // residual, and its next stage is measured from there.
             apply_operator(k, terms, X_int, AP64, s);
             launch_bcg_residual(n_, k, B, AP64, d_write, R, partials, d_true_sq, s);
             check_cuda(cudaMemcpyAsync(h_true, d_true_sq, static_cast<size_t>(k) * sizeof(double),
@@ -556,6 +523,6 @@ PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* 
                                     cudaStream_t stream, const double* x0) {
     const std::scoped_lock lock(mutex_, preconditioner.mutex());
     const PcgBlockResult r =
-        solve_block(preconditioner, b, x, 1, tolerance, max_iters, stream, x0, Path::kSingle);
+        solve_block(preconditioner, b, x, 1, tolerance, max_iters, stream, x0, true);
     return {r.iterations, r.relative_residual[0]};
 }

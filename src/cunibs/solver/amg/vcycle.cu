@@ -1,6 +1,5 @@
-// Every V-cycle step is written once, templated on the number of right-hand sides K, and
-// the single-RHS cycle is the K = 1 instantiation: for K = 1 the row-major (n, K) operands
-// collapse to plain vectors and the compiler folds the column loops away.
+// Every V-cycle step is written once, templated on the number of right-hand sides K. For K = 1 the
+// row-major (n, K) operands collapse to plain vectors and the compiler folds the column loops away.
 #include "amg/vcycle.hpp"
 #include "amg/slot_csr.hpp"
 #include "core/device_math.cuh"
@@ -12,21 +11,20 @@
 #include <cstdint>
 #include <iterator>
 #include <stdexcept>
-#include <string>
 #include <utility>
 
 namespace {
 
-template <typename T>
-using Buffer = DeviceBuffer<T>;
+using Level = NativeVCycle::Level;
 
 template <typename T>
-Buffer<T> device_alloc(std::size_t count, const char* what) {
+DeviceBuffer<T> device_alloc(std::size_t count, const char* what) {
     return ::device_alloc<T>(count, "vcycle", what);
 }
 
 template <typename T>
-Buffer<T> device_clone(const T* src, std::size_t count, cudaStream_t stream, const char* what) {
+DeviceBuffer<T> device_clone(const T* src, std::size_t count, cudaStream_t stream,
+                             const char* what) {
     return ::device_clone<T>(src, count, stream, "vcycle", what);
 }
 
@@ -384,12 +382,12 @@ __global__ void __launch_bounds__(kBlock)
 // GraphCache handles a launch that fails inside the CG stream capture. Grid dimensions are checked
 // here, which is the only launch failure this code can cause on its own.
 template <int K>
-void launch_jacobi_zero(int n, const float* dinv, const float* b, float alpha, float* x,
+void launch_jacobi_zero(const Level& l, const float* b, float alpha, float* x,
                         cudaStream_t stream) {
-    const std::int64_t total = static_cast<std::int64_t>(n) * K;
+    const std::int64_t total = static_cast<std::int64_t>(l.n) * K;
     if (const unsigned blocks = grid_for(total)) {
         vc_jacobi_zero_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            static_cast<std::uint64_t>(total), dinv, b, alpha, x);
+            static_cast<std::uint64_t>(total), l.dinv.get(), b, alpha, x);
     }
 }
 
@@ -405,64 +403,55 @@ void dispatch_tpr(int tpr, F&& f) {
 }
 
 template <int K>
-void launch_residual(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
-                     const __half* values,
-                     const float* row_scale, const float* x, const float* b, float* r,
+void launch_residual(const Level& l, const float* x, const float* b, float* r,
                      cudaStream_t stream) {
-    dispatch_tpr(tpr, [&](auto tc) {
+    dispatch_tpr(l.tpr, [&](auto tc) {
         constexpr int TPR = decltype(tc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
-            vc_residual_kernel<K, TPR>
-                <<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, values, row_scale, x, b, r);
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n) * TPR)) {
+            vc_residual_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
+                l.n, l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(), x, b, r);
         }
     });
 }
 
 template <int K>
-void launch_restrict(int n_coarse, const int* r_row_ptr, const int* r_col_idx,
-                     const float* r_vals, const float* r_fine, float* b_coarse,
-                     cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n_coarse) * kRestrictTpr)) {
-        vc_restrict_kernel<K><<<blocks, kBlock, 0, stream>>>(n_coarse, r_row_ptr, r_col_idx,
-                                                             r_vals, r_fine, b_coarse);
+void launch_restrict(const Level& l, const float* r_fine, float* b_coarse, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n_coarse) * kRestrictTpr)) {
+        vc_restrict_kernel<K><<<blocks, kBlock, 0, stream>>>(
+            l.n_coarse, l.r_row_ptr.get(), l.r_col_idx.get(), l.r_values.get(), r_fine, b_coarse);
     }
 }
 
 template <int K>
-void launch_prolongate(int n, const int* p_row_ptr, const int* p_col_idx, const float* p_vals,
-                       const float* x_coarse, float* x_fine, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        vc_prolongate_kernel<K><<<blocks, kBlock, 0, stream>>>(n, p_row_ptr, p_col_idx, p_vals,
-                                                               x_coarse, x_fine);
+void launch_prolongate(const Level& l, const float* x_coarse, float* x_fine, cudaStream_t stream) {
+    if (const unsigned blocks = grid_for(l.n)) {
+        vc_prolongate_kernel<K><<<blocks, kBlock, 0, stream>>>(
+            l.n, l.p_row_ptr.get(), l.p_col_idx.get(), l.p_values.get(), x_coarse, x_fine);
     }
 }
 
 template <int K>
-void launch_cheby_step(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
-                       const __half* values, const float* row_scale, const float* dinv,
-                       const float* b, const float* x_cur, const float* x_prev, float c_cur,
-                       float c_prev, float alpha, float* x_out, cudaStream_t stream) {
-    dispatch_tpr(tpr, [&](auto tc) {
+void launch_cheby_step(const Level& l, const float* b, const float* x_cur, const float* x_prev,
+                       float c_cur, float c_prev, float alpha, float* x_out, cudaStream_t stream) {
+    dispatch_tpr(l.tpr, [&](auto tc) {
         constexpr int TPR = decltype(tc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n) * TPR)) {
             vc_cheby_step_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                n, row_ptr, cols, values, row_scale, dinv, b, x_cur, x_prev, c_cur, c_prev,
-                alpha, x_out);
+                l.n, l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(),
+                l.dinv.get(), b, x_cur, x_prev, c_cur, c_prev, alpha, x_out);
         }
     });
 }
 
 template <int K>
-void launch_cheby_first(int n, int tpr, const int* row_ptr, const std::int16_t* cols,
-                        const __half* values, const float* row_scale, const float* dinv,
-                        const float* b, float alpha0, float c_cur, float alpha,
+void launch_cheby_first(const Level& l, const float* b, float alpha0, float c_cur, float alpha,
                         float* x1_out, float* x_out, cudaStream_t stream) {
-    dispatch_tpr(tpr, [&](auto tc) {
+    dispatch_tpr(l.tpr, [&](auto tc) {
         constexpr int TPR = decltype(tc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * TPR)) {
+        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n) * TPR)) {
             vc_cheby_first_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                n, row_ptr, cols, values, row_scale, dinv, b, alpha0, c_cur, alpha,
-                x1_out, x_out);
+                l.n, l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(),
+                l.dinv.get(), b, alpha0, c_cur, alpha, x1_out, x_out);
         }
     });
 }
@@ -586,12 +575,6 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
         device_clone(r_col_idx, static_cast<std::size_t>(p_nnz), stream, "level R idx");
     lvl.r_values = device_clone(r_values, static_cast<std::size_t>(p_nnz), stream, "level R val");
     check_cuda(cudaStreamSynchronize(stream), "vcycle", "level copies");
-    // The finest level reads the caller's b in place, so it needs no RHS of its own.
-    if (!levels_.empty()) {
-        lvl.b = device_alloc<float>(static_cast<std::size_t>(n_rows), "level b");
-    }
-    lvl.x = device_alloc<float>(static_cast<std::size_t>(n_rows), "level x");
-    lvl.r = device_alloc<float>(static_cast<std::size_t>(n_rows), "level r");
     levels_.push_back(std::move(lvl));
 }
 
@@ -600,8 +583,6 @@ void NativeVCycle::set_coarse(int n, const float* ainv, cudaStream_t stream) {
     if (n <= 0) throw std::invalid_argument("NativeVCycle: coarse size must be positive");
     coarse_ainv_ = device_clone(ainv, static_cast<std::size_t>(n) * n, stream, "coarse ainv");
     check_cuda(cudaStreamSynchronize(stream), "vcycle", "coarse copy");
-    coarse_b_ = device_alloc<float>(static_cast<std::size_t>(n), "coarse b");
-    coarse_x_ = device_alloc<float>(static_cast<std::size_t>(n), "coarse x");
     coarse_n_ = n;
 }
 
@@ -627,38 +608,24 @@ void NativeVCycle::ensure_block_buffers(int k) {
     for (std::size_t i = 0; i < levels_.size(); ++i) {
         Level& lvl = levels_[i];
         const std::size_t count = static_cast<std::size_t>(lvl.n) * k;
-        lvl.bk.reset();
-        lvl.xk.reset();
-        lvl.rk.reset();
-        if (i != 0) lvl.bk = device_alloc<float>(count, "level bk");
-        lvl.xk = device_alloc<float>(count, "level xk");
-        lvl.rk = device_alloc<float>(count, "level rk");
+        lvl.b.reset();
+        lvl.x.reset();
+        lvl.r.reset();
+        // The finest level reads the caller's b in place, so it needs no RHS of its own.
+        if (i != 0) lvl.b = device_alloc<float>(count, "level b");
+        lvl.x = device_alloc<float>(count, "level x");
+        lvl.r = device_alloc<float>(count, "level r");
     }
     const std::size_t coarse_count = static_cast<std::size_t>(coarse_n_) * k;
-    coarse_bk_.reset();
-    coarse_xk_.reset();
-    coarse_bk_ = device_alloc<float>(coarse_count, "coarse bk");
-    coarse_xk_ = device_alloc<float>(coarse_count, "coarse xk");
+    coarse_b_.reset();
+    coarse_x_.reset();
+    coarse_b_ = device_alloc<float>(coarse_count, "coarse b");
+    coarse_x_ = device_alloc<float>(coarse_count, "coarse x");
     block_k_ = k;
-}
-
-void NativeVCycle::check_ready(int n, const char* what) const {
-    if (!finalized_) {
-        throw std::runtime_error(std::string("NativeVCycle: ") + what + " before finalize");
-    }
-    const int expected = levels_.empty() ? coarse_n_ : levels_[0].n;
-    if (n != expected) throw std::runtime_error("NativeVCycle: size mismatch");
 }
 
 template <int K>
 void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
-    constexpr bool kSingle = (K == 1);
-    const auto level_b = [](Level& l) { return kSingle ? l.b.get() : l.bk.get(); };
-    const auto level_x = [](Level& l) { return kSingle ? l.x.get() : l.xk.get(); };
-    const auto level_r = [](Level& l) { return kSingle ? l.r.get() : l.rk.get(); };
-    float* const coarse_b = kSingle ? coarse_b_.get() : coarse_bk_.get();
-    float* const coarse_x = kSingle ? coarse_x_.get() : coarse_xk_.get();
-
     if (levels_.empty()) {
         launch_coarse_gemv<K>(coarse_n_, coarse_ainv_.get(), b, x, stream);
         return;
@@ -687,25 +654,19 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
         if (x0 == nullptr && degree_ > 1) {
             // Steps 0 and 1 fused; x1 is only materialised when step 2 will read it as x_prev.
             // Step 1's x_prev term drops out because x0 is zero.
-            launch_cheby_first<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
-                                  lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi,
-                                  cheby_.alpha0, cheby_.c_cur[0], cheby_.alpha[0],
+            launch_cheby_first<K>(lvl, bi, cheby_.alpha0, cheby_.c_cur[0], cheby_.alpha[0],
                                   degree_ > 2 ? target(0) : nullptr, target(1), stream);
             prev = target(0);
             cur = target(1);
             first_step = 2;
         } else if (x0 == nullptr) {
-            launch_jacobi_zero<K>(lvl.n, lvl.dinv.get(), bi, cheby_.alpha0, target(0), stream);
+            launch_jacobi_zero<K>(lvl, bi, cheby_.alpha0, target(0), stream);
         } else {
-            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
-                                 lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, x0,
-                                 x0, 1.0f, 0.0f, cheby_.alpha0, target(0), stream);
+            launch_cheby_step<K>(lvl, bi, x0, x0, 1.0f, 0.0f, cheby_.alpha0, target(0), stream);
         }
         for (int s = first_step; s < degree_; ++s) {
             float* out = target(s);
-            launch_cheby_step<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
-                                 lvl.values.get(), lvl.row_scale.get(), lvl.dinv.get(), bi, cur,
-                                 prev, cheby_.c_cur[s - 1], cheby_.c_prev[s - 1],
+            launch_cheby_step<K>(lvl, bi, cur, prev, cheby_.c_cur[s - 1], cheby_.c_prev[s - 1],
                                  cheby_.alpha[s - 1], out, stream);
             prev = cur;
             cur = out;
@@ -720,41 +681,36 @@ void NativeVCycle::run_cycle(const float* b, float* x, cudaStream_t stream) {
     const bool odd = (degree_ % 2) != 0;
     for (int i = 0; i < n_levels; ++i) {
         Level& lvl = levels_[i];
-        const float* bi = (i == 0) ? b : level_b(lvl);
-        smooth(lvl, bi, nullptr, odd ? level_x(lvl) : level_r(lvl),
-               odd ? level_r(lvl) : level_x(lvl), nullptr);
-        launch_residual<K>(lvl.n, lvl.tpr, lvl.row_ptr.get(), lvl.cols.get(),
-                           lvl.values.get(), lvl.row_scale.get(), level_x(lvl), bi, level_r(lvl),
-                           stream);
-        float* next_b = (i + 1 < n_levels) ? level_b(levels_[i + 1]) : coarse_b;
-        launch_restrict<K>(lvl.n_coarse, lvl.r_row_ptr.get(), lvl.r_col_idx.get(),
-                           lvl.r_values.get(), level_r(lvl), next_b, stream);
+        const float* bi = (i == 0) ? b : lvl.b.get();
+        float* const lx = lvl.x.get();
+        float* const lr = lvl.r.get();
+        smooth(lvl, bi, nullptr, odd ? lx : lr, odd ? lr : lx, nullptr);
+        launch_residual<K>(lvl, lx, bi, lr, stream);
+        float* next_b = (i + 1 < n_levels) ? levels_[i + 1].b.get() : coarse_b_.get();
+        launch_restrict<K>(lvl, lr, next_b, stream);
     }
 
-    launch_coarse_gemv<K>(coarse_n_, coarse_ainv_.get(), coarse_b, coarse_x, stream);
+    launch_coarse_gemv<K>(coarse_n_, coarse_ainv_.get(), coarse_b_.get(), coarse_x_.get(), stream);
 
     // xc is the coarser level's smoothed correction, wherever its sweep left it.
-    const float* xc = coarse_x;
+    const float* xc = coarse_x_.get();
     for (int i = n_levels - 1; i >= 0; --i) {
         Level& lvl = levels_[i];
-        const float* bi = (i == 0) ? b : level_b(lvl);
-        launch_prolongate<K>(lvl.n, lvl.p_row_ptr.get(), lvl.p_col_idx.get(),
-                             lvl.p_values.get(), xc, level_x(lvl), stream);
-        xc = smooth(lvl, bi, level_x(lvl), level_r(lvl), level_x(lvl), (i == 0) ? x : nullptr);
+        const float* bi = (i == 0) ? b : lvl.b.get();
+        launch_prolongate<K>(lvl, xc, lvl.x.get(), stream);
+        xc = smooth(lvl, bi, lvl.x.get(), lvl.r.get(), lvl.x.get(), (i == 0) ? x : nullptr);
     }
-}
-
-void NativeVCycle::apply(int n, const float* b, float* x, cudaStream_t stream) {
-    check_ready(n, "apply");
-    run_cycle<1>(b, x, stream);
 }
 
 void NativeVCycle::apply_block(int n, int k, const float* B, float* X, cudaStream_t stream) {
-    check_ready(n, "apply_block");
+    if (!finalized_) throw std::runtime_error("NativeVCycle: apply_block before finalize");
+    if (n != (levels_.empty() ? coarse_n_ : levels_[0].n)) {
+        throw std::runtime_error("NativeVCycle: size mismatch");
+    }
     // Dispatch before allocating so an unsupported k costs nothing.
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
-        if constexpr (K > 1) ensure_block_buffers(K);
+        ensure_block_buffers(K);
         run_cycle<K>(B, X, stream);
     });
 }

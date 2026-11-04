@@ -327,15 +327,6 @@ __device__ __forceinline__ T fold_mul_add(T a, T b, T acc) {
     }
 }
 
-template <typename T>
-__device__ __forceinline__ T fold_add(T a, T acc) {
-    if constexpr (cuda::std::is_same_v<T, float>) {
-        return __fadd_rn(acc, a);
-    } else {
-        return acc + a;
-    }
-}
-
 template <int K, typename T>
 __device__ __forceinline__ cuda::std::array<double, K> widen(const cuda::std::array<T, K>& v) {
     cuda::std::array<double, K> out;
@@ -369,9 +360,9 @@ __device__ __forceinline__ void batched_rows(int n, Load&& load, Use&& fold) {
     }
 }
 
-// Column-wise reductions, stage 1: one partial per (column, block). y is read only by kDot. x and
-// y are both fp64 or both fp32, and the fold runs in their precision.
-template <int K, Fold F, typename T = double>
+// Column-wise reductions, stage 1: one partial per (column, block). y is read only by kDot. kNorm
+// folds fp64 operands, the others fp32, each in that precision.
+template <int K, Fold F, typename T>
 __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __restrict__ y,
                                     double* __restrict__ partials, int n_blocks) {
     const WidthView<const T, K> xv(x, n);
@@ -397,7 +388,7 @@ __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __r
                 } else if constexpr (F == Fold::kNorm) {
                     local[c] = fold_mul_add(xc, xc, local[c]);
                 } else {
-                    local[c] = fold_add(xc, local[c]);
+                    local[c] = __fadd_rn(local[c], xc);
                 }
             }
         });
@@ -444,8 +435,8 @@ __global__ void bcg_reduce_masked_kernel(const double* __restrict__ partials, in
 //
 // Grounding one node of a pure-Neumann operator leaves the constant as a near-null mode that the
 // aggregation hierarchy does not capture. On a head mesh the preconditioned spectrum has a single
-// eigenvalue near 4e-3 against a bulk above 0.05, its eigenvector is the constant everywhere but
-// at the ground, and deflating it takes 21-27% of the CG iterations off.
+// eigenvalue near 4e-3 against a bulk above 0.05, and its eigenvector is the constant everywhere but
+// at the ground.
 //
 // The constant is what makes it nearly free. A w is a stiffness row sum, zero everywhere but at
 // the ground node's neighbours, so it is kept only on that support, and both corrections are
@@ -550,7 +541,7 @@ __global__ void bcg_deflate_start_kernel(int n, const double* __restrict__ rsum0
 #pragma unroll
         for (int c = 0; c < K; ++c) {
             xv[c] += delta[c];
-            sloc[c] = fold_add(rv[c], sloc[c]);
+            sloc[c] = __fadd_rn(sloc[c], rv[c]);
         }
         store_row<K>(&xrows(i, 0), xv);
     }
@@ -655,7 +646,7 @@ __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
             for (int c = 0; c < K; ++c) {
                 rv[t][c] = __fmaf_rn(na[c], apv[t][c], rv[t][c]);
                 rloc[c] = fold_mul_add(rv[t][c], rv[t][c], rloc[c]);
-                rloc[K + c] = fold_add(rv[t][c], rloc[K + c]);
+                rloc[K + c] = __fadd_rn(rloc[K + c], rv[t][c]);
             }
             store_row<K>(&rrows(i, 0), rv[t]);
         }
@@ -853,14 +844,14 @@ void launch_bcsrmv_diff_block(int n, int k, const int* row_ptr, const std::int16
     });
 }
 
-void launch_affine_diff_block(int n, int k, const AffineOperator& op, const float* vals,
+void launch_affine_diff_block(int n, int k, const AffineSlots& op, const float* vals,
                               const float* sigma, const float* x, float* y, cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         if (const unsigned blocks = grid_for(n)) {
             affine_diff_kernel<K><<<blocks, kBlock, 0, stream>>>(
-                n, op.order, op.seg_ptr, op.seg_start, op.seg_term, op.cols, vals, sigma,
-                op.n_terms, x, y);
+                n, op.order.get(), op.seg_ptr.get(), op.seg_start.get(), op.seg_term.get(),
+                op.cols.get(), vals, sigma, op.n_terms, x, y);
         }
     });
 }
@@ -872,56 +863,55 @@ void launch_diff_values(int n_segs, const int* bounds, const std::int16_t* cols,
     }
 }
 
-void launch_affine_spmv_block(int n, int k, const AffineOperator& op, const double* sigma,
+void launch_affine_spmv_block(int n, int k, const AffineSlots& op, const double* sigma,
                               const double* x, double* y, cudaStream_t stream) {
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
             affine_spmv_kernel<K><<<blocks, kBlock, 0, stream>>>(
-                n, op.order, op.seg_ptr, op.seg_start, op.seg_term, op.cols, op.vals, sigma,
-                op.n_terms, x, y);
+                n, op.order.get(), op.seg_ptr.get(), op.seg_start.get(), op.seg_term.get(),
+                op.cols.get(), op.vals.get(), sigma, op.n_terms, x, y);
         }
     });
 }
 
+namespace {
+
+template <Fold F, typename T>
+void launch_partials(int n, int k, const T* x, const T* y, double* partials, int n_blocks,
+                     cudaStream_t stream) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        bcg_partials_kernel<K, F, T>
+            <<<n_blocks, kBlock, 0, stream>>>(n, x, y, partials, n_blocks);
+    });
+}
+
+void launch_init_p(int n, int k, const double* shift, const float* zf, const double* mask,
+                   float* p, cudaStream_t stream) {
+    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
+        constexpr int K = decltype(kc)::value;
+        if (const unsigned blocks = grid_for(n)) {
+            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, mask, p);
+        }
+    });
+}
+
+}  // namespace
+
 void launch_bcg_dot(int n, int k, const float* x, const float* y, double* partials, double* out,
                     cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kDot, float>
-            <<<n_blocks, kBlock, 0, stream>>>(n, x, y, partials, n_blocks);
-    });
+    launch_partials<Fold::kDot>(n, k, x, y, partials, n_blocks, stream);
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
 }
 
 void launch_bcg_norm2(int n, int k, const double* x, double* partials, double* out,
                       cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kNorm>
-            <<<n_blocks, kBlock, 0, stream>>>(n, x, static_cast<const double*>(nullptr),
-                                              partials, n_blocks);
-    });
+    launch_partials<Fold::kNorm, double>(n, k, x, nullptr, partials, n_blocks, stream);
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
 }
-
-namespace {
-
-void launch_bcg_sum(int n, int k, const float* x, double* partials, double* out,
-                    cudaStream_t stream) {
-    const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kSum, float>
-            <<<n_blocks, kBlock, 0, stream>>>(n, x, static_cast<const float*>(nullptr),
-                                              partials, n_blocks);
-    });
-    bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, out);
-}
-
-}  // namespace
 
 int select_deflation_rows(int n, const int* row_ptr, const double* vals, double tol, int* rows,
                           cudaStream_t stream) {
@@ -966,8 +956,9 @@ void launch_bcg_defl_affine(int n_s, int n_terms, const double* aw_t, const doub
 
 void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, float* r,
                               double* partials, double* rsum, cudaStream_t stream) {
-    launch_bcg_sum(n, k, r, partials, rsum, stream);
     const int n_blocks = bcg_partials_blocks(n);
+    launch_partials<Fold::kSum, float>(n, k, r, nullptr, partials, n_blocks, stream);
+    bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rsum);
     dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
         constexpr int K = decltype(kc)::value;
         if (const unsigned blocks = grid_for(defl.n_rows)) {
@@ -1002,55 +993,36 @@ void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const float
     bcg_reduce_kernel<<<2 * k, kBlock, 0, stream>>>(partials, n_blocks, norms_sums);
 }
 
-void launch_bcg_cast_dot_beta(int n, int k, const float* zf, const float* r, Deflation defl,
-                              const double* converged, const double* rsum, double* partials,
-                              double* rz, double* beta, double* shift, cudaStream_t stream) {
+void launch_bcg_dot_beta(int n, int k, const float* zf, const float* r, Deflation defl,
+                         const double* converged, const double* rsum, double* partials,
+                         double* rz, double* beta, double* shift, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kDot, float>
-            <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
-    });
+    launch_partials<Fold::kDot>(n, k, r, zf, partials, n_blocks, stream);
     bcg_reduce_beta_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, converged, defl, zf, k,
                                                      rsum, rz, beta, shift);
 }
 
-void launch_bcg_cast_dot_init(int n, int k, const float* zf, const float* r, Deflation defl,
-                              const double* rsum, double* partials, double* rz, double* shift,
-                              float* p, cudaStream_t stream) {
+void launch_bcg_dot_init(int n, int k, const float* zf, const float* r, Deflation defl,
+                         const double* rsum, double* partials, double* rz, double* shift,
+                         float* p, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kDot, float>
-            <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
-        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, k, rsum,
-                                                         nullptr, rz, shift);
-        if (const unsigned blocks = grid_for(n)) {
-            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, nullptr, p);
-        }
-    });
+    launch_partials<Fold::kDot>(n, k, r, zf, partials, n_blocks, stream);
+    bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, k, rsum,
+                                                     nullptr, rz, shift);
+    launch_init_p(n, k, shift, zf, nullptr, p, stream);
 }
 
 void launch_bcg_restart(int n, int k, const float* zf, const float* r, Deflation defl,
                         const double* mask, double* partials, double* rsum, double* rz,
                         double* shift, float* p, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        bcg_partials_kernel<K, Fold::kSum, float>
-            <<<n_blocks, kBlock, 0, stream>>>(n, r, static_cast<const float*>(nullptr), partials,
-                                              n_blocks);
-        bcg_reduce_masked_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, mask, rsum);
-        bcg_partials_kernel<K, Fold::kDot, float>
-            <<<n_blocks, kBlock, 0, stream>>>(n, r, zf, partials, n_blocks);
-        bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, k, rsum,
-                                                         mask, rz, shift);
-        if (const unsigned blocks = grid_for(n)) {
-            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, mask, p);
-        }
-    });
+    launch_partials<Fold::kSum, float>(n, k, r, nullptr, partials, n_blocks, stream);
+    bcg_reduce_masked_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, mask, rsum);
+    launch_partials<Fold::kDot>(n, k, r, zf, partials, n_blocks, stream);
+    bcg_reduce_init_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, defl, zf, k, rsum, mask,
+                                                     rz, shift);
+    launch_init_p(n, k, shift, zf, mask, p, stream);
 }
-
 
 void launch_bcg_update_p(int n, int k, const double* alpha, const double* beta,
                          const double* shift, const float* zf, float* p, double* x,

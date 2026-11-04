@@ -24,7 +24,8 @@
 // covers, and unscaled fp16 costs iterations on some meshes. Callers hand over fp32; add_level
 // converts.
 //
-// apply() is stream-ordered and CUDA-graph-capturable (no allocations, no host syncs).
+// apply_block() is stream-ordered and, after a first call at its width, CUDA-graph-capturable (no
+// allocations, no host syncs).
 // generation() keys PcgAmgSolver's cached CG graph, which embeds pointers into the buffers
 // owned here.
 
@@ -34,6 +35,38 @@ inline constexpr int kMaxSmootherDegree = 8;
 
 class NativeVCycle {
 public:
+    struct Level {
+        int n = 0;
+        int n_coarse = 0;
+        // Threads cooperating on one row in this level's SpMV-shaped kernels, from the operator's
+        // own shape (see choose_tpr). Never a function of k, so a placement's result does not
+        // depend on the block width it was solved at.
+        int tpr = 0;
+        // The level operator as a slot CSR (amg/slot_csr.hpp): row_ptr indexes slots.
+        DeviceBuffer<int> row_ptr;
+        DeviceBuffer<std::int16_t> cols;
+        DeviceBuffer<__half> values;    // a_ij / row_scale[i], in slot order
+        DeviceBuffer<float> row_scale;  // max_j |a_ij|, or 1 for an empty row
+        DeviceBuffer<float> dinv;
+        // P (n, n_coarse) and R = P^T (n_coarse, n), both CSR with indices sorted at setup so
+        // the transfer kernels' row sums have a fixed order.
+        DeviceBuffer<int> p_row_ptr;
+        DeviceBuffer<int> p_col_idx;
+        DeviceBuffer<float> p_values;
+        DeviceBuffer<int> r_row_ptr;
+        DeviceBuffer<int> r_col_idx;
+        DeviceBuffer<float> r_values;
+        // (n, k) row-major work buffers, sized for block_k_.
+        DeviceBuffer<float> b;  // level RHS (restricted residual); null at level 0, which reads
+                          // the caller's b directly
+        // The smoother's two ping-pong buffers, also holding the residual between sweeps.
+        // Every Chebyshev step gathers x_cur across the whole vector, so it cannot write the
+        // buffer it reads and a sweep alternates between these two; two suffice because the
+        // step kernel's x_prev read is per-row, so its output may alias x_prev.
+        DeviceBuffer<float> x;
+        DeviceBuffer<float> r;
+    };
+
     NativeVCycle();
 
     NativeVCycle(const NativeVCycle&) = delete;
@@ -53,9 +86,7 @@ public:
     void set_coarse(int n, const float* ainv, cudaStream_t stream);
     void finalize();
 
-    void apply(int n, const float* b, float* x, cudaStream_t stream);
-    // Block variant: B and X are row-major (n, k), k in {1, 2, 4, 8}; k = 1 is apply. Must be
-    // graph-capturable after a first (warm-up) call.
+    // B and X are row-major (n, k), k in {1, 2, 4, 8}.
     void apply_block(int n, int k, const float* B, float* X, cudaStream_t stream);
     int generation() const { return generation_; }
     // Held by a solve for its whole length: a replayed graph reads the cycle's buffers without
@@ -65,9 +96,6 @@ public:
     int n_levels() const { return static_cast<int>(levels_.size()); }
 
 private:
-    template <typename T>
-    using Buffer = DeviceBuffer<T>;
-
     // Host-side Chebyshev coefficients. Step 0 is alpha0 * D^-1 b from a zero guess; step s > 0 is
     //     x_out = c_cur[s-1] x_cur + c_prev[s-1] x_prev + alpha[s-1] D^-1 (b - A x_cur).
     // They depend only on the smoother interval, which the l1 diagonal fixes to
@@ -79,44 +107,7 @@ private:
         float alpha[kMaxSmootherDegree] = {};
     };
 
-    struct Level {
-        int n = 0;
-        int n_coarse = 0;
-        // Threads cooperating on one row in this level's SpMV-shaped kernels, from the operator's
-        // own shape (see choose_tpr). Never a function of k, so a placement's result does not
-        // depend on the block width it was solved at.
-        int tpr = 0;
-        // The level operator as a slot CSR (amg/slot_csr.hpp): row_ptr indexes slots.
-        Buffer<int> row_ptr;
-        Buffer<std::int16_t> cols;
-        Buffer<__half> values;    // a_ij / row_scale[i], in slot order
-        Buffer<float> row_scale;  // max_j |a_ij|, or 1 for an empty row
-        Buffer<float> dinv;
-        // P (n, n_coarse) and R = P^T (n_coarse, n), both CSR with indices sorted at setup so
-        // the transfer kernels' row sums have a fixed order.
-        Buffer<int> p_row_ptr;
-        Buffer<int> p_col_idx;
-        Buffer<float> p_values;
-        Buffer<int> r_row_ptr;
-        Buffer<int> r_col_idx;
-        Buffer<float> r_values;
-        Buffer<float> b;  // level RHS (restricted residual); null at level 0, which reads
-                          // the caller's b directly
-        // The smoother's two ping-pong buffers, also holding the residual between sweeps.
-        // Every Chebyshev step gathers x_cur across the whole vector, so it cannot write the
-        // buffer it reads and a sweep alternates between these two; two suffice because the
-        // step kernel's x_prev read is per-row, so its output may alias x_prev.
-        Buffer<float> x;
-        Buffer<float> r;
-        // (n, k) row-major work buffers for apply_block, sized for block_k_.
-        Buffer<float> bk;
-        Buffer<float> xk;
-        Buffer<float> rk;
-    };
-
     void ensure_block_buffers(int k);
-    void check_ready(int n, const char* what) const;
-    // K = 1 walks the single-RHS buffers, K > 1 the (n, K) row-major ones.
     template <int K>
     void run_cycle(const float* b, float* x, cudaStream_t stream);
 
@@ -125,11 +116,9 @@ private:
     int degree_ = 1;
     bool smoother_set_ = false;
     int coarse_n_ = 0;
-    Buffer<float> coarse_ainv_;
-    Buffer<float> coarse_b_;
-    Buffer<float> coarse_x_;
-    Buffer<float> coarse_bk_;
-    Buffer<float> coarse_xk_;
+    DeviceBuffer<float> coarse_ainv_;
+    DeviceBuffer<float> coarse_b_;
+    DeviceBuffer<float> coarse_x_;
     int block_k_ = 0;
     int generation_ = 0;
     bool finalized_ = false;
