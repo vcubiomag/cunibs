@@ -428,3 +428,23 @@ def test_csr_matmul_is_the_product_and_repeats_bitwise(cp):
     for _ in range(3):
         np.testing.assert_array_equal(cp.asnumpy(csr_matmul(a, x)), cp.asnumpy(y))
     np.testing.assert_array_equal(cp.asnumpy(csr_matmul(a, x[:, 3])), cp.asnumpy(y[:, 3]))
+
+
+@pytest.mark.parametrize(
+    ("field", "bad"),
+    [("tet_nodes", 10**6), ("tet_nodes", -1), ("surf_tris", 10**6), ("surf_tris", -1)],
+)
+def test_head_mesh_rejects_a_node_outside_the_mesh(cube_mesh, field, bad):
+    """Nothing on the device bounds-checks these, and a HeadMesh need not come from a file."""
+    from cunibs.mesh import HeadMesh
+
+    arrays = {
+        "nodes_mm": cube_mesh.nodes_mm,
+        "tet_nodes": cube_mesh.tet_nodes.copy(),
+        "tet_tags": cube_mesh.tet_tags,
+        "surf_tris": cube_mesh.surf_tris.copy(),
+        "surf_tags": cube_mesh.surf_tags,
+    }
+    arrays[field][0, 0] = bad
+    with pytest.raises(ValueError, match="outside the"):
+        HeadMesh(*arrays.values())

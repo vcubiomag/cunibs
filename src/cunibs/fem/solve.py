@@ -853,7 +853,7 @@ def build_context(mesh: HeadMesh) -> SolverContext:
     # Device arrays throughout, so reading any of the mesh on the host is a caller's decision
     # rather than a cost of building the context.
     return SolverContext(
-        HeadMesh(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags),
+        HeadMesh(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags, validate=False),
         nodes_mm,
         tet_nodes,
         tet_tags,

@@ -491,6 +491,9 @@ class HeadMesh:
     Derived surface geometry is not here. The smoothed skin normals a placement projects against
     are built on the device with the rest of the solver context; see
     :func:`~cunibs.fem.solve.skin_triangle_normals` and ``SolverContext.skin_tri_normals``.
+
+    ``validate`` checks that every element names a node of the mesh, since nothing on the device
+    bounds-checks them. :func:`load_mesh` has already done so.
     """
 
     def __init__(
@@ -500,7 +503,17 @@ class HeadMesh:
         tet_tags: npt.NDArray[np.int32],
         surf_tris: npt.NDArray[np.int32],
         surf_tags: npt.NDArray[np.int32],
+        *,
+        validate: bool = True,
     ) -> None:
+        if validate:
+            for what, ids in (("tetrahedron", tet_nodes), ("surface triangle", surf_tris)):
+                if ids.size and not (
+                    int(ids.min()) >= 0 and int(ids.max()) < nodes_mm.shape[0]
+                ):
+                    raise ValueError(
+                        f"A {what} names a node outside the {nodes_mm.shape[0]} in the mesh."
+                    )
         self._nodes_mm = nodes_mm
         self._tet_nodes = tet_nodes
         self._tet_tags = tet_tags
@@ -641,7 +654,7 @@ class HeadMesh:
 
 def load_mesh(mesh_file: str | Path) -> HeadMesh:
     """Load a tetrahedral head mesh from binary Gmsh 2.2 or from :meth:`HeadMesh.save`'s HDF5."""
-    return HeadMesh(*parse_mesh(Path(mesh_file)))
+    return HeadMesh(*parse_mesh(Path(mesh_file)), validate=False)
 
 
 # Tissues a head model has to have for a TMS field to mean anything. Deliberately not the whole
