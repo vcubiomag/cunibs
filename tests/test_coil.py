@@ -36,13 +36,6 @@ def test_encode_ccd_roundtrips_to_coil(tmp_path):
     assert c.positions_m.shape == (2, 3) and c.moments.shape == (2, 3)
 
 
-def test_load_bundled_coil():
-    c = Coil.load("MagStim_D70")
-    assert c.positions_m.shape[1] == 3
-    assert c.moments.shape == c.positions_m.shape
-    assert c.name
-
-
 def test_bundled_didt_max_is_in_a_per_s():
     """dIdtmax is stored in A/us and exposed in A/s, so didt=coil.didt_max is a real pulse."""
     c = Coil.load("MagStim_D70")
@@ -73,7 +66,6 @@ def test_repr_names_the_coil_rather_than_dumping_its_dipoles():
 
 @pytest.mark.parametrize("path", [p for _, p in BUNDLED], ids=[n for n, _ in BUNDLED])
 def test_all_bundled_coils_load(path):
-    assert path.exists(), path
     c = Coil.load(path)
     n = c.positions_m.shape[0]
     assert n > 0

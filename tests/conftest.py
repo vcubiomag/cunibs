@@ -2,7 +2,7 @@
 
 The ``Subject`` fixtures are session-scoped so the GPU context and UQ precompute are built
 once for the whole run. Never call ``.free()`` on one, and never mutate its ``HeadMesh``
-(``tet_barycenters_mm`` is a ``cached_property``) — take the ``fresh_subject`` factory instead.
+(``tet_barycenters_mm`` is a ``cached_property``). Take the ``fresh_subject`` factory instead.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,6 @@ _CUBE_CORNERS = np.array(
         [0, 1, 1],
         [1, 1, 1],
     ],
-    dtype=np.float64,
 )
 _CUBE_TETS = np.array(
     [
@@ -63,20 +63,16 @@ _CUBE_TRIS = np.array(
     dtype=np.int32,
 )
 
-_has_gpu: bool | None = None
 
-
+@cache
 def has_gpu() -> bool:
-    global _has_gpu
-    if _has_gpu is None:
-        try:
-            import cupy
+    try:
+        import cupy
 
-            _has_gpu = cupy.cuda.runtime.getDeviceCount() > 0
-        # cupy raises its own driver/runtime errors when no device or driver is present.
-        except Exception:  # noqa: BLE001
-            _has_gpu = False
-    return _has_gpu
+        return cupy.cuda.runtime.getDeviceCount() > 0
+    # cupy raises its own driver/runtime errors when no device or driver is present.
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def pytest_collection_modifyitems(items):
@@ -170,10 +166,6 @@ def two_tissue_cube_mesh() -> HeadMesh:
     )
 
 
-_CUBE_CORNERS_IDX = np.array(
-    [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]]
-)
-
 #: The conforming interface plane of ``two_region_mesh``, in mm.
 TWO_REGION_Z0 = 50.0
 
@@ -203,37 +195,32 @@ def _boundary_faces(tets: np.ndarray, nodes: np.ndarray | None = None) -> np.nda
 
 
 def _grid_tet_mesh(
-    cells: int,
-    *,
-    jitter: float = 0.25,
-    side_mm: float = 100.0,
-    keep_plane_z: float | None = None,
-    seed: int = 0,
+    cells: int, *, keep_plane_z: float | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
-    """A ``cells``-cubed grid of the 6-tet cube, with interior nodes jittered.
+    """A 100 mm ``cells``-cubed grid of the 6-tet cube, with interior nodes jittered.
 
-    The 8-node ``cube_mesh`` has no interior node at all -- every one of its corners is on the
-    outer boundary -- so it can only ever exercise a recovery's boundary rule. This is the
-    smallest mesh that reaches the interior branch. Jittering breaks the grid symmetry that
-    would otherwise flatter a patch fit; boundary nodes stay put so the outer surface is planar,
-    and so do the nodes at ``keep_plane_z``, which keeps an interface plane flat and conforming.
+    Every corner of the 8-node ``cube_mesh`` is on the outer boundary, so it can only ever exercise
+    a recovery's boundary rule. This is the smallest mesh that reaches the interior branch.
+    Jittering breaks the grid symmetry that would otherwise flatter a patch fit; boundary nodes
+    stay put so the outer surface is planar, and so do the nodes at ``keep_plane_z``, which keeps
+    an interface plane flat and conforming.
     """
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(0)
     gid = np.arange((cells + 1) ** 3).reshape((cells + 1,) * 3)
-    lin = np.linspace(0.0, side_mm, cells + 1)
+    lin = np.linspace(0.0, 100.0, cells + 1)
     nodes = np.stack(np.meshgrid(lin, lin, lin, indexing="ij"), -1).reshape(-1, 3)
     movable = np.ones((cells + 1,) * 3, dtype=bool)
     movable[[0, -1], :, :] = movable[:, [0, -1], :] = movable[:, :, [0, -1]] = False
     movable = movable.ravel()
     if keep_plane_z is not None:
         movable &= ~np.isclose(nodes[:, 2], keep_plane_z)
-    nodes[movable] += rng.uniform(-jitter, jitter, (int(movable.sum()), 3)) * (side_mm / cells)
+    nodes[movable] += rng.uniform(-0.25, 0.25, (int(movable.sum()), 3)) * (100.0 / cells)
     tets = np.concatenate(
         [
             gid[
-                i + _CUBE_CORNERS_IDX[:, 0],
-                j + _CUBE_CORNERS_IDX[:, 1],
-                k + _CUBE_CORNERS_IDX[:, 2],
+                i + _CUBE_CORNERS[:, 0],
+                j + _CUBE_CORNERS[:, 1],
+                k + _CUBE_CORNERS[:, 2],
             ][_CUBE_TETS]
             for i in range(cells)
             for j in range(cells)
@@ -348,7 +335,7 @@ def patch_mesh(patch_mesh_path) -> HeadMesh:
 
 @pytest.fixture(scope="session")
 def patch_top_mm(patch_mesh) -> np.ndarray:
-    """The topmost scalp node of the patch — the canonical coil target."""
+    """The topmost scalp node of the patch, the canonical coil target."""
     skin_nodes = np.unique(patch_mesh.skin_tris)
     coords = patch_mesh.nodes_mm[skin_nodes]
     return np.ascontiguousarray(coords[np.argmax(coords[:, 2])])
@@ -401,7 +388,4 @@ def fresh_subject():
 
 @pytest.fixture(scope="session")
 def reference_mesh_path() -> Path:
-    path = os.environ.get("CUNIBS_REFERENCE_MESH")
-    if not path:
-        pytest.skip("CUNIBS_REFERENCE_MESH is not set")
-    return Path(path)
+    return Path(os.environ["CUNIBS_REFERENCE_MESH"])

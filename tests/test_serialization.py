@@ -119,6 +119,23 @@ def test_nodal_field_resolves_each_tissue_to_its_own_slot():
     assert not np.isnan(gray[0]).any()
 
 
+def test_a_node_slot_field_resolves_a_region_after_a_roundtrip(tmp_path):
+    """With slots on plain nodes, the region comes from the connectivity the file carries."""
+    r = dataclasses.replace(
+        _make_result(),
+        recovery="spr_global",
+        n_nodes=4,
+        E_slots=np.arange(12, dtype=np.float32).reshape(4, 3),
+        slot_node=np.arange(4, dtype=np.int32),
+        tet_nodes=np.array([[0, 1, 2, 1]] * 3 + [[1, 2, 3, 1]] * 3, dtype=np.int32),
+    )
+    path = tmp_path / "nodal.h5"
+    r.save(path)
+    gray = FieldResult.load(path).nodal_field("gray_matter")
+    np.testing.assert_array_equal(gray[:3], r.E_slots[:3])
+    assert np.isnan(gray[3]).all()
+
+
 def test_recovery_defaults_to_raw_for_a_file_without_the_attribute(tmp_path):
     """A file with no recovery attribute holds a raw field, whatever the current default is."""
     r = _make_result()
@@ -129,12 +146,20 @@ def test_recovery_defaults_to_raw_for_a_file_without_the_attribute(tmp_path):
     assert FieldResult.load(path).recovery == "raw"
 
 
+def _assert_same_metrics(got, want):
+    assert got.keys() == want.keys()
+    for key, value in want.items():
+        if isinstance(value, np.ndarray):
+            np.testing.assert_array_equal(got[key], value, err_msg=key)
+        else:
+            assert got[key] == value, key
+
+
 def test_metrics_survive_roundtrip(tmp_path):
     r = _make_result()
     path = tmp_path / "result.h5"
     r.save(path)
-    loaded = FieldResult.load(path)
-    assert loaded.summary["peak_magnE"] == r.summary["peak_magnE"]
+    _assert_same_metrics(FieldResult.load(path).summary, r.summary)
 
 
 def test_placement_normalizes_inputs():
@@ -145,8 +170,7 @@ def test_placement_normalizes_inputs():
 
 
 def test_placement_roundtrip_non_default_distance(tmp_path):
-    r = _make_result()
-    object.__setattr__(r.placement, "distance_mm", 7.5)
+    r = dataclasses.replace(_make_result(), placement=Placement([1, 2, 3], [4, 5, 6], 7.5))
     path = tmp_path / "result.h5"
     r.save(path)
     assert FieldResult.load(path).placement.distance_mm == 7.5
@@ -218,9 +242,21 @@ def test_uq_result_format_version_mismatch_raises(tmp_path):
         ConductivityUQResult.load(path)
 
 
-def test_unretained_arrays_are_absent_from_the_file(tmp_path):
-    factory, cls, kept, dropped = _make_result, FieldResult, "magnE", ("E", "v")
-    r = dataclasses.replace(factory(), **dict.fromkeys(dropped))
+@pytest.mark.parametrize(
+    ("r", "kept", "dropped"),
+    [
+        (_make_result(), "magnE", ("E", "v")),
+        (
+            _make_uq_result(with_rois=False),
+            "sigma_samples",
+            ("mean_magnE", "std_magnE", "cov_magnE"),
+        ),
+    ],
+    ids=["field", "uq"],
+)
+def test_unretained_arrays_are_absent_from_the_file(tmp_path, r, kept, dropped):
+    cls = type(r)
+    r = dataclasses.replace(r, **dict.fromkeys(dropped))
     path = tmp_path / "partial.h5"
     r.save(path)
     with h5py.File(path, "r") as f:
@@ -233,18 +269,19 @@ def test_unretained_arrays_are_absent_from_the_file(tmp_path):
         assert getattr(loaded, name) is None, name
 
 
+def test_uq_result_needs_a_summary_to_save(tmp_path):
+    r = dataclasses.replace(_make_uq_result(with_rois=False), summary=None)
+    with pytest.raises(ValueError, match="compute_summary"):
+        r.save(tmp_path / "uq.h5")
+
+
 def test_uq_summary_from_loaded_result(tmp_path):
     r = _make_uq_result(with_rois=True)
     path = tmp_path / "uq.h5"
     r.save(path)
     loaded = ConductivityUQResult.load(path)
-    before, after = r.summary, loaded.summary
-    assert before.mean_field["peak_magnE"] == after.mean_field["peak_magnE"]
-    assert before.max_local_cov == after.max_local_cov
-    assert before.mean_field["region_volume_m3"] == after.mean_field["region_volume_m3"]
-    np.testing.assert_array_equal(
-        before.mean_field["peak_location_mm"], after.mean_field["peak_location_mm"]
-    )
+    _assert_same_metrics(loaded.summary.mean_field, r.summary.mean_field)
+    assert loaded.summary.max_local_cov == r.summary.max_local_cov
 
 
 @pytest.mark.realmesh
@@ -273,9 +310,9 @@ def test_provenance_ties_a_saved_result_to_its_inputs(
     assert attrs["coil_n_dipoles"] == d70_coil.n_dipoles
 
     loaded = FieldResult.load(path)
-    assert loaded.provenance["mesh_content_hash"] == patch_mesh.content_hash
+    assert loaded.provenance == {k: v for k, v in result.provenance.items() if v is not None}
     assert loaded.iterations == result.iterations > 0
-    assert loaded.relative_residual == pytest.approx(result.relative_residual)
+    assert loaded.relative_residual == result.relative_residual
 
 
 @pytest.mark.realmesh

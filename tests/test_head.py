@@ -7,18 +7,19 @@ import pytest
 
 from cunibs.head import eeg
 
-# --- geometry ---------------------------------------------------------------------------------
 
-
-def _mesh_with_tagged_interface(two_region_mesh, z0):
-    """The two-region cube, with its flat interface exposed as a gray-matter surface.
+@pytest.fixture(scope="module")
+def interface_ctx(two_region_mesh, two_region_z0):
+    """A context on the two-region cube, with its flat interface exposed as a gray-matter surface.
 
     The fixture's interface is conforming and exactly planar, so the distance from the top face
     down to it is known to the bit: that is what makes this a ground truth rather than a
     self-consistency check.
     """
+    from cunibs.fem import build_context
     from cunibs.mesh import HeadMesh
 
+    z0 = two_region_z0
     nodes = two_region_mesh.nodes_mm
     tets = two_region_mesh.tet_nodes
     faces = tets[:, [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]].reshape(-1, 3)
@@ -31,64 +32,61 @@ def _mesh_with_tagged_interface(two_region_mesh, z0):
     surf_tags = np.concatenate(
         [np.full(len(skin), 1005), np.full(len(interface), 1002)]
     ).astype(np.int32)
-    return HeadMesh(nodes, tets, two_region_mesh.tet_tags, surf_tris, surf_tags)
+    return build_context(HeadMesh(nodes, tets, two_region_mesh.tet_tags, surf_tris, surf_tags))
 
 
 @pytest.mark.gpu
-def test_depth_to_surface_is_exact_on_a_flat_interface(two_region_mesh, two_region_z0):
+def test_depth_to_surface_is_exact_on_a_flat_interface(interface_ctx, two_region_z0):
     """A planar interface at a known depth is the one case with an answer to check against."""
-    from cunibs.fem import build_context
     from cunibs.head import depth_to_surface_mm
 
-    ctx = build_context(_mesh_with_tagged_interface(two_region_mesh, two_region_z0))
     # Points above the top face; each projects straight down onto it.
     xy = np.array([[30.0, 30.0], [50.0, 50.0], [70.0, 40.0]])
     pts = np.column_stack([xy, np.full(len(xy), 130.0)])
 
-    depth = depth_to_surface_mm(ctx, pts, "gray_matter")
+    depth = depth_to_surface_mm(interface_ctx, pts, "gray_matter")
     np.testing.assert_allclose(depth, 100.0 - two_region_z0, atol=1e-9)
 
 
 @pytest.mark.gpu
-def test_depth_is_measured_from_the_scalp_not_from_the_query_point(
-    two_region_mesh, two_region_z0
-):
+def test_depth_is_measured_from_the_scalp_not_from_the_query_point(interface_ctx):
     """Moving the query point along its own normal must not change the distance.
 
     The quantity is a property of the head, not of where the caller happened to stand, so the
     projection has to be what the ray starts from.
     """
-    from cunibs.fem import build_context
     from cunibs.head import depth_to_surface_mm
 
-    ctx = build_context(_mesh_with_tagged_interface(two_region_mesh, two_region_z0))
     near = np.array([[50.0, 50.0, 105.0]])
     far = np.array([[50.0, 50.0, 400.0]])
-    assert depth_to_surface_mm(ctx, near) == pytest.approx(depth_to_surface_mm(ctx, far))
+    assert depth_to_surface_mm(interface_ctx, near) == pytest.approx(
+        depth_to_surface_mm(interface_ctx, far)
+    )
 
 
 @pytest.mark.gpu
-def test_thickness_differences_two_depths_along_one_ray(two_region_mesh, two_region_z0):
-    from cunibs.fem import build_context
+def test_thickness_differences_two_depths_along_one_ray(interface_ctx, two_region_z0):
+    """From the top face the interface comes first, and the scalp only again at the bottom face."""
     from cunibs.head import tissue_depths_mm, tissue_thickness_mm
 
-    ctx = build_context(_mesh_with_tagged_interface(two_region_mesh, two_region_z0))
     pts = np.array([[50.0, 50.0, 130.0]])
-    depths = tissue_depths_mm(ctx, pts, ["gray_matter"])
+    depths = tissue_depths_mm(interface_ctx, pts, ["gray_matter", "scalp"])
     assert depths["gray_matter"][0] == pytest.approx(100.0 - two_region_z0)
-    # Same surface twice is a zero-thickness layer, which pins the sign convention.
-    assert tissue_thickness_mm(ctx, pts, "gray_matter", "gray_matter")[0] == pytest.approx(0.0)
+    assert depths["scalp"][0] == pytest.approx(100.0)
+    assert tissue_thickness_mm(interface_ctx, pts, "gray_matter", "scalp")[0] == pytest.approx(
+        two_region_z0
+    )
+    with pytest.raises(ValueError, match="swapped"):
+        tissue_thickness_mm(interface_ctx, pts, "scalp", "gray_matter")
 
 
 @pytest.mark.gpu
-def test_missing_surface_is_nan_rather_than_a_plausible_number(two_region_mesh, two_region_z0):
+def test_missing_surface_is_nan_rather_than_a_plausible_number(interface_ctx):
     """A ray that never crosses the surface must not come back as a deep target."""
-    from cunibs.fem import build_context
     from cunibs.head import depth_to_surface_mm
 
-    ctx = build_context(_mesh_with_tagged_interface(two_region_mesh, two_region_z0))
     # Projects onto a side wall, so the inward normal runs parallel to the interface plane.
-    depth = depth_to_surface_mm(ctx, np.array([[130.0, 50.0, 75.0]]))
+    depth = depth_to_surface_mm(interface_ctx, np.array([[130.0, 50.0, 75.0]]))
     assert np.isnan(depth[0])
 
 
@@ -131,9 +129,6 @@ def test_a_mesh_without_the_surface_says_so(patch_subject):
     assert ctx.mesh.surface_tags == (1005,)
     with pytest.raises(KeyError, match="no surface with tag 1002"):
         depth_to_surface_mm(ctx, np.array([[0.0, 0.0, 0.0]]))
-
-
-# --- EEG cap ----------------------------------------------------------------------------------
 
 
 _CAP = """\
@@ -183,9 +178,6 @@ def test_find_cap_names_what_is_available(tmp_path):
     with pytest.raises(FileNotFoundError, match="Okamoto"):
         eeg.find_cap(tmp_path / "m2m_sub-001")
     assert eeg.find_cap(tmp_path / "m2m_sub-001", "EEG10-20_Okamoto_2004").exists()
-
-
-# --- candidate grid ---------------------------------------------------------------------------
 
 
 @pytest.mark.gpu

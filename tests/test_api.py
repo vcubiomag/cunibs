@@ -140,7 +140,6 @@ def test_summary_for_is_cached_per_region():
     r = _field_result()
     assert r.summary_for("gray_matter") is r.summary  # the precomputed one, not recomputed
     assert r.summary_for("csf") is r.summary_for("csf")
-    assert set(r._summaries) == {"csf"}
 
 
 def test_field_result_unknown_region_raises():

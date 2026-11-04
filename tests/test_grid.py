@@ -1,9 +1,4 @@
-"""The ADM sampling grid and batched dipole placement, end to end.
-
-``adm/grid.py`` decides where the Q-field is sampled and how world coordinates map to index
-space. An axis transposition in ``world_to_index`` would silently corrupt every ADM evaluation
-while leaving shapes intact, so the load-bearing test here is interpolating a known linear field.
-"""
+"""The ADM sampling grid and batched dipole placement."""
 
 from __future__ import annotations
 
@@ -59,28 +54,18 @@ def test_world_to_index_roundtrip_is_integral(cp, dipole_cloud):
     np.testing.assert_allclose(idx, expected, atol=1e-9)
 
 
-def test_map_coordinates_on_linear_field_is_exact(cp):
-    """Trilinear interpolation is exact for a·x + b, so any axis mix-up shows up immediately."""
-    from cupyx.scipy.ndimage import map_coordinates
-
+def test_world_to_index_uses_each_axis_own_origin_and_spacing(cp):
     grid = Grid(
         origin_m=(-0.02, 0.05, 0.11),
         spacing_m=(2e-3, 3e-3, 5e-3),
         shape=(9, 7, 5),
     )
-    a = np.array([3.0, -7.0, 11.0])
-    b = 0.5
-
-    pts = cp.asnumpy(_points_m(grid))
-    field = cp.asarray((pts @ a + b).reshape(grid.shape))
-
-    rng = np.random.default_rng(2)
-    query = rng.uniform(grid.origin_m, grid.upper_m, size=(500, 3))
-
-    got = cp.asnumpy(
-        map_coordinates(field, grid.world_to_index(cp.asarray(query)), order=1, mode="nearest")
+    query = np.array([[-0.02, 0.05, 0.11], [-0.018, 0.056, 0.125], [-0.004, 0.068, 0.13]])
+    np.testing.assert_allclose(
+        cp.asnumpy(grid.world_to_index(cp.asarray(query))),
+        [[0.0, 1.0, 8.0], [0.0, 2.0, 6.0], [0.0, 3.0, 4.0]],
+        atol=1e-9,
     )
-    np.testing.assert_allclose(got, query @ a + b, rtol=1e-6)
 
 
 def test_upper_m_is_the_last_sample_on_each_axis(cp, dipole_cloud):
@@ -88,29 +73,6 @@ def test_upper_m_is_the_last_sample_on_each_axis(cp, dipole_cloud):
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
     idx = grid.world_to_index(cp.asarray([grid.upper_m]))
     np.testing.assert_allclose(cp.asnumpy(idx).ravel(), np.asarray(grid.shape) - 1.0, atol=1e-9)
-
-
-def test_outside_grid_clamps_to_the_edge(cp):
-    """The hazard ``_require_in_grid`` exists to catch: clamping, not an error, past the edge."""
-    from cupyx.scipy.ndimage import map_coordinates
-
-    grid = Grid(
-        origin_m=(0.0, 0.0, 0.0),
-        spacing_m=(1e-3, 1e-3, 1e-3),
-        shape=(4, 4, 4),
-    )
-    field = cp.asarray(
-        (cp.asnumpy(_points_m(grid)) @ np.array([1.0, 0.0, 0.0])).reshape(grid.shape)
-    )
-    inside = cp.asarray([[3e-3, 0.0, 0.0]])
-    outside = cp.asarray([[3e-3 + 3 * 1e-3, 0.0, 0.0]])
-    edge = float(
-        map_coordinates(field, grid.world_to_index(inside), order=1, mode="nearest")[0]
-    )
-    clamped = float(
-        map_coordinates(field, grid.world_to_index(outside), order=1, mode="nearest")[0]
-    )
-    assert clamped == edge
 
 
 def test_place_coil_dipoles_batch_matches_numpy(cp, synthetic_coil):
@@ -143,19 +105,27 @@ def test_place_batch_leaves_moments_alone_under_pure_translation(cp, synthetic_c
     )
 
 
-def test_place_batch_agrees_with_the_dadt_placement_math(cp, cube_subject, synthetic_coil):
-    """``place_coil_dipoles_batch`` and the inline placement in ``coil_dadt_at_nodes`` must not drift apart."""
-    from cunibs.fem.placement import compute_coil_transform
+def test_place_batch_agrees_with_the_dadt_placement(cp, cube_subject, figure8_coil):
+    """Dipoles placed here and then translated only give the dA/dt the kernel's own placement does."""
+    from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
 
-    tf = compute_coil_transform(cube_subject.context, [50, 50, 120], [50, 150, 100], 4.0)
+    ctx = cube_subject.context
+    tf = compute_coil_transform(ctx, [50, 50, 120], [90, 150, 100], 4.0)
     s, m = place_coil_dipoles_batch(
-        cp.asarray(tf[None]), synthetic_coil.positions_m, synthetic_coil.moments
+        cp.asarray(tf[None]), figure8_coil.positions_m, figure8_coil.moments
     )
-    rot, trans = tf[:3, :3], tf[:3, 3]
-    inline_s = (synthetic_coil.positions_m * 1e3 @ rot.T + trans) * 1e-3
-    inline_m = synthetic_coil.moments @ rot.T
-    np.testing.assert_allclose(cp.asnumpy(s[0]), inline_s, atol=1e-12)
-    np.testing.assert_allclose(cp.asnumpy(m[0]), inline_m, atol=1e-12)
+    trans = np.eye(4)
+    trans[:3, 3] = tf[:3, 3]
+    local = cp.asnumpy(s[0]) - tf[:3, 3] * 1e-3
+
+    placed = cp.asnumpy(coil_dadt_at_nodes(local, m[0], trans, 1e6, ctx.nodes_mm))
+    direct = cp.asnumpy(
+        coil_dadt_at_nodes(
+            figure8_coil.positions_m, figure8_coil.moments, tf, 1e6, ctx.nodes_mm
+        )
+    )
+    assert np.linalg.norm(direct) > 0.0
+    assert np.linalg.norm(placed - direct) / np.linalg.norm(direct) < 1e-6
 
 
 def test_grid_for_placements_contains_every_dipole(cp, cube_subject, figure8_coil):

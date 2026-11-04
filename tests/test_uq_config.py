@@ -49,24 +49,24 @@ def test_naming_only_missing_tissues_is_rejected():
 
 
 @pytest.mark.parametrize(
-    "kwargs",
+    ("kwargs", "match"),
     [
-        {"n_samples": 0},
-        {"n_samples": 2.5},
-        {"seed": 1.5},
-        {"seed": -1},
-        {"distribution": "uniform"},
-        {"tissue_cov": {2: -0.1}},
-        {"tissue_cov": {2: float("nan")}},
-        {"tissue_cov": {99: 0.1}},
-        {"tissue_cov": {"grey_matter": 0.1}},
-        {"tissue_cov": {2: 0.1, "gray_matter": 0.2}},
-        {"perturbed_tags": ()},
-        {"perturbed_tags": (2, 2)},
+        ({"n_samples": 0}, "positive integer"),
+        ({"n_samples": 2.5}, "positive integer"),
+        ({"seed": 1.5}, "seed"),
+        ({"seed": -1}, "seed"),
+        ({"distribution": "uniform"}, "distribution must be"),
+        ({"tissue_cov": {2: -0.1}}, "finite and >= 0"),
+        ({"tissue_cov": {2: float("nan")}}, "finite and >= 0"),
+        ({"tissue_cov": {99: 0.1}}, "no built-in conductivity"),
+        ({"tissue_cov": {"grey_matter": 0.1}}, "grey_matter"),
+        ({"tissue_cov": {2: 0.1, "gray_matter": 0.2}}, "twice"),
+        ({"perturbed_tags": ()}, "at least one tissue"),
+        ({"perturbed_tags": (2, 2)}, "twice"),
     ],
 )
-def test_invalid_configs_raise(kwargs):
-    with pytest.raises(ValueError):
+def test_invalid_configs_raise(kwargs, match):
+    with pytest.raises(ValueError, match=match):
         ConductivityUQConfig(**kwargs)
 
 

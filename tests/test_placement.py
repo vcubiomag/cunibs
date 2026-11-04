@@ -19,7 +19,7 @@ pytestmark = pytest.mark.gpu
 
 
 def closest_on_tri(p, a, b, c):
-    """Ericson's closest point on a triangle — the reference for ``place.cu``'s branch ladder."""
+    """Ericson's closest point on a triangle, the reference for ``place.cu``'s branch ladder."""
     ab, ac, ap = b - a, c - a, p - a
     d1, d2 = ab @ ap, ac @ ap
     if d1 <= 0.0 and d2 <= 0.0:
@@ -58,7 +58,7 @@ def project_to_skin(mesh, point):
 
 
 def dadt_reference(positions_m, moments, transform, didt, targets_mm):
-    """A(r) = (μ₀/4π) Σⱼ mⱼ × (r − sⱼ)/|r − sⱼ|³, times dI/dt — all in float64."""
+    """A(r) = (μ₀/4π) Σⱼ mⱼ × (r − sⱼ)/|r − sⱼ|³, times dI/dt, all in float64."""
     rot, trans = transform[:3, :3], transform[:3, 3]
     s = (np.asarray(positions_m) * 1e3 @ rot.T + trans) * 1e-3
     m = np.asarray(moments) @ rot.T
@@ -107,16 +107,21 @@ def test_transform_columns_follow_the_documented_convention(
 
 
 @pytest.mark.parametrize(
-    ("centers", "handles", "dists"),
+    ("centers", "handles", "dists", "match"),
     [
-        ([50.0, 50.0, 120.0], None, [4.0]),
-        ([[50.0, 50.0, 120.0]] * 2, [[50.0, 150.0, 100.0]], [4.0, 4.0]),
-        ([[50.0, 50.0, 120.0]] * 2, None, [4.0]),
+        ([50.0, 50.0, 120.0], None, [4.0], "centers_mm must be"),
+        (
+            [[50.0, 50.0, 120.0]] * 2,
+            [[50.0, 150.0, 100.0]],
+            [4.0, 4.0],
+            "handles_mm must match",
+        ),
+        ([[50.0, 50.0, 120.0]] * 2, None, [4.0], "distances_mm must be"),
     ],
 )
-def test_transforms_reject_mismatched_shapes(cube_subject, centers, handles, dists):
+def test_transforms_reject_mismatched_shapes(cube_subject, centers, handles, dists, match):
     """The kernel reads one handle and distance per centre, so a short array must not reach it."""
-    with pytest.raises(ValueError, match="must"):
+    with pytest.raises(ValueError, match=match):
         compute_coil_transforms(cube_subject.context, centers, handles, dists)
 
 
@@ -209,7 +214,7 @@ def test_degenerate_handle_would_give_an_arbitrary_in_plane_axis(
     tf = cp.asnumpy(out).reshape(2, 4, 4)
 
     assert cp.asnumpy(degenerate).tolist() == [1, 1]
-    # Frames are finite and orthonormal -- nothing downstream could detect the problem.
+    # Frames are finite and orthonormal, so nothing downstream could detect the problem.
     assert np.isfinite(tf).all()
     np.testing.assert_allclose(tf[0, :3, :3] @ tf[0, :3, :3].T, np.eye(3), atol=1e-12)
     # And identical, so the handle contributed nothing.
@@ -323,12 +328,16 @@ def test_transform_from_inside_the_head_projects_outward(patch_subject, patch_me
 
 
 @pytest.mark.realmesh
-def test_transform_curved_scalp_offset(patch_subject, patch_mesh):
-    """Across 20 real scalp sites the standoff is exactly distance_mm along the outward normal."""
-    import cupy as cp
+def test_transform_curved_scalp_offset(cp, patch_subject, patch_mesh, patch_skin_normals):
+    """Across 20 real scalp sites the standoff is exactly distance_mm along that triangle's normal.
 
+    Each centre is a skin triangle's centroid, so it projects onto itself and the normal is that
+    triangle's own. The normals here come from the loaded mesh, whose triangles the reordering
+    leaves in file order.
+    """
     centroids = patch_mesh.nodes_mm[patch_mesh.skin_tris].mean(axis=1)
-    centers = centroids[:: max(len(centroids) // 20, 1)][:20]
+    triangles = np.arange(len(centroids))[:: max(len(centroids) // 20, 1)][:20]
+    centers = centroids[triangles]
     tfs = cp.asnumpy(
         compute_coil_transforms(
             patch_subject.context,
@@ -337,11 +346,10 @@ def test_transform_curved_scalp_offset(patch_subject, patch_mesh):
             np.full(len(centers), 4.0),
         )
     )
-    for i, tf in enumerate(tfs):
-        proj = tf[:3, 3] + 4.0 * tf[:3, 2]
-        offset = tf[:3, 3] - proj
-        assert np.linalg.norm(offset) == pytest.approx(4.0, rel=1e-12), f"site {i}"
-        assert float(offset @ -tf[:3, 2]) > 0, f"site {i}"  # outward, not inward
+    normals = patch_skin_normals[triangles]
+    np.testing.assert_allclose(tfs[:, :3, 3], centers + 4.0 * normals, atol=1e-9)
+    np.testing.assert_allclose(tfs[:, :3, 2], -normals, atol=1e-12)
+    for tf in tfs:
         np.testing.assert_allclose(tf[:3, :3].T @ tf[:3, :3], np.eye(3), atol=1e-12)
 
 
@@ -433,7 +441,7 @@ def test_dadt_applies_rotation_to_moments_not_translation(cp, cube_subject):
 
 
 def test_dadt_rotation_is_applied_to_moments(cp, cube_subject):
-    """A 90° rotation about x must carry m = ẑ to ŷ, which the analytic oracle checks directly."""
+    """A 90° rotation about x must carry m = ẑ to -ŷ, which the analytic oracle checks directly."""
     from cunibs.fem.placement import coil_dadt_at_nodes
 
     ctx = cube_subject.context
@@ -469,14 +477,14 @@ def test_dadt_matches_analytic_on_real_nodes(cp, patch_subject, patch_placement,
     assert rel_l2(got.astype(np.float64), ref) <= 1e-5
 
 
+@pytest.mark.parametrize("on_device", [False, True])
 @pytest.mark.parametrize("bad", ["center", "handle", "distance"])
-def test_a_non_finite_placement_input_is_rejected(cube_subject, bad):
+def test_a_non_finite_placement_input_is_rejected(cp, cube_subject, bad, on_device):
     """A NaN centre finds no closest triangle at all, so it is refused before the kernel."""
-    from cunibs.fem.placement import compute_coil_transforms
-
     centers = np.array([[50.0, 50.0, 120.0]])
     handles = centers + np.array([0.0, 50.0, 0.0])
     dists = np.array([4.0])
     {"center": centers, "handle": handles, "distance": dists}[bad][0, ...] = np.nan
+    to = cp.asarray if on_device else np.asarray
     with pytest.raises(ValueError, match="must be finite"):
-        compute_coil_transforms(cube_subject.context, centers, handles, dists)
+        compute_coil_transforms(cube_subject.context, to(centers), to(handles), to(dists))

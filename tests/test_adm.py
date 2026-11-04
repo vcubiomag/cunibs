@@ -41,7 +41,7 @@ def test_reciprocity_matches_forward_directional(cp, cube_mesh, coil):
 
     ctx, res, dadt_nodes = _setup(cube_mesh, coil)
     tgt_elm = int(cp.argmax(res["magnE"]))
-    tgt_pt = cp.asnumpy(cp.asarray(cube_mesh.tet_barycenters_mm)[tgt_elm])
+    tgt_pt = cp.asnumpy(ctx.tet_barycenters_mm[tgt_elm])
 
     for direction in ([1, 0, 0], [0, 0, 1], [0.3, -0.7, 0.6]):
         rt = resolve_target(ctx, Target(tgt_pt, direction, region="gray_matter"))
@@ -61,7 +61,7 @@ def test_reciprocity_magnitude(cp, cube_mesh, coil):
 
     ctx, res, dadt_nodes = _setup(cube_mesh, coil)
     tgt_elm = int(cp.argmax(res["magnE"]))
-    tgt_pt = cp.asnumpy(cp.asarray(cube_mesh.tet_barycenters_mm)[tgt_elm])
+    tgt_pt = cp.asnumpy(ctx.tet_barycenters_mm[tgt_elm])
 
     rt = resolve_target(ctx, Target(tgt_pt, region="gray_matter"))  # direction=None
     assert rt.magnitude and rt.directions.shape[0] == 3
@@ -79,7 +79,7 @@ def test_qfield_reformulation_and_grid_interp(cp, cube_mesh, coil):
 
     ctx, res, dadt_nodes = _setup(cube_mesh, coil)
     tgt_elm = int(cp.argmax(res["magnE"]))
-    tgt_pt = cp.asnumpy(cp.asarray(cube_mesh.tet_barycenters_mm)[tgt_elm])
+    tgt_pt = cp.asnumpy(ctx.tet_barycenters_mm[tgt_elm])
     rt = resolve_target(ctx, Target(tgt_pt, region="gray_matter"))
     adj = solve_adjoint(ctx, rt)
 
@@ -105,7 +105,7 @@ def test_optimize_consistent_with_forward(cp, cube_mesh, coil):
     ctx = build_context(cube_mesh)
     res0 = solve_placement(ctx, coil.positions_m, coil.moments, CENTER, HANDLE, DIST, DIDT)
     tgt_elm = int(cp.argmax(res0["magnE"]))
-    tgt_pt = cp.asnumpy(cp.asarray(cube_mesh.tet_barycenters_mm)[tgt_elm])
+    tgt_pt = cp.asnumpy(ctx.tet_barycenters_mm[tgt_elm])
 
     tf = compute_coil_transform(ctx, CENTER, HANDLE, DIST)
     x0, y0 = cp.asnumpy(tf[:3, 0]), cp.asnumpy(tf[:3, 1])
@@ -138,7 +138,7 @@ def test_fourier_matches_brute_angle_sweep(cp, cube_mesh, coil):
     ctx = build_context(cube_mesh)
     res0 = solve_placement(ctx, coil.positions_m, coil.moments, CENTER, HANDLE, DIST, DIDT)
     tgt_elm = int(cp.argmax(res0["magnE"]))
-    tgt_pt = cp.asnumpy(cp.asarray(cube_mesh.tet_barycenters_mm)[tgt_elm])
+    tgt_pt = cp.asnumpy(ctx.tet_barycenters_mm[tgt_elm])
     center = np.array([50.0, 50.0, 100.0])
     recip = build_reciprocity(ctx, coil, Target(tgt_pt, region="gray_matter"), center[None])
 
@@ -160,7 +160,28 @@ def test_fourier_matches_brute_angle_sweep(cp, cube_mesh, coil):
     assert result.best_objective == pytest.approx(brute_max, rel=5e-3)
 
 
-# --- Target resolution -------------------------------------------------------------------
+def test_directional_optimum_matches_a_brute_angle_sweep(cube_subject, coil):
+    """A directional objective is signed, so the optimum is the largest E·ê, not the largest |E·ê|."""
+    from cunibs.adm import build_reciprocity, evaluate, optimize_placement
+    from cunibs.adm.target import Target
+    from cunibs.simulation import Placement
+
+    center = np.array([[50.0, 50.0, 100.0]])
+    recip = build_reciprocity(cube_subject, coil, Target([50, 50, 60], [1, 0, 0]), center)
+    result = optimize_placement(recip, coil, n_samples=17)
+
+    proj = result.best_center_mm
+    angles = np.linspace(0, 2 * np.pi, 720, endpoint=False)
+    sweep = [
+        Placement(proj, proj + [50 * np.cos(a), 50 * np.sin(a), 0.0], DIST) for a in angles
+    ]
+    brute = evaluate(recip, coil, sweep, DIDT)[:, 0]
+
+    assert brute.min() < 0.0 < brute.max()
+    assert result.best_objective == pytest.approx(float(brute.max()), rel=5e-3)
+    np.testing.assert_allclose(
+        evaluate(recip, coil, result.best_placement, DIDT), result.best_E, rtol=1e-12
+    )
 
 
 def test_resolve_target_empty_region_raises(cube_subject):
@@ -171,17 +192,18 @@ def test_resolve_target_empty_region_raises(cube_subject):
         resolve_target(cube_subject.context, Target([50, 50, 50], region="white_matter"))
 
 
-def test_resolve_target_radius_zero_picks_nearest(cp, cube_subject, cube_mesh):
+def test_resolve_target_radius_zero_picks_nearest(cp, cube_subject):
     from cunibs.adm.target import Target, resolve_target
 
     point = np.array([10.0, 10.0, 10.0])
     rt = resolve_target(cube_subject.context, Target(point, radius_mm=0.0))
-    expected = int(np.argmin(np.linalg.norm(cube_mesh.tet_barycenters_mm - point, axis=1)))
+    barys = cube_subject.mesh.tet_barycenters_mm
+    expected = int(np.argmin(np.linalg.norm(barys - point, axis=1)))
     assert cp.asnumpy(rt.elem_idx).tolist() == [expected]
     np.testing.assert_array_equal(cp.asnumpy(rt.weights), [1.0])
 
 
-def test_resolve_target_weights_are_volume_fractions(cp, cube_subject, cube_mesh):
+def test_resolve_target_weights_are_volume_fractions(cp, cube_subject):
     from cunibs.adm.target import Target, resolve_target
 
     ctx = cube_subject.context
@@ -194,12 +216,12 @@ def test_resolve_target_weights_are_volume_fractions(cp, cube_subject, cube_mesh
     assert float(rt.weights.sum()) == pytest.approx(1.0, abs=1e-12)
     np.testing.assert_allclose(
         cp.asnumpy(rt.barycenter_mm),
-        cp.asnumpy(rt.weights) @ cube_mesh.tet_barycenters_mm[idx],
+        cp.asnumpy(rt.weights) @ cube_subject.mesh.tet_barycenters_mm[idx],
         rtol=1e-12,
     )
 
 
-def test_resolve_target_tiny_radius_falls_back_to_nearest(cp, cube_subject, cube_mesh):
+def test_resolve_target_tiny_radius_falls_back_to_nearest(cp, cube_subject):
     """A ball containing no barycentre degrades to the nearest element(s).
 
     The cube's six tetrahedra are images of each other under its symmetry group, so a point on
@@ -211,7 +233,8 @@ def test_resolve_target_tiny_radius_falls_back_to_nearest(cp, cube_subject, cube
     point = np.array([1e4, 3e3, -7e3])
     with pytest.warns(UserWarning, match="outside gray_matter"):
         rt = resolve_target(cube_subject.context, Target(point, radius_mm=1e-6))
-    expected = int(np.argmin(np.linalg.norm(cube_mesh.tet_barycenters_mm - point, axis=1)))
+    barys = cube_subject.mesh.tet_barycenters_mm
+    expected = int(np.argmin(np.linalg.norm(barys - point, axis=1)))
     assert cp.asnumpy(rt.elem_idx).tolist() == [expected]
     assert float(rt.weights.sum()) == pytest.approx(1.0, abs=1e-12)
 
@@ -261,9 +284,10 @@ def test_resolve_target_equidistant_fallback_keeps_all_ties(cp, cube_subject):
 def test_target_direction_is_normalized():
     from cunibs.adm.target import Target
 
-    t = Target([0, 0, 0], [0.0, 0.0, -7.5])
+    given = np.array([0.0, 0.0, -7.5])
+    t = Target([0, 0, 0], given)
     np.testing.assert_allclose(t.direction, [0.0, 0.0, -1.0])
-    assert not np.shares_memory(t.direction, np.zeros(3))
+    assert not np.shares_memory(t.direction, given)
 
 
 def test_target_zero_direction_raises():
@@ -341,9 +365,6 @@ def test_optimize_placement_rejects_even_n_samples(cube_subject, coil):
         optimize_placement(recip, coil, center, n_samples=8)
 
 
-# --- evaluate() contracts ----------------------------------------------------------------
-
-
 @pytest.fixture
 def cube_reciprocity(cube_subject, coil):
     from cunibs.adm import build_reciprocity
@@ -366,9 +387,7 @@ def test_evaluate_batched_matches_single(cp, cube_reciprocity, coil):
     batched = cp.asnumpy(evaluate(cube_reciprocity, coil, pls, DIDT))
     assert batched.shape == (3, 3)
     for i, pl in enumerate(pls):
-        one = cp.asnumpy(evaluate(cube_reciprocity, coil, pl, DIDT))
-        # Not bitwise: the batch reduces over a (P, N, 3) block, the single over (1, N, 3).
-        np.testing.assert_allclose(batched[i], one, rtol=1e-12)
+        np.testing.assert_array_equal(batched[i], evaluate(cube_reciprocity, coil, pl, DIDT))
 
 
 def test_evaluate_frames_matches_the_placement_path(cp, cube_reciprocity, coil):
@@ -434,13 +453,37 @@ def test_evaluate_reports_the_offending_sample_in_a_batch(cube_reciprocity, coil
         evaluate(cube_reciprocity, coil, [good, good, far], DIDT)
 
 
-def test_evaluate_accepts_a_dipole_on_the_grid_corner(cp, cube_reciprocity):
-    """The bounds check has to admit the last sample, not just the interior."""
-    from cunibs.adm.evaluate import _require_in_grid
+def test_evaluate_answers_a_dipole_on_each_grid_corner(cp, cube_reciprocity):
+    """The bounds check admits the last sample, and what it reads there is the real field."""
+    from cunibs.adm import evaluate_frames
+    from cunibs.adm.reciprocity import exact_functional, solve_adjoint
+    from cunibs.coil import Coil
+    from cunibs.fem.placement import coil_dadt_at_nodes
 
     grid = cube_reciprocity.grid
-    corners = cp.asarray([grid.origin_m, grid.upper_m])
-    _require_in_grid(grid, grid.world_to_index(corners), offset=0, n_dip=1, n_total=2)
+    dipole = Coil(np.zeros((1, 3)), np.array([[0.0, 0.0, 1.0]]))
+    frames = np.repeat(np.eye(4)[None], 2, axis=0)
+    frames[0, :3, 3] = np.asarray(grid.origin_m) * 1e3
+    frames[1, :3, 3] = np.asarray(grid.upper_m) * 1e3
+
+    got = evaluate_frames(cube_reciprocity, dipole, frames, DIDT)
+
+    ctx = cube_reciprocity.ctx
+    weights = solve_adjoint(ctx, cube_reciprocity.target).node_weights
+    for frame, value in zip(frames, got, strict=True):
+        exact = cp.asnumpy(
+            exact_functional(
+                weights,
+                coil_dadt_at_nodes(
+                    dipole.positions_m, dipole.moments, frame, DIDT, ctx.nodes_mm
+                ),
+            )
+        )
+        np.testing.assert_allclose(value, exact, rtol=2e-3, atol=2e-3 * np.linalg.norm(exact))
+
+    frames[1, 0, 3] += 1.0
+    with pytest.raises(ValueError, match="sample 1 of 2"):
+        evaluate_frames(cube_reciprocity, dipole, frames, DIDT)
 
 
 def test_a_single_dipole_at_the_origin_needs_no_margin(cube_subject):
@@ -496,9 +539,6 @@ def test_optimize_result_fields_consistent(cube_subject, coil):
     np.testing.assert_array_equal(best.center_mm, result.best_center_mm)
     np.testing.assert_array_equal(best.handle_mm, result.best_handle_mm)
     assert best.distance_mm == 4.0
-
-
-# --- The real-mesh ladder ----------------------------------------------------------------
 
 
 @pytest.fixture(scope="session")

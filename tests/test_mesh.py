@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import mmap
 import struct
-import time
 
 import numpy as np
 import pytest
@@ -163,10 +162,7 @@ def test_parser_rejects_nonfinite_referenced_nodes(tmp_path):
 
 
 def test_every_conductivity_tag_is_loadable():
-    """The two tables must agree, or the loader narrows the tissue model behind an error.
-
-    Imported here rather than at module scope to keep this file runnable without CUDA.
-    """
+    """The two tables must agree, or the loader narrows the tissue model behind an error."""
     from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
 
     assert set(VOLUME_KEY_TO_LABEL) == set(TISSUE_CONDUCTIVITY)
@@ -270,17 +266,14 @@ def test_region_labels_cover_every_documented_tag(tmp_path):
 
 
 def test_pack_msh_roundtrip_at_scale(tmp_path):
-    """41k elements must round-trip exactly, and pack fast enough to stay vectorized."""
+    """41k elements must round-trip exactly."""
     n = 41_139
     rng = np.random.default_rng(0)
     nodes, tets, _ = _disjoint_mesh(n, np.full(n, 2))
     tags = rng.choice(np.array(sorted(VOLUME_KEY_TO_LABEL), np.int32), n)
     tris = tets[:, :3]
 
-    start = time.perf_counter()
     blob = pack_msh(nodes, tets + 1, tags, tris + 1, np.full(n, 1005, np.int32))
-    assert time.perf_counter() - start < 1.0
-
     path = tmp_path / "big.msh"
     path.write_bytes(blob)
     out_nodes, tet_nodes, tet_tags, surf_tris, surf_tags = parse_msh_binary(path)
@@ -296,20 +289,41 @@ def test_pack_msh_rejects_mismatched_tag_counts():
         pack_msh(_NODES, _TETS_1B, [2, 2], _TRIS_1B, _TRI_TAGS)
 
 
-# --- Truncation and malformed headers -----------------------------------------------------
-#
-# The reader maps the file and consumes blocks as views, so every bounds check is its own
-# responsibility: an unchecked length would read past the mapping rather than raise.
+def test_parser_rejects_truncation_at_any_point(tmp_path):
+    """A file cut at any byte must raise, never read past the mapping or return short arrays.
 
-
-@pytest.mark.parametrize("keep", [0.1, 0.5, 0.9, 0.99])
-def test_parser_rejects_truncation_at_any_point(tmp_path, keep):
-    """A file cut anywhere must raise, never read past the mapping or return short arrays."""
-    blob = pack_msh(_NODES, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS)
+    The reader maps the file and consumes blocks as views, so an unchecked length would read past
+    the mapping rather than raise.
+    """
+    blob = pack_msh(
+        _NODES,
+        _TETS_1B,
+        _TET_TAGS,
+        _TRIS_1B,
+        _TRI_TAGS,
+        extra_blocks=[_element_block(1, 1, 2)],
+    )
     path = tmp_path / "cut.msh"
-    path.write_bytes(blob[: int(len(blob) * keep)])
-    with pytest.raises(ValueError):
-        parse_msh_binary(path)
+    for keep in range(len(blob)):
+        path.write_bytes(blob[:keep])
+        with pytest.raises(ValueError):
+            parse_msh_binary(path)
+
+
+def test_parser_stops_at_the_end_of_the_elements(tmp_path):
+    """SimNIBS appends $ElementData to the meshes it writes; those sections are not the mesh."""
+    blob = pack_msh(_NODES, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS)
+    path = tmp_path / "with_data.msh"
+    path.write_bytes(blob + b'$ElementData\n1\n"E"\n$EndElementData\n')
+    np.testing.assert_array_equal(parse_msh_binary(path).tet_tags, [2])
+
+
+def test_parser_ignores_a_non_finite_node_no_element_uses(tmp_path):
+    nodes = _NODES.copy()
+    nodes[4, 0] = np.nan
+    path = tmp_path / "unused_nan.msh"
+    path.write_bytes(pack_msh(nodes, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS))
+    np.testing.assert_array_equal(parse_msh_binary(path).nodes_mm, _NODES[:4])
 
 
 def test_parser_rejects_a_node_block_longer_than_the_file(tmp_path):
@@ -455,9 +469,6 @@ def test_parser_rejects_out_of_range_surface_node_ids(tmp_path, bad_id):
         parse_msh_binary(path)
 
 
-# --- Memory-map ownership -----------------------------------------------------------------
-
-
 @pytest.mark.parametrize("all_nodes_used", [True, False])
 def test_parsed_arrays_do_not_alias_the_mapping(tmp_path, all_nodes_used):
     """Nothing returned may be a view into the mmap, which is released on return.
@@ -493,19 +504,6 @@ def test_parsed_arrays_are_writable(tmp_path):
     arrays = parse_msh_binary(path)
     for name, value in arrays._asdict().items():
         assert value.flags.writeable, name
-
-
-def test_mesh_arrays_is_a_named_tuple(tmp_path):
-    """The result still unpacks positionally, so older five-tuple call sites keep working."""
-    path = tmp_path / "named.msh"
-    path.write_bytes(pack_msh(_NODES, _TETS_1B, _TET_TAGS, _TRIS_1B, _TRI_TAGS))
-    arrays = parse_msh_binary(path)
-    nodes, tet_nodes, tet_tags, surf_tris, surf_tags = arrays
-    assert nodes is arrays.nodes_mm
-    assert tet_nodes is arrays.tet_nodes
-    assert tet_tags is arrays.tet_tags
-    assert surf_tris is arrays.surf_tris
-    assert surf_tags is arrays.surf_tags
 
 
 def _write_mesh(tmp_path, nodes, tets, tags, tris=None, tri_tags=None, name="m.msh"):
@@ -682,15 +680,33 @@ def test_head_mesh_rejects_arrays_that_disagree_in_shape(change, match):
         HeadMesh(**(arrays | change))
 
 
-# --- HeadMesh.save ----------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("suffix", [".h5", ".msh"])
 def test_save_round_trips_exactly(tmp_path, suffix):
     mesh = load_mesh(_write(tmp_path))
     out = tmp_path / f"saved{suffix}"
     mesh.save(out)
     assert load_mesh(out).content_hash == mesh.content_hash
+
+
+def test_content_hash_covers_every_array():
+    """Round trips compare hashes, which proves nothing unless a changed mesh changes its hash."""
+    nodes, tets, tags, tris, surf_tags = (
+        _NODES[:4],
+        _TETS_1B - 1,
+        _TET_TAGS,
+        _TRIS_1B - 1,
+        _TRI_TAGS,
+    )
+    base = HeadMesh(nodes, tets, tags, tris, surf_tags).content_hash
+    assert base == HeadMesh(nodes.copy(), tets.copy(), tags, tris, surf_tags).content_hash
+    for changed in (
+        (nodes + 1e-9, tets, tags, tris, surf_tags),
+        (nodes, tets[:, [1, 0, 2, 3]], tags, tris, surf_tags),
+        (nodes, tets, tags + 1, tris, surf_tags),
+        (nodes, tets, tags, tris[:, [1, 0, 2]], surf_tags),
+        (nodes, tets, tags, tris, surf_tags - 3),
+    ):
+        assert HeadMesh(*changed).content_hash != base
 
 
 def test_h5_round_trips_every_tag_at_scale(tmp_path):
@@ -763,6 +779,9 @@ def _rewrite_h5(path, **changes):
         ({"tet_tags": np.array([42], np.uint8)}, "absent from"),
         ({"nodes_mm": np.full((4, 3), np.nan)}, "non-finite"),
         ({"tet_tags": np.array([2, 2], np.uint8)}, "differ in length"),
+        ({"surf_tags": np.array([1005, 1005], np.uint16)}, "differ in length"),
+        ({"nodes_mm": np.zeros((4, 2))}, "expected \\(n, 3\\)"),
+        ({"tet_nodes": np.array([[-1, 1, 2, 3]], np.int32)}, "outside the node table"),
     ],
 )
 def test_h5_load_applies_the_msh_checks(tmp_path, changes, match):

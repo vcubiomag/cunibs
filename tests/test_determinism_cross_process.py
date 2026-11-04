@@ -1,18 +1,16 @@
-"""The AMG hierarchy must come out identical in a fresh interpreter, not just a fresh call.
+"""A run must come out identical in a fresh interpreter, not just a fresh call.
 
-Every other determinism test in this suite runs inside one pytest process with warm caches,
-which cannot see the failure mode this file exists for: cuSPARSE chooses how to split a row
-from runtime state, so two calls in one process can agree bit for bit while two processes do
-not. Without this, the README's "repeating a run reproduces it bitwise" is a per-process claim.
-
-Marked ``reference`` deliberately. The patch mesh cannot answer the question: at 8403 rows
-every stage is already bit-identical across processes, because cuSPARSE only repartitions once
-rows get long.
+Every other determinism test in this suite runs inside one pytest process with warm caches, which
+cannot see what a process carries: cuSPARSE chooses how to split a row from runtime state, so two
+calls in one process can agree bit for bit while two processes do not. Without this, the README's
+"repeating a run reproduces it bitwise" is a per-process claim.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -22,33 +20,20 @@ import pytest
 pytestmark = pytest.mark.gpu
 
 CHILD = Path(__file__).parent / "_hierarchy_child.py"
+REPEAT_CHILD = Path(__file__).parent / "_repeat_child.py"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-_CHILD_ATTEMPTS = 3
 
 
 def _spawn(args: list[str], env_overrides: dict[str, str]) -> subprocess.CompletedProcess:
-    """Run the child, retrying only one killed by a signal.
-
-    A child building a full-mesh hierarchy while another process in the session holds a CUDA
-    context intermittently dies inside ``select_size4`` with an illegal access or a segfault.
-    The fixture keeps this test's own parent out of CUDA, but a full-suite run has already put
-    a context there. A child that raised and exited on its own has produced a real answer --
-    an OutOfMemoryError when something else on the card is holding memory is the common one --
-    and retrying it only delays reporting it under a message about crashing.
-    """
-    for _ in range(_CHILD_ATTEMPTS):
-        proc = subprocess.run(  # noqa: S603  # this interpreter, a file in this directory
-            [sys.executable, "-u", str(CHILD), *args],
-            capture_output=True,
-            text=True,
-            env=os.environ | env_overrides,
-            cwd=REPO_ROOT,
-            timeout=900,
-            check=False,
-        )
-        if proc.returncode >= 0:
-            break
-    return proc
+    return subprocess.run(  # noqa: S603  # this interpreter, a file in this directory
+        [sys.executable, "-u", str(CHILD), *args],
+        capture_output=True,
+        text=True,
+        env=os.environ | env_overrides,
+        cwd=REPO_ROOT,
+        timeout=900,
+        check=False,
+    )
 
 
 def _run_child(operator_dir: Path, env_overrides: dict[str, str]) -> dict[str, str]:
@@ -70,17 +55,7 @@ def _run_child(operator_dir: Path, env_overrides: dict[str, str]) -> dict[str, s
 
 @pytest.fixture
 def saved_operator(reference_mesh_path, tmp_path) -> Path:
-    """The reduced fp32 operator, assembled once and handed to every child as bytes.
-
-    Assembled in a subprocess, so this test never brings a CUDA context into the pytest
-    process; see ``_spawn``.
-
-    Handing the children an operator rather than a mesh also keeps the assembly out of what is
-    being compared. A head mesh carries near-degenerate tetrahedra, and the batched solve behind
-    ``gradient_operator`` takes a pivoting path for those that depends on how much device memory
-    is free. That is a real and separate question; folding it in would only make this test flaky
-    about something it is not asking.
-    """
+    """The reduced fp32 operator, assembled once and handed to every child as bytes."""
     path = tmp_path / "operator"
     proc = _spawn(["--save-operator", str(reference_mesh_path), str(path)], {})
     if proc.returncode != 0:
@@ -88,6 +63,22 @@ def saved_operator(reference_mesh_path, tmp_path) -> Path:
             f"could not assemble the operator (rc={proc.returncode})\n{proc.stderr[-2000:]}"
         )
     return path
+
+
+@pytest.mark.realmesh
+def test_a_fresh_interpreter_with_the_gil_reproduces_a_run(patch_mesh_path):
+    """A cold process against this warm one, and on a free-threaded build, GIL on against off."""
+    proc = subprocess.run(  # noqa: S603  # this interpreter, a file in this directory
+        [sys.executable, str(REPEAT_CHILD), str(patch_mesh_path)],
+        capture_output=True,
+        text=True,
+        env=os.environ | {"PYTHON_GIL": "1"},
+        timeout=600,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    fresh = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert fresh == runpy.run_path(str(REPEAT_CHILD))["digests"](patch_mesh_path)
 
 
 @pytest.mark.reference
@@ -99,10 +90,8 @@ def test_hierarchy_is_reproducible_across_processes(saved_operator, tmp_path):
     ``CUPY_CACHE_DIR`` is what a new machine has, and it is the state a user re-running the
     analysis tomorrow is most likely to be in.
 
-    ``PYTHON_GIL=0`` is deliberately not one of the axes here. Free-threaded NumPy has a
-    separate, known sorting race that would fail this test for an unrelated reason;
-    ``benchmarks/manuscript_determinism.py`` part D covers that axis where it can be reported
-    rather than merely failing.
+    Marked ``reference`` because at the patch's 8403 rows every stage is already bit-identical
+    across processes: cuSPARSE only repartitions once rows get long.
     """
     runs = [
         _run_child(saved_operator, {}),

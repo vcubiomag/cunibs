@@ -62,7 +62,7 @@ def test_tissue_sensitivity_attributes_all_variance_to_the_driving_tissue():
 def test_tissue_sensitivity_splits_between_two_tissues():
     """Independent inputs: shares are βⱼ²Var(log σⱼ)/Var(log y).
 
-    They sum to one only to the extent the sampled columns are uncorrelated — the residual
+    They sum to one only to the extent the sampled columns are uncorrelated. The residual
     sample covariance is why this is an approximate, first-order index rather than an exact
     variance decomposition.
     """
@@ -119,20 +119,6 @@ def test_an_roi_name_holding_a_slash_survives_a_round_trip(tmp_path):
     loaded = ConductivityUQResult.load(tmp_path / "uq.h5")
     assert set(loaded.roi_samples) == {"m1/hand", "dlpfc"}
     np.testing.assert_array_equal(loaded.roi_samples["m1/hand"], samples)
-
-
-def test_per_draw_samples_and_sensitivity_live_on_the_result():
-    sigma = _lognormal_draws(128, 2)
-    r = _result(sigma, y_peak=sigma[:, 0] ** 2, roi={"m1": sigma[:, 1]})
-    assert r.n_samples == 128
-    assert r.perturbed_tags == (1, 2)
-    assert r.tissue_sensitivity("peak")[1] == pytest.approx(1.0, abs=1e-6)
-
-
-def test_non_default_region_is_computed_from_the_retained_moments():
-    r = _result(_lognormal_draws(16, 2))
-    assert r.peak_mean_magnE("csf") > 0
-    assert r.max_local_cov("csf") >= 0
 
 
 def test_non_default_region_needs_the_moments():

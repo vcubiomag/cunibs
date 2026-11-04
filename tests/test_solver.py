@@ -162,7 +162,6 @@ def test_l1_dinv_matches_dense_reference(cp, cube_subject):
 
 def test_solve_grounded_matches_dense_solve(cp, cube_subject):
     """The mixed-precision PCG must reproduce a dense fp64 solve of the reduced system."""
-
     from cunibs.fem.solve import solve_grounded
 
     solver = cube_subject.context.solver
@@ -176,8 +175,8 @@ def test_solve_grounded_matches_dense_solve(cp, cube_subject):
     x_ref = np.linalg.solve(
         cp.asnumpy(a_red.toarray()), cp.asnumpy(b[solver.idx]).astype(np.float64)
     )
-    # The PCG stops at a 1e-6 relative residual, so the solution error is bounded by that
-    # times the system's conditioning, not by machine precision.
+    # This mesh has no level to coarsen, so the V-cycle is the dense coarse inverse and one step
+    # lands far inside the tolerance.
     got = cp.asnumpy(v[solver.idx])
     assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
 
@@ -194,9 +193,8 @@ def test_solve_grounded_rejects_a_right_hand_side_of_the_wrong_length(
         solve_grounded(solver, cp.ones(solver.n + n_entries))
 
 
-@pytest.mark.parametrize("degree", [1, 2, 3, 4])
-def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degree):
-    """Every Chebyshev degree must converge, and to the same place.
+def test_smoother_degree_changes_the_rate_not_the_answer(cp, two_region_mesh):
+    """Every Chebyshev degree must converge to the same place, each faster than the one below.
 
     The preconditioner is a pure function of A, so it cannot move the fixed point, only the rate.
 
@@ -207,50 +205,58 @@ def test_smoother_degree_changes_the_rate_not_the_answer(cp, cube_subject, degre
     cycle silently returns a corrupted correction, which shows up here as a wrong answer or a
     blown iteration count rather than as a crash.
     """
+    from cunibs.fem import build_context
+    from cunibs.fem.solve import BLOCK_SIZES, MAX_BLOCK, SmootherParams, build_native_vcycle
 
-    from cunibs.fem.solve import (
-        BLOCK_SIZES,
-        SmootherParams,
-        _solve_grounded_block_mat,
-        build_native_vcycle,
-        solve_grounded,
-    )
+    solver = build_context(two_region_mesh).solver
+    # With no level the V-cycle is the dense coarse inverse and no smoother ever runs.
+    assert solver.precond.n_levels() >= 1
+    a = solver.matrix()
+    values = a.data.astype(cp.float32)
+    n = int(solver.idx.shape[0])
+    b = np.random.default_rng(0).standard_normal((n, MAX_BLOCK))
+    x_ref = np.linalg.solve(cp.asnumpy(a.toarray()), b)
+    tolerance = 1e-9
+    stream = cp.cuda.get_current_stream().ptr
 
-    solver = cube_subject.context.solver
-    a_red = solver.matrix()
-    rng = np.random.default_rng(0)
-    b = cp.asarray(rng.standard_normal(solver.n))
-    x_ref = np.linalg.solve(
-        cp.asnumpy(a_red.toarray()), cp.asnumpy(b[solver.idx]).astype(np.float64)
-    )
+    def rel_error(x, column):
+        return np.linalg.norm(x - x_ref[:, column]) / np.linalg.norm(x_ref[:, column])
 
-    solver.precond = build_native_vcycle(
-        a_red.indptr,
-        a_red.indices,
-        a_red.data.astype(cp.float32),
-        smoother=SmootherParams(degree=degree),
-    )
-    v, telemetry = solve_grounded(solver, b)
-    got = cp.asnumpy(v[solver.idx])
+    iterations = []
+    for degree in (1, 2, 3, 4):
+        precond = build_native_vcycle(
+            a.indptr, a.indices, values, smoother=SmootherParams(degree=degree)
+        )
+        x = cp.empty(n, dtype=cp.float64)
+        iters, _ = solver.pcg.solve_mixed(
+            precond,
+            cp.ascontiguousarray(cp.asarray(b[:, 0])),
+            x,
+            tolerance,
+            solver.max_iters,
+            stream,
+        )
+        assert rel_error(cp.asnumpy(x), 0) <= 1e-8, f"degree={degree}"
+        iterations.append(int(iters))
 
-    assert np.linalg.norm(got - x_ref) / np.linalg.norm(x_ref) <= 1e-6
-    # A broken sweep still converges eventually on a problem this small, so gate the rate too.
-    assert telemetry.iterations < solver.max_iters // 4
+        # Every compiled block width, not just the scalar path. The aliasing between a step's
+        # output and its x_prev is per-column, so a K-wide bug can leave some columns exact and
+        # others NaN at one width and one degree only, which the scalar path above cannot see.
+        widest = None
+        for k in reversed(BLOCK_SIZES):
+            B = cp.ascontiguousarray(cp.asarray(b[:, :k]))
+            X = cp.empty_like(B)
+            solver.pcg.solve_mixed_block(precond, B, X, tolerance, solver.max_iters, stream)
+            X = cp.asnumpy(X)
+            widest = X if widest is None else widest
+            for c in range(k):
+                assert rel_error(X[:, c], c) <= 1e-8, f"k={k}, column {c}, degree={degree}"
+                np.testing.assert_array_equal(
+                    X[:, c], widest[:, c], err_msg=f"k={k}, column {c}, degree={degree}"
+                )
 
-    # Every compiled block width, not just the scalar path. The aliasing between a step's
-    # output and its x_prev is per-column, so a K-wide bug can leave some columns exact and
-    # others NaN at one width and one degree only, which the scalar path above cannot see.
-    b_red = cp.ascontiguousarray(b[solver.idx], dtype=cp.float64)
-    for k in BLOCK_SIZES:
-        B = cp.ascontiguousarray(cp.tile(b_red[:, None], (1, k)))
-        X, telemetry = _solve_grounded_block_mat(solver, B, k)
-        assert bool(cp.isfinite(X).all()), f"block_k={k}, degree={degree}: non-finite solve"
-        # Identical columns, so identical counts: a count that varied here would be reading the
-        # wrong column's residual.
-        assert len({t.iterations for t in telemetry}) == 1, f"block_k={k}, degree={degree}"
-        for c in range(k):
-            err = np.linalg.norm(cp.asnumpy(X[:, c]) - x_ref) / np.linalg.norm(x_ref)
-            assert err <= 1e-6, f"block_k={k}, column {c}, degree={degree}: rel {err:.3e}"
+    assert iterations == sorted(set(iterations), reverse=True), iterations
+    assert iterations[0] <= 20, iterations
 
 
 def test_solve_placement_is_linear_in_didt(cp, cube_subject, synthetic_coil):
@@ -318,7 +324,7 @@ def test_solver_bindings_reject_dtype_and_layout(cp):
     """``.noconvert()`` on every array parameter: dtype and layout are strict, not converting.
 
     Without it nanobind repairs a mismatch through cupy's ``.astype(dtype, order)``, costing a
-    device allocation and copy per call — invisible in a hot loop.
+    device allocation and copy per call, invisible in a hot loop.
     """
     from cunibs.solver import dadt_node_to_element
 
@@ -404,7 +410,7 @@ def test_reconstruct_matches_numpy_reference(cp, cube_mesh):
     grad_v = np.einsum("ei,eik->ek", v[tet_nodes], g)
     e_ref = -grad_v - dadt
     np.testing.assert_allclose(
-        cp.asnumpy(out["E"]), e_ref, rtol=1e-3, atol=1e-4 * np.abs(e_ref).max()
+        cp.asnumpy(out["E"]), e_ref, rtol=1e-5, atol=1e-5 * np.abs(e_ref).max()
     )
 
 

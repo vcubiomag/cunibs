@@ -2,14 +2,11 @@
 
 Not a test module (pytest collects ``test_*.py``): this is the child process
 ``test_determinism_cross_process.py`` spawns. It has to be a separate interpreter because the
-thing under test is what a warm process hides -- cuSPARSE picks work splits from runtime state,
-so a second call inside one process can agree bit for bit while a second *process* does not.
+thing under test is what a warm process hides: cuSPARSE picks work splits from runtime state, so a
+second call inside one process can agree bit for bit while a second *process* does not.
 
 Takes the operator as a saved CSR rather than a mesh, so every child starts from byte-identical
-input and the only thing that can move is the hierarchy build itself. Assembling per child would
-fold in a separate, unrelated source: a head mesh carries near-degenerate tets, and the batched
-solve behind ``gradient_operator`` takes a different pivoting path for those depending on how
-much device memory is free.
+input and the only thing that can move is the hierarchy build itself.
 
 Prints one ``CHILD_HASH <name> <sha256>`` line per array and one ``CHILD_SIZES`` line. The
 parent compares them; anything that moves shows up under a name that says which stage it was.
@@ -36,13 +33,7 @@ def _emit(name: str, array: cp.ndarray) -> None:
 
 
 def save_operator(mesh_path: Path, out_dir: Path) -> None:
-    """Assemble the reduced operator once and write it out, in a process of its own.
-
-    The parent stays free of a CUDA context this way. That is not tidiness: a child building a
-    full-mesh hierarchy while another process in the same session holds a context intermittently
-    dies inside ``select_size4`` with an illegal access. Keeping the parent out of CUDA sidesteps
-    a flake this test is not trying to measure.
-    """
+    """Assemble the reduced operator once and write it out."""
     from cunibs import Subject
     from cunibs.mesh import load_mesh
 

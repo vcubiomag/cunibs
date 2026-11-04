@@ -12,7 +12,8 @@ atomic-free with a fixed summation order, which is what makes the solver determi
 
 from __future__ import annotations
 
-import itertools
+import re
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -61,9 +62,6 @@ def stream(cp):
     return cp.cuda.get_current_stream().ptr
 
 
-# --- dadt_node_to_element ----------------------------------------------------------------
-
-
 def test_dadt_node_to_element_averages_the_four_corners(cp, dev, mesh_arrays, stream):
     """dadt_elm[e] = ¼ Σᵢ dadt_nodes[tet_nodes[e,i]]."""
     from cunibs.solver import dadt_node_to_element
@@ -85,9 +83,6 @@ def test_dadt_node_to_element_is_exact_on_a_constant_field(cp, dev, stream):
     out = cp.empty((N_TET, 3), dtype=cp.float32)
     dadt_node_to_element(cp.ascontiguousarray(dadt_nodes), dev["tet_nodes"], out, stream)
     np.testing.assert_array_equal(cp.asnumpy(out), np.tile([1.5, -2.5, 3.5], (N_TET, 1)))
-
-
-# --- RHS assembly ------------------------------------------------------------------------
 
 
 def rhs_reference(mesh_arrays, wg=None):
@@ -169,7 +164,7 @@ def test_rhs_operator_block_matches_single(cp, dev, mesh_arrays, stream, k):
 
 
 def test_rhs_assembly_is_bit_reproducible(cp, dev, stream):
-    """Node-centric, atomic-free, fixed summation order — repeated calls must be identical."""
+    """Node-centric, atomic-free, fixed summation order, so repeated calls must be identical."""
     from cunibs.solver import rhs_assemble
 
     runs = []
@@ -181,9 +176,6 @@ def test_rhs_assembly_is_bit_reproducible(cp, dev, stream):
         runs.append(cp.asnumpy(b))
     np.testing.assert_array_equal(runs[0], runs[1])
     np.testing.assert_array_equal(runs[0], runs[2])
-
-
-# --- E reconstruction --------------------------------------------------------------------
 
 
 def reconstruct_reference(mesh_arrays, v=None, dadt_elm=None):
@@ -295,9 +287,6 @@ def test_reconstruct_e_nodal_block_skips_an_output_without_moving_the_other(cp, 
         np.testing.assert_array_equal(cp.asnumpy(e_only[c]), cp.asnumpy(es[c]))
 
 
-# --- ADM reciprocity weights -------------------------------------------------------------
-
-
 def _p1_grad_reference(v, tet_nodes, g):
     """Σᵢ v_i g_i taken as Σ_{i≥1} (v_i − v_0) g_i, which P1 gradients summing to zero allow.
 
@@ -382,11 +371,8 @@ def test_node_weight_is_linear_in_values(cp, dev, stream):
     np.testing.assert_allclose(b, 3.0 * a, rtol=1e-12)
 
 
-# --- streaming moments -------------------------------------------------------------------
-
-
 def test_accumulate_moments_adds_to_the_running_sums(cp, stream):
-    """sum_e += |E|, sumsq_e += |E|² — it accumulates, it does not overwrite."""
+    """sum_e += |E| and sumsq_e += |E|²: it accumulates, it does not overwrite."""
     from cunibs.solver import accumulate_moments_block
 
     rng = np.random.default_rng(5)
@@ -429,9 +415,6 @@ def test_accumulate_moments_recovers_mean_and_variance(cp, stream):
     ref = draws.astype(np.float64)
     np.testing.assert_allclose(mean, ref.mean(axis=0), rtol=1e-10)
     np.testing.assert_allclose(var, ref.var(axis=0), rtol=1e-6, atol=1e-12)
-
-
-# --- N-body and placement, called directly ------------------------------------------------
 
 
 @pytest.mark.parametrize("planar", [False, True])
@@ -507,9 +490,6 @@ def test_place_transforms_batches_independently(cp, cube_subject, stream):
     everything = run(np.arange(4))
     for i in range(4):
         np.testing.assert_array_equal(run(np.array([i]))[0], everything[i], err_msg=f"site {i}")
-
-
-# --- native SIZE_4 aggregation ------------------------------------------------------------
 
 
 @pytest.mark.realmesh
@@ -689,13 +669,6 @@ def test_native_hierarchy_level_sizes(cp, patch_subject):
     levels, _ = aggregation_levels(a.indptr, a.indices, a.data.astype(cp.float32))
     sizes = [int(solver.idx.shape[0])] + [level.n_coarse for level in levels]
     assert sizes == [8403, 465], f"hierarchy shape changed: {sizes}"
-
-    for level, (fine, coarse) in enumerate(itertools.pairwise(sizes)):
-        ratio = fine / coarse
-        assert 14.0 <= ratio <= 22.0, f"level {level} coarsening ratio {ratio:.2f} out of range"
-
-
-# --- PcgAmgSolver argument validation ------------------------------------------------------
 
 
 def test_dadt_of_a_coil_with_no_dipoles_is_zero(cp):
@@ -887,8 +860,8 @@ def test_exported_block_widths_are_the_ones_the_solver_accepts(cp, cube_subject)
 def _fan_mesh(n_fan, *, extra_tets=0):
     """A centre node joined to a ring of ``n_fan`` triangles, so its valence is ``n_fan``.
 
-    This is how an analytic sphere is built -- ``metrics/_analytic.ball_mesh`` fills the core with
-    exactly this fan -- which is why the shape has to work rather than merely not crash. The
+    This is how an analytic sphere is built, since ``benchmarks/_exact.ball_mesh`` fills the core
+    with exactly this fan, which is why the shape has to work rather than merely not crash. The
     centre's segment is four candidates per incident tetrahedron.
 
     ``extra_tets`` appends disjoint unit tetrahedra whose nodes have ordinary valence, so one mesh
@@ -911,7 +884,7 @@ def _fan_mesh(n_fan, *, extra_tets=0):
 def _expected_pattern(n_nodes, tets):
     """The same CSR by a different route: every (corner, corner) pair of every tetrahedron.
 
-    Written without a per-node scan of the mesh so the widest fixtures below stay quick -- the
+    Written without a per-node scan of the mesh so the widest fixtures below stay quick: the
     obvious ``tets[np.any(tets == n)]`` loop is quadratic and dominates their runtime.
     """
     owner = np.repeat(tets, 4, axis=1).reshape(-1)
@@ -935,18 +908,21 @@ def _assert_pattern_matches_numpy(cp, nodes, tets):
     return int(cp.diff(ptr).max()) * 4
 
 
-# kFastPad in pattern.cu: the widest padded segment four warps hold in 48 KB, and so the boundary
-# between the shared-memory class and the global-memory one.
-_FAST_PAD = 2048
-
-# Fan sizes on both sides of that boundary. 400 sorts in shared memory at 1600 candidates; 20480 is
+# Fan sizes on both sides of kFastPad, the boundary between the shared-memory segment class and
+# the global-memory one. 400 sorts in shared memory at 1600 candidates; 20480 is
 # the centre node of ball_mesh(5), the finest rung of the analytic sphere ladder, at 81920.
 _FAN_SIZES = [400, 900, 20480]
 
 
 def test_fan_sizes_straddle_the_segment_class_boundary():
-    """The widths below only cover both classes as long as they sit either side of kFastPad."""
-    assert 4 * min(_FAN_SIZES) <= _FAST_PAD < 4 * max(_FAN_SIZES)
+    """The widths below only cover both classes as long as they sit either side of kFastPad.
+
+    It is the widest padded segment four warps hold in 48 KB, private to pattern.cu, so the source
+    is the only place to read it from.
+    """
+    source = Path(__file__).parents[1] / "src/cunibs/solver/fem/pattern.cu"
+    fast_pad = int(re.search(r"constexpr int kFastPad = (\d+);", source.read_text())[1])
+    assert 4 * min(_FAN_SIZES) <= fast_pad < 4 * max(_FAN_SIZES)
 
 
 @pytest.mark.parametrize("n_fan", _FAN_SIZES)
@@ -1049,7 +1025,7 @@ def test_skin_normals_match_a_numpy_transcription(patch_mesh, patch_skin_normals
 
     Not bitwise: the kernel sums each node's faces in node2corner order and ``bincount`` sums them
     in triangle order, which lands a third of the components one ulp apart. The tolerance is a few
-    ulp, tight enough that a wrong corner, weighting, or round count is nowhere near it -- one
+    ulp, tight enough that a wrong corner, weighting, or round count is nowhere near it: one
     smoothing round instead of two moves this surface by more than 1e-3.
     """
     expected = _smoothed_skin_normals(patch_mesh.nodes_mm, patch_mesh.skin_tris)

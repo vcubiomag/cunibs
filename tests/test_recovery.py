@@ -221,19 +221,6 @@ def test_harmonic_is_the_default(patch_subject, d70_coil, patch_placement):
 
 
 @pytest.mark.realmesh
-def test_raw_reports_the_unsmoothed_peak(patch_subject, d70_coil, patch_placement):
-    """The raw peak is set by a sliver element, so it sits above every recovered mode's."""
-    raw = patch_subject.simulate(
-        d70_coil, patch_placement, 1e6, magnitude=True, vectors=True, recovery="raw"
-    )
-    harmonic = patch_subject.simulate(
-        d70_coil, patch_placement, 1e6, magnitude=True, recovery="harmonic"
-    )
-    assert raw.recovery == "raw"
-    assert raw.peak_magnE() > harmonic.peak_magnE()
-
-
-@pytest.mark.realmesh
 def test_boundary_nodes_are_a_superset_of_the_skin(cp, patch_subject):
     """Skin is surface tag 1005 alone; volume-tag filtering exposes more than that."""
     from cunibs.fem import outer_boundary_nodes
@@ -253,9 +240,14 @@ def test_spr_smooths_the_peak_and_keeps_provenance(patch_subject, d70_coil, patc
         d70_coil, patch_placement, 1e6, magnitude=True, nodal=True, recovery="spr_global"
     )
     assert spr.recovery == "spr_global"
-    assert spr.peak_magnE() < raw.peak_magnE()
     assert spr.summary["distribution"]["p99.9"] < raw.summary["distribution"]["p99.9"]
     assert spr.E_slots.shape == (patch_subject.mesh.n_nodes, 3)
+
+
+def _gray_matter_nodes(mesh):
+    touched = np.zeros(mesh.n_nodes, dtype=bool)
+    touched[mesh.tet_nodes[mesh.tet_tags == 2]] = True
+    return touched
 
 
 @pytest.mark.realmesh
@@ -266,8 +258,9 @@ def test_nodal_field_masks_to_the_region(patch_subject, d70_coil, patch_placemen
     everywhere = result.nodal_field("all")
     gray = result.nodal_field("gray_matter")
     assert not np.isnan(everywhere).any()
-    touched = ~np.isnan(gray[:, 0])
+    touched = _gray_matter_nodes(patch_subject.mesh)
     assert touched.any() and not touched.all()
+    assert np.isnan(gray[~touched]).all()
     np.testing.assert_array_equal(gray[touched], everywhere[touched])
 
 
@@ -283,8 +276,7 @@ def test_nodal_field_is_per_node_for_every_mode(patch_subject, d70_coil, patch_p
         assert result.E_slots.shape[0] > n_nodes
     gray = result.nodal_field("gray_matter")
     assert gray.shape == (n_nodes, 3)
-    touched = ~np.isnan(gray[:, 0])
-    assert touched.any() and not touched.all()
+    np.testing.assert_array_equal(~np.isnan(gray[:, 0]), _gray_matter_nodes(patch_subject.mesh))
 
 
 @pytest.mark.realmesh
@@ -322,25 +314,34 @@ def test_nodal_field_rejects_all_for_two_valued_modes(patch_subject, d70_coil, p
 
 
 @pytest.mark.realmesh
-@pytest.mark.parametrize("width", [1, 2, 3, 5, 8])
-def test_recovered_field_is_block_width_invariant(
-    patch_subject, d70_coil, patch_placement, width
+@pytest.mark.parametrize("mode", ["spr_global", "spr_tissue", "harmonic"])
+def test_recovered_field_is_reproducible_and_block_width_invariant(
+    patch_subject, d70_coil, patch_top_mm, mode
 ):
+    """Eight placements that differ, since a width past the sweep's length changes no chunk."""
+    from cunibs import Placement
     from cunibs.simulation import _block_width
 
-    sites = [patch_placement] * 3
+    angles = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+    handles = patch_top_mm + 50.0 * np.stack(
+        [np.cos(angles), np.sin(angles), 0 * angles], axis=1
+    )
+    sites = [Placement(patch_top_mm, handle) for handle in handles]
 
     def magn(k):
         with _block_width(k):
             return [
                 r.magnE
                 for r in patch_subject.iter_simulate(
-                    d70_coil, sites, 1e6, magnitude=True, recovery="spr_global"
+                    d70_coil, sites, 1e6, magnitude=True, recovery=mode
                 )
             ]
 
-    for i, (a, b) in enumerate(zip(magn(width), magn(1), strict=True)):
-        np.testing.assert_array_equal(a, b, err_msg=f"width={width}, placement {i}")
+    reference = magn(8)
+    assert not np.array_equal(reference[0], reference[1])
+    for width in (8, 5, 3, 2, 1):
+        for i, (a, b) in enumerate(zip(magn(width), reference, strict=True)):
+            np.testing.assert_array_equal(a, b, err_msg=f"width={width}, placement {i}")
 
 
 @pytest.mark.realmesh
@@ -374,10 +375,11 @@ def test_tissue_slots_split_each_node_by_tissue(cp, two_tissue_cube_mesh):
     tets = cp.asarray(two_tissue_cube_mesh.tet_nodes)
     tags = cp.asarray(two_tissue_cube_mesh.tet_tags)
     n_nodes = two_tissue_cube_mesh.n_nodes
-    ptr, idx, slot_of_corner, slot_node, _ = tissue_slots(tets, tags)
+    ptr, idx, slot_of_corner, slot_node, slot_tag = tissue_slots(tets, tags)
 
     ptr, idx = cp.asnumpy(ptr), cp.asnumpy(idx)
     slot_of_corner, slot_node = cp.asnumpy(slot_of_corner), cp.asnumpy(slot_node)
+    slot_tag = cp.asnumpy(slot_tag)
     host_tets, host_tags = two_tissue_cube_mesh.tet_nodes, two_tissue_cube_mesh.tet_tags
 
     assert ptr[0] == 0 and ptr[-1] == idx.size == host_tets.size
@@ -387,7 +389,7 @@ def test_tissue_slots_split_each_node_by_tissue(cp, two_tissue_cube_mesh):
         assert corners.size > 0
         # Every corner of a slot names the same node and the same tissue.
         np.testing.assert_array_equal(host_tets.reshape(-1)[corners], slot_node[slot])
-        assert len(set(host_tags[corners >> 2].tolist())) == 1
+        np.testing.assert_array_equal(host_tags[corners >> 2], slot_tag[slot])
         np.testing.assert_array_equal(slot_of_corner[corners], slot)
     # This mesh gives every node both tissues at the interface, so it must split somewhere.
     assert slot_node.size > n_nodes
@@ -637,9 +639,6 @@ def test_spr_tissue_preserves_the_jump_that_spr_smears(
     assert rel(at_interface) > 10 * rel(~at_interface)
 
 
-# --- harmonic-constrained potential recovery -------------------------------------------------
-
-
 def _harmonic_grads(op, v, dadt, n_tet, cp):
     """Run the harmonic operator for one placement and return (per-slot E, per-tet E)."""
     from cunibs.fem import apply_recovery
@@ -730,11 +729,72 @@ def test_harmonic_adds_dadt_exactly_at_the_nodes(cp, harmonic_op):
     np.testing.assert_allclose(at_nodes, -slope * 1e3 - dadt, rtol=1e-4)
 
 
-def test_harmonic_patch_ladder_covers_every_slot(harmonic_op):
-    """Growing to the next ring is what keeps the 16-term fit determined on real patches."""
+def test_harmonic_patch_ladder_covers_every_slot(cp, harmonic_op):
+    """Growing to the next ring keeps every slot's fit determined, the cube's corners included.
+
+    A corner tetrahedron's node starts from a first ring of 4 nodes, far short of the 9 terms of
+    the quadratic rung.
+    """
     _, op = harmonic_op
-    assert op.n_slots > 0
-    assert op.idx.shape[0] / op.n_slots >= 20, "patches must be big enough for the basis"
+    assert np.diff(cp.asnumpy(op.ptr)).min() > 9
+    assert op.n_fallback == 0
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_harmonic_block_matches_one_column_at_a_time(cp, harmonic_op, shared):
+    """Each column reads its own potential and dA/dt, or the one field every column shares.
+
+    The potential block may be wider than the placements, as a padded solve's is, so the extra
+    column is NaN to show it is never read.
+    """
+    from cunibs.fem.recovery import RecoveredField, apply_recovery_into
+
+    ctx, op = harmonic_op
+    n_nodes, n_tet = ctx.mesh.n_nodes, ctx.mesh.tet_nodes.shape[0]
+    k = 3
+    rng = np.random.default_rng(14)
+    v = rng.standard_normal((n_nodes, k + 1))
+    v[:, k] = np.nan
+    dadt = rng.standard_normal((n_nodes, 1 if shared else k, 3)).astype(np.float32)
+
+    out = RecoveredField.allocate(op, n_tet, k)
+    apply_recovery_into(op, out, potential=cp.asarray(v), dadt_nodes=cp.asarray(dadt))
+    for c in range(k):
+        slots, elements = _harmonic_grads(op, v[:, c], dadt[:, 0 if shared else c], n_tet, cp)
+        np.testing.assert_array_equal(cp.asnumpy(out.E_slots[c]), slots, err_msg=f"column {c}")
+        np.testing.assert_array_equal(cp.asnumpy(out.E[c]), elements, err_msg=f"column {c}")
+
+
+def test_apply_recovery_rejects_missing_inputs_and_mismatched_buffers(cp, cube_op, harmonic_op):
+    """A list longer than the buffers would otherwise have the kernels write past them."""
+    from cunibs.fem.recovery import (
+        RecoveredField,
+        apply_recovery,
+        apply_recovery_into,
+        build_recovery_operator,
+    )
+
+    ctx, spr = cube_op
+    _, harmonic = harmonic_op
+    n_nodes, n_tet = ctx.mesh.n_nodes, ctx.mesh.tet_nodes.shape[0]
+    field = cp.zeros((n_tet, 3), dtype=cp.float32)
+    v = cp.zeros((n_nodes, 2))
+    dadt = cp.zeros((n_nodes, 2, 3), dtype=cp.float32)
+
+    with pytest.raises(ValueError, match="needs elements="):
+        apply_recovery(spr, n_tet)
+    with pytest.raises(ValueError, match="given 2 placements but buffers for 1"):
+        apply_recovery_into(spr, RecoveredField.allocate(spr, n_tet), elements=[field, field])
+    with pytest.raises(ValueError, match="needs potential="):
+        apply_recovery(harmonic, n_tet, dadt_nodes=dadt)
+    with pytest.raises(ValueError, match="needs dadt_nodes="):
+        apply_recovery(harmonic, n_tet, potential=v)
+    with pytest.raises(ValueError, match="given 2 placements but buffers for 1"):
+        apply_recovery_into(
+            harmonic, RecoveredField.allocate(harmonic, n_tet), potential=v, dadt_nodes=dadt
+        )
+    with pytest.raises(ValueError, match="no recovery operator"):
+        build_recovery_operator(ctx, "raw")
 
 
 def test_status_is_the_array_the_fallback_counts_reduce(cp, harmonic_op):
@@ -843,30 +903,7 @@ def test_a_coplanar_patch_determines_no_gradient(cp):
     np.testing.assert_array_equal(cp.asnumpy(w), np.zeros((6, 3), dtype=np.float32))
 
 
-@pytest.mark.realmesh
-def test_harmonic_is_reproducible_and_block_width_invariant(
-    patch_subject, d70_coil, patch_placement
-):
-    from cunibs.simulation import _block_width
-
-    def magn(k):
-        with _block_width(k):
-            return [
-                r.magnE
-                for r in patch_subject.iter_simulate(
-                    d70_coil, [patch_placement] * 3, 1e6, magnitude=True, recovery="harmonic"
-                )
-            ]
-
-    reference = magn(1)
-    for width in (1, 2, 3, 5, 8):
-        for i, (a, b) in enumerate(zip(magn(width), reference, strict=True)):
-            np.testing.assert_array_equal(a, b, err_msg=f"width={width}, placement {i}")
-
-
-# --- the interface comparison ------------------------------------------------------------------
-
-_SIGMA = {2: 0.275, 3: 1.654}  # gray matter, CSF -- the table cuNIBS solves with
+_SIGMA = {2: 0.275, 3: 1.654}  # gray matter, CSF, from the table cuNIBS solves with
 # 1/mm. The exact solution varies over ~1/k = 50 mm, so at the fixture's 10 mm cells the
 # mesh resolves it (h/lambda = 0.2). Coarser than about 0.4 and plain discretisation error
 # swamps the recovery being compared, which makes the comparison meaningless rather than
@@ -1055,15 +1092,14 @@ def test_patch_weights_cannot_amplify(cp, refined_cube_mesh, mode):
 
 @pytest.mark.realmesh
 @pytest.mark.parametrize("mode", ["spr_global", "spr_tissue", "harmonic"])
-def test_recovery_does_not_raise_the_peak(patch_subject, d70_coil, patch_placement, mode):
-    """Recovery exists to suppress the sliver-driven peak, so it must never exceed the raw one."""
+def test_recovery_lowers_the_raw_peak(patch_subject, d70_coil, patch_placement, mode):
+    """The raw peak is set by a sliver element, and recovery exists to suppress it."""
     raw = patch_subject.simulate(d70_coil, patch_placement, 1e6, magnitude=True, recovery="raw")
     recovered = patch_subject.simulate(
         d70_coil, patch_placement, 1e6, magnitude=True, recovery=mode
     )
-    assert recovered.peak_magnE() <= raw.peak_magnE(), (
-        f"{mode} peak {recovered.peak_magnE()} exceeds raw {raw.peak_magnE()}"
-    )
+    assert raw.recovery == "raw"
+    assert recovered.peak_magnE() < raw.peak_magnE()
 
 
 @pytest.mark.realmesh

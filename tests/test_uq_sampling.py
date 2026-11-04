@@ -1,9 +1,8 @@
-"""Statistics of ``sample_conductivities`` — the conductivity draws feeding every UQ run.
+"""Statistics of ``sample_conductivities``, the conductivity draws feeding every UQ run.
 
-The lognormal branch uses the median parameterisation σ₀·exp(s·z − s²/2) with
-s = √log(1+cov²), chosen so E[σ] = σ₀ *and* std/mean = cov exactly. Both identities are
-checked here, since a plausible-looking reparameterisation would silently bias every
-ensemble mean.
+The lognormal branch is σ₀·exp(s·z − s²/2) with s = √log(1+cov²), chosen so E[σ] = σ₀ *and*
+std/mean = cov exactly. Its median is below σ₀. Both identities are checked here, since a
+plausible-looking reparameterisation would silently bias every ensemble mean.
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ def test_shape_and_dtype(cp):
 
 
 def test_lognormal_mean_is_nominal(cp):
-    """E[σ] = σ₀ and std/mean = cov — the two properties the parameterisation exists for."""
+    """E[σ] = σ₀ and std/mean = cov, the two properties the parameterisation exists for."""
     cov = 0.3
     s = draw(cp, (2,), tissue_cov={2: cov})[:, 0]
     nominal = TISSUE_CONDUCTIVITY[2]
@@ -58,7 +57,7 @@ def test_lognormal_is_lognormal(cp):
 
 
 def test_zero_cov_is_degenerate(cp):
-    """Zero variance must be exactly nominal, not merely close — UQ tests rely on this."""
+    """Zero variance must be exactly nominal, not merely close, since UQ tests rely on this."""
     s = draw(cp, (2, 3), n=64, tissue_cov={2: 0.0, 3: 0.0})
     np.testing.assert_array_equal(s[:, 0], np.full(64, TISSUE_CONDUCTIVITY[2]))
     np.testing.assert_array_equal(s[:, 1], np.full(64, TISSUE_CONDUCTIVITY[3]))

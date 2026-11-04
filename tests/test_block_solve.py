@@ -1,9 +1,9 @@
 """Block-CG parity: ``Subject.simulate``'s default path against the serial solve.
 
-``simulate`` batches placements through ``solve_placements_block`` at ``MAX_BLOCK`` wide
-unless memory runs short, so the lockstep k-RHS kernels and the RHS padding are what almost every caller
-actually runs. The oracle throughout is ``serial`` below, one placement at a time through the
-single-RHS ``solve_grounded``, held to the same 2e-5 relative-L2 gate the block probe uses.
+``simulate`` batches placements through ``solve_placements_block`` at ``MAX_BLOCK`` wide unless
+memory runs short, so the lockstep k-RHS kernels and the RHS padding are what almost every caller
+runs. The oracle throughout is ``serial`` below, one placement at a time through the single-RHS
+``solve_grounded``, to a relative L2 of 2e-5.
 """
 
 from __future__ import annotations
@@ -167,7 +167,7 @@ def test_block_matches_serial_cube(cube_subject, synthetic_coil, k):
     sites = cube_sites(k)
     ctx = cube_subject.context
     for got, ref in zip(
-        block(ctx, synthetic_coil, sites), serial(ctx, synthetic_coil, sites), strict=False
+        block(ctx, synthetic_coil, sites), serial(ctx, synthetic_coil, sites), strict=True
     ):
         assert rel_l2(got["magnE"], ref["magnE"]) <= PARITY
         assert rel_l2(got["E"], ref["E"]) <= PARITY
@@ -178,15 +178,14 @@ def test_block_matches_serial_cube(cube_subject, synthetic_coil, k):
 def test_block_padding_widths(cube_subject, synthetic_coil, k):
     """Widths off the compiled 2/4/8 ladder pad by replicating the last column.
 
-    Every real column must still match serial — a padded column bleeding into a live one
-    would show up here and nowhere else.
+    Every real column must still match serial, or a padded column has bled into a live one.
     """
     sites = cube_sites(k)
     ctx = cube_subject.context
     got = block(ctx, synthetic_coil, sites)
     ref = serial(ctx, synthetic_coil, sites)
     assert len(got) == k
-    for i, (g, r) in enumerate(zip(got, ref, strict=False)):
+    for i, (g, r) in enumerate(zip(got, ref, strict=True)):
         assert rel_l2(g["magnE"], r["magnE"]) <= PARITY, f"column {i}"
         assert rel_l2(g["E"], r["E"]) <= PARITY, f"column {i}"
 
@@ -197,7 +196,7 @@ def test_block_matches_serial_patch_k8(patch_subject, d70_coil, patch_sites):
     ctx = patch_subject.context
     got = block(ctx, d70_coil, patch_sites)
     ref = serial(ctx, d70_coil, patch_sites)
-    for i, (g, r) in enumerate(zip(got, ref, strict=False)):
+    for i, (g, r) in enumerate(zip(got, ref, strict=True)):
         assert rel_l2(g["magnE"], r["magnE"]) <= PARITY, f"placement {i}"
         assert rel_l2(g["E"], r["E"]) <= PARITY, f"placement {i}"
         assert rel_l2(g["v"], r["v"]) <= PARITY, f"placement {i}"
@@ -251,8 +250,8 @@ def test_block_width_invariance(patch_subject, d70_coil, patch_sites, k):
     """The chunk width is a throughput and memory choice, never an accuracy one.
 
     Every compiled width shares one fp64 summation order and every column stops on its own
-    residual, so the width cannot reach the answer at all -- not even in the last bits. That is
-    what lets a sweep narrow its chunks on a GPU short of memory without its numbers moving.
+    residual, so the width cannot reach even the last bits. That is what lets a sweep narrow its
+    chunks on a GPU short of memory without its numbers moving.
     """
     placements = [Placement(c, h, d) for c, h, d in patch_sites]
     ref = _magn(patch_subject, d70_coil, placements, 1)
@@ -310,9 +309,14 @@ def test_simulate_default_width_matches_serial(patch_subject, d70_coil, patch_si
     with _block_width(1):
         serialized = list(patch_subject.iter_simulate(d70_coil, placements, DIDT))
     assert len(blocked) == len(serialized) == len(placements)
-    for b, s in zip(blocked, serialized, strict=False):
-        assert b.peak_magnE() == pytest.approx(s.peak_magnE(), rel=1e-5)
-        np.testing.assert_allclose(b.peak_location_mm(), s.peak_location_mm(), atol=1e-9)
+    for b, s in zip(blocked, serialized, strict=True):
+        assert b.iterations == s.iterations
+        assert b.relative_residual == s.relative_residual
+        assert b.peak_magnE() == s.peak_magnE()
+        assert b.summary["focality_m3"] == s.summary["focality_m3"]
+        assert b.summary["distribution"] == s.summary["distribution"]
+        np.testing.assert_array_equal(b.peak_location_mm(), s.peak_location_mm())
+        np.testing.assert_array_equal(b.center_of_gravity_mm(), s.center_of_gravity_mm())
 
 
 def _solve_two(solver, cp, left, right):
@@ -434,8 +438,8 @@ def test_a_native_allocation_failure_is_a_memory_error(
 def _force_fallback(ctx) -> None:
     """Make the mixed PCG miss unconditionally.
 
-    A merely tiny tolerance is not enough — the mixed solver reaches ~5e-17 relative
-    residual on this system. Only a target of exactly zero is unreachable.
+    A merely tiny tolerance is not enough: the mixed solver reaches ~5e-17 relative residual on
+    this system. Only a target of exactly zero is unreachable.
     """
     ctx.solver.tolerance = 0.0
     ctx.solver.max_iters = 25
@@ -447,9 +451,7 @@ def test_unreachable_tolerance_rebuilds_then_raises_block(
 ):
     """An unreachable tolerance must rebuild the preconditioner once, then fail loudly.
 
-    Reporting a converged solve that did not converge is the one outcome worse than raising;
-    the fp64 fallback this replaced reported a residual of exactly 0.0 for a solve that had
-    only reached 1e-6.
+    Reporting a converged solve that did not converge is the one outcome worse than raising.
     """
     from cunibs.fem import SolverConvergenceError
 
@@ -516,8 +518,8 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
 ):
     """Swapping the hierarchy changes only the rate; rebuilding restores the original exactly.
 
-    That the preconditioner cannot move the fixed point is what lets the retry path replace an
-    fp64 fallback solver: there is no more accurate solve to fall back to, only a faster one.
+    The preconditioner cannot move the fixed point, so a retry can only be faster, not more
+    accurate.
 
     The substitute is a hierarchy built from single pairwise passes rather than the composed
     pairs production uses, so on the patch it coarsens 8403 -> 1936 -> 465 where production goes
@@ -553,7 +555,10 @@ def test_rebuild_preconditioner_restores_the_full_hierarchy(
     # Rebuilt from the same values by the same deterministic selector, so the hierarchy is
     # identical and the solve must repeat exactly.
     assert rebuilt["iterations"] == reference["iterations"]
-    assert rel_l2(rebuilt["magnE"], reference["magnE"]) <= PARITY
+    for key in ("magnE", "E", "v"):
+        np.testing.assert_array_equal(
+            cp.asnumpy(rebuilt[key]), cp.asnumpy(reference[key]), err_msg=key
+        )
 
 
 @pytest.mark.realmesh
@@ -561,8 +566,8 @@ def test_a_block_solve_honours_its_own_tolerance(cp, fresh_subject, patch_mesh):
     """A solve must stop on its own tolerance whatever tolerance the solver last ran at.
 
     The iteration body is captured once and replayed, so anything it bakes in from one solve
-    reaches the next. The ADM adjoint shares the forward solver at a tolerance a thousand times
-    tighter, so both orders matter: a loose capture replayed at a tight tolerance freezes columns
+    reaches the next, and ``build_reciprocity(tolerance=)`` shares the forward solver at any
+    tolerance. Both orders matter: a loose capture replayed at a tight tolerance freezes columns
     the host still waits on and runs to max_iters, and a tight one replayed loose carries columns
     past their own crossing, which makes them depend on their block.
     """

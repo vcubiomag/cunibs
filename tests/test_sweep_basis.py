@@ -57,6 +57,22 @@ def _magn(subject, coil, placements, width):
         ]
 
 
+def test_a_basis_does_not_seed_or_stamp_a_conductivity_run(
+    fresh_subject, two_tissue_cube_mesh, synthetic_coil
+):
+    """Draws have their own warm start, so a forward basis must neither move them nor be recorded."""
+    from cunibs import ConductivityUQConfig
+
+    placement = Placement([50, 50, 100], [50, 100, 100])
+    config = ConductivityUQConfig(n_samples=4, seed=0)
+    subject = fresh_subject(two_tissue_cube_mesh)
+    before = subject.simulate_conductivity_uq(synthetic_coil, placement, config, DIDT)
+    subject.prepare_sweep(synthetic_coil, size=4)
+    after = subject.simulate_conductivity_uq(synthetic_coil, placement, config, DIDT)
+    np.testing.assert_array_equal(after.peak_samples, before.peak_samples)
+    assert after.provenance["sweep_basis_size"] is None
+
+
 @pytest.mark.realmesh
 def test_basis_handle_pairs_are_right_angles(fresh_subject, patch_mesh):
     """The field turns as (cos t, sin t) with the handle, so a pair spans it at 90 degrees."""

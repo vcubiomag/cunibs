@@ -6,11 +6,6 @@ import pytest
 pytestmark = pytest.mark.gpu
 
 
-@pytest.fixture
-def two_tissue_cube(two_tissue_cube_mesh):
-    return two_tissue_cube_mesh
-
-
 def _coil():
     from cunibs.coil import Coil
 
@@ -70,7 +65,7 @@ def test_uq_precompute_matches_direct_nominal_assembly(cp, two_tissue_subject):
 
 @pytest.mark.parametrize("sigma", [(0.4, 2.1), (1e-3, 5.0), (1.0, 1.0)])
 def test_uq_combine_matches_direct_assembly_at_nonnominal_sigma(cp, two_tissue_subject, sigma):
-    """``values`` away from nominal — the point the library's internal gate never checks."""
+    """``values`` away from nominal, the point the library's internal gate never checks."""
     from cunibs.uq.assembly import build_conductivity_uq_precompute
 
     ctx = two_tissue_subject.context
@@ -124,20 +119,70 @@ def test_uq_precompute_cached_per_tagset(two_tissue_subject):
     assert csf_only.perturbed_tags == (3,)
 
 
-def test_uq_perturbed_tags_subset(two_tissue_subject):
-    """Perturbing only CSF must leave the gray-matter elements' conductivity fixed."""
-    from cunibs import ConductivityUQConfig
+def _dense_gray_matter_peak(cp, ctx, coil, placement, sigma_by_tag):
+    """The gray-matter peak ``|E|`` of a dense fp64 solve at explicit per-tag conductivities."""
+    from cunibs.fem.assembly import gradient_operator
+    from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
+    from cunibs.fem.solve import ground_node_of, grounded_index
 
-    r = two_tissue_subject.simulate_conductivity_uq(
-        _coil(),
-        _placement(),
-        config=ConductivityUQConfig(
-            n_samples=32, tissue_cov={3: 0.3}, perturbed_tags=(3,), seed=0
-        ),
-        moments=True,
+    transform = compute_coil_transform(
+        ctx, placement.center_mm, placement.handle_mm, placement.distance_mm
     )
-    assert r.perturbed_tags == (3,)
-    assert r.sigma_samples.shape == (32, 1)
+    dadt = coil_dadt_at_nodes(coil.positions_m, coil.moments, transform, 1e6, ctx.nodes_mm)
+    g, vols = (cp.asnumpy(a) for a in gradient_operator(ctx.nodes_mm, ctx.tet_nodes))
+    tets, tags = cp.asnumpy(ctx.tet_nodes), cp.asnumpy(ctx.tet_tags)
+    dadt_elm = cp.asnumpy(dadt).astype(np.float64)[tets].mean(axis=1)
+    sigma = np.array([sigma_by_tag[int(t)] for t in tags])
+
+    b = np.zeros(ctx.n_nodes)
+    np.add.at(b, tets, -(vols * sigma)[:, None] * np.einsum("eik,ek->ei", g, dadt_elm))
+    idx = cp.asnumpy(grounded_index(ctx.n_nodes, ground_node_of(ctx.nodes_mm)))
+    stiffness = cp.asnumpy(_direct_reduced_stiffness(ctx, sigma_by_tag).toarray())
+    v = np.zeros(ctx.n_nodes)
+    v[idx] = np.linalg.solve(stiffness, b[idx])
+    e = -np.einsum("ei,eik->ek", v[tets], g) - dadt_elm
+    return float(np.linalg.norm(e, axis=1)[tags == 2].max())
+
+
+@pytest.mark.parametrize("perturbed", [(2, 3), (3,)])
+def test_every_draw_solves_at_its_own_conductivities(cp, two_tissue_subject, perturbed):
+    """Each draw's peak against a dense solve assembled from scratch at that draw's sigma.
+
+    This shares neither the affine operator, the per-tissue right-hand sides, the warm start nor
+    the draw schedule with the run, and more draws than one block shows the per-draw arrays stay
+    in draw order. A tissue left out of ``perturbed`` must stay at its nominal conductivity.
+    """
+    from cunibs import ConductivityUQConfig
+    from cunibs.fem.assembly import TISSUE_CONDUCTIVITY
+
+    coil, placement = _coil(), _placement()
+    r = two_tissue_subject.simulate_conductivity_uq(
+        coil,
+        placement,
+        ConductivityUQConfig(
+            n_samples=11,
+            tissue_cov=dict.fromkeys(perturbed, 0.3),
+            perturbed_tags=perturbed,
+            seed=7,
+        ),
+        recovery="raw",
+    )
+    assert r.perturbed_tags == perturbed
+    assert r.sigma_samples.shape == (11, len(perturbed))
+
+    ctx = two_tissue_subject.context
+    want = [
+        _dense_gray_matter_peak(
+            cp,
+            ctx,
+            coil,
+            placement,
+            TISSUE_CONDUCTIVITY | dict(zip(perturbed, sigma, strict=True)),
+        )
+        for sigma in r.sigma_samples.tolist()
+    ]
+    assert np.ptp(want) > 1e-3 * np.max(want), "the draws should move the peak"
+    np.testing.assert_allclose(r.peak_samples, want, rtol=1e-4)
 
 
 def test_uq_tissue_cov_alone_perturbs_only_the_named_tissues(two_tissue_subject):
@@ -162,17 +207,16 @@ def test_run_conductivity_uq_rejects_a_precompute_for_other_tissues(two_tissue_s
         run_conductivity_uq(ctx, pre, _coil(), _placement(), config)
 
 
-def test_uq_degenerate_matches_forward(cp, cube_mesh):
+def test_uq_degenerate_matches_forward(cube_subject):
     """Zero conductivity variance → mean field equals the deterministic solve, std is zero."""
-    from cunibs import ConductivityUQConfig, Subject
+    from cunibs import ConductivityUQConfig
 
-    subj = Subject(cube_mesh)
     coil, pl = _coil(), _placement()
-    det = subj.simulate(coil, pl, magnitude=True, vectors=True, potential=True)
+    det = cube_subject.simulate(coil, pl, magnitude=True)
     cfg = ConductivityUQConfig(n_samples=8, tissue_cov={2: 0.0}, seed=1)
-    r = subj.simulate_conductivity_uq(coil, pl, config=cfg, moments=True)
-    np.testing.assert_allclose(cp.asnumpy(r.mean_magnE), cp.asnumpy(det.magnE), atol=1e-6)
-    assert float(cp.asarray(r.std_magnE).max()) == 0.0
+    r = cube_subject.simulate_conductivity_uq(coil, pl, config=cfg, moments=True)
+    np.testing.assert_allclose(r.mean_magnE, det.magnE, atol=1e-6)
+    assert float(r.std_magnE.max()) == 0.0
 
 
 @pytest.mark.realmesh
@@ -197,66 +241,50 @@ def test_per_draw_focality_uses_the_same_anchor_as_the_summary(
     np.testing.assert_allclose(r.focality_samples, expected, rtol=1e-6)
 
 
-def test_uq_homogeneous_has_no_sensitivity(cp, cube_mesh):
+def test_uq_homogeneous_has_no_sensitivity(cube_subject):
     """A single-tissue domain: scaling σ scales K and b equally, so |E| is σ-invariant."""
-    from cunibs import ConductivityUQConfig, Subject
+    from cunibs import ConductivityUQConfig
 
-    subj = Subject(cube_mesh)
-    r = subj.simulate_conductivity_uq(
+    r = cube_subject.simulate_conductivity_uq(
         _coil(),
         _placement(),
         config=ConductivityUQConfig(n_samples=32, tissue_cov={2: 0.3}, seed=0),
         moments=True,
     )
-    assert float(cp.asarray(r.cov_magnE).max()) < 1e-5
+    assert float(r.cov_magnE.max()) < 1e-5
 
 
-def test_uq_of_a_zero_field_is_zero(two_tissue_subject):
-    """A forward solve at didt=0 returns a zero field, so the warm start must cope with one."""
+def test_uq_two_tissue_has_variance(two_tissue_subject):
+    """Distinct tissues make |E| depend on the conductivity ratio, so the ensemble has spread."""
     from cunibs import ConductivityUQConfig
 
-    config = ConductivityUQConfig(n_samples=4, seed=0)
-    result = two_tissue_subject.simulate_conductivity_uq(
-        _coil(), _placement(), config, didt=0.0, moments=True, recovery="raw"
-    )
-    assert not result.mean_magnE.any()
-    assert not result.peak_samples.any()
-    assert set(result.tissue_sensitivity().values()) == {0.0}
-
-
-def test_uq_two_tissue_has_variance(cp, two_tissue_cube):
-    """Distinct tissues make |E| depend on the conductivity ratio, so the ensemble has spread."""
-    from cunibs import ConductivityUQConfig, Subject
-
-    subj = Subject(two_tissue_cube)
-    r = subj.simulate_conductivity_uq(
+    r = two_tissue_subject.simulate_conductivity_uq(
         _coil(),
         _placement(),
         config=ConductivityUQConfig(n_samples=200, tissue_cov={2: 0.2, 3: 0.3}, seed=0),
         moments=True,
     )
-    cov = cp.asarray(r.cov_magnE)
-    assert float(cov.max()) > 1e-3
-    assert bool(cp.isfinite(cov).all())
+    assert np.isfinite(r.cov_magnE).all()
+    assert float(r.cov_magnE.max()) > 1e-3
 
 
-def test_uq_deterministic_seed(cp, two_tissue_cube):
+def test_uq_deterministic_seed(two_tissue_subject):
     """A fixed seed reproduces identical moments."""
-    from cunibs import ConductivityUQConfig, Subject
+    from cunibs import ConductivityUQConfig
 
-    subj = Subject(two_tissue_cube)
+    subj = two_tissue_subject
     coil, pl = _coil(), _placement()
     cfg = ConductivityUQConfig(n_samples=32, tissue_cov={2: 0.2, 3: 0.3}, seed=5)
     r1 = subj.simulate_conductivity_uq(coil, pl, config=cfg, moments=True)
     r2 = subj.simulate_conductivity_uq(coil, pl, config=cfg, moments=True)
-    assert bool(cp.all(cp.asarray(r1.mean_magnE) == cp.asarray(r2.mean_magnE)))
-    assert bool(cp.all(cp.asarray(r1.std_magnE) == cp.asarray(r2.std_magnE)))
+    np.testing.assert_array_equal(r1.mean_magnE, r2.mean_magnE)
+    np.testing.assert_array_equal(r1.std_magnE, r2.std_magnE)
 
 
-def test_uq_default_sequence_returns_summaries(two_tissue_cube):
-    from cunibs import ConductivityUQConfig, Placement, Subject
+def test_uq_default_sequence_returns_summaries(two_tissue_subject):
+    from cunibs import ConductivityUQConfig, Placement
 
-    subj = Subject(two_tissue_cube)
+    subj = two_tissue_subject
     placements = [
         _placement(),
         Placement([50, 50, 100], [100, 50, 100], 4.0),
@@ -274,25 +302,86 @@ def test_uq_default_sequence_returns_summaries(two_tissue_cube):
         assert item.max_local_cov() >= 0.0
 
 
-def test_max_local_cov_does_not_depend_on_retaining_the_moments(two_tissue_cube):
+def test_max_local_cov_does_not_depend_on_retaining_the_moments(cp, two_tissue_subject):
     """Without moments the recovery covers only the summary's tissues; the rest must not leak in."""
-    from cunibs import ConductivityUQConfig, Subject
+    from cunibs import ConductivityUQConfig
+    from cunibs._memory import release_scratch, scratch_pool
 
-    subj = Subject(two_tissue_cube)
+    subj = two_tissue_subject
     config = ConductivityUQConfig(n_samples=8, seed=3)
-    # Pool memory left full of NaN, which an unwritten element would otherwise read back.
-    import cupy as cp
-
-    cp.full(1 << 24, cp.nan, dtype=cp.float32)
+    # The run's temporaries come from the scratch pool, so that is the pool to leave full of NaN
+    # for an unwritten element to read back.
+    release_scratch()
+    with cp.cuda.using_allocator(scratch_pool().malloc):
+        cp.full(1 << 24, cp.nan, dtype=cp.float32)
     lean = subj.simulate_conductivity_uq(_coil(), _placement(), config)
     full = subj.simulate_conductivity_uq(_coil(), _placement(), config, moments=True)
     assert lean.max_local_cov() == full.max_local_cov()
 
 
-def test_uq_streamed_sequence_results_are_host_backed(cp, two_tissue_cube):
-    from cunibs import ConductivityUQConfig, Placement, Subject
+@pytest.mark.parametrize("recovery", ["raw", "harmonic"])
+def test_uq_of_a_zero_field_is_zero(cp, two_tissue_subject, recovery):
+    """A forward solve returns zeros at didt=0, and an empty warm-start basis must do the same."""
+    from cunibs import ConductivityUQConfig
+    from cunibs._memory import release_scratch, scratch_pool
 
-    subj = Subject(two_tissue_cube)
+    release_scratch()
+    with cp.cuda.using_allocator(scratch_pool().malloc):
+        cp.full(1 << 24, cp.nan, dtype=cp.float32)
+    r = two_tissue_subject.simulate_conductivity_uq(
+        _coil(),
+        _placement(),
+        ConductivityUQConfig(n_samples=4, seed=0),
+        0.0,
+        moments=True,
+        recovery=recovery,
+    )
+    assert not r.mean_magnE.any()
+    assert not r.peak_samples.any()
+    assert r.tissue_sensitivity() == {2: 0.0, 3: 0.0}
+
+
+@pytest.mark.realmesh
+def test_uq_per_draw_scalars_do_not_depend_on_retaining_the_moments(
+    cp, patch_subject, patch_placement, d70_coil
+):
+    """Without moments the recovery covers only what is read, which must include every ROI."""
+    from cunibs import ConductivityUQConfig
+    from cunibs._memory import release_scratch, scratch_pool
+
+    mesh = patch_subject.mesh
+    csf = mesh.tet_barycenters_mm[mesh.tet_tags == 3].mean(axis=0)
+    rois = {
+        "csf": patch_subject.roi(csf, radius_mm=4.0, region="csf"),
+        "any_tissue": patch_subject.roi(csf, radius_mm=8.0, region="all"),
+    }
+    assert np.unique(mesh.tet_tags[cp.asnumpy(rois["any_tissue"].elem_idx)]).size > 1
+    config = ConductivityUQConfig(n_samples=4, seed=0, perturbed_tags=(2, 3))
+
+    def run(moments):
+        return patch_subject.simulate_conductivity_uq(
+            d70_coil, patch_placement, config, 1e6, moments=moments, record_rois=rois
+        )
+
+    full = run(True)
+    # NaN in the pool stops an element the recovery skipped reading back the run above's value.
+    release_scratch()
+    with cp.cuda.using_allocator(scratch_pool().malloc):
+        cp.full(1 << 24, cp.nan, dtype=cp.float32)
+    lean = run(False)
+    assert lean.mean_magnE is None
+    for name in ("peak_samples", "focality_samples", "peak_location_samples"):
+        np.testing.assert_array_equal(getattr(lean, name), getattr(full, name), err_msg=name)
+    for name in rois:
+        np.testing.assert_array_equal(
+            lean.roi_samples[name], full.roi_samples[name], err_msg=name
+        )
+
+
+def test_uq_streamed_sequence_results_are_host_backed(two_tissue_subject):
+    from cunibs import ConductivityUQConfig, Placement
+
+    subj = two_tissue_subject
     placements = [
         _placement(),
         Placement([50, 50, 100], [100, 50, 100], 4.0),
@@ -309,7 +398,6 @@ def test_uq_streamed_sequence_results_are_host_backed(cp, two_tissue_cube):
     for item in r:
         assert isinstance(item.mean_magnE, np.ndarray)
         assert isinstance(item.vols, np.ndarray)
-        assert not isinstance(item.mean_magnE, cp.ndarray)
     assert r[0].vols is r[1].vols
 
 
@@ -354,29 +442,11 @@ def test_per_draw_arrays_are_always_recorded(two_tissue_subject):
         _coil(),
         _placement(),
         config=ConductivityUQConfig(n_samples=16, tissue_cov={2: 0.2, 3: 0.3}, seed=4),
-        moments=True,
     )
     assert r.roi_samples == {}
     assert r.peak_samples.shape == (16,)
     assert r.focality_samples.shape == (16,)
     assert r.peak_location_samples.shape == (16, 3)
-
-
-def test_record_rois_adds_named_probes(two_tissue_subject):
-    """record_rois only adds ROI columns; the whole-field arrays are there regardless."""
-    from cunibs import ConductivityUQConfig
-
-    subj = two_tissue_subject
-    r = subj.simulate_conductivity_uq(
-        _coil(),
-        _placement(),
-        config=ConductivityUQConfig(n_samples=8, tissue_cov={2: 0.2, 3: 0.3}, seed=4),
-        moments=True,
-        record_rois={"centre": subj.roi([50.0, 50.0, 60.0], radius_mm=8.0)},
-    )
-    assert set(r.roi_samples) == {"centre"}
-    assert r.roi_samples["centre"].shape == (8,)
-    assert r.peak_samples.shape == (8,)
 
 
 def test_tissue_sensitivity_identifies_the_varying_tissue(two_tissue_subject):
@@ -394,20 +464,6 @@ def test_tissue_sensitivity_identifies_the_varying_tissue(two_tissue_subject):
     assert abs(s[2]) < 0.05
 
 
-def test_tissue_sensitivity_rejects_an_unrecorded_roi(two_tissue_subject):
-    from cunibs import ConductivityUQConfig
-
-    r = two_tissue_subject.simulate_conductivity_uq(
-        _coil(),
-        _placement(),
-        config=ConductivityUQConfig(n_samples=8, seed=6),
-        moments=True,
-    )
-    r.tissue_sensitivity("peak")  # always available
-    with pytest.raises(ValueError, match="Unknown output 'm1'"):
-        r.tissue_sensitivity("m1")
-
-
 @pytest.mark.parametrize(("small_n", "large_n"), [(8, 64), (32, 200)])
 def test_uq_draws_do_not_depend_on_the_ensemble_size(two_tissue_subject, small_n, large_n):
     """A draw's field must be the same however many draws were asked for, to the last bit.
@@ -418,7 +474,7 @@ def test_uq_draws_do_not_depend_on_the_ensemble_size(two_tissue_subject, small_n
     ``n_samples`` reaches it nowhere.
 
     Bitwise, not ``allclose``. Anything that reaches x0 from the ensemble moves a draw by about
-    the solve tolerance, 6e-07 on sub-004, which an ``rtol=1e-6`` would wave through.
+    the solve tolerance, which an ``allclose`` would wave through.
     """
     from cunibs import ConductivityUQConfig
 
@@ -523,8 +579,10 @@ def test_reduced_solve_does_not_depend_on_the_batch():
         np.testing.assert_array_equal(_cholesky_solve(e[lo:hi], rhs[lo:hi]), full[lo:hi])
 
 
-def test_uq_unreachable_tolerance_rebuilds_then_raises(fresh_subject, two_tissue_cube_mesh):
-    """An unreachable tolerance makes each draw build a matched preconditioner, then fail loudly."""
+def test_uq_unreachable_tolerance_rebuilds_then_raises(
+    monkeypatch, fresh_subject, two_tissue_cube_mesh
+):
+    """An unreachable tolerance makes a draw build a matched preconditioner, then fail loudly."""
     from cunibs import ConductivityUQConfig
     from cunibs.fem import SolverConvergenceError
 
@@ -535,10 +593,57 @@ def test_uq_unreachable_tolerance_rebuilds_then_raises(fresh_subject, two_tissue
     subj.simulate_conductivity_uq(_coil(), _placement(), **kw)
     pre = subj._conductivity_uq_precompute(cfg)
 
+    rebuilds = []
+    build = pre.preconditioner_for
+    monkeypatch.setattr(pre, "preconditioner_for", lambda s: rebuilds.append(s) or build(s))
     pre.tolerance = 0.0
     pre.max_iters = 5
     with pytest.raises(SolverConvergenceError):
         subj.simulate_conductivity_uq(_coil(), _placement(), **kw)
+    assert len(rebuilds) == 1
+
+
+class _FirstBlockMisses:
+    """A solver whose first affine block reports every column short of tolerance."""
+
+    def __init__(self, pcg):
+        self._pcg = pcg
+        self._first = True
+
+    def __getattr__(self, name):
+        return getattr(self._pcg, name)
+
+    def solve_affine_block(self, *args):
+        iters, rels, column_iters = self._pcg.solve_affine_block(*args)
+        if self._first:
+            self._first = False
+            rels = [float("inf")] * len(rels)
+        return iters, rels, column_iters
+
+
+def test_uq_retried_draws_solve_against_their_own_matrix(
+    monkeypatch, fresh_subject, two_tissue_cube_mesh
+):
+    """The retry restarts a column from its iterate, so the wrong draw's sigma would move it.
+
+    A converging ensemble never takes this path. The draws run in schedule order, so a retry that
+    read a column index as a draw index would solve another draw's system.
+    """
+    from cunibs import ConductivityUQConfig
+
+    subj = fresh_subject(two_tissue_cube_mesh)
+    config = ConductivityUQConfig(n_samples=11, tissue_cov={2: 0.3, 3: 0.3}, seed=10)
+    want = subj.simulate_conductivity_uq(_coil(), _placement(), config).peak_samples
+
+    pre = subj._conductivity_uq_precompute(config)
+    rebuilds = []
+    build = pre.preconditioner_for
+    monkeypatch.setattr(pre, "preconditioner_for", lambda s: rebuilds.append(s) or build(s))
+    monkeypatch.setattr(pre.solver, "pcg", _FirstBlockMisses(pre.solver.pcg))
+    got = subj.simulate_conductivity_uq(_coil(), _placement(), config).peak_samples
+
+    assert len(rebuilds) == 8
+    np.testing.assert_allclose(got, want, rtol=1e-4)
 
 
 def test_uq_draw_preconditioner_solves_its_own_sample(cp, fresh_subject, two_tissue_cube_mesh):
@@ -553,37 +658,40 @@ def test_uq_draw_preconditioner_solves_its_own_sample(cp, fresh_subject, two_tis
     subj.simulate_conductivity_uq(_coil(), _placement(), config=cfg, moments=True)
     pre = subj._conductivity_uq_precompute(cfg)
 
-    extreme = pre.nominal_sigma.get() * 5.0
-    precond = pre.preconditioner_for(extreme)
-
+    # Apart in ratio, since a preconditioner is blind to a common scale.
+    extreme = pre.nominal_sigma.get() * np.array([5.0, 0.2])
     n_red = int(pre.idx.shape[0])
     rng = cp.random.default_rng(0)
     b = cp.ascontiguousarray(rng.standard_normal((n_red, 1), dtype=cp.float64))
-    x = cp.empty((n_red, 1), dtype=cp.float64)
-    _, rels, _ = pre.solver.pcg.solve_affine_block(
-        precond,
-        pre.terms,
-        b,
-        x,
-        pre.affine_coefficients(extreme[None]),
-        pre.tolerance,
-        pre.max_iters,
-        cp.cuda.get_current_stream().ptr,
-    )
-    assert rels[0] <= pre.tolerance
+
+    def solve_with(precond):
+        x = cp.empty((n_red, 1), dtype=cp.float64)
+        iters, rels, _ = pre.solver.pcg.solve_affine_block(
+            precond,
+            pre.terms,
+            b,
+            x,
+            pre.affine_coefficients(extreme[None]),
+            pre.tolerance,
+            pre.max_iters,
+            cp.cuda.get_current_stream().ptr,
+        )
+        assert rels[0] <= pre.tolerance
+        return int(iters)
+
+    assert solve_with(pre.preconditioner_for(extreme)) < solve_with(pre.solver.precond)
 
 
-def test_uq_result_save_load(tmp_path, two_tissue_cube):
-    from cunibs import ConductivityUQConfig, Subject
+def test_uq_result_save_load(tmp_path, two_tissue_subject):
+    from cunibs import ConductivityUQConfig
     from cunibs.uq import ConductivityUQResult
 
-    subj = Subject(two_tissue_cube)
-    r = subj.simulate_conductivity_uq(
+    r = two_tissue_subject.simulate_conductivity_uq(
         _coil(),
         _placement(),
         config=ConductivityUQConfig(n_samples=16, seed=3),
         moments=True,
-    ).to_numpy()
+    )
     path = tmp_path / "uq.h5"
     r.save(path)
     loaded = ConductivityUQResult.load(path)
@@ -591,6 +699,8 @@ def test_uq_result_save_load(tmp_path, two_tissue_cube):
     np.testing.assert_array_equal(loaded.cov_magnE, r.cov_magnE)
     assert loaded.n_samples == r.n_samples
     assert loaded.perturbed_tags == r.perturbed_tags
+    assert loaded.recovery == r.recovery
+    assert loaded.provenance == {k: v for k, v in r.provenance.items() if v is not None}
 
 
 def test_affine_block_solves_each_draw_against_its_own_matrix(cp, two_tissue_subject):

@@ -1,10 +1,8 @@
 """Robustness on a real head model, and end-to-end regression pins.
 
-Everything else in the GPU suite runs on a 6-tetrahedron single-tissue cube, which by
-construction cannot exercise seven-tissue conductivity contrasts, a curved non-convex scalp,
-sliver tetrahedra, or an AMG hierarchy deeper than one level. These tests run on
-``tests/data/head_patch_r25.msh.gz`` — a 25 mm ball cropped out of a SimNIBS CHARM head mesh
-around the vertex (see ``tests/data/head_patch_r25.json``).
+The synthetic cubes cannot exercise seven-tissue conductivity contrasts, a curved non-convex
+scalp or sliver tetrahedra. These tests run on ``tests/data/head_patch_r25.msh.gz``, a 25 mm ball
+cropped out of a SimNIBS CHARM head mesh around the vertex.
 
 Marked ``reference`` tests need the full 184 MB mesh via ``CUNIBS_REFERENCE_MESH``.
 """
@@ -23,7 +21,9 @@ from cunibs.mesh import VOLUME_KEY_TO_LABEL, load_mesh
 
 pytestmark = pytest.mark.gpu
 
-# Pinned from a run of the committed fixture. Changing these means the pipeline changed.
+# Pinned from a run of the committed fixture. Changing these means the pipeline changed. A peak
+# may move within the solve's 1e-5 tolerance, so PEAK_RTOL sits ten times above that.
+PEAK_RTOL = 1e-4
 PATCH_PEAK_MAGNE = 0.556405
 PATCH_PEAK_MAGNE_HARMONIC = 0.484461
 PATCH_PEAK_LOCATION_MM = np.array([11.794, -1.125, 77.349])
@@ -44,7 +44,7 @@ def test_patch_counts_match_manifest(patch_mesh, patch_manifest):
     assert patch_mesh.skin_tris.shape == (patch_manifest["n_skin_tris"], 3)
 
     tags, counts = np.unique(patch_mesh.tet_tags, return_counts=True)
-    assert {str(int(t)): int(c) for t, c in zip(tags, counts, strict=False)} == patch_manifest[
+    assert {str(int(t)): int(c) for t, c in zip(tags, counts, strict=True)} == patch_manifest[
         "tet_tags"
     ]
     assert set(tags.tolist()) == {1, 2, 3, 5, 7, 8, 9}
@@ -56,7 +56,7 @@ def test_patch_indices_are_in_range(patch_mesh):
     assert patch_mesh.tet_nodes.max() < patch_mesh.n_nodes
     assert patch_mesh.skin_tris.min() >= 0
     assert patch_mesh.skin_tris.max() < patch_mesh.n_nodes
-    # Every node is referenced by some tet — the crop reindexes orphans away.
+    # Every node is referenced by some tet, since the crop reindexes orphans away.
     assert np.unique(patch_mesh.tet_nodes).size == patch_mesh.n_nodes
 
 
@@ -78,7 +78,7 @@ def test_patch_multi_tissue_conductivity_mapping(cp, patch_subject):
 
 @pytest.mark.realmesh
 def test_patch_skin_normals_point_outward(patch_mesh, patch_manifest, patch_skin_normals):
-    """All 1125 smoothed normals face away from the crop centre — no inverted triangles."""
+    """All 1125 smoothed normals face away from the crop centre, so no triangle is inverted."""
     normals = patch_skin_normals
     centroids = patch_mesh.nodes_mm[patch_mesh.skin_tris].mean(axis=1)
     outward = centroids - np.asarray(patch_manifest["center_mm"])
@@ -129,8 +129,8 @@ def test_patch_solve_peak_regression(patch_subject, patch_placement, d70_coil):
         potential=True,
         recovery="raw",
     )
-    assert r.peak_magnE() == pytest.approx(PATCH_PEAK_MAGNE, rel=2e-3)
-    np.testing.assert_allclose(r.peak_location_mm(), PATCH_PEAK_LOCATION_MM, atol=2.0)
+    assert r.peak_magnE() == pytest.approx(PATCH_PEAK_MAGNE, rel=PEAK_RTOL)
+    np.testing.assert_allclose(r.peak_location_mm(), PATCH_PEAK_LOCATION_MM, atol=1e-2)
     assert r.coil_name == d70_coil.name
 
 
@@ -139,7 +139,7 @@ def test_patch_default_recovery_peak_regression(patch_subject, patch_placement, 
     """The same pin on the default path, which is harmonic recovery."""
     r = patch_subject.simulate(d70_coil, patch_placement, 1e6, magnitude=True)
     assert r.recovery == "harmonic"
-    assert r.peak_magnE() == pytest.approx(PATCH_PEAK_MAGNE_HARMONIC, rel=2e-3)
+    assert r.peak_magnE() == pytest.approx(PATCH_PEAK_MAGNE_HARMONIC, rel=PEAK_RTOL)
 
 
 @pytest.mark.realmesh
@@ -161,9 +161,7 @@ def test_patch_solve_converged(patch_subject, patch_placement, d70_coil):
 
 
 @pytest.mark.realmesh
-def test_patch_multilevel_solve_true_residual(
-    cp, fresh_subject, patch_mesh, patch_placement, d70_coil
-):
+def test_patch_multilevel_solve_true_residual(cp, patch_subject, patch_placement, d70_coil):
     """A multi-level V-cycle solve, checked against a freshly computed ``b - Ax``.
 
     ``solve_mixed`` iterates in float32 and confirms convergence on the float64 residual itself;
@@ -172,11 +170,10 @@ def test_patch_multilevel_solve_true_residual(
     enough that the hierarchy has no coarse levels at all; this is the same guarantee at a
     size where the V-cycle actually runs.
     """
-
     from cunibs.fem.placement import coil_dadt_at_nodes, compute_coil_transform
     from cunibs.fem.solve import _assemble_rhs, solve_grounded
 
-    ctx = fresh_subject(patch_mesh).context
+    ctx = patch_subject.context
     tf = compute_coil_transform(
         ctx, patch_placement.center_mm, patch_placement.handle_mm, patch_placement.distance_mm
     )
@@ -208,13 +205,14 @@ def test_patch_roi_on_cortex(cp, patch_subject):
 
     idx = cp.asnumpy(roi.elem_idx)
     weights = cp.asnumpy(roi.weights)
+    mesh = patch_subject.mesh
+    in_ball = np.linalg.norm(mesh.tet_barycenters_mm - point, axis=1) <= 5.0
     assert idx.size > 1
-    np.testing.assert_array_equal(patch_subject.mesh.tet_tags[idx], 2)
+    np.testing.assert_array_equal(np.sort(idx), np.flatnonzero(in_ball & (mesh.tet_tags == 2)))
     assert weights.sum() == pytest.approx(1.0, abs=1e-12)
     assert np.all(weights > 0)
 
-    barys = patch_subject.mesh.tet_barycenters_mm[idx]
-    assert np.linalg.norm(barys - point, axis=1).max() <= 5.0 + 1e-9
+    barys = mesh.tet_barycenters_mm[idx]
     np.testing.assert_allclose(cp.asnumpy(roi.barycenter_mm), weights @ barys, atol=1e-9)
 
 
@@ -252,7 +250,10 @@ def test_patch_metrics_all_present_regions(patch_subject, patch_placement, d70_c
 
 @pytest.mark.realmesh
 def test_patch_field_result_roundtrip(tmp_path, patch_subject, patch_placement, d70_coil):
-    """Save/load at 41k elements, with compression actually applied."""
+    """Save/load at 41k elements, with compression actually applied.
+
+    Random-looking floats compress by about 13% here, and the raw arrays are 2 MB.
+    """
     from cunibs.simulation import FieldResult
 
     r = patch_subject.simulate(
@@ -265,8 +266,11 @@ def test_patch_field_result_roundtrip(tmp_path, patch_subject, patch_placement, 
     for name in ("E", "magnE", "v", "transform", "vols", "tet_tags", "barycenters_mm"):
         np.testing.assert_array_equal(getattr(loaded, name), getattr(r, name), err_msg=name)
     assert loaded.summary["peak_magnE"] == r.summary["peak_magnE"]
-    # 41k tets of raw float32/float64 would be well over 3 MB uncompressed.
-    assert path.stat().st_size < 3_000_000
+    raw = sum(
+        getattr(r, name).nbytes
+        for name in ("E", "magnE", "v", "vols", "tet_tags", "barycenters_mm")
+    )
+    assert path.stat().st_size < raw
 
 
 @pytest.mark.realmesh
@@ -320,18 +324,55 @@ def test_full_mesh_forward(cp, fresh_subject, reference_mesh_path, d70_coil):
     placements = [Placement(top, top + [0.0, 50.0, 0.0], 4.0)] * 8
 
     blocked = list(subj.iter_simulate(d70_coil, placements, 1e6, recovery="raw"))
-    assert blocked[0].peak_magnE() == pytest.approx(FULL_PEAK_MAGNE, rel=5e-3)
+    assert blocked[0].peak_magnE() == pytest.approx(FULL_PEAK_MAGNE, rel=PEAK_RTOL)
 
     serialized = list(subj.iter_simulate(d70_coil, placements[:1], 1e6, recovery="raw"))
-    assert blocked[0].peak_magnE() == pytest.approx(serialized[0].peak_magnE(), rel=2e-5)
+    assert blocked[0].peak_magnE() == serialized[0].peak_magnE()
     free, total = cp.cuda.runtime.memGetInfo()
     assert total - free - device_before < 4e9
+
+
+@pytest.mark.realmesh
+@pytest.mark.parametrize("hold", [False, True])
+def test_free_cycles_return_their_device_memory(
+    cp, patch_mesh, d70_coil, patch_placement, hold
+):
+    """free() leaves a held context valid, and dropping it later must still return its memory.
+
+    Read from the driver, since a leak in the native state shows in no CuPy pool. A context that
+    outlives its cycle costs 22 MiB here, so the bound catches one over three cycles and tolerates
+    another process's small movement. A stranded pool chunk is too small to see on this mesh, so
+    that needs the full-mesh test below.
+    """
+
+    def in_use():
+        gc.collect()
+        cp.cuda.Device().synchronize()
+        free, total = cp.cuda.runtime.memGetInfo()
+        return total - free
+
+    def cycle():
+        subj = Subject(patch_mesh)
+        held = subj.context if hold else None
+        subj.simulate(d70_coil, patch_placement, 1e6)
+        during = in_use()
+        subj.free()
+        if hold:
+            assert held.vols.size > 0
+        del held, subj
+        return during, in_use()
+
+    during, settled = cycle()
+    assert during > settled, "the build should show in the driver's count"
+    for _ in range(3):
+        cycle()
+    assert in_use() - settled < 30 << 20
 
 
 @pytest.mark.reference
 @pytest.mark.slow
 def test_context_held_across_free_is_released_when_dropped(cp, reference_mesh_path):
-    """free() leaves a held context valid, and dropping it later must still return its memory."""
+    """A pool dropped with a held context's blocks in use strands a chunk per cycle, at this size."""
     mesh = load_mesh(reference_mesh_path)
 
     def cycle():

@@ -76,17 +76,12 @@ def test_free_drops_and_rebuilds_context(fresh_subject, cube_mesh, synthetic_coi
     first_ctx = subj.context
 
     subj.free()
-    assert subj._ctx is None
 
-    second_ctx = subj.context
-    assert second_ctx is not first_ctx
-    after = subj.simulate(synthetic_coil, PLACEMENT).peak_magnE()
-    assert after == pytest.approx(before, rel=1e-6)
+    assert subj.context is not first_ctx
+    assert subj.simulate(synthetic_coil, PLACEMENT).peak_magnE() == before
 
 
 def test_free_clears_uq_precompute(fresh_subject, two_tissue_cube_mesh, synthetic_coil):
-    from cunibs import ConductivityUQConfig
-
     subj = fresh_subject(two_tissue_cube_mesh)
     subj.simulate_conductivity_uq(
         synthetic_coil, PLACEMENT, config=ConductivityUQConfig(n_samples=8, seed=0)
@@ -100,8 +95,9 @@ def test_free_clears_uq_precompute(fresh_subject, two_tissue_cube_mesh, syntheti
 def test_context_manager_frees_on_exit(cube_mesh, synthetic_coil):
     with Subject(cube_mesh) as subj:
         subj.simulate(synthetic_coil, PLACEMENT)
-        assert subj._ctx is not None
-    assert subj._ctx is None
+        held = weakref.ref(subj.context)
+    gc.collect()
+    assert held() is None
     # Still usable afterwards: state is rebuilt lazily.
     assert subj.simulate(synthetic_coil, PLACEMENT).peak_magnE() > 0
     subj.free()
@@ -142,10 +138,9 @@ def test_free_releases_device_memory(cp, patch_mesh):
 @pytest.mark.realmesh
 def test_cached_arrays_do_not_share_a_pool_chunk(cp, patch_mesh):
     """An array sharing a chunk with a dropped pool's other blocks would strand that chunk."""
-    subj = Subject(patch_mesh)
-    assert type(subj.context.vols.data.mem) is cp.cuda.Memory
-    assert type(subj.context.rhs_indptr.data.mem) is cp.cuda.Memory
-    subj.free()
+    with Subject(patch_mesh) as subj:
+        assert type(subj.context.vols.data.mem) is cp.cuda.Memory
+        assert type(subj.context.rhs_indptr.data.mem) is cp.cuda.Memory
 
 
 @pytest.mark.realmesh
@@ -183,22 +178,24 @@ def test_retained_fields_are_host_backed_and_leave_the_pool_flat(
     assert _held(cp) - settled < 1_000_000
 
 
-def test_roi_radius_zero_is_nearest_gm_element(cp, cube_subject, cube_mesh):
+def test_roi_radius_zero_is_nearest_gm_element(cp, cube_subject):
     point = np.array([80.0, 40.0, 20.0])
     roi = cube_subject.roi(point)
-    expected = int(np.argmin(np.linalg.norm(cube_mesh.tet_barycenters_mm - point, axis=1)))
+    barycenters = cube_subject.mesh.tet_barycenters_mm
+    expected = int(np.argmin(np.linalg.norm(barycenters - point, axis=1)))
     assert cp.asnumpy(roi.elem_idx).tolist() == [expected]
     np.testing.assert_array_equal(cp.asnumpy(roi.weights), [1.0])
 
 
-def test_roi_radius_selects_ball_with_volume_weights(cp, cube_subject, cube_mesh):
+def test_roi_radius_selects_ball_with_volume_weights(cp, cube_subject):
     ctx = cube_subject.context
     point = np.array([50.0, 50.0, 50.0])
     roi = cube_subject.roi(point, radius_mm=40.0)
 
     idx = cp.asnumpy(roi.elem_idx)
     assert idx.size > 1
-    assert np.linalg.norm(cube_mesh.tet_barycenters_mm[idx] - point, axis=1).max() <= 40.0
+    distance = np.linalg.norm(cube_subject.mesh.tet_barycenters_mm - point, axis=1)
+    np.testing.assert_array_equal(np.sort(idx), np.flatnonzero(distance <= 40.0))
     vols = cp.asnumpy(ctx.vols).astype(np.float64)[idx]
     np.testing.assert_allclose(cp.asnumpy(roi.weights), vols / vols.sum(), rtol=1e-14)
 
@@ -225,7 +222,7 @@ def test_depth_probes_normalizes_the_direction(cp, cube_subject):
     depths = [0.0, 10.0, 30.0]
     unit = cube_subject.depth_probes([50, 50, 100], [0, 0, -1], depths, radius_mm=40.0)
     scaled = cube_subject.depth_probes([50, 50, 100], [0, 0, -12.5], depths, radius_mm=40.0)
-    for a, b in zip(unit, scaled, strict=False):
+    for a, b in zip(unit, scaled, strict=True):
         np.testing.assert_array_equal(cp.asnumpy(a.elem_idx), cp.asnumpy(b.elem_idx))
         np.testing.assert_allclose(cp.asnumpy(a.barycenter_mm), cp.asnumpy(b.barycenter_mm))
 
@@ -233,7 +230,7 @@ def test_depth_probes_normalizes_the_direction(cp, cube_subject):
 def test_depth_probes_matches_roi_at_each_depth(cp, cube_subject):
     depths = [0.0, 15.0, 35.0]
     probes = cube_subject.depth_probes([50, 50, 100], [0, 0, -1], depths, radius_mm=40.0)
-    for depth, probe in zip(depths, probes, strict=False):
+    for depth, probe in zip(depths, probes, strict=True):
         expected = cube_subject.roi([50, 50, 100 - depth], radius_mm=40.0, region="gray_matter")
         np.testing.assert_array_equal(cp.asnumpy(probe.elem_idx), cp.asnumpy(expected.elem_idx))
 
@@ -254,15 +251,17 @@ def test_depth_probes_rejects_an_undefined_direction(cube_subject, bad):
 
 @pytest.mark.realmesh
 def test_two_subjects_are_independent(fresh_subject, patch_mesh, cube_mesh, synthetic_coil):
-    """Freeing one subject must not disturb another's cached state."""
+    """Freeing one subject must not disturb another's cached state, though the pool is shared."""
     a = fresh_subject(cube_mesh)
     b = fresh_subject(patch_mesh)
     a_ctx, b_ctx = a.context, b.context
     assert a_ctx is not b_ctx
+    before = b.simulate(synthetic_coil, PLACEMENT, magnitude=True).magnE
 
     a.free()
-    assert b._ctx is b_ctx
-    assert b.simulate(synthetic_coil, PLACEMENT) is not None
+    assert b.context is b_ctx
+    after = b.simulate(synthetic_coil, PLACEMENT, magnitude=True).magnE
+    np.testing.assert_array_equal(after, before)
 
 
 @pytest.mark.realmesh
@@ -298,10 +297,14 @@ def test_record_rois_matches_a_reduction_of_the_retained_field(
     rois = {
         "near": patch_subject.roi(cortex, radius_mm=5.0, region="gray_matter"),
         "point": patch_subject.roi(cortex, region="gray_matter"),
+        "any_tissue": patch_subject.roi(cortex, radius_mm=8.0, region="all"),
     }
+    assert (
+        np.unique(patch_subject.mesh.tet_tags[cp.asnumpy(rois["any_tissue"].elem_idx)]).size > 1
+    )
     result = patch_subject.simulate(d70_coil, patch_placement, magnitude=True, record_rois=rois)
 
-    assert set(result.roi_means) == {"near", "point"}
+    assert set(result.roi_means) == set(rois)
     for name, target in rois.items():
         retained = metrics.roi_mean(cp.asarray(result.magnE), target.elem_idx, target.weights)
         assert result.roi_means[name] == float(retained)
@@ -310,7 +313,11 @@ def test_record_rois_matches_a_reduction_of_the_retained_field(
         host = float((result.magnE[idx].astype(np.float64) * w).sum())
         assert result.roi_means[name] == pytest.approx(host, rel=1e-14)
 
-    # Recording an ROI must not require retaining anything.
+    # Recording an ROI must not require retaining anything, whichever tissues it reaches. NaN in
+    # the pool stops an element the recovery skipped reading back the run above's value.
+    release_scratch()
+    with cp.cuda.using_allocator(scratch_pool().malloc):
+        cp.full(1 << 24, cp.nan, dtype=cp.float32)
     lean = patch_subject.simulate(d70_coil, patch_placement, record_rois=rois)
     assert lean.magnE is None and lean.E is None
     assert lean.roi_means == result.roi_means
@@ -318,8 +325,6 @@ def test_record_rois_matches_a_reduction_of_the_retained_field(
 
 @pytest.mark.realmesh
 def test_roi_means_round_trip_through_hdf5(patch_subject, d70_coil, patch_placement, tmp_path):
-    from cunibs import FieldResult
-
     rois = {
         "m1": patch_subject.roi(_cortex_under(patch_subject, patch_placement), radius_mm=5.0)
     }
@@ -414,6 +419,12 @@ def no_gray_matter(patch_mesh):
     )
 
 
+def _white_matter_point(mesh) -> np.ndarray:
+    """The white-matter barycentre nearest that tissue's centroid, so an ROI there is in it."""
+    white = mesh.tet_barycenters_mm[mesh.tet_tags == 1]
+    return white[np.argmin(np.linalg.norm(white - white.mean(axis=0), axis=1))]
+
+
 @pytest.mark.realmesh
 @pytest.mark.parametrize("recovery", RECOVERY_MODES)
 def test_a_mesh_with_no_gray_matter_skips_the_summary(
@@ -439,7 +450,7 @@ def test_a_mesh_with_no_gray_matter_still_reads_rois_and_saves(
     tmp_path, no_gray_matter, d70_coil, patch_placement
 ):
     with Subject(no_gray_matter) as subj:
-        roi = subj.roi(patch_placement.center_mm - [0.0, 0.0, 6.0], 4.0, "white_matter")
+        roi = subj.roi(_white_matter_point(no_gray_matter), 4.0, "white_matter")
         result = subj.simulate(d70_coil, patch_placement, 1e6, record_rois={"a": roi})
         assert result.summary is None
         assert result.roi_means["a"] > 0.0
@@ -455,7 +466,7 @@ def test_uq_on_a_mesh_with_no_gray_matter_skips_its_scalars(
 ):
     config = ConductivityUQConfig(n_samples=9, seed=0)
     with Subject(no_gray_matter) as subj:
-        roi = subj.roi(patch_placement.center_mm - [0.0, 0.0, 6.0], 4.0, "white_matter")
+        roi = subj.roi(_white_matter_point(no_gray_matter), 4.0, "white_matter")
         uq = subj.simulate_conductivity_uq(
             d70_coil, patch_placement, config, 1e6, moments=True, record_rois={"a": roi}
         )
@@ -511,10 +522,12 @@ def _fails_once_holding(cp, size):
 def test_a_retried_build_does_not_hold_the_failed_attempts_memory(cp, cube_mesh):
     """The handler's traceback pins the failed frames, so the retry must run outside it."""
     release_scratch()
+    # The pool is the process's, so another test's blocks may still be alive in it.
+    before = scratch_pool().used_bytes()
     build, seen = _fails_once_holding(cp, 1 << 24)
     with Subject(cube_mesh) as subj:
         assert subj._build(build) == "built"
-    assert seen[1] == 0
+    assert seen[1] <= before
 
 
 @pytest.mark.parametrize(
@@ -541,7 +554,7 @@ def test_element_and_node_order_map_results_to_the_loaded_mesh(
     patch_mesh, d70_coil, patch_placement
 ):
     with Subject(patch_mesh) as subj:
-        result = subj.simulate(d70_coil, patch_placement, 1e6, magnitude=True, potential=True)
+        result = subj.simulate(d70_coil, patch_placement, 1e6, magnitude=True)
         elements, nodes = subj.element_order, subj.node_order
 
         assert sorted(elements.tolist()) == list(range(patch_mesh.n_tets))
@@ -553,24 +566,31 @@ def test_element_and_node_order_map_results_to_the_loaded_mesh(
             result.barycenters_mm,
             atol=1e-9,
         )
-
-        in_file_order = np.empty_like(result.magnE)
-        in_file_order[elements] = result.magnE
-        np.testing.assert_array_equal(in_file_order[elements], result.magnE)
-        gray = patch_mesh.tet_tags == 2
-        assert in_file_order[gray].sum() == pytest.approx(
-            result.magnE[result.tet_tags == 2].sum(), rel=1e-6
+        np.testing.assert_array_equal(
+            nodes[subj.mesh.tet_nodes], patch_mesh.tet_nodes[elements]
         )
 
 
 @pytest.mark.realmesh
 def test_order_does_not_depend_on_when_it_is_asked_for(patch_mesh):
+    """Asked before the build, the orders are recomputed, and must be the ones the build used."""
     with Subject(patch_mesh) as subj:
-        before = subj.element_order.copy(), subj.node_order.copy()
-        assert subj.context is not None
-        np.testing.assert_array_equal(subj.element_order, before[0])
-        np.testing.assert_array_equal(subj.node_order, before[1])
+        elements, nodes = subj.element_order, subj.node_order
         with pytest.raises(ValueError, match="read-only"):
-            subj.element_order[0] = 0
+            elements[0] = 0
+        np.testing.assert_array_equal(patch_mesh.nodes_mm[nodes], subj.mesh.nodes_mm)
+        np.testing.assert_array_equal(patch_mesh.tet_tags[elements], subj.mesh.tet_tags)
+
         subj.free()
-        np.testing.assert_array_equal(subj.element_order, before[0])
+        assert subj.context is not None
+        np.testing.assert_array_equal(subj.element_order, elements)
+        np.testing.assert_array_equal(subj.node_order, nodes)
+
+
+@pytest.mark.realmesh
+def test_a_mesh_already_in_order_stays_in_it(patch_subject):
+    """Stable sorts make the reordering idempotent, so a subject's own mesh maps to itself."""
+    mesh = patch_subject.mesh
+    with Subject(mesh) as again:
+        np.testing.assert_array_equal(again.node_order, np.arange(mesh.n_nodes))
+        np.testing.assert_array_equal(again.element_order, np.arange(mesh.n_tets))
