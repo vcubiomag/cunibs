@@ -233,6 +233,12 @@ def test_load_finds_a_bundled_name_despite_a_directory_called_that(tmp_path, mon
     assert Coil.load("MagStim_D70").n_dipoles > 0
 
 
+def test_coils_compare_by_identity_and_hash():
+    a, b = Coil.load("MagStim_D70"), Coil.load("MagStim_D70")
+    assert a != b
+    assert len({a, b, a}) == 2
+
+
 def test_coil_load_rejects_malformed_dipoles(tmp_path):
     path = tmp_path / "bad.h5"
     with h5py.File(path, "w") as f:

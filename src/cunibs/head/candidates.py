@@ -154,18 +154,18 @@ def scalp_grid(
             f"no scalp triangles within {radius_mm} mm of the projected centre; "
             "the radius is smaller than one facet."
         )
-    verts = cp.ascontiguousarray(verts[near])
+    verts = verts[near]
 
     # Refine only where the mesh cannot already resolve the requested spacing: below facet size,
     # extra candidates differ only in a position the geometry does not distinguish.
     edge = float(cp.linalg.norm(verts[:, 1] - verts[:, 0], axis=1).mean())
-    verts = _subdivide(verts, max(0, int(np.ceil(np.log2(max(edge / spacing_mm, 1.0))))))
+    verts = _subdivide(verts, int(np.ceil(np.log2(max(edge / spacing_mm, 1.0)))))
 
     centroids = verts.mean(axis=1)
     centroids = centroids[cp.linalg.norm(centroids - p0, axis=1) <= radius_mm]
     chosen = _thin_to_spacing(centroids, p0, normal, spacing_mm)
 
-    centers = cp.asnumpy(cp.ascontiguousarray(centroids[chosen]))
+    centers = cp.asnumpy(centroids[chosen])
     return ScalpGrid(
         centers_mm=centers,
         center_mm=cp.asnumpy(p0),

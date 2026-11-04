@@ -88,6 +88,12 @@ type _HostMetricInputs = tuple[
 ]
 
 
+def _read_only[T: np.ndarray](array: T) -> T:
+    """``array``, made safe to share by reference: an in-place edit would reach every holder."""
+    array.setflags(write=False)
+    return array
+
+
 def _published[T](value: T) -> T:
     """``value``, once the stream that built it has finished.
 
@@ -174,7 +180,7 @@ class _Retain:
     nodal: bool = False
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class Placement:
     """Define a coil placement on the scalp in millimetres.
 
@@ -184,6 +190,8 @@ class Placement:
     All three must be finite, and ``handle_mm`` must differ from ``center_mm``. A handle on
     the outward normal through the scalp projection of ``center_mm`` is rejected too, but only
     once a mesh is available to project against.
+
+    Placements compare and hash by value, and their arrays are read-only.
     """
 
     center_mm: npt.NDArray[np.float64]
@@ -207,9 +215,20 @@ class Placement:
             raise ValueError(
                 "handle_mm must differ from center_mm; it defines the coil's handle direction."
             )
+        center.setflags(write=False)
+        handle.setflags(write=False)
         object.__setattr__(self, "center_mm", center)
         object.__setattr__(self, "handle_mm", handle)
         object.__setattr__(self, "distance_mm", distance)
+
+    def _key(self) -> tuple[float, ...]:
+        return (*self.center_mm.tolist(), *self.handle_mm.tolist(), self.distance_mm)
+
+    def __eq__(self, other: object) -> bool:
+        return self._key() == other._key() if isinstance(other, Placement) else NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._key())
 
 
 class Subject:
@@ -219,12 +238,11 @@ class Subject:
         self._mesh = mesh
         self._ctx: SolverContext | None = None
         self._host_metrics: _HostMetricInputs | None = None
-        self._host_tets: npt.NDArray[np.int32] | None = None
         self._file_order: tuple[npt.NDArray[np.integer], npt.NDArray[np.integer]] | None = None
         self._host_slots: dict[
             Recovery, tuple[npt.NDArray[np.int32], npt.NDArray[np.int32] | None]
         ] = {}
-        self._region_slices: dict[metrics.Region, metrics.RegionSlice] = {}
+        self._default_slice: metrics.RegionSlice | None = None
         self._conductivity_uq_pre: dict[tuple[int, ...], ConductivityUQPrecompute] = {}
         self._copier: AsyncCopier | None = None
         # Guards every lazy field above: under the free-threaded build two threads sharing a
@@ -244,18 +262,16 @@ class Subject:
         reclaim memory as it goes. Arrays a caller still holds from the cached state, such as
         ``subject.context``'s, stay valid and are released when dropped. The subject stays usable
         afterwards; cached state is rebuilt lazily on the next call. Also available via the context
-        manager:
-        ``with Subject.from_mesh(path) as subject: ...``.
+        manager: ``with Subject.from_mesh(path) as subject: ...``.
         """
         with self._lock:
             self._conductivity_uq_pre.clear()
             # The recovery operators hang off the context, so dropping it releases them too.
             self._ctx = None
             self._host_metrics = None
-            self._host_tets = None
             self._file_order = None
             self._host_slots.clear()
-            self._region_slices.clear()
+            self._default_slice = None
             if self._copier is not None:
                 self._copier.drain()
                 self._copier = None
@@ -319,10 +335,10 @@ class Subject:
                     node_perm, _, tet_perm = spatial_order(
                         cp.asarray(self._mesh.nodes_mm), cp.asarray(self._mesh.tet_nodes)
                     )
-                    nodes, elements = cp.asnumpy(node_perm), cp.asnumpy(tet_perm)
-                nodes.setflags(write=False)
-                elements.setflags(write=False)
-                self._file_order = (nodes, elements)
+                    self._file_order = (
+                        _read_only(cp.asnumpy(node_perm)),
+                        _read_only(cp.asnumpy(tet_perm)),
+                    )
             return self._file_order
 
     @property
@@ -395,10 +411,10 @@ class Subject:
         """
         from cunibs.uq import build_conductivity_uq_precompute
 
-        ctx = self.context
-        with cp.cuda.using_allocator(scratch_pool().malloc):
-            tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
         with self._lock:
+            ctx = self.context
+            with cp.cuda.using_allocator(scratch_pool().malloc):
+                tags = config.tags_for(cp.asnumpy(cp.unique(ctx.tet_tags)))
             if tags not in self._conductivity_uq_pre:
                 self._conductivity_uq_pre[tags] = self._build(
                     lambda: build_conductivity_uq_precompute(ctx, tags)
@@ -428,19 +444,18 @@ class Subject:
             "sweep_basis_size": None if basis is None else basis.requested_size,
         }
 
-    def _region_slice(self, region: metrics.Region) -> metrics.RegionSlice:
-        """The field-independent half of a summary, gathered once per region."""
+    @property
+    def _region_slice(self) -> metrics.RegionSlice:
+        """The field-independent half of a summary over the default region, gathered once."""
         with self._lock:
-            cached = self._region_slices.get(region)
-            if cached is None:
+            if self._default_slice is None:
                 ctx = self.context
-                cached = self._build(
+                self._default_slice = self._build(
                     lambda: metrics.region_slice(
-                        ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, region
+                        ctx.vols, ctx.tet_barycenters_mm, ctx.tet_tags, DEFAULT_REGION
                     )
                 )
-                self._region_slices[region] = cached
-            return cached
+            return self._default_slice
 
     @property
     def _host_metric_inputs(self) -> _HostMetricInputs:
@@ -449,9 +464,9 @@ class Subject:
             if self._host_metrics is None:
                 ctx = self.context
                 self._host_metrics = (
-                    cp.asnumpy(ctx.vols),
-                    cp.asnumpy(ctx.tet_tags),
-                    cp.asnumpy(ctx.tet_barycenters_mm),
+                    _read_only(cp.asnumpy(ctx.vols)),
+                    _read_only(cp.asnumpy(ctx.tet_tags)),
+                    _read_only(cp.asnumpy(ctx.tet_barycenters_mm)),
                 )
             return self._host_metrics
 
@@ -486,7 +501,7 @@ class Subject:
         if full_volume:
             return None
         tags = set()
-        if not self._region_slice(DEFAULT_REGION).empty:
+        if not self._region_slice.empty:
             tags.add(metrics.region_tag(DEFAULT_REGION))
         for target in record_rois.values():
             tags.update(int(t) for t in cp.asnumpy(cp.unique(tet_tags[target.elem_idx])))
@@ -532,7 +547,11 @@ class Subject:
         slot_node, slot_tag = self._host_slot_maps(op) if retain.nodal else (None, None)
         # Only per-node slots need the connectivity to say which nodes a region touches; a
         # (node, tissue) slot carries its own tag.
-        tet_nodes = self._host_tet_nodes if retain.nodal and slot_tag is None else None
+        tet_nodes = (
+            _read_only(self.context.mesh.tet_nodes)
+            if retain.nodal and slot_tag is None
+            else None
+        )
         n_nodes = int(self.context.n_nodes) if retain.nodal else None
         fields = [out["magnE"] for out in outs]
         summaries = [None] * len(chunk) if region.empty else region.summarize_block(fields)
@@ -564,21 +583,13 @@ class Subject:
             for site, out, summary, rois in zip(chunk, outs, summaries, roi_means, strict=True)
         ]
 
-    @property
-    def _host_tet_nodes(self) -> npt.NDArray[np.int32]:
-        """Host connectivity, built once and shared by every result carrying a nodal field."""
-        with self._lock:
-            if self._host_tets is None:
-                self._host_tets = np.asarray(self.context.mesh.tet_nodes)
-            return self._host_tets
-
     def _host_slot_maps(
         self, op: RecoveryOperator | None
     ) -> tuple[npt.NDArray[np.int32] | None, npt.NDArray[np.int32] | None]:
         """Host ``(slot_node, slot_tag)`` for ``op``, shared by every result it produces.
 
-        Cached like :attr:`_host_tet_nodes`: a sweep would otherwise copy an n_slots-length
-        array off the device once per placement.
+        Cached because a sweep would otherwise copy an n_slots-length array off the device once
+        per placement.
         """
         if op is None:
             return None, None
@@ -586,8 +597,8 @@ class Subject:
             cached = self._host_slots.get(op.mode)
             if cached is None:
                 cached = (
-                    cp.asnumpy(op.slot_node),
-                    None if op.slot_tag is None else cp.asnumpy(op.slot_tag),
+                    _read_only(cp.asnumpy(op.slot_node)),
+                    None if op.slot_tag is None else _read_only(cp.asnumpy(op.slot_tag)),
                 )
                 self._host_slots[op.mode] = cached
             return cached
@@ -610,7 +621,7 @@ class Subject:
         if not sites:
             return
         ctx = self.context
-        region = self._region_slice(DEFAULT_REGION)
+        region = self._region_slice
         temp_pool = scratch_pool()
         with cp.cuda.using_allocator(temp_pool.malloc):
             dip_pos_m = cp.asarray(coil.positions_m)
@@ -717,10 +728,9 @@ class Subject:
 
         Each solve then starts from the Galerkin solution over those placements' solutions
         rather than from zero, which on a head mesh cuts the CG iterations of a dense sweep about
-        one target by about a third. Building the basis
-        costs ``size`` solves (about 0.9 s) and ``size`` fp32 vectors of device memory (about
-        360 MB at the default on a 700k-node mesh), so it pays from several hundred placements
-        and is never built implicitly.
+        one target by about a third. Building the basis costs ``size`` solves (about 0.9 s) and
+        ``size`` fp32 vectors of device memory (about 360 MB at the default on a 700k-node mesh),
+        so it pays from several hundred placements and is never built implicitly.
 
         A placement's result does not depend on the other placements in its sweep, with or
         without a basis. It does change, within the solver tolerance, once a basis is present,
@@ -847,13 +857,15 @@ class Subject:
         """
         from cunibs.uq import run_conductivity_uq
 
+        if not sites:
+            return
         ctx = self.context
         pre = self._conductivity_uq_precompute(config)
         temp_pool = scratch_pool()
         with cp.cuda.using_allocator(temp_pool.malloc):
             tissues = self._needed_tissues(moments, record_rois)
         op = self._recovery_operator(recovery, tissues)
-        gray_matter = self._region_slice(DEFAULT_REGION)
+        gray_matter = self._region_slice
         provenance = self._provenance(coil, seeded=False)
         host = self._host_metric_inputs if moments else None
 
@@ -980,17 +992,17 @@ class Subject:
         return result
 
 
-@dataclass
+@dataclass(eq=False)
 class FieldResult:
     """Metrics for one placement, plus whichever full-volume arrays were retained.
 
     ``summary`` holds the gray-matter metrics, and is ``None`` on a mesh with no gray matter.
     ``magnE``, ``E`` and ``v`` are ``None`` unless the run asked for them with ``magnitude=``,
-    ``vectors=`` or ``potential=``. All arrays are NumPy.
+    ``vectors=`` or ``potential=``. All arrays are NumPy: ``magnE`` and ``E`` in V/m, ``v`` in V
+    and ``vols`` in m³.
 
     ``vols``, ``tet_tags`` and ``barycenters_mm`` accompany ``magnE``, since they are what the
-    on-demand metrics need. Results from one subject share them, so treat them as
-    read-only.
+    on-demand metrics need. Results from one subject share them, so they are read-only.
 
     ``recovery`` records which post-processing produced ``E``/``magnE``/``summary``. It is
     provenance, not a switch: a result carries one field, not several.
@@ -1001,6 +1013,8 @@ class FieldResult:
     ``provenance`` records what produced the result, so a saved file can be tied back to its
     inputs: cuNIBS and dependency versions, the GPU, and the identity of the mesh and coil. It is
     ``None`` on a result loaded from a file that carries none.
+
+    Two results compare equal only if they are the same object; compare their fields instead.
 
     ``roi_means`` is the volume-weighted mean ``|E|`` over each ROI the run named in
     ``record_rois``, and is ``None`` when it named none. It describes the same recovered field as
@@ -1035,7 +1049,9 @@ class FieldResult:
     slot_node: npt.NDArray[np.int32] | None = None
     slot_tag: npt.NDArray[np.int32] | None = None
     tet_nodes: npt.NDArray[np.int32] | None = None
-    _summaries: dict[str, metrics.FieldMetrics] = field(default_factory=dict, repr=False)
+    _summaries: dict[str, metrics.FieldMetrics] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def nodal_field(self, region: metrics.Region = DEFAULT_REGION) -> npt.NDArray[np.float32]:
         """The recovered field at the mesh nodes, on ``region``'s side of any boundary.
@@ -1068,7 +1084,7 @@ class FieldResult:
             if self.tet_nodes is None or self.tet_tags is None:
                 raise ValueError(
                     "nodal_field for a specific region needs the mesh connectivity, which this "
-                    "result did not retain. Re-run with nodal=True and magnitude=True."
+                    "result did not retain. Re-run with nodal=True."
                 )
             touched = np.zeros(self.n_nodes, dtype=bool)
             touched[self.tet_nodes[metrics.region_mask(self.tet_tags, region)]] = True

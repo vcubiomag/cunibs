@@ -15,13 +15,15 @@ _COILS_ROOT = Path(__file__).resolve().parent / "coils"
 _CCD_DIDTMAX_TO_A_PER_S = 1e6
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Coil:
     """Store magnetic dipoles and coil metadata.
 
     Positions use metres and moments A·m², as ``(n, 3)`` arrays of float64. ``didt_max`` records
     the stimulator's rated peak dI/dt in A/s, or ``None`` when the source file gives none; it is
     metadata.
+
+    Two coils compare equal only if they are the same object.
     """
 
     positions_m: npt.NDArray[np.float64]

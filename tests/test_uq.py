@@ -805,3 +805,14 @@ def test_uq_raises_when_even_one_draw_at_a_time_does_not_fit(
             d70_coil, patch_placement, ConductivityUQConfig(n_samples=4), 1e6
         )
     assert widths == [8, 4, 2, 1]
+
+
+def test_uq_with_no_placements_builds_nothing(
+    fresh_subject, two_tissue_cube_mesh, synthetic_coil
+):
+    from cunibs import ConductivityUQConfig
+
+    subject = fresh_subject(two_tissue_cube_mesh)
+    results = subject.iter_simulate_conductivity_uq(synthetic_coil, [], ConductivityUQConfig())
+    assert list(results) == []
+    assert subject._ctx is None

@@ -212,3 +212,24 @@ def test_simulate_conductivity_uq_rejects_a_sequence(cube_subject, synthetic_coi
 def test_target_rejects_what_would_select_an_arbitrary_element(args, kwargs):
     with pytest.raises(ValueError, match="must be"):
         Target(*args, **kwargs)
+
+
+def test_placements_compare_and_hash_by_value():
+    a = Placement([1.0, 2.0, 3.0], [1.0, 2.0, 9.0])
+    same = Placement((1, 2, 3), np.array([1.0, 2.0, 9.0]), 4.0)
+    assert a == same and hash(a) == hash(same)
+    assert a != Placement([1.0, 2.0, 3.0], [1.0, 2.0, 9.0], 5.0)
+    assert a != "a placement"
+    assert len({a, same}) == 1
+
+
+def test_placement_arrays_cannot_drift_from_its_hash():
+    a = Placement([1.0, 2.0, 3.0], [1.0, 2.0, 9.0])
+    with pytest.raises(ValueError, match="read-only"):
+        a.center_mm[0] = 5.0
+
+
+def test_field_results_compare_by_identity():
+    a, b = _field_result(), _field_result()
+    assert a != b
+    assert [a].count(a) == 1

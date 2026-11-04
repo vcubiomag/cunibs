@@ -61,6 +61,15 @@ def test_context_is_cached(cube_subject):
     assert cube_subject.context is cube_subject.context
 
 
+def test_host_arrays_results_share_are_read_only(cube_subject, synthetic_coil, tmp_path):
+    """One result's in-place unit change would otherwise reach every other result."""
+    r = cube_subject.simulate(synthetic_coil, PLACEMENT, magnitude=True, nodal=True)
+    for shared in (r.vols, r.tet_tags, r.barycenters_mm, r.slot_node):
+        with pytest.raises(ValueError, match="read-only"):
+            shared[0] = 0
+    r.save(tmp_path / "result.h5")
+
+
 def test_free_drops_and_rebuilds_context(fresh_subject, cube_mesh, synthetic_coil):
     subj = fresh_subject(cube_mesh)
     before = subj.simulate(synthetic_coil, PLACEMENT).peak_magnE()

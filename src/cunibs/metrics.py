@@ -176,7 +176,7 @@ def focality(
     return stimulated_volume(magnE, vols, mask, frac * anchor)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class RegionSlice:
     """The field-independent half of a region summary, gathered once.
 

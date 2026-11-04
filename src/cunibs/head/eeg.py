@@ -21,12 +21,12 @@ import h5py
 import numpy as np
 import numpy.typing as npt
 
-from cunibs.mesh import EEG_POSITIONS_GROUP, is_hdf5
+from cunibs.mesh import EEG_POSITIONS_GROUP
 
 # Both are electrode sites at scalp positions; which one a label lands in is a property of the cap
 # montage, not of the position.
 _ELECTRODE_KINDS = frozenset({"Electrode", "ReferenceElectrode"})
-_FIDUCIAL_KIND = "Fiducial"
+_FIDUCIAL_KINDS = frozenset({"Fiducial"})
 
 # What CHARM names the directory, and the cap SimNIBS treats as its default 10-10 montage.
 EEG_POSITIONS_DIR = "eeg_positions"
@@ -35,7 +35,7 @@ DEFAULT_CAP = "EEG10-10_UI_Jurak_2007"
 
 def _cap_text(path: Path, cap: str) -> str:
     try:
-        if not is_hdf5(path):
+        if not h5py.is_hdf5(path):
             return path.read_text()
         with h5py.File(path, "r") as f:
             caps = f.get(EEG_POSITIONS_GROUP, {})
@@ -48,7 +48,7 @@ def _cap_text(path: Path, cap: str) -> str:
 
 
 def _read_rows(
-    path: Path, cap: str, kinds: frozenset[str] | set[str]
+    path: Path, cap: str, kinds: frozenset[str]
 ) -> dict[str, npt.NDArray[np.float64]]:
     text = _cap_text(path, cap)
 
@@ -83,7 +83,7 @@ def read_fiducials(
     path: str | Path, cap: str = DEFAULT_CAP
 ) -> dict[str, npt.NDArray[np.float64]]:
     """Anatomical landmark label -> position in mm (``Nz``, ``Iz``, ``LPA``, ``RPA``)."""
-    return _read_rows(Path(path), cap, {_FIDUCIAL_KIND})
+    return _read_rows(Path(path), cap, _FIDUCIAL_KINDS)
 
 
 def find_cap(m2m_dir: str | Path, cap: str = DEFAULT_CAP) -> Path:
