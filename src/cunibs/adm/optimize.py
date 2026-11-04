@@ -235,6 +235,8 @@ def optimize_placement(
             "this reciprocity field does not record the centres and distance it was built for; "
             "pass centers_mm and distance_mm."
         )
+    if distance_mm < 0.0:
+        raise ValueError(f"distance_mm must be non-negative, got {distance_mm!r}.")
 
     ctx = recip.ctx
     centers = cp.ascontiguousarray(cp.asarray(centers_mm, dtype=cp.float64).reshape(-1, 3))

@@ -70,7 +70,8 @@ def build_grid(dipole_positions_m: cp.ndarray, spacing_mm: float, margin_mm: flo
     margin_m = margin_mm * 1e-3
     lo = cp.asnumpy(dipole_positions_m.min(0)) - margin_m
     hi = cp.asnumpy(dipole_positions_m.max(0)) + margin_m
-    n = np.ceil((hi - lo) / spacing_m).astype(np.int64) + 1
+    # The kernels need a full cell on every axis, which dipoles in a plane with no margin lack.
+    n = np.maximum(np.ceil((hi - lo) / spacing_m), 1).astype(np.int64) + 1
     return Grid(
         origin_m=tuple(lo.tolist()),
         spacing_m=(spacing_m, spacing_m, spacing_m),

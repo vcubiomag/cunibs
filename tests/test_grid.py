@@ -45,6 +45,11 @@ def test_grid_shape_and_n_points_consistent(dipole_cloud):
     np.testing.assert_allclose(grid.spacing_m, 3e-3)
 
 
+def test_build_grid_keeps_a_cell_on_an_axis_with_no_extent(cp):
+    grid = build_grid(cp.asarray([[0.01, 0.02, 0.03], [0.05, 0.02, 0.03]]), 3.0, 0.0)
+    assert grid.shape[1:] == (2, 2)
+
+
 def test_world_to_index_roundtrip_is_integral(cp, dipole_cloud):
     grid = build_grid(dipole_cloud, spacing_mm=3.0, margin_mm=8.0)
     idx = cp.asnumpy(grid.world_to_index(_points_m(grid)))

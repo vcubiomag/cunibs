@@ -15,6 +15,8 @@ import pytest
 
 from cunibs import ConductivityUQConfig, Placement, Subject
 from cunibs._memory import release_scratch, scratch_pool
+from cunibs.adm import Target, build_reciprocity, evaluate, evaluate_frames
+from cunibs.adm.optimize import _frames, _project
 
 pytestmark = [pytest.mark.gpu, pytest.mark.realmesh]
 
@@ -160,6 +162,55 @@ def test_free_during_sweeps_leaves_them_correct(patch_mesh, d70_coil, placements
     for _ in range(ROUNDS):
         for sweep in _sweeps_while_freeing(Subject(patch_mesh), d70_coil, placements):
             assert sweep == serial["harmonic"]
+
+
+@pytest.fixture(scope="module")
+def adm_case(patch_mesh, placements):
+    """A gray-matter target, and the scalp point a reciprocity field is built to reach."""
+    gm = patch_mesh.tet_barycenters_mm[patch_mesh.tet_tags == 2]
+    target = Target(gm[np.argmax(gm[:, 2])] - np.array([0.0, 0.0, 4.0]), region="gray_matter")
+    return target, placements[0]
+
+
+def test_adjoint_builds_racing_a_cold_subject_match_serial(patch_mesh, d70_coil, adm_case):
+    target, placement = adm_case
+    centers = placement.center_mm[None]
+
+    def field_at(subject):
+        recip = build_reciprocity(subject, d70_coil, target, centers, spacing_mm=4.0)
+        return evaluate(recip, d70_coil, placement).tobytes()
+
+    with Subject(patch_mesh) as subject:
+        want = field_at(subject)
+    for _ in range(ROUNDS):
+        with Subject(patch_mesh) as subject:
+            assert _in_threads(*[lambda: field_at(subject)] * THREADS) == [want] * THREADS
+
+
+def test_threads_sampling_one_field_on_demand_match_serial(cp, patch_mesh, d70_coil, adm_case):
+    """A frame off the coverage grows the field's arrays, while other threads read them."""
+    target, placement = adm_case
+    centers = placement.center_mm[None]
+
+    def tilted(subject, degrees):
+        proj, normal, u, v = _project(subject.context, cp.asarray(centers), 4.0)
+        frames = _frames(proj, normal, u, v, cp.linspace(0.0, 6.0, 5), 4.0)
+        t = np.deg2rad(degrees)
+        rot = cp.asarray([[1, 0, 0], [0, np.cos(t), -np.sin(t)], [0, np.sin(t), np.cos(t)]])
+        frames[:, :3, :3] = frames[:, :3, :3] @ rot
+        return frames
+
+    def build(subject):
+        return build_reciprocity(subject, d70_coil, target, centers, spacing_mm=4.0)
+
+    with Subject(patch_mesh) as subject:
+        sets = [tilted(subject, d) for d in np.linspace(-12.0, 12.0, THREADS)]
+        want = [evaluate_frames(build(subject), d70_coil, f).tobytes() for f in sets]
+        for recip in [build(subject) for _ in range(ROUNDS)]:
+            got = _in_threads(
+                *[lambda r=recip, f=f: evaluate_frames(r, d70_coil, f).tobytes() for f in sets]
+            )
+            assert got == want
 
 
 def test_concurrent_sweeps_release_their_device_arrays(patch_mesh, d70_coil, placements):

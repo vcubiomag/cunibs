@@ -443,6 +443,20 @@ def test_evaluate_accepts_a_dipole_on_the_grid_corner(cp, cube_reciprocity):
     _require_in_grid(grid, grid.world_to_index(corners), offset=0, n_dip=1, n_total=2)
 
 
+def test_a_single_dipole_at_the_origin_needs_no_margin(cube_subject):
+    from cunibs.adm import Target, build_reciprocity, evaluate
+    from cunibs.coil import Coil
+    from cunibs.simulation import Placement
+
+    dipole = Coil(np.zeros((1, 3)), np.array([[0.0, 0.0, 1.0]]))
+    center = [50.0, 50.0, 100.0]
+    recip = build_reciprocity(
+        cube_subject, dipole, Target([50.0, 50.0, 80.0]), [center], margin_mm=0.0
+    )
+    assert min(recip.grid.shape) == 2
+    assert np.isfinite(evaluate(recip, dipole, Placement(center, [50.0, 150.0, 100.0]))).all()
+
+
 def test_evaluate_is_linear_in_didt(cp, cube_reciprocity, coil):
     from cunibs.adm import evaluate
     from cunibs.simulation import Placement
@@ -658,6 +672,44 @@ def test_a_reciprocity_build_reuses_the_forward_hierarchy(
 
 
 @pytest.mark.realmesh
+def test_threads_sharing_a_field_can_sample_it_on_demand(
+    patch_subject, d70_coil, patch_target, patch_top_mm
+):
+    """Frames off the coverage add to the field's slot arrays while other threads read them."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from cunibs.adm import Target, build_reciprocity, evaluate
+    from cunibs.simulation import Placement
+
+    ctx = patch_subject.context
+    corners = patch_top_mm + np.array([[-12.0, -12.0, 0.0], [12.0, 12.0, 0.0]])
+    target = Target(patch_target, region="gray_matter")
+
+    def build():
+        return build_reciprocity(ctx, d70_coil, target, corners, margin_mm=1.0)
+
+    between = [
+        Placement(patch_top_mm + [x, y, 0.0], patch_top_mm + [x, y + 50.0, 0.0])
+        for x in np.linspace(-10.0, 10.0, 6)
+        for y in np.linspace(-10.0, 10.0, 6)
+    ]
+    alone = build()
+    expected = [evaluate(alone, d70_coil, pl, DIDT) for pl in between]
+    order = np.random.default_rng(0).permutation(len(between)).tolist()
+
+    def work(shared, start):
+        for i in order[start:] + order[:start]:
+            got = evaluate(shared, d70_coil, between[i], DIDT)
+            np.testing.assert_array_equal(got, expected[i])
+
+    for _ in range(4):
+        shared = build()
+        with ThreadPoolExecutor(6) as pool:
+            for future in [pool.submit(work, shared, 5 * t) for t in range(6)]:
+                future.result()
+
+
+@pytest.mark.realmesh
 def test_masked_sampling_matches_the_full_box_and_fills_off_coverage_frames(
     cp, patch_subject, d70_coil, patch_target, patch_top_mm
 ):
@@ -803,6 +855,8 @@ def test_evaluate_and_optimize_reject_what_they_cannot_answer(cube_subject, coil
         evaluate(recip, coil, Placement(center, center + [0, 40.0, 0]), float("nan"))
     with pytest.raises(ValueError, match="resolution must be"):
         optimize_placement(recip, coil, n_samples=1, resolution=1)
+    with pytest.raises(ValueError, match="distance_mm must be"):
+        optimize_placement(recip, coil, distance_mm=-1.0)
 
 
 def test_evaluate_when_dipoles_sit_on_the_grid_faces(cp, cube_mesh):

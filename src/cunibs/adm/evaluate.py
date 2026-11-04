@@ -135,11 +135,7 @@ def _evaluate_native(
             pos,
             mom,
             q,
-            recip.cell_ok,
-            recip.cell_slot,
-            recip.q_near.reshape(-1),
-            recip.list_ptr,
-            recip.entries.reshape(-1),
+            *recip.slot_arrays(),
             *grid.kernel_args,
             n_dir,
             float(didt),
@@ -155,7 +151,7 @@ def _evaluate_native(
         if attempt == 0:
             need = cp.zeros(grid.n_points, dtype=cp.uint8)
             adm_mark(frames, pos, *grid.kernel_args, need, stream)
-            recip.sample_points(cp.flatnonzero(need & (recip.sampled ^ 1)))
+            recip.sample_points(cp.flatnonzero(need))
     raise AssertionError(
         "cells were still unsampled after sampling every point the frames need"
     )

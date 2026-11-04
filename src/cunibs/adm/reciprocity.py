@@ -11,7 +11,8 @@ with ``W_n = ¼ Σ_{e∋n} w_e``, evaluable as a node-sourced N-body with no ext
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import cupy as cp
@@ -260,7 +261,8 @@ class ReciprocityField:
     marks them, and ``cell_ok`` marks the cells whose eight corners all are, which is the only
     place interpolation is allowed to read. A frame that lands elsewhere has its points sampled on
     demand from the kept sources, so the coverage decides what is paid up front and never what a
-    frame may ask for.
+    frame may ask for. Threads can share a field: sampling swaps in new slot arrays, never changes
+    ones an evaluation may be reading, and :meth:`slot_arrays` gives each evaluation one set.
     """
 
     ctx: SolverContext
@@ -284,29 +286,47 @@ class ReciprocityField:
     # None for a field not built by build_reciprocity. optimize_placement defaults to both.
     distance_mm: float | None = None
     centers_mm: npt.NDArray[np.float64] | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def n_directions(self) -> int:
         return int(self.q.shape[3])
 
+    def slot_arrays(self) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
+        """``cell_ok``, ``cell_slot``, flat ``q_near``, ``list_ptr`` and flat ``entries`` as one set."""
+        with self._lock:
+            return (
+                self.cell_ok,
+                self.cell_slot,
+                self.q_near.reshape(-1),
+                self.list_ptr,
+                self.entries.reshape(-1),
+            )
+
     def sample_points(self, points: cp.ndarray) -> None:
-        """Sample the field at the flat grid indices ``points`` and mark them sampled."""
-        if points.size == 0:
-            return
-        grid = self.grid
-        adm_sample(
-            self.src,
-            self.src_w,
-            self.tile_box,
-            cp.ascontiguousarray(cp.sort(points), dtype=cp.int64),
-            *grid.kernel_args,
-            self.q.reshape(-1),
-            cp.cuda.get_current_stream().ptr,
-        )
-        self.sampled[points] = 1
-        self.cell_ok = _cells_ok(self.sampled, grid.shape)
-        fresh = (self.cell_ok & self.cell_near).astype(cp.bool_) & (self.cell_slot < 0)
-        self._add_slots(cp.flatnonzero(fresh))
+        """Sample the field at those of the flat grid indices ``points`` not yet sampled."""
+        with self._lock:
+            # Writing a point again could tear the value another thread's evaluation is reading.
+            points = points[self.sampled[points] == 0]
+            if points.size == 0:
+                return
+            grid = self.grid
+            stream = cp.cuda.get_current_stream()
+            adm_sample(
+                self.src,
+                self.src_w,
+                self.tile_box,
+                cp.ascontiguousarray(cp.sort(points), dtype=cp.int64),
+                *grid.kernel_args,
+                self.q.reshape(-1),
+                stream.ptr,
+            )
+            self.sampled[points] = 1
+            self.cell_ok = _cells_ok(self.sampled, grid.shape)
+            fresh = (self.cell_ok & self.cell_near).astype(cp.bool_) & (self.cell_slot < 0)
+            self._add_slots(cp.flatnonzero(fresh))
+            # Another thread's stream may read these as soon as the lock is free.
+            stream.synchronize()
 
     def _add_slots(self, cells: cp.ndarray) -> None:
         """Give each of the sampled near cells ``cells`` a slot: its node list and corners."""
@@ -356,6 +376,7 @@ class ReciprocityField:
             self.q_near = cp.concatenate([self.q_near, fresh])
         del packed, fresh
         self.slot_cells = cp.concatenate([self.slot_cells, cells.astype(cp.int64)])
+        self.cell_slot = self.cell_slot.copy()
         self.cell_slot[cells] = cp.arange(first, first + int(cells.size), dtype=cp.int32)
         adm_slot_corners(
             self.slot_cells,
