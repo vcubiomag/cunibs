@@ -15,14 +15,7 @@ import numpy as np
 
 def tet_volumes(nodes: np.ndarray, tets: np.ndarray) -> np.ndarray:
     p = nodes[tets]
-    return (
-        np.abs(
-            np.einsum(
-                "ij,ij->i", np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]), p[:, 3] - p[:, 0]
-            )
-        )
-        / 6.0
-    )
+    return np.abs(np.linalg.det(p[:, 1:] - p[:, :1])) / 6.0
 
 
 def wnorm(x: np.ndarray, w: np.ndarray | None = None) -> float:
@@ -49,9 +42,7 @@ def compare(test: np.ndarray, ref: np.ndarray, w: np.ndarray | None = None) -> d
 
 
 def weighted_percentile(x: np.ndarray, w: np.ndarray, q: float) -> float:
-    order = np.argsort(x)
-    cdf = np.cumsum(w[order])
-    return float(x[order][np.searchsorted(cdf, q / 100 * cdf[-1])])
+    return float(np.percentile(x, q, weights=w, method="inverted_cdf"))
 
 
 def roi_mean(x: np.ndarray, elements: np.ndarray, w: np.ndarray) -> float:
@@ -60,11 +51,8 @@ def roi_mean(x: np.ndarray, elements: np.ndarray, w: np.ndarray) -> float:
 
 def fit_power(x, y) -> dict[str, float]:
     """``y = a * x**slope`` by least squares in log-log; ``slope`` is the order or exponent."""
-    lx, ly = np.log(np.asarray(x, float)), np.log(np.asarray(y, float))
-    slope, intercept = np.polyfit(lx, ly, 1)
-    resid = ly - (slope * lx + intercept)
-    r2 = 1 - resid @ resid / ((ly - ly.mean()) @ (ly - ly.mean()))
-    return {"slope": float(slope), "a": float(np.exp(intercept)), "r2": float(r2)}
+    line = fit_line(np.log(np.asarray(x, float)), np.log(np.asarray(y, float)))
+    return {"slope": line["slope"], "a": float(np.exp(line["intercept"])), "r2": line["r2"]}
 
 
 def fit_line(x, y) -> dict[str, float]:
@@ -77,13 +65,10 @@ def fit_line(x, y) -> dict[str, float]:
 
 def spearman(a, b) -> float:
     def ranks(v):
-        v = np.asarray(v, float)
-        order = np.argsort(v, kind="stable")
-        r = np.empty(v.size)
-        r[order] = np.arange(v.size)
-        _, inverse, counts = np.unique(v, return_inverse=True, return_counts=True)
-        sums = np.bincount(inverse, weights=r)
-        return sums[inverse] / counts[inverse]
+        _, inverse, counts = np.unique(
+            np.asarray(v, float), return_inverse=True, return_counts=True
+        )
+        return (np.cumsum(counts) - (counts + 1) / 2)[inverse]
 
     return float(np.corrcoef(ranks(a), ranks(b))[0, 1])
 

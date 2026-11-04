@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -66,19 +67,11 @@ def _conductivity(msh, sigma_by_tag: dict[int, float] | None = None):
     return tl.cond2elmdata(logger_level=0)
 
 
+@contextmanager
 def _clock(timings: dict, key: str):
-    class Clock:
-        def __enter__(self):
-            self.t0 = time.perf_counter()
-
-        def __exit__(self, *exc):
-            timings[key] = time.perf_counter() - self.t0
-
-    return Clock()
-
-
-def op_info(p, a):
-    return {}, {}
+    t0 = time.perf_counter()
+    yield
+    timings[key] = time.perf_counter() - t0
 
 
 def op_forward(p, a):
@@ -501,14 +494,19 @@ def serve(directory: Path, ops: list[str]) -> None:
             op = json.loads(f["__request__"].tobytes())["op"]
         if response.exists() or (ops and op not in ops):
             continue
+        claim = request.with_suffix(".claim")
         try:
-            request.with_suffix(".claim").touch(exist_ok=False)
+            claim.touch(exist_ok=False)
         except FileExistsError:
             continue
         print(f"answering {request.name} ({op})", flush=True)
-        subprocess.run(
-            [sys.executable, __file__, "run", str(request), str(response)], check=True
-        )
+        try:
+            subprocess.run(
+                [sys.executable, __file__, "run", str(request), str(response)], check=True
+            )
+        except subprocess.CalledProcessError:
+            claim.unlink()
+            raise
 
 
 if __name__ == "__main__":

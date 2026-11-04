@@ -74,7 +74,11 @@ def main() -> int:
     run.add_argument("--data", type=Path, required=True, help="the extracted dataset")
     run.add_argument("--quick", action="store_true", help="a few subjects and repeats")
     run.add_argument("--device", type=int, default=0)
-    run.add_argument("--out", type=Path, default=Path(__file__).with_name("results"))
+    run.add_argument(
+        "--out",
+        type=Path,
+        help="where results go (default: results/ beside this file, or results/quick/ with --quick)",
+    )
     run.add_argument(
         "--simnibs-python",
         default=_default_simnibs_python(),
@@ -126,14 +130,14 @@ def main() -> int:
     from benchmarks._data import Dataset
     from benchmarks._simnibs import Simnibs
 
+    # A smoke test must not overwrite the full results of the same benchmark.
+    out = args.out or Path(__file__).with_name("results") / ("quick" if args.quick else "")
     ctx = _run.Context(
         data=Dataset(args.data),
         quick=args.quick,
         device=args.device,
-        out=args.out,
-        simnibs=Simnibs(
-            args.simnibs_python or None, args.simnibs_exchange, args.out / ".simnibs"
-        ),
+        out=out,
+        simnibs=Simnibs(args.simnibs_python or None, args.simnibs_exchange, out / ".simnibs"),
     )
     print(_run.run(names[0], ctx))
     return 0

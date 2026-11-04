@@ -104,7 +104,7 @@ def _jitter(points: np.ndarray, movable: np.ndarray, step: float, rng, jitter: f
         points[movable] += rng.uniform(-jitter, jitter, (int(movable.sum()), 3)) * step
 
 
-def ball_mesh(subdivisions: int, tags=BALL_TAGS, jitter: float = JITTER) -> HeadMesh:
+def ball_mesh(subdivisions: int, tags=BALL_TAGS) -> HeadMesh:
     """A solid ball of concentric shells, with conforming interfaces at ``BALL_RADII_MM``.
 
     Each shell gets as many radial layers as keep its elements near isotropic. Nodes between
@@ -122,7 +122,7 @@ def ball_mesh(subdivisions: int, tags=BALL_TAGS, jitter: float = JITTER) -> Head
         radii = np.linspace(inner, outer, n_layers + 1)[1:]
         rings = (radii[:, None, None] * sphere).reshape(-1, 3)
         step = min(radii[0] - inner, edge * max(inner, radii[0]))
-        _jitter(rings, np.arange(len(rings)) < (n_layers - 1) * n_v, step, rng, jitter)
+        _jitter(rings, np.arange(len(rings)) < (n_layers - 1) * n_v, step, rng, JITTER)
         nodes.append(rings)
         block = (
             [np.column_stack([np.zeros(len(tris), np.int64), tris + start])]
@@ -398,7 +398,7 @@ class Solved:
         op = ensure_recovery(self.ctx, mode)
         if op.on_potential:
             zero = cp.zeros((len(self.nodes), 3), cp.float32)
-            v = cp.ascontiguousarray(cp.asarray(self.v).reshape(-1, 1))
+            v = cp.asarray(self.v).reshape(-1, 1)
             out = apply_recovery(op, len(self.tets), potential=v, dadt_nodes=zero)
         else:
             out = apply_recovery(

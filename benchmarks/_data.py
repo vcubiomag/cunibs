@@ -14,8 +14,20 @@ import re
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import cupy as cp
 import numpy as np
+
+import cunibs
+from cunibs.fem import compute_coil_transforms
+from cunibs.head import project_to_scalp, read_cap
+
+if TYPE_CHECKING:
+    from benchmarks._run import Context
+
+GRAY_MATTER = 2
+RECOVERY_MODES = cunibs.RECOVERY_MODES
 
 COIL = "MagVenture_C-B70"
 DIDT = 1e6
@@ -67,10 +79,15 @@ class Dataset:
         return self.ladder[0].subject if self.ladder else self.subjects[0]
 
 
+def reference(ctx: Context) -> tuple[str, Path, cunibs.Subject]:
+    """The reference subject's id and mesh path, and the subject loaded from that mesh."""
+    sid = ctx.data.reference_subject
+    path = ctx.data.mesh(sid)
+    return sid, path, cunibs.Subject.from_mesh(path)
+
+
 def handle_points(subject, centers_mm, angle_deg: float = HANDLE_ANGLE_DEG) -> np.ndarray:
     """Handle points at ``angle_deg`` from posterior, about each center's inward scalp normal."""
-    from cunibs.head import project_to_scalp
-
     origins, inward = project_to_scalp(subject, centers_mm)
     posterior = np.array([0.0, -1.0, 0.0])
     base = posterior - (inward @ posterior)[:, None] * inward
@@ -82,22 +99,22 @@ def handle_points(subject, centers_mm, angle_deg: float = HANDLE_ANGLE_DEG) -> n
 
 def placements(subject, mesh_path: Path, labels=TARGETS, angles_deg=(HANDLE_ANGLE_DEG,)):
     """One :class:`~cunibs.Placement` per (label, angle), labels outermost."""
-    from cunibs import Placement
-    from cunibs.head import read_cap
-
     cap = read_cap(mesh_path)
     centers = np.array([cap[label] for label in labels])
     out = []
     for center, *handles in zip(
         centers, *(handle_points(subject, centers, a) for a in angles_deg), strict=True
     ):
-        out += [Placement(center, h, DISTANCE_MM) for h in handles]
+        out += [cunibs.Placement(center, h, DISTANCE_MM) for h in handles]
     return out
 
 
-def roi_centers(subject, placements) -> np.ndarray:
-    from cunibs.head import project_to_scalp
+def sites(placements) -> list[tuple]:
+    """The ``(center_mm, handle_mm, distance_mm)`` triples the solver's block calls take."""
+    return [(p.center_mm, p.handle_mm, p.distance_mm) for p in placements]
 
+
+def roi_centers(subject, placements) -> np.ndarray:
     origins, inward = project_to_scalp(subject, np.array([p.center_mm for p in placements]))
     return origins + ROI_DEPTH_MM * inward
 
@@ -109,10 +126,6 @@ def rois(subject, placements) -> list:
 
 def frames(subject, placements) -> np.ndarray:
     """The ``(P, 4, 4)`` coil-to-head affines in mm that the solver builds from ``placements``."""
-    import cupy as cp
-
-    from cunibs.fem import compute_coil_transforms
-
     return cp.asnumpy(
         compute_coil_transforms(
             subject.context,

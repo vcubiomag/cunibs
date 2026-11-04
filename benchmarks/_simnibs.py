@@ -22,6 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
+from benchmarks._run import cpu_tag
+
 CHILD = Path(__file__).with_name("simnibs_child.py")
 SOLVERS = ("hypre", "pardiso", "mumps", "petsc_pardiso")
 
@@ -77,6 +79,25 @@ def mesh_arrays(mesh) -> dict[str, np.ndarray]:
     }
 
 
+def host_tag(values: dict) -> str:
+    """Where a stage whose values come from SimNIBS files them: under the CPU that ran it."""
+    return cpu_tag(values.get("host", {}).get("cpu"))
+
+
+def medians(rows: list[dict]) -> dict:
+    """Each phase's median over ``rows``, which all time the same phases."""
+    return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
+
+
+def conductivity_draws(mesh, n: int) -> tuple[list[int], np.ndarray]:
+    """``mesh``'s tissue tags and ``(n, tags)`` conductivities, each lognormal about its default."""
+    from cunibs.fem import TISSUE_CONDUCTIVITY
+
+    tags = sorted(int(t) for t in np.unique(mesh.tet_tags))
+    sigmas = np.random.default_rng(0).lognormal(0.0, 0.2, (n, len(tags)))
+    return tags, sigmas * np.array([TISSUE_CONDUCTIVITY[t] for t in tags])
+
+
 class Simnibs:
     def __init__(self, python: str | None, exchange: Path | None, scratch: Path) -> None:
         self.python = python
@@ -84,10 +105,6 @@ class Simnibs:
         self.scratch = scratch
         self.pending = 0
         self.unanswered = 0
-
-    @property
-    def available(self) -> bool:
-        return bool(self.python or self.exchange)
 
     def call(self, op: str, params: dict | None = None, **arrays: np.ndarray):
         """``(meta, arrays)`` from the child, or ``None`` if SimNIBS cannot answer yet."""

@@ -111,12 +111,10 @@ def _compare(subject, coil, roi, response) -> dict:
 
 
 def run(ctx: _run.Context) -> dict | None:
-    from cunibs import Coil, Subject
+    from cunibs import Coil
     from cunibs.adm import resolve_target
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     (placement,) = _data.placements(subject, path, labels=("C3",))
     target = _objective.cortical_target(subject, placement)
     roi = resolve_target(subject, target)

@@ -5,8 +5,8 @@ CUDA major version, so results from different cards sit side by side. A benchmar
 SimNIBS is tagged by the CPU that ran it instead.
 
 Nothing here refuses to write. Anything that could have disturbed a timing (another process on
-the GPU, or clocks slowed by power or heat at the start or end of the run) is listed under
-``warnings``.
+the GPU, a busy GPU at the start, or clocks slowed by power or heat at the start or end of the
+run) is listed under ``warnings``.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import platform
 import re
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import import_module
@@ -96,6 +97,9 @@ def cpu_tag(name: str | None = None) -> str:
     )
 
 
+# A desktop idles at a few percent. A game never appears among compute processes, so this is the
+# only trace of one.
+BUSY_PERCENT = 20
 SLOWDOWNS = tuple(
     f"clocks_throttle_reasons.{r}"
     for r in (
@@ -109,6 +113,10 @@ SLOWDOWNS = tuple(
 
 
 def _nvidia_smi(device: int, query: str, what: str = "gpu") -> list[list[str]]:
+    import cupy as cp
+
+    # nvidia-smi's indices ignore CUDA_VISIBLE_DEVICES and CUDA's fastest-first order.
+    card = uuid.UUID(bytes=cp.cuda.runtime.getDeviceProperties(device)["uuid"])
     try:
         out = subprocess.run(
             [
@@ -116,7 +124,7 @@ def _nvidia_smi(device: int, query: str, what: str = "gpu") -> list[list[str]]:
                 f"--query-{what}={query}",
                 "--format=csv,noheader,nounits",
                 "-i",
-                str(device),
+                f"GPU-{card}",
             ],
             capture_output=True,
             text=True,
@@ -129,7 +137,7 @@ def _nvidia_smi(device: int, query: str, what: str = "gpu") -> list[list[str]]:
 
 
 def gpu_state(device: int) -> dict:
-    fields = ("driver_version", "clocks.sm", *SLOWDOWNS)
+    fields = ("driver_version", "clocks.sm", "utilization.gpu", *SLOWDOWNS)
     rows = _nvidia_smi(device, ",".join(fields))
     state = dict(zip(fields, rows[0], strict=True)) if rows else {}
     others = [
@@ -152,6 +160,8 @@ def gpu_tag(device: int) -> str:
 
 
 def cunibs_version() -> str:
+    import cunibs
+
     def git(*args: str) -> str:
         return subprocess.run(
             ["git", "-C", str(REPO), *args], capture_output=True, text=True, check=False
@@ -161,11 +171,16 @@ def cunibs_version() -> str:
     if not commit:
         return version("cunibs")
     modified = ", modified" if git("status", "--porcelain", "--", "src") else ""
-    return f"{version('cunibs')} ({commit}{modified})"
+    # An installed wheel can come from any commit, so the checkout's says nothing about its code.
+    wheel = "" if Path(cunibs.__file__).resolve().is_relative_to(REPO / "src") else ", wheel"
+    return f"{version('cunibs')} ({commit}{modified}{wheel})"
 
 
 def _warnings(before: dict, after: dict) -> list[str]:
     out = []
+    busy = before.get("utilization.gpu", "")
+    if busy.isdigit() and int(busy) >= BUSY_PERCENT:
+        out.append(f"the GPU was {busy}% busy before the run started")
     for when, state in (("start", before), ("end", after)):
         if state.get("others_mib"):
             out.append(

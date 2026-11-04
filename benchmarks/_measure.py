@@ -41,10 +41,10 @@ def timed(fn: Callable[[], object], n: int, warmup: int = 3) -> list[float]:
     return [once(fn)[0] for _ in range(n)]
 
 
-def stats(samples: list[float] | np.ndarray, *, seed: int = 0) -> dict[str, float]:
+def stats(samples: list[float] | np.ndarray) -> dict[str, float]:
     """Median with a 95% bootstrap interval, and the spread of the samples."""
     x = np.asarray(samples, dtype=np.float64)
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(0)
     medians = np.median(rng.choice(x, size=(2000, x.size)), axis=1)
     q1, median, q3 = np.percentile(x, [25, 50, 75])
     return {
@@ -63,7 +63,10 @@ def free_pools() -> None:
     """Return cached blocks to the device. Callers must drop their references first."""
     import cupy as cp
 
+    from cunibs._memory import release_scratch
+
     sync()
+    release_scratch()
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
 
@@ -81,8 +84,7 @@ class PeakMemory:
     Polls the driver rather than CuPy's pool, so allocations the extension makes itself count.
     """
 
-    def __init__(self, interval_s: float = 0.005) -> None:
-        self.interval_s = interval_s
+    def __init__(self) -> None:
         self.peak_mib = 0.0
 
     def __enter__(self) -> Self:
@@ -101,7 +103,7 @@ class PeakMemory:
         with cp.cuda.Device(self._device):
             while True:
                 self.peak_mib = max(self.peak_mib, used_mib() - self._baseline)
-                if self._stop.wait(self.interval_s):
+                if self._stop.wait(0.005):
                     return
 
     def __exit__(self, *exc) -> None:

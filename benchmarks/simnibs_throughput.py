@@ -8,8 +8,9 @@ best is the node's throughput. At about 12 GB per process, 64 is as many as a 1 
 Run the SimNIBS side on an exclusive node, so that nothing else shares its CPUs or memory
 bandwidth.
 
-The GPU does the same work per subject in sequence (load, set up, recover and solve the four
-targets) over several subjects, which is how a cohort runs on it.
+The GPU does the same work on the same mesh (load, set up, recover and solve the four targets)
+several times in sequence, which is how a cohort runs on it. Solve cost follows the mesh size, so
+a different set of meshes would shift the ratio by their size difference.
 """
 
 from __future__ import annotations
@@ -23,35 +24,31 @@ from benchmarks._simnibs import mesh_arrays
 
 PROCESSES = (1, 4, 8, 16, 32, 64)
 SOLVERS = ("hypre", "pardiso")
-GPU_SUBJECTS = 10
+GPU_RUNS = 10
 
 
-def _gpu_pairs_per_hour(ctx: _run.Context, coil) -> dict:
+def _gpu_pairs_per_hour(ctx: _run.Context, coil, path) -> dict:
     from cunibs import Subject
 
-    subjects = ctx.data.subjects[: 2 if ctx.quick else GPU_SUBJECTS]
-    # Read once untimed, so the pace measures the work rather than whether the files are cached.
-    for sid in subjects:
-        ctx.data.mesh(sid).read_bytes()
+    runs = 2 if ctx.quick else GPU_RUNS
+    # Read once untimed, so the pace measures the work rather than whether the file is cached.
+    path.read_bytes()
     _measure.sync()
     t0 = time.perf_counter()
-    for sid in subjects:
-        path = ctx.data.mesh(sid)
+    for _ in range(runs):
         subject = Subject.from_mesh(path)
         list(subject.iter_simulate(coil, _data.placements(subject, path)))
         subject.free()
     _measure.sync()
     wall = time.perf_counter() - t0
-    pairs = len(subjects) * len(_data.TARGETS)
-    return {"subjects": len(subjects), "wall_s": wall, "pairs_per_hour": pairs * 3600 / wall}
+    pairs = runs * len(_data.TARGETS)
+    return {"subjects": runs, "wall_s": wall, "pairs_per_hour": pairs * 3600 / wall}
 
 
 def run(ctx: _run.Context) -> dict | None:
-    from cunibs import Coil, Subject
+    from cunibs import Coil
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     mesh = mesh_arrays(subject.mesh)
     frames = _data.frames(subject, _data.placements(subject, path))
     subject.free()
@@ -87,7 +84,7 @@ def run(ctx: _run.Context) -> dict | None:
         return None
 
     best = max(node, key=lambda r: r["pairs_per_hour"])
-    gpu = _gpu_pairs_per_hour(ctx, Coil.load(_data.COIL))
+    gpu = _gpu_pairs_per_hour(ctx, Coil.load(_data.COIL), path)
     return {
         "subject": sid,
         "simnibs_host": host,

@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from benchmarks import _data, _run
-from benchmarks._simnibs import SOLVERS, mesh_arrays
+from benchmarks._simnibs import SOLVERS, conductivity_draws, host_tag, medians, mesh_arrays
 
 # 0 is every CPU the SimNIBS process may use, which only that host knows.
 THREADS = (1, 4, 8, 16, 0)
@@ -19,12 +19,7 @@ PLACEMENTS = 3
 UQ_DRAWS = 9
 
 
-def tag(values: dict) -> str:
-    return _run.cpu_tag(values.get("host", {}).get("cpu"))
-
-
-def _medians(rows: list[dict]) -> dict:
-    return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
+tag = host_tag
 
 
 def _summary(meta: dict) -> dict:
@@ -32,7 +27,7 @@ def _summary(meta: dict) -> dict:
     first, *rest = meta["placements_s"]
     # The first placement also pays for lazily built solver state, so the steady cost is the
     # median of the rest.
-    steady = _medians(rest)
+    steady = medians(rest)
     return {
         "setup_s": meta["setup_s"],
         "steady_placement_phases_s": steady,
@@ -42,11 +37,7 @@ def _summary(meta: dict) -> dict:
 
 
 def run(ctx: _run.Context) -> dict | None:
-    from cunibs import Subject
-
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     mesh = mesh_arrays(subject.mesh)
     placements = _data.placements(
         subject,
@@ -84,12 +75,7 @@ def run(ctx: _run.Context) -> dict | None:
 
     # A conductivity draw changes the stiffness matrix, so SimNIBS re-runs everything but the
     # mesh read for each one. Timed under both winners.
-    tags = sorted(int(t) for t in np.unique(subject.mesh.tet_tags))
-    rng = np.random.default_rng(0)
-    sigmas = rng.lognormal(0.0, 0.2, (3 if ctx.quick else UQ_DRAWS, len(tags)))
-    from cunibs.fem import TISSUE_CONDUCTIVITY
-
-    sigmas *= np.array([TISSUE_CONDUCTIVITY[t] for t in tags])
+    tags, sigmas = conductivity_draws(subject.mesh, 3 if ctx.quick else UQ_DRAWS)
     uq = {}
     for case, config in (("cold", cold), ("sweep", sweep)):
         response = ctx.simnibs.call(
@@ -106,7 +92,7 @@ def run(ctx: _run.Context) -> dict | None:
             **mesh,
         )
         if response is not None:
-            phases = _medians(
+            phases = medians(
                 [{k: v for k, v in d.items() if k.endswith("_s")} for d in response[0]["draws"]]
             )
             uq[case] = {

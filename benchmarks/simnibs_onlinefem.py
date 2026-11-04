@@ -24,28 +24,22 @@ from __future__ import annotations
 
 import numpy as np
 
-from benchmarks import _data, _run
-from benchmarks._simnibs import mesh_arrays
+from benchmarks import _data, _fields, _run
+from benchmarks._simnibs import conductivity_draws, host_tag, medians, mesh_arrays
 
 # 0 is every CPU the SimNIBS process may use, which only that host knows.
 THREADS = (1, 4, 8, 16, 0)
 # The first placement also compiles numba's kernels, so the steady cost is the median of the rest.
 PLACEMENTS = 6
 UQ_DRAWS = 3
-GRAY_MATTER = 2
 
 
-def tag(values: dict) -> str:
-    return _run.cpu_tag(values.get("host", {}).get("cpu"))
-
-
-def _medians(rows: list[dict]) -> dict:
-    return {k: float(np.median([r[k] for r in rows])) for k in rows[0]}
+tag = host_tag
 
 
 def _summary(meta: dict) -> dict:
     first, *rest = meta["placements_s"]
-    steady = _medians(rest)
+    steady = medians(rest)
 
     def per_output(phases: dict, name: str) -> float:
         return phases["rhs_s"] + phases["solve_s"] + phases[f"fields_{name}_s"]
@@ -63,21 +57,16 @@ def _summary(meta: dict) -> dict:
 
 
 def _agreement(test: np.ndarray, ref: np.ndarray, vols: np.ndarray) -> dict:
-    w = np.sqrt(vols)
-    return {
-        "relative_l2": float(np.linalg.norm((test - ref) * w) / np.linalg.norm(ref * w)),
-        "max_abs_over_peak": float(np.abs(test - ref).max() / np.abs(ref).max()),
-    }
+    c = _fields.compare(test, ref, vols)
+    return {"relative_l2": c["rel_l2"], "max_abs_over_peak": c["max_abs_over_peak"]}
 
 
 def run(ctx: _run.Context) -> dict | None:
     import cupy as cp
 
-    from cunibs import Coil, Subject
+    from cunibs import Coil
 
-    sid = ctx.data.reference_subject
-    path = ctx.data.mesh(sid)
-    subject = Subject.from_mesh(path)
+    sid, path, subject = _data.reference(ctx)
     mesh = mesh_arrays(subject.mesh)
     placements = _data.placements(
         subject,
@@ -138,7 +127,7 @@ def run(ctx: _run.Context) -> dict | None:
         ref = result.magnE.astype(np.float64)
         # The sampled coil's interpolation error sits next to the windings, in the scalp, so the
         # gray matter, where a study reads the field, is reported apart from the whole head.
-        gm = subject.mesh.tet_tags == GRAY_MATTER
+        gm = subject.mesh.tet_tags == _data.GRAY_MATTER
         for k, f in fields.items():
             f = f.reshape(-1).astype(np.float64)
             agreement[k] = {
@@ -152,12 +141,7 @@ def run(ctx: _run.Context) -> dict | None:
     sweep = {o: best("steady_placement_s", o) for o in ("volume", "roi")}
     cold = {o: best("cold_s", o) for o in ("volume", "roi")}
 
-    tags = sorted(int(t) for t in np.unique(subject.mesh.tet_tags))
-    rng = np.random.default_rng(0)
-    sigmas = rng.lognormal(0.0, 0.2, (1 if ctx.quick else UQ_DRAWS, len(tags)))
-    from cunibs.fem import TISSUE_CONDUCTIVITY
-
-    sigmas *= np.array([TISSUE_CONDUCTIVITY[t] for t in tags])
+    tags, sigmas = conductivity_draws(subject.mesh, 1 if ctx.quick else UQ_DRAWS)
     winner = sweep["roi"]
     uq = None
     response = ctx.simnibs.call(
@@ -176,7 +160,7 @@ def run(ctx: _run.Context) -> dict | None:
         **mesh,
     )
     if response is not None:
-        phases = _medians(response[0]["draws"])
+        phases = medians(response[0]["draws"])
         uq = {
             "threads": winner["threads"],
             "use_elements": winner["use_elements"],

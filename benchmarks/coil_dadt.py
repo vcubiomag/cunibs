@@ -89,7 +89,7 @@ def run(ctx: _run.Context) -> dict:
     frame = _data.frames(subject, _data.placements(subject, path, labels=("C3",)))[0]
     rng = np.random.default_rng(0)
     sample = rng.choice(subject.mesh.n_nodes, SAMPLED_NODES, replace=False)
-    mesh = mesh_arrays(subject.mesh) if ctx.simnibs.available else {}
+    mesh = mesh_arrays(subject.mesh)
     names = QUICK_COILS if ctx.quick else tuple(bundled_coils())
     rows = [_coil(ctx, subject, name, frame, sample, mesh) for name in names]
     subject.free()

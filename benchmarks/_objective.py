@@ -64,7 +64,7 @@ def forward_objective(subject, coil, frames: np.ndarray, roi) -> np.ndarray:
 
     out = np.empty(len(frames))
     for lo in range(0, len(frames), MAX_BLOCK):
-        chunk = np.ascontiguousarray(frames[lo : lo + MAX_BLOCK])
+        chunk = frames[lo : lo + MAX_BLOCK]
         # The solver reads the transforms; the sites only set the block width.
         sites = [(f[:3, 3], f[:3, 3] + f[:3, 1], 0.0) for f in chunk]
         results = solve_placements_block(
