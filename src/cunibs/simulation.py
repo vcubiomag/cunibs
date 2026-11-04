@@ -292,8 +292,10 @@ class Subject:
             try:
                 return _published(build())
             except MemoryError:
-                self._release_free_blocks()
-                return _published(build())
+                pass
+            # Outside the handler, whose traceback keeps the failed attempt's arrays alive.
+            self._release_free_blocks()
+            return _published(build())
 
     @property
     def mesh(self) -> HeadMesh:
@@ -610,6 +612,7 @@ class Subject:
                 chunk = sites[start : start + width]
                 site_args = [(s.center_mm, s.handle_mm, s.distance_mm) for s in chunk]
                 held: list[object] = []
+                batch = None
                 try:
                     with cp.cuda.using_allocator(temp_pool.malloc):
                         outs = solve_placements_block(
@@ -643,9 +646,13 @@ class Subject:
                 except MemoryError:
                     if width == 1:
                         raise
+                if batch is None:
+                    # Outside the handler, whose traceback keeps the failed chunk's arrays alive.
+                    outs = None
                     width //= 2
                     if copier is not None:
                         copier.drain()
+                    held.clear()
                     self._release_free_blocks()
                     continue
                 start += len(chunk)

@@ -24,7 +24,7 @@ from cunibs import (
     Subject,
     resolve_target,
 )
-from cunibs._memory import build_arena, scratch_pool, unpooled
+from cunibs._memory import build_arena, release_scratch, scratch_pool, unpooled
 from cunibs.fem.solve import SolverConvergenceError
 from cunibs.mesh import load_mesh
 
@@ -471,3 +471,28 @@ def test_uq_skips_a_named_tissue_the_mesh_does_not_hold(
     )
     assert skipped.perturbed_tags == (2,)
     np.testing.assert_array_equal(skipped.peak_samples, alone.peak_samples)
+
+
+def _fails_once_holding(cp, size):
+    """A build whose first attempt dies holding a temporary, and reports what the retry saw."""
+    seen = []
+
+    def build():
+        if not seen:
+            seen.append(None)
+            with cp.cuda.using_allocator(scratch_pool().malloc):
+                held = cp.empty(size, dtype=cp.uint8)
+                raise MemoryError(held.size)
+        seen.append(scratch_pool().used_bytes())
+        return "built"
+
+    return build, seen
+
+
+def test_a_retried_build_does_not_hold_the_failed_attempts_memory(cp, cube_mesh):
+    """The handler's traceback pins the failed frames, so the retry must run outside it."""
+    release_scratch()
+    build, seen = _fails_once_holding(cp, 1 << 24)
+    with Subject(cube_mesh) as subj:
+        assert subj._build(build) == "built"
+    assert seen[1] == 0
