@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cuda/std/cmath>
@@ -123,20 +124,18 @@ void launch_skin_normals(const double* nodes_mm, const int* tris_ptr, const int*
                                                              stream, "skin", "node normals");
 
     const Vec3View<const int> tris(tris_ptr, n_tri);
-    const unsigned tri_blocks = grid_for(n_tri);
-    const unsigned node_blocks = grid_for(n_nodes);
-    face_normals_kernel<<<tri_blocks, kBlock, 0, stream>>>(nodes_mm, tris, face.get(), n_tri);
-    spread_to_nodes_kernel<<<node_blocks, kBlock, 0, stream>>>(face.get(), node_ptr, node_idx,
-                                                               node.get(), n_nodes);
+    const auto spread = [&] {
+        launch_threads(n_nodes, spread_to_nodes_kernel, stream, face.get(), node_ptr, node_idx,
+                       node.get(), n_nodes);
+    };
+    launch_threads(n_tri, face_normals_kernel, stream, nodes_mm, tris, face.get(), n_tri);
+    spread();
     // The gather that closes a round feeds the next one's spread, so the last round does not need
     // one: what survives to the end is the node vector, not the face vector.
     for (int round = 1; round < kSmoothingRounds; ++round) {
-        gather_to_faces_kernel<<<tri_blocks, kBlock, 0, stream>>>(node.get(), tris, face.get(),
-                                                                  n_tri);
-        spread_to_nodes_kernel<<<node_blocks, kBlock, 0, stream>>>(face.get(), node_ptr, node_idx,
-                                                                   node.get(), n_nodes);
+        launch_threads(n_tri, gather_to_faces_kernel, stream, node.get(), tris, face.get(), n_tri);
+        spread();
     }
-    normalise_rows_kernel<<<node_blocks, kBlock, 0, stream>>>(node.get(), n_nodes);
-    gather_to_faces_kernel<<<tri_blocks, kBlock, 0, stream>>>(node.get(), tris, out_tri_normals,
-                                                              n_tri);
+    launch_threads(n_nodes, normalise_rows_kernel, stream, node.get(), n_nodes);
+    launch_threads(n_tri, gather_to_faces_kernel, stream, node.get(), tris, out_tri_normals, n_tri);
 }

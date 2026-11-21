@@ -1,4 +1,5 @@
 #include "amg/l1.hpp"
+#include "core/launch.cuh"
 
 // One thread per row, which fixes the summation order.
 //   d[i]    = sign(a_ii) · Σ_j |a_ij|,  the diagonal included
@@ -36,7 +37,5 @@ __global__ void l1_dinv_kernel(const int* __restrict__ indptr, const int* __rest
 
 void launch_l1_dinv(const int* indptr, const int* indices, const float* data, float* dinv,
                     int n_rows, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_rows)) {
-        l1_dinv_kernel<<<blocks, kBlock, 0, stream>>>(indptr, indices, data, dinv, n_rows);
-    }
+    launch_threads(n_rows, l1_dinv_kernel, stream, indptr, indices, data, dinv, n_rows);
 }

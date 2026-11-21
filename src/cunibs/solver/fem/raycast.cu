@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cub/block/block_reduce.cuh>
@@ -104,6 +105,5 @@ void launch_ray_first_hit(const double* origins, const double* directions, const
     // Rays go on x, the only grid axis not capped at 65535 blocks.
     ray_scan_kernel<<<dim3(n_rays, n_chunks), kBlock, 0, stream>>>(
         origins, directions, VertsView(verts, n_tri), chunk_t.get(), n_tri, n_chunks, min_t);
-    ray_select_kernel<<<grid_for(n_rays), kBlock, 0, stream>>>(chunk_t.get(), out_t, n_rays,
-                                                               n_chunks);
+    launch_threads(n_rays, ray_select_kernel, stream, chunk_t.get(), out_t, n_rays, n_chunks);
 }

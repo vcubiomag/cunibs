@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cstdint>
@@ -45,14 +46,10 @@ __global__ void row_dot_kernel(const double* __restrict__ a, const double* __res
 void launch_accumulate_moments_block(const float* const* magn, int k, double* sum_e,
                                      double* sumsq_e, int n, cudaStream_t stream) {
     const ConstPtrPack in = ptr_pack(magn, k);
-    if (const unsigned blocks = grid_for(n)) {
-        accumulate_moments_block_kernel<<<blocks, kBlock, 0, stream>>>(in, k, sum_e, sumsq_e, n);
-    }
+    launch_threads(n, accumulate_moments_block_kernel, stream, in, k, sum_e, sumsq_e, n);
 }
 
 void launch_row_dot(const double* a, const double* s, double* out, int n, int p, int k,
                     cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * k)) {
-        row_dot_kernel<<<blocks, kBlock, 0, stream>>>(a, s, out, n, p, k);
-    }
+    launch_threads(std::int64_t{n} * k, row_dot_kernel, stream, a, s, out, n, p, k);
 }

@@ -5,6 +5,7 @@
 // sort, and the weight prefix sum is a fixed-tile scan. Decoupled-lookback scans and atomics are
 // avoided because both associate float adds in an order that follows scheduling.
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cub/device/device_radix_sort.cuh>
@@ -388,7 +389,7 @@ void summarize(const void* const* fields, int k, int n, const int* index, const 
     summary_spread_kernel<T><<<grid, kBlock, 0, stream>>>(f, n, index, w, scratch, spread, nb);
     summary_spread_finish_kernel<<<k, kBlock, 0, stream>>>(spread, nb, scratch, n_out, out);
     for (int c = 0; c < k; ++c) {
-        summary_gather_kernel<T><<<grid_for(n), kBlock, 0, stream>>>(f.p[c], index, n, keys);
+        launch_threads(n, summary_gather_kernel<T>, stream, f.p[c], index, n, keys);
         check_cuda(cub::DeviceRadixSort::SortPairs(sort_temp, sort_temp_bytes, keys, keys_sorted,
                                                    w, w_sorted, n, 0, sizeof(T) * 8, stream),
                    "summary", "sort");

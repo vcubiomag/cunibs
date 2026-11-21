@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cuda/std/algorithm>
@@ -60,8 +61,6 @@ __global__ void stiffness_rows_kernel(const double* __restrict__ g,
 void launch_stiffness_rows(const double* g, const double* scale, const int* tet_nodes,
                            const int* ptr, const int* idx, const int* indptr, const int* indices,
                            double* data, int n_rows, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_rows)) {
-        stiffness_rows_kernel<<<blocks, kBlock, 0, stream>>>(g, scale, tet_nodes, ptr, idx, indptr,
-                                                             indices, data, n_rows);
-    }
+    launch_threads(n_rows, stiffness_rows_kernel, stream, g, scale, tet_nodes, ptr, idx, indptr,
+                   indices, data, n_rows);
 }

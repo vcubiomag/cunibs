@@ -14,8 +14,6 @@ namespace {
 constexpr int kMaxMatchingIterations = 15;
 constexpr float kMaxUnassignedFraction = 0.05f;
 
-void check_cuda(cudaError_t err, const char* what) { ::check_cuda(err, "aggregate", what); }
-
 __device__ __forceinline__ unsigned int agg_hash(unsigned int a, unsigned int seed) {
     a ^= seed;
     a = (a + 0x7ed55d16) + (a << 12);
@@ -310,27 +308,23 @@ struct Scratch {
 // Every scratch buffer shares one stream-ordered allocation: on the small coarse levels a dozen
 // separate ones cost more than the aggregation itself.
 Scratch lay_out(Bump& bump, size_t n, size_t nnz) {
-    Scratch s{};
-    s.diag = bump.take<float>(n);
-    s.w = bump.take<float>(nnz);
-    s.wsn = bump.take<float>(n);
-    s.partner = bump.take<int>(n);
-    s.strongest = bump.take<int>(n);
-    s.aggregated = bump.take<int>(n);
-    s.cand = bump.take<int>(n);
-    s.used = bump.take<int>(n + 1);
-    s.excl = bump.take<int>(n + 1);
-    s.counter = bump.take<int>(1);
-    return s;
+    return {
+        .diag = bump.take<float>(n),
+        .w = bump.take<float>(nnz),
+        .wsn = bump.take<float>(n),
+        .partner = bump.take<int>(n),
+        .strongest = bump.take<int>(n),
+        .aggregated = bump.take<int>(n),
+        .cand = bump.take<int>(n),
+        .used = bump.take<int>(n + 1),
+        .excl = bump.take<int>(n + 1),
+        .counter = bump.take<int>(1),
+    };
 }
 
 // The matching loops are data dependent, so each one costs a round trip per iteration.
 int read_counter(const int* counter, cudaStream_t stream) {
-    int host = 0;
-    check_cuda(cudaMemcpyAsync(&host, counter, sizeof(int), cudaMemcpyDeviceToHost, stream),
-               "copy counter");
-    check_cuda(cudaStreamSynchronize(stream), "sync counter");
-    return host;
+    return read_back(counter, stream, "aggregate", "counter");
 }
 
 }  // namespace
@@ -344,7 +338,7 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     // so read_counter below is the first synchronising point on the whole hierarchy build.
     // Draining here keeps an asynchronous fault from that upstream work out of the aggregation's
     // own error reports.
-    check_cuda(cudaStreamSynchronize(stream), "fault from work queued before this call");
+    sync_stream(stream, "aggregate", "fault from work queued before this call");
 
     // Nonzero: n_rows > 0 above, and grid_for only returns 0 for an empty range.
     const unsigned blocks = grid_for(n_rows, kBlock);
@@ -361,7 +355,6 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
                                                           s.w);
     agg_init_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.partner, s.strongest,
                                                    s.wsn, s.aggregated);
-    check_cuda(cudaGetLastError(), "init launch");
 
     // Round 1: pairs. AMGx counts unassigned rows over a 3n-length partner array, which makes
     // its `== 0` and `< kMaxUnassignedFraction` exits unreachable here; counting over n and
@@ -369,25 +362,23 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
     // rows self-paired.
     int unassigned = n_rows;
     for (int iter = 0; iter <= kMaxMatchingIterations; ++iter) {
-        check_cuda(cudaMemsetAsync(s.counter, 0, sizeof(int), stream), "memset counter");
+        zero_async(s.counter, 1, stream, "aggregate", "memset counter");
         agg_find_strongest_nomerge_kernel<<<blocks, kBlock, 0, stream>>>(
             n_rows, row_ptr, col_idx, s.w, s.partner, s.strongest);
         agg_match_edges_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, s.partner, aggregates,
                                                               s.strongest, s.counter);
-        check_cuda(cudaGetLastError(), "round 1 launch");
         const int previous = unassigned;
         unassigned = read_counter(s.counter, stream);
         if (unassigned == 0 || unassigned == previous) break;
     }
 
     agg_assign_unassigned_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, s.partner);
-    check_cuda(cudaGetLastError(), "assign unassigned launch");
 
     // Round 2: merge pairs into quads. Here all four AMGx exits apply, including the
     // kMaxUnassignedFraction one, because `aggregated` really is n-length upstream.
     unassigned = n_rows;
     for (int iter = 0; iter <= kMaxMatchingIterations; ++iter) {
-        check_cuda(cudaMemsetAsync(s.counter, 0, sizeof(int), stream), "memset counter");
+        zero_async(s.counter, 1, stream, "aggregate", "memset counter");
         agg_find_strongest_store_kernel<<<blocks, kBlock, 0, stream>>>(
             n_rows, row_ptr, col_idx, s.w, s.aggregated, aggregates, s.partner, s.strongest,
             s.wsn);
@@ -397,7 +388,6 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
         agg_match_aggregates_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates,
                                                                    s.aggregated, s.strongest,
                                                                    s.counter);
-        check_cuda(cudaGetLastError(), "round 2 launch");
         const int previous = unassigned;
         unassigned = read_counter(s.counter, stream);
         if (unassigned == 0 || unassigned == previous ||
@@ -416,17 +406,13 @@ int select_size4(int n_rows, int nnz, const int* row_ptr, const int* col_idx,
                                                                  s.cand);
         agg_join_existing_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.aggregated,
                                                                 s.cand);
-        check_cuda(cudaGetLastError(), "leftover merge launch");
     }
 
     // Order-preserving dense renumbering (agg_selector.cu): mark the labels in use,
     // exclusive-scan the flags, and gather. Surjective by construction.
-    check_cuda(cudaMemsetAsync(s.used, 0, static_cast<size_t>(n_rows) * sizeof(int), stream),
-               "memset used");
+    zero_async(s.used, static_cast<size_t>(n_rows), stream, "aggregate", "memset used");
     agg_mark_used_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.used);
-    check_cuda(cudaGetLastError(), "mark used launch");
     const int n_coarse = scan_counts(n_rows, s.used, s.excl, stream, "aggregate");
     agg_relabel_kernel<<<blocks, kBlock, 0, stream>>>(n_rows, aggregates, s.excl);
-    check_cuda(cudaGetLastError(), "relabel launch");
     return n_coarse;
 }

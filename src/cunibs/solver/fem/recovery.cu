@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cuda/atomic>
@@ -761,31 +762,24 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
 void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int* idx,
                                 int* is_boundary, int n_tet, cudaStream_t stream) {
     const std::int64_t n_face = static_cast<std::int64_t>(n_tet) * 4;
-    if (const unsigned blocks = grid_for(n_face)) {
-        mark_outer_boundary_kernel<<<blocks, kBlock, 0, stream>>>(
-            tet_nodes, ptr, idx, is_boundary, static_cast<int>(n_face));
-    }
+    launch_threads(n_face, mark_outer_boundary_kernel, stream, tet_nodes, ptr, idx, is_boundary,
+                   static_cast<int>(n_face));
 }
 
 void launch_spr_weights(const double* nodes_mm, const int* tet_nodes, const float* vols,
                         const int* ptr, const int* idx, const int* slot_node,
                         const int* is_boundary, float* w, int* n_fallback, int n_slots,
                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_slots)) {
-        spr_weights_kernel<<<blocks, kBlock, 0, stream>>>(nodes_mm, tet_nodes, vols, ptr, idx,
-                                                          slot_node, is_boundary, w, n_fallback,
-                                                          n_slots);
-    }
+    launch_threads(n_slots, spr_weights_kernel, stream, nodes_mm, tet_nodes, vols, ptr, idx,
+                   slot_node, is_boundary, w, n_fallback, n_slots);
 }
 
 void launch_hpr_weights(const double* nodes_m, const int* pptr, const int* pidx,
                         const int* slot_node, float* w, int* status, const int* active, int n,
                         cudaStream_t stream) {
     // One warp per slot, so the grid is sized in slots per block rather than in threads.
-    if (const unsigned blocks = grid_for(n, kFitWarps)) {
-        hpr_weights_kernel<<<blocks, kFitBlock, 0, stream>>>(nodes_m, pptr, pidx, slot_node, w,
-                                                             status, active, n);
-    }
+    launch_threads<kFitBlock>(std::int64_t{n} * kWarp, hpr_weights_kernel, stream, nodes_m, pptr,
+                              pidx, slot_node, w, status, active, n);
 }
 
 std::size_t hpr_grad_work_floats(int n_nodes, int k) {
@@ -801,16 +795,11 @@ void launch_hpr_grad(const double* v_block, const float* w, const int* pptr, con
     const std::size_t count = static_cast<std::size_t>(n_nodes) * k;
     float* const v_hi = work;
     float* const v_lo = v_hi + count;
-    dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "hpr_grad: unsupported block width", [&](auto kk) {
-        constexpr int K = decltype(kk)::value;
-        const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kHprLanes);
-        if (const unsigned sb = grid_for(static_cast<std::int64_t>(count))) {
-            split_potential_kernel<K>
-                <<<sb, kBlock, 0, stream>>>(v_block, stride, n_nodes, v_hi, v_lo);
-        }
-        hpr_grad_kernel<K><<<blocks, kBlock, 0, stream>>>(v_hi, v_lo, w, pptr, pidx, slot_node,
-                                                          dadt_nodes, dadt_row, dadt_column, out,
-                                                          n_slots, active, n);
+    dispatch<kStageWidths>(k, "hpr_grad: unsupported block width", [&]<int K>() {
+        launch_threads(count, split_potential_kernel<K>, stream, v_block, stride, n_nodes, v_hi,
+                       v_lo);
+        launch_threads(std::int64_t{n} * kHprLanes, hpr_grad_kernel<K>, stream, v_hi, v_lo, w, pptr,
+                       pidx, slot_node, dadt_nodes, dadt_row, dadt_column, out, n_slots, active, n);
     });
 }
 
@@ -818,14 +807,11 @@ void launch_recover_nodes(const float* const* e_in, const float* w, const int* p
                           float* const* e_slots, int n_slots, int k, cudaStream_t stream) {
     const ConstPtrPack in = ptr_pack(e_in, k);
     const PtrPack out = ptr_pack(e_slots, k);
-    const unsigned blocks = grid_for(n_slots);
-    if (!blocks) return;
     // Every width up to kMaxStageBlock is compiled, not just the solver's {1,2,4,8}: a chunk
     // carries however many placements the sweep had left, and padding the pack by replicating a
     // pointer would recompute a column to throw it away.
-    dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "recover_nodes: unsupported block width", [&](auto kk) {
-        recover_nodes_kernel<decltype(kk)::value>
-            <<<blocks, kBlock, 0, stream>>>(in, w, ptr, idx, out, n_slots);
+    dispatch<kStageWidths>(k, "recover_nodes: unsupported block width", [&]<int K>() {
+        launch_threads(n_slots, recover_nodes_kernel<K>, stream, in, w, ptr, idx, out, n_slots);
     });
 }
 
@@ -835,11 +821,8 @@ void launch_recover_elements(const float* const* e_slots, const int* slot_of_cor
     const ConstPtrPack in = ptr_pack(e_slots, k);
     const PtrPack eo = ptr_pack(e_out, k);
     const PtrPack mo = ptr_pack(magn_out, k);
-    const unsigned blocks = grid_for(n);
-    if (!blocks) return;
-    dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(
-        k, "recover_elements: unsupported block width", [&](auto kk) {
-            recover_elements_kernel<decltype(kk)::value>
-                <<<blocks, kBlock, 0, stream>>>(in, slot_of_corner, eo, mo, n_tet, active, n);
-        });
+    dispatch<kStageWidths>(k, "recover_elements: unsupported block width", [&]<int K>() {
+        launch_threads(n, recover_elements_kernel<K>, stream, in, slot_of_corner, eo, mo, n_tet,
+                       active, n);
+    });
 }

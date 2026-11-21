@@ -1,5 +1,6 @@
 #include "coil/coil.hpp"
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 
 #include <cub/block/block_reduce.cuh>
 #include <cuda/cmath>
@@ -244,6 +245,6 @@ void launch_place(const double* centers, const double* handles, const double* di
     // Placements go on x, the only grid axis not capped at 65535 blocks.
     place_scan_kernel<<<dim3(n_pl, n_chunks), kBlock, 0, stream>>>(centers, scalp, cand.get(),
                                                                    n_tri, n_chunks);
-    place_frame_kernel<<<grid_for(n_pl), kBlock, 0, stream>>>(
-        centers, handles, dists, scalp, cand.get(), out, degenerate, n_pl, n_chunks);
+    launch_threads(n_pl, place_frame_kernel, stream, centers, handles, dists, scalp, cand.get(),
+                   out, degenerate, n_pl, n_chunks);
 }

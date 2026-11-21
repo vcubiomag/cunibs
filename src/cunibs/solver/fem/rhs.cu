@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 // Assign one thread per node to avoid atomic updates and fix the sum order.
@@ -119,28 +120,20 @@ __global__ void __launch_bounds__(kBlock)
 
 void launch_rhs(const float* dadt_elm, const float* g, const float* neg_vc, const int* ptr,
                 const int* idx, float* b, int n_nodes, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_nodes)) {
-        rhs_kernel<<<blocks, kBlock, 0, stream>>>(dadt_elm, g, neg_vc, ptr, idx, b, n_nodes);
-    }
+    launch_threads(n_nodes, rhs_kernel, stream, dadt_elm, g, neg_vc, ptr, idx, b, n_nodes);
 }
 
 void launch_rhs_operator_fill(const double* g, const double* scale, const int* tet_nodes,
                               const int* ptr, const int* idx, const int* indptr,
                               const int* indices, float* op, int n_rows, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_rows)) {
-        rhs_operator_fill_kernel<<<blocks, kBlock, 0, stream>>>(
-            g, scale, tet_nodes, ptr, idx, indptr, indices, reinterpret_cast<float4*>(op), n_rows);
-    }
+    launch_threads(n_rows, rhs_operator_fill_kernel, stream, g, scale, tet_nodes, ptr, idx, indptr,
+                   indices, reinterpret_cast<float4*>(op), n_rows);
 }
 
 void launch_rhs_operator(const int* indptr, const float* op, const float* a, float* b,
                          int n_nodes, int k, cudaStream_t stream) {
-    dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "RHS operator supports k in [1, 8]", [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks =
-                grid_for(static_cast<std::int64_t>(n_nodes) * kRhsOpTpr)) {
-            rhs_operator_kernel<K><<<blocks, kBlock, 0, stream>>>(
-                n_nodes, indptr, reinterpret_cast<const float4*>(op), a, b);
-        }
+    dispatch<kStageWidths>(k, "RHS operator supports k in [1, 8]", [&]<int K>() {
+        launch_threads(std::int64_t{n_nodes} * kRhsOpTpr, rhs_operator_kernel<K>, stream, n_nodes,
+                       indptr, reinterpret_cast<const float4*>(op), a, b);
     });
 }

@@ -1,10 +1,13 @@
 #include "amg/slot_csr.hpp"
+#include "core/launch.cuh"
 #include "core/scan.cuh"
 #include "core/slot_csr.cuh"
 
 #include <algorithm>
+#include <functional>
 #include <numeric>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -218,27 +221,19 @@ SlotCsr build_slot_csr(int n, const int* row_ptr, const int* col_idx, cudaStream
     out.ptr = device_alloc<int>(static_cast<std::size_t>(n) + 1, origin, "slot ptr");
     const ScratchBuffer<int> counts =
         scratch_alloc<int>(static_cast<std::size_t>(n) + 1, stream, origin, "slot counts");
-    if (const unsigned blocks = grid_for(n)) {
-        slot_count_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, counts.get());
-    }
+    launch_threads(n, slot_count_kernel, stream, n, row_ptr, col_idx, counts.get());
     out.n_slots = scan_counts(n, counts.get(), out.ptr.get(), stream, origin);
     out.cols = device_alloc<std::int16_t>(static_cast<std::size_t>(out.n_slots), origin,
                                           "slot cols");
-    if (const unsigned blocks = grid_for(n)) {
-        slot_fill_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, col_idx, out.ptr.get(),
-                                                        out.cols.get());
-    }
-    check_cuda(cudaGetLastError(), origin, "slot fill");
-    check_cuda(cudaStreamSynchronize(stream), origin, "slot fill");
+    launch_threads(n, slot_fill_kernel, stream, n, row_ptr, col_idx, out.ptr.get(), out.cols.get());
+    sync_stream(stream, origin, "slot fill");
     return out;
 }
 
 void launch_slot_scatter(int n, const int* row_ptr, const int* slot_ptr,
                          const std::int16_t* cols, const double* src, double* dst,
                          cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        slot_scatter_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, slot_ptr, cols, src, dst);
-    }
+    launch_threads(n, slot_scatter_kernel, stream, n, row_ptr, slot_ptr, cols, src, dst);
 }
 
 AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* slot_ptr,
@@ -252,11 +247,8 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
     const std::size_t rows1 = static_cast<std::size_t>(n) + 1;
     const ScratchBuffer<int> segs = scratch_alloc<int>(rows1, stream, origin, "affine segs");
     const ScratchBuffer<int> slots = scratch_alloc<int>(rows1, stream, origin, "affine slots");
-    if (const unsigned blocks = grid_for(n)) {
-        affine_count_kernel<<<blocks, kBlock, 0, stream>>>(n, nnz, row_ptr, slot_ptr, slot_cols,
-                                                           term_vals, n_terms, segs.get(),
-                                                           slots.get());
-    }
+    launch_threads(n, affine_count_kernel, stream, n, nnz, row_ptr, slot_ptr, slot_cols, term_vals,
+                   n_terms, segs.get(), slots.get());
     out.seg_ptr = device_alloc<int>(rows1, origin, "affine seg_ptr");
     const ScratchBuffer<int> slot_base =
         scratch_alloc<int>(rows1, stream, origin, "affine slot base");
@@ -269,73 +261,50 @@ AffineSlots build_affine_slots(int n, int nnz, const int* row_ptr, const int* sl
     out.cols = device_alloc<std::int16_t>(static_cast<std::size_t>(out.n_slots), origin,
                                           "affine cols");
     out.vals = device_alloc<double>(static_cast<std::size_t>(out.n_slots), origin, "affine vals");
-    if (const unsigned blocks = grid_for(n)) {
-        affine_fill_kernel<<<blocks, kBlock, 0, stream>>>(
-            n, nnz, row_ptr, slot_ptr, slot_cols, term_vals, n_terms, out.seg_ptr.get(),
-            slot_base.get(), out.seg_start.get(), out.seg_term.get(), out.cols.get(),
-            out.vals.get());
-    }
+    launch_threads(n, affine_fill_kernel, stream, n, nnz, row_ptr, slot_ptr, slot_cols, term_vals,
+                   n_terms, out.seg_ptr.get(), slot_base.get(), out.seg_start.get(),
+                   out.seg_term.get(), out.cols.get(), out.vals.get());
     // The last segment ends where the slots do.
-    check_cuda(cudaMemcpyAsync(out.seg_start.get() + out.n_segs, &out.n_slots, sizeof(int),
-                               cudaMemcpyHostToDevice, stream),
-               origin, "affine seg end");
+    copy_async(out.seg_start.get() + out.n_segs, &out.n_slots, 1, stream, origin, "affine seg end");
     std::vector<int> h_slots(n), h_segs(n);
-    check_cuda(cudaMemcpyAsync(h_slots.data(), slots.get(), n * sizeof(int),
-                               cudaMemcpyDeviceToHost, stream),
-               origin, "affine lengths");
-    check_cuda(cudaMemcpyAsync(h_segs.data(), segs.get(), n * sizeof(int),
-                               cudaMemcpyDeviceToHost, stream),
-               origin, "affine segments");
-    check_cuda(cudaStreamSynchronize(stream), origin, "affine lengths");
+    copy_async(h_slots.data(), slots.get(), n, stream, origin, "affine lengths");
+    copy_async(h_segs.data(), segs.get(), n, stream, origin, "affine segments");
+    sync_stream(stream, origin, "affine lengths");
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
     for (int lo = 0; lo < n; lo += kAffineWindow) {
-        const int hi = std::min(n, lo + kAffineWindow);
-        std::stable_sort(order.begin() + lo, order.begin() + hi, [&](int a, int b) {
-            if (h_segs[a] != h_segs[b]) return h_segs[a] > h_segs[b];
-            return h_slots[a] > h_slots[b];
-        });
+        std::ranges::stable_sort(
+            order.begin() + lo, order.begin() + std::min(n, lo + kAffineWindow),
+            std::ranges::greater{}, [&](int r) { return std::pair{h_segs[r], h_slots[r]}; });
     }
     out.order = device_alloc<int>(static_cast<std::size_t>(n), origin, "affine order");
-    check_cuda(cudaMemcpyAsync(out.order.get(), order.data(), n * sizeof(int),
-                               cudaMemcpyHostToDevice, stream),
-               origin, "affine order");
-    check_cuda(cudaGetLastError(), origin, "affine fill");
-    check_cuda(cudaStreamSynchronize(stream), origin, "affine fill");
+    copy_async(out.order.get(), order.data(), n, stream, origin, "affine order");
+    sync_stream(stream, origin, "affine fill");
     return out;
 }
 
 void launch_slot_gather(int n, const int* row_ptr, const int* slot_ptr, const std::int16_t* cols,
                         const double* src, int* col_idx, double* values, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        slot_gather_kernel<<<blocks, kBlock, 0, stream>>>(n, row_ptr, slot_ptr, cols, src,
-                                                          col_idx, values);
-    }
+    launch_threads(n, slot_gather_kernel, stream, n, row_ptr, slot_ptr, cols, src, col_idx, values);
 }
 
 void launch_affine_values(int n, const int* row_ptr, const int* slot_ptr,
                           const std::int16_t* slot_cols, const AffineSlots& terms,
                           const double* sigma, double* out, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n)) {
-        affine_values_kernel<<<blocks, kBlock, 0, stream>>>(
-            n, row_ptr, slot_ptr, slot_cols, terms.seg_ptr.get(), terms.seg_start.get(),
-            terms.seg_term.get(), terms.cols.get(), terms.vals.get(), sigma, out);
-    }
+    launch_threads(n, affine_values_kernel, stream, n, row_ptr, slot_ptr, slot_cols,
+                   terms.seg_ptr.get(), terms.seg_start.get(), terms.seg_term.get(),
+                   terms.cols.get(), terms.vals.get(), sigma, out);
 }
 
 void launch_affine_term_matmul(int n, const AffineSlots& terms, int term, const double* x,
                                double* y, int m, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * m)) {
-        affine_term_matmul_kernel<<<blocks, kBlock, 0, stream>>>(
-            n, m, term, terms.seg_ptr.get(), terms.seg_start.get(), terms.seg_term.get(),
-            terms.cols.get(), terms.vals.get(), x, y);
-    }
+    launch_threads(std::int64_t{n} * m, affine_term_matmul_kernel, stream, n, m, term,
+                   terms.seg_ptr.get(), terms.seg_start.get(), terms.seg_term.get(),
+                   terms.cols.get(), terms.vals.get(), x, y);
 }
 
 void launch_term_row_sums(int n_s, const int* rows, const int* row_ptr, const double* term_vals,
                           int nnz, int n_terms, double* aw_t, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n_s) * n_terms)) {
-        term_row_sums_kernel<<<blocks, kBlock, 0, stream>>>(n_s, rows, row_ptr, term_vals, nnz,
-                                                            n_terms, aw_t);
-    }
+    launch_threads(std::int64_t{n_s} * n_terms, term_row_sums_kernel, stream, n_s, rows, row_ptr,
+                   term_vals, nnz, n_terms, aw_t);
 }

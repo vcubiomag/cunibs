@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "core/scan.cuh"
 #include "fem/fem.hpp"
 
@@ -7,6 +8,7 @@
 #include <cuda/std/bit>
 #include <cuda/std/limits>
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -222,14 +224,12 @@ struct SegmentPlan {
 template <typename Gather>
 SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
     const ScratchBuffer<int> stats = scratch_alloc<int>(3, stream, "pattern", "segment plan");
-    check_cuda(cudaMemsetAsync(stats.get(), 0, 3 * sizeof(int), stream), "memset(segment plan)");
-    plan_kernel<<<grid_for(n_seg), kBlock, 0, stream>>>(g, stats.get(), n_seg);
-    check_cuda(cudaGetLastError(), "segment plan launch");
+    zero_async(stats.get(), 3, stream, "pattern", "memset(segment plan)");
+    launch_threads(n_seg, plan_kernel<Gather>, stream, g, stats.get(), n_seg);
 
-    int host[3] = {0, 0, 0};
-    check_cuda(cudaMemcpyAsync(host, stats.get(), sizeof(host), cudaMemcpyDeviceToHost, stream),
-               "copy(segment plan)");
-    check_cuda(cudaStreamSynchronize(stream), "sync(segment plan)");
+    std::array<int, 3> host{};
+    copy_async(host.data(), stats.get(), host.size(), stream, "pattern", "copy(segment plan)");
+    sync_stream(stream, "pattern", "sync(segment plan)");
 
     SegmentPlan plan;
     plan.fast_pad = static_cast<int>(std::bit_ceil(static_cast<unsigned>(host[0])));
@@ -244,10 +244,9 @@ SegmentPlan plan_segments(Gather g, int n_seg, cudaStream_t stream) {
     const ScratchBuffer<int> sizes =
         scratch_alloc<int>(wide + 1, stream, "pattern", "wide segment sizes");
     const ScratchBuffer<int> cursor = scratch_alloc<int>(1, stream, "pattern", "wide cursor");
-    check_cuda(cudaMemsetAsync(cursor.get(), 0, sizeof(int), stream), "memset(wide cursor)");
-    compact_wide_kernel<<<grid_for(n_seg), kBlock, 0, stream>>>(
-        g, cursor.get(), plan.wide_ids.get(), sizes.get(), n_seg);
-    check_cuda(cudaGetLastError(), "wide segment compaction launch");
+    zero_async(cursor.get(), 1, stream, "pattern", "memset(wide cursor)");
+    launch_threads(n_seg, compact_wide_kernel<Gather>, stream, g, cursor.get(), plan.wide_ids.get(),
+                   sizes.get(), n_seg);
     plan.n_cand = scan_counts(plan.n_wide, sizes.get(), plan.wide_off.get(), stream, "pattern");
     return plan;
 }
@@ -400,7 +399,6 @@ void launch_fast(Gather g, const int* out_ptr, int* out_idx, int* counts, int n_
     };
     launch(-1, plan.fast_pad);
     if (plan.tall_pad) launch(kCommonPad, plan.tall_pad);
-    check_cuda(cudaGetLastError(), "segment unique launch");
 }
 
 // Segments too wide for shared memory: their candidates are materialised in global memory, sorted
@@ -439,29 +437,27 @@ void launch_wide(Gather g, const int* out_ptr, int* out_idx, int* counts, const 
     const int n_wide = plan.n_wide;
     const int* seg_ids = plan.wide_ids.get();
     const int* off = plan.wide_off.get();
-    const unsigned grid = grid_for(n_wide, kSortWarps);
     const std::size_t n_cand = static_cast<std::size_t>(plan.n_cand);
 
     const ScratchBuffer<int> cand = scratch_alloc<int>(n_cand, stream, "pattern", "candidates");
     const ScratchBuffer<int> sorted =
         scratch_alloc<int>(n_cand, stream, "pattern", "sorted candidates");
-    gather_wide_kernel<<<grid, kWarp * kSortWarps, 0, stream>>>(g, seg_ids, off, cand.get(),
-                                                                n_wide);
-    check_cuda(cudaGetLastError(), "wide segment gather launch");
+    const std::int64_t threads = std::int64_t{n_wide} * kWarp;
+    launch_threads<kWarp * kSortWarps>(threads, gather_wide_kernel<Gather>, stream, g, seg_ids, off,
+                                       cand.get(), n_wide);
 
+    const auto sort = [&](void* temp, std::size_t& bytes) {
+        return cub::DeviceSegmentedSort::SortKeys(temp, bytes, cand.get(), sorted.get(),
+                                                  plan.n_cand, n_wide, off, off + 1, stream);
+    };
     std::size_t bytes = 0;
-    check_cuda(cub::DeviceSegmentedSort::SortKeys(nullptr, bytes, cand.get(), sorted.get(),
-                                                  plan.n_cand, n_wide, off, off + 1, stream),
-               "size(wide segmented sort)");
+    check_cuda(sort(nullptr, bytes), "size(wide segmented sort)");
     const ScratchBuffer<std::byte> temp =
         scratch_alloc<std::byte>(bytes, stream, "pattern", "wide sort");
-    check_cuda(cub::DeviceSegmentedSort::SortKeys(temp.get(), bytes, cand.get(), sorted.get(),
-                                                  plan.n_cand, n_wide, off, off + 1, stream),
-               "wide segmented sort");
+    check_cuda(sort(temp.get(), bytes), "wide segmented sort");
 
-    dedupe_wide_kernel<Fill><<<grid, kWarp * kSortWarps, 0, stream>>>(
-        sorted.get(), off, seg_ids, out_ptr, out_idx, counts, n_wide);
-    check_cuda(cudaGetLastError(), "wide segment dedupe launch");
+    launch_threads<kWarp * kSortWarps>(threads, dedupe_wide_kernel<Fill>, stream, sorted.get(), off,
+                                       seg_ids, out_ptr, out_idx, counts, n_wide);
 }
 
 // Distinct counts per segment, exclusive-scanned into out_ptr. Returns the total, which is the
@@ -469,7 +465,7 @@ void launch_wide(Gather g, const int* out_ptr, int* out_idx, int* counts, const 
 template <typename Gather>
 int count_rows(Gather g, int* out_ptr, int n_seg, cudaStream_t stream) {
     if (n_seg <= 0) {
-        check_cuda(cudaMemsetAsync(out_ptr, 0, (n_seg + 1) * sizeof(int), stream), "empty offsets");
+        zero_async(out_ptr, n_seg + 1, stream, "pattern", "empty offsets");
         return 0;
     }
     const SegmentPlan plan = plan_segments(g, n_seg, stream);

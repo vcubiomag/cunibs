@@ -1,14 +1,19 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cuda/cmath>
 #include <cuda/std/algorithm>
 
+#include <array>
 #include <climits>
 #include <cstdint>
 #include <stdexcept>
 
 namespace {
+
+// Weight sets a reciprocity field carries: one for a target direction, three for the vector field.
+constexpr std::array kDirections = {1, 3};
 
 // grad_v = Σ_i v[tet_nodes[e,i]] · g[e,i,:] for one P1 tetrahedron, taken as
 // Σ_{i≥1} (v_i − v_0) g[e,i,:] since P1 gradients sum to zero over the corners. The direct sum
@@ -652,9 +657,7 @@ __global__ void __launch_bounds__(kSampleBlock)
 
 void launch_node_gather(const double* corner, const int* ptr, const int* idx, double* out,
                         int n_nodes, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_nodes)) {
-        node_gather_kernel<<<blocks, kBlock, 0, stream>>>(corner, ptr, idx, out, n_nodes);
-    }
+    launch_threads(n_nodes, node_gather_kernel, stream, corner, ptr, idx, out, n_nodes);
 }
 
 void launch_node_weight(const double* lam, const int* tet_nodes, const float* g,
@@ -662,11 +665,9 @@ void launch_node_weight(const double* lam, const int* tet_nodes, const float* g,
                         const int* roi_elems, const double* roi_alpha, int n_roi,
                         const double* direction, double* node_w, int n_nodes,
                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_nodes)) {
-        node_weight_kernel<<<blocks, kBlock, 0, stream>>>(
-            lam, tet_nodes, g, neg_vc, n_tet, ptr, idx, roi_elems, roi_alpha, n_roi, direction[0],
-            direction[1], direction[2], node_w, n_nodes);
-    }
+    launch_threads(n_nodes, node_weight_kernel, stream, lam, tet_nodes, g, neg_vc, n_tet, ptr, idx,
+                   roi_elems, roi_alpha, n_roi, direction[0], direction[1], direction[2], node_w,
+                   n_nodes);
 }
 
 void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_pos,
@@ -674,13 +675,11 @@ void launch_adm_evaluate(const double* frames, int n_frames, const float* coil_p
                          const unsigned char* cell_ok, const int* cell_slot, const float* q_near,
                          const int* list_ptr, const float* entries, const GridGeom& g, int n_dir,
                          double didt, double* out, int* fault, cudaStream_t stream) {
-    const unsigned blocks = grid_for(static_cast<std::int64_t>(n_frames) * kWarp);
-    if (blocks == 0) return;
     const auto near_scale = static_cast<float>(kMu0Over4Pi / (g.spacing[0] * g.spacing[0]));
-    dispatch_k<1, 3>(n_dir, "adm_evaluate: directions must be 1 or 3", [&](auto dc) {
-        adm_evaluate_kernel<decltype(dc)::value><<<blocks, kBlock, 0, stream>>>(
-            frames, n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, cell_slot, q_near, list_ptr,
-            entries, near_scale, g, didt, out, fault);
+    dispatch<kDirections>(n_dir, "adm_evaluate: directions must be 1 or 3", [&]<int D>() {
+        launch_threads(std::int64_t{n_frames} * kWarp, adm_evaluate_kernel<D>, stream, frames,
+                       n_frames, coil_pos, coil_mom, n_dip, q, cell_ok, cell_slot, q_near, list_ptr,
+                       entries, near_scale, g, didt, out, fault);
     });
 }
 
@@ -688,11 +687,9 @@ void launch_adm_slot_corners(const std::int64_t* slot_cells, int first_slot, int
                              const int* list_ptr, const float* entries, int n_dir, const float* q,
                              const GridGeom& g, float* q_near, cudaStream_t stream) {
     const auto scale = static_cast<float>(kMu0Over4Pi / (g.spacing[0] * g.spacing[0]));
-    const unsigned blocks = grid_for(static_cast<std::int64_t>(n_slots - first_slot) * 8);
-    if (blocks == 0) return;
-    dispatch_k<1, 3>(n_dir, "adm_slot_corners: directions must be 1 or 3", [&](auto dc) {
-        adm_slot_corners_kernel<decltype(dc)::value><<<blocks, kBlock, 0, stream>>>(
-            slot_cells, first_slot, n_slots, list_ptr, entries, q, g, scale, q_near);
+    dispatch<kDirections>(n_dir, "adm_slot_corners: directions must be 1 or 3", [&]<int D>() {
+        launch_threads(std::int64_t{n_slots - first_slot} * 8, adm_slot_corners_kernel<D>, stream,
+                       slot_cells, first_slot, n_slots, list_ptr, entries, q, g, scale, q_near);
     });
 }
 
@@ -701,11 +698,9 @@ int adm_sample_tile() { return kSampleBlock; }
 void launch_adm_q_points(const float* src, const float* src_w, int n_src, int n_dir,
                          const float* points, int n_points, double scale, float* out,
                          cudaStream_t stream) {
-    const unsigned blocks = grid_for(n_points, kSampleBlock);
-    if (blocks == 0) return;
-    dispatch_k<1, 3>(n_dir, "adm_q_points: directions must be 1 or 3", [&](auto dc) {
-        adm_q_points_kernel<decltype(dc)::value><<<blocks, kSampleBlock, 0, stream>>>(
-            src, src_w, n_src, points, n_points, scale, out);
+    dispatch<kDirections>(n_dir, "adm_q_points: directions must be 1 or 3", [&]<int D>() {
+        launch_threads<kSampleBlock>(n_points, adm_q_points_kernel<D>, stream, src, src_w, n_src,
+                                     points, n_points, scale, out);
     });
 }
 
@@ -719,27 +714,22 @@ void launch_adm_sample(const float* src, const float* src_w, int n_src, int n_di
                        const int* tile_box, const std::int64_t* points, int n_points,
                        const GridGeom& g, float* q, cudaStream_t stream) {
     const double scale = kMu0Over4Pi / (g.spacing[0] * g.spacing[0]);
-    const unsigned blocks = grid_for(n_points, kSampleBlock * kSamplePoints);
-    if (blocks == 0) return;
-    dispatch_k<1, 3>(n_dir, "adm_sample: directions must be 1 or 3", [&](auto dc) {
-        adm_sample_kernel<decltype(dc)::value><<<blocks, kSampleBlock, 0, stream>>>(
-            src, src_w, n_src, tile_box, points, n_points, g, scale, q);
+    dispatch<kDirections>(n_dir, "adm_sample: directions must be 1 or 3", [&]<int D>() {
+        launch_threads<kSampleBlock>(cuda::ceil_div(n_points, kSamplePoints), adm_sample_kernel<D>,
+                                     stream, src, src_w, n_src, tile_box, points, n_points, g,
+                                     scale, q);
     });
 }
 
 void launch_adm_mark(const double* frames, int n_frames, const float* coil_pos, int n_dip,
                      const GridGeom& g, unsigned char* need, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n_frames) * n_dip)) {
-        adm_mark_kernel<<<blocks, kBlock, 0, stream>>>(frames, n_frames, coil_pos, n_dip, g,
-                                                        need);
-    }
+    launch_threads(std::int64_t{n_frames} * n_dip, adm_mark_kernel, stream, frames, n_frames,
+                   coil_pos, n_dip, g, need);
 }
 
 void launch_adm_reach(const GridGeom& g, const double* origins, const double* axes, int n_centers,
                       const unsigned char* profile, int n_rho, int n_h, double h0, double cell,
                       unsigned char* mask, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(g.points())) {
-        adm_reach_kernel<<<blocks, kBlock, 0, stream>>>(g, origins, axes, n_centers, profile,
-                                                         n_rho, n_h, h0, cell, mask);
-    }
+    launch_threads(g.points(), adm_reach_kernel, stream, g, origins, axes, n_centers, profile,
+                   n_rho, n_h, h0, cell, mask);
 }

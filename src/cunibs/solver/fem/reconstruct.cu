@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 // Assign one thread per tetrahedron to avoid scatter writes.
@@ -158,12 +159,9 @@ void launch_reconstruct_with(const double* v_block, const int* tet_nodes, const 
                              int n_tet, int k, cudaStream_t stream) {
     const PtrPack eo = ptr_pack(e_out, k);
     const PtrPack mo = ptr_pack(magn_out, k);
-    dispatch_k<1, 2, 3, 4, 5, 6, 7, 8>(k, "reconstruct supports k in [1, 8]", [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(n_tet)) {
-            reconstruct_block_kernel<K, Dadt>
-                <<<blocks, kBlock, 0, stream>>>(v_block, tet_nodes, g, dadt, eo, mo, n_tet);
-        }
+    dispatch<kStageWidths>(k, "reconstruct supports k in [1, 8]", [&]<int K>() {
+        launch_threads(n_tet, reconstruct_block_kernel<K, Dadt>, stream, v_block, tet_nodes, g,
+                       dadt, eo, mo, n_tet);
     });
 }
 
@@ -187,8 +185,6 @@ void launch_reconstruct(const double* v, const int* tet_nodes, const float* g,
                         cudaStream_t stream) {
     const PtrPack eo = ptr_pack(&e_out, 1);
     const PtrPack mo = ptr_pack(&magn_out, 1);
-    if (const unsigned blocks = grid_for(n_tet)) {
-        reconstruct_block_kernel<1, ElementDadt><<<blocks, kBlock, 0, stream>>>(
-            v, tet_nodes, g, ElementDadt{dadt_elm, n_tet}, eo, mo, n_tet);
-    }
+    launch_threads(n_tet, reconstruct_block_kernel<1, ElementDadt>, stream, v, tet_nodes, g,
+                   ElementDadt{dadt_elm, n_tet}, eo, mo, n_tet);
 }

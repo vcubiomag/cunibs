@@ -3,6 +3,7 @@
 #include "amg/vcycle.hpp"
 #include "amg/slot_csr.hpp"
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "core/slot_csr.cuh"
 
 #include <algorithm>
@@ -378,90 +379,64 @@ __global__ void __launch_bounds__(kBlock)
     if (row < n && lane == 0) store_row<K>(&WidthView<float, K>(x, n)(row, 0), sum);
 }
 
-// The launchers do not check cudaGetLastError(): the native call reads it once on return, and
-// GraphCache handles a launch that fails inside the CG stream capture. Grid dimensions are checked
-// here, which is the only launch failure this code can cause on its own.
 template <int K>
 void launch_jacobi_zero(const Level& l, const float* b, float alpha, float* x,
                         cudaStream_t stream) {
     const std::int64_t total = static_cast<std::int64_t>(l.n) * K;
-    if (const unsigned blocks = grid_for(total)) {
-        vc_jacobi_zero_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            static_cast<std::uint64_t>(total), l.dinv.get(), b, alpha, x);
-    }
+    launch_threads(total, vc_jacobi_zero_kernel<K>, stream, static_cast<std::uint64_t>(total),
+                   l.dinv.get(), b, alpha, x);
 }
 
-// Turns a level's threads-per-row into the template argument the SpMV-shaped kernels take, over
-// exactly the set choose_tpr picks from, so an unmatched value is a disagreement between the two
-// and not something a caller can provoke.
-template <typename F>
-void dispatch_tpr(int tpr, F&& f) {
-    [&]<std::size_t... I>(std::index_sequence<I...>) {
-        dispatch_k<kTprChoices[I]...>(tpr, "V-cycle threads-per-row outside kTprChoices",
-                                      std::forward<F>(f));
-    }(std::make_index_sequence<std::size(kTprChoices)>{});
-}
+// choose_tpr picks from kTprChoices, so an unmatched value is a disagreement between the two and
+// not something a caller can provoke.
+constexpr const char* kBadTpr = "V-cycle threads-per-row outside kTprChoices";
 
 template <int K>
 void launch_residual(const Level& l, const float* x, const float* b, float* r,
                      cudaStream_t stream) {
-    dispatch_tpr(l.tpr, [&](auto tc) {
-        constexpr int TPR = decltype(tc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n) * TPR)) {
-            vc_residual_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                l.n, l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(), x, b, r);
-        }
+    dispatch<kTprChoices>(l.tpr, kBadTpr, [&]<int TPR>() {
+        launch_threads(std::int64_t{l.n} * TPR, vc_residual_kernel<K, TPR>, stream, l.n,
+                       l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(), x, b, r);
     });
 }
 
 template <int K>
 void launch_restrict(const Level& l, const float* r_fine, float* b_coarse, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n_coarse) * kRestrictTpr)) {
-        vc_restrict_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            l.n_coarse, l.r_row_ptr.get(), l.r_col_idx.get(), l.r_values.get(), r_fine, b_coarse);
-    }
+    launch_threads(std::int64_t{l.n_coarse} * kRestrictTpr, vc_restrict_kernel<K>, stream,
+                   l.n_coarse, l.r_row_ptr.get(), l.r_col_idx.get(), l.r_values.get(), r_fine,
+                   b_coarse);
 }
 
 template <int K>
 void launch_prolongate(const Level& l, const float* x_coarse, float* x_fine, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(l.n)) {
-        vc_prolongate_kernel<K><<<blocks, kBlock, 0, stream>>>(
-            l.n, l.p_row_ptr.get(), l.p_col_idx.get(), l.p_values.get(), x_coarse, x_fine);
-    }
+    launch_threads(l.n, vc_prolongate_kernel<K>, stream, l.n, l.p_row_ptr.get(), l.p_col_idx.get(),
+                   l.p_values.get(), x_coarse, x_fine);
 }
 
 template <int K>
 void launch_cheby_step(const Level& l, const float* b, const float* x_cur, const float* x_prev,
                        float c_cur, float c_prev, float alpha, float* x_out, cudaStream_t stream) {
-    dispatch_tpr(l.tpr, [&](auto tc) {
-        constexpr int TPR = decltype(tc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n) * TPR)) {
-            vc_cheby_step_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                l.n, l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(),
-                l.dinv.get(), b, x_cur, x_prev, c_cur, c_prev, alpha, x_out);
-        }
+    dispatch<kTprChoices>(l.tpr, kBadTpr, [&]<int TPR>() {
+        launch_threads(std::int64_t{l.n} * TPR, vc_cheby_step_kernel<K, TPR>, stream, l.n,
+                       l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(),
+                       l.dinv.get(), b, x_cur, x_prev, c_cur, c_prev, alpha, x_out);
     });
 }
 
 template <int K>
 void launch_cheby_first(const Level& l, const float* b, float alpha0, float c_cur, float alpha,
                         float* x1_out, float* x_out, cudaStream_t stream) {
-    dispatch_tpr(l.tpr, [&](auto tc) {
-        constexpr int TPR = decltype(tc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(l.n) * TPR)) {
-            vc_cheby_first_kernel<K, TPR><<<blocks, kBlock, 0, stream>>>(
-                l.n, l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(),
-                l.dinv.get(), b, alpha0, c_cur, alpha, x1_out, x_out);
-        }
+    dispatch<kTprChoices>(l.tpr, kBadTpr, [&]<int TPR>() {
+        launch_threads(std::int64_t{l.n} * TPR, vc_cheby_first_kernel<K, TPR>, stream, l.n,
+                       l.row_ptr.get(), l.cols.get(), l.values.get(), l.row_scale.get(),
+                       l.dinv.get(), b, alpha0, c_cur, alpha, x1_out, x_out);
     });
 }
 
 template <int K>
 void launch_coarse_gemv(int n, const float* ainv, const float* b, float* x,
                         cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kWarp)) {
-        vc_coarse_gemv_kernel<K><<<blocks, kBlock, 0, stream>>>(n, ainv, b, x);
-    }
+    launch_threads(std::int64_t{n} * kWarp, vc_coarse_gemv_kernel<K>, stream, n, ainv, b, x);
 }
 
 // Setup-only: one thread per row takes the row's max |a_ij| as its scale, then lays the row out
@@ -557,12 +532,8 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     lvl.cols = std::move(slots.cols);
     lvl.values = device_alloc<__half>(static_cast<std::size_t>(slots.n_slots), "level values");
     lvl.row_scale = device_alloc<float>(static_cast<std::size_t>(n_rows), "level row_scale");
-    if (const unsigned blocks = grid_for(n_rows)) {
-        vc_pack_values_kernel<<<blocks, kBlock, 0, stream>>>(
-            n_rows, row_ptr, lvl.row_ptr.get(), lvl.cols.get(), values, lvl.values.get(),
-            lvl.row_scale.get());
-        check_cuda(cudaGetLastError(), "vcycle", "pack values");
-    }
+    launch_threads(n_rows, vc_pack_values_kernel, stream, n_rows, row_ptr, lvl.row_ptr.get(),
+                   lvl.cols.get(), values, lvl.values.get(), lvl.row_scale.get());
     lvl.dinv = device_clone(dinv, static_cast<std::size_t>(n_rows), stream, "level dinv");
     lvl.p_row_ptr =
         device_clone(p_row_ptr, static_cast<std::size_t>(n_rows) + 1, stream, "level P ptr");
@@ -574,7 +545,7 @@ void NativeVCycle::add_level(int n_rows, int nnz, int n_coarse, int p_nnz, const
     lvl.r_col_idx =
         device_clone(r_col_idx, static_cast<std::size_t>(p_nnz), stream, "level R idx");
     lvl.r_values = device_clone(r_values, static_cast<std::size_t>(p_nnz), stream, "level R val");
-    check_cuda(cudaStreamSynchronize(stream), "vcycle", "level copies");
+    sync_stream(stream, "vcycle", "level copies");
     levels_.push_back(std::move(lvl));
 }
 
@@ -582,7 +553,7 @@ void NativeVCycle::set_coarse(int n, const float* ainv, cudaStream_t stream) {
     if (finalized_) throw std::runtime_error("NativeVCycle: set_coarse after finalize");
     if (n <= 0) throw std::invalid_argument("NativeVCycle: coarse size must be positive");
     coarse_ainv_ = device_clone(ainv, static_cast<std::size_t>(n) * n, stream, "coarse ainv");
-    check_cuda(cudaStreamSynchronize(stream), "vcycle", "coarse copy");
+    sync_stream(stream, "vcycle", "coarse copy");
     coarse_n_ = n;
 }
 
@@ -708,8 +679,7 @@ void NativeVCycle::apply_block(int n, int k, const float* B, float* X, cudaStrea
         throw std::runtime_error("NativeVCycle: size mismatch");
     }
     // Dispatch before allocating so an unsupported k costs nothing.
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
         ensure_block_buffers(K);
         run_cycle<K>(B, X, stream);
     });

@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cstdint>
@@ -63,7 +64,5 @@ __global__ void p1_gradients_kernel(const double* __restrict__ nodes_mm,
 
 void launch_p1_gradients(const double* nodes_mm, const int* tet_nodes, double* g, double* vols,
                          int n_tet, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_tet)) {
-        p1_gradients_kernel<<<blocks, kBlock, 0, stream>>>(nodes_mm, tet_nodes, g, vols, n_tet);
-    }
+    launch_threads(n_tet, p1_gradients_kernel, stream, nodes_mm, tet_nodes, g, vols, n_tet);
 }

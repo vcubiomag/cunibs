@@ -7,6 +7,7 @@
 // independent of its neighbours.
 #include "amg/cg_kernels.hpp"
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "core/slot_csr.cuh"
 
 #include <cub/device/device_select.cuh>
@@ -819,59 +820,45 @@ int bcg_partials_blocks(int n) { return static_cast<int>(grid_for(n, kBlock * kR
 void launch_bcsrmv_f64_block(int n, int k, const int* row_ptr, const std::int16_t* cols,
                              const double* vals, const double* x, double* y,
                              cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        constexpr int kThreadsPerRow = (K >= 4) ? K : kTpr;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kThreadsPerRow)) {
-            if constexpr (K >= 4) {
-                bcsrmv_f64_collane_kernel<K>
-                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, vals, x, y);
-            } else {
-                bcsrmv_f64_kernel<K>
-                    <<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, vals, x, y);
-            }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        if constexpr (K >= 4) {
+            launch_threads(std::int64_t{n} * K, bcsrmv_f64_collane_kernel<K>, stream, n, row_ptr,
+                           cols, vals, x, y);
+        } else {
+            launch_threads(std::int64_t{n} * kTpr, bcsrmv_f64_kernel<K>, stream, n, row_ptr, cols,
+                           vals, x, y);
         }
     });
 }
 
 void launch_bcsrmv_diff_block(int n, int k, const int* row_ptr, const std::int16_t* cols,
                               const float* vals, const float* x, float* y, cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * kTpr)) {
-            bcsrmv_diff_kernel<K><<<blocks, kBlock, 0, stream>>>(n, row_ptr, cols, vals, x, y);
-        }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        launch_threads(std::int64_t{n} * kTpr, bcsrmv_diff_kernel<K>, stream, n, row_ptr, cols,
+                       vals, x, y);
     });
 }
 
 void launch_affine_diff_block(int n, int k, const AffineSlots& op, const float* vals,
                               const float* sigma, const float* x, float* y, cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(n)) {
-            affine_diff_kernel<K><<<blocks, kBlock, 0, stream>>>(
-                n, op.order.get(), op.seg_ptr.get(), op.seg_start.get(), op.seg_term.get(),
-                op.cols.get(), vals, sigma, op.n_terms, x, y);
-        }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        launch_threads(n, affine_diff_kernel<K>, stream, n, op.order.get(), op.seg_ptr.get(),
+                       op.seg_start.get(), op.seg_term.get(), op.cols.get(), vals, sigma,
+                       op.n_terms, x, y);
     });
 }
 
 void launch_diff_values(int n_segs, const int* bounds, const std::int16_t* cols,
                         const double* vals, double tol, float* out, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_segs)) {
-        diff_values_kernel<<<blocks, kBlock, 0, stream>>>(n_segs, bounds, cols, vals, tol, out);
-    }
+    launch_threads(n_segs, diff_values_kernel, stream, n_segs, bounds, cols, vals, tol, out);
 }
 
 void launch_affine_spmv_block(int n, int k, const AffineSlots& op, const double* sigma,
                               const double* x, double* y, cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(static_cast<std::int64_t>(n) * K)) {
-            affine_spmv_kernel<K><<<blocks, kBlock, 0, stream>>>(
-                n, op.order.get(), op.seg_ptr.get(), op.seg_start.get(), op.seg_term.get(),
-                op.cols.get(), op.vals.get(), sigma, op.n_terms, x, y);
-        }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        launch_threads(std::int64_t{n} * K, affine_spmv_kernel<K>, stream, n, op.order.get(),
+                       op.seg_ptr.get(), op.seg_start.get(), op.seg_term.get(), op.cols.get(),
+                       op.vals.get(), sigma, op.n_terms, x, y);
     });
 }
 
@@ -880,8 +867,7 @@ namespace {
 template <Fold F, typename T>
 void launch_partials(int n, int k, const T* x, const T* y, double* partials, int n_blocks,
                      cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
         bcg_partials_kernel<K, F, T>
             <<<n_blocks, kBlock, 0, stream>>>(n, x, y, partials, n_blocks);
     });
@@ -889,11 +875,8 @@ void launch_partials(int n, int k, const T* x, const T* y, double* partials, int
 
 void launch_init_p(int n, int k, const double* shift, const float* zf, const double* mask,
                    float* p, cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(n)) {
-            bcg_init_p_kernel<K><<<blocks, kBlock, 0, stream>>>(n, shift, zf, mask, p);
-        }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        launch_threads(n, bcg_init_p_kernel<K>, stream, n, shift, zf, mask, p);
     });
 }
 
@@ -918,8 +901,7 @@ int select_deflation_rows(int n, const int* row_ptr, const double* vals, double 
     const ScratchBuffer<unsigned char> flags =
         scratch_alloc<unsigned char>(static_cast<std::size_t>(n), stream, "solver", "support");
     const ScratchBuffer<int> count = scratch_alloc<int>(1, stream, "solver", "support count");
-    bcg_support_flags_kernel<<<grid_for(n), kBlock, 0, stream>>>(n, row_ptr, vals, tol,
-                                                                 flags.get());
+    launch_threads(n, bcg_support_flags_kernel, stream, n, row_ptr, vals, tol, flags.get());
     const cuda::counting_iterator<int> row_ids(0);
     std::size_t bytes = 0;
     check_cuda(cub::DeviceSelect::Flagged(nullptr, bytes, row_ids, flags.get(), rows, count.get(),
@@ -930,27 +912,19 @@ int select_deflation_rows(int n, const int* row_ptr, const double* vals, double 
     check_cuda(cub::DeviceSelect::Flagged(temp.get(), bytes, row_ids, flags.get(), rows,
                                           count.get(), n, stream),
                "solver", "support select");
-    int n_rows = 0;
-    check_cuda(cudaMemcpyAsync(&n_rows, count.get(), sizeof(int), cudaMemcpyDeviceToHost, stream),
-               "solver", "support count");
-    check_cuda(cudaStreamSynchronize(stream), "solver", "support count");
-    return n_rows;
+    return read_back(count.get(), stream, "solver", "support count");
 }
 
 void launch_bcg_defl_from_values(int n_s, const int* rows, const int* row_ptr,
                                  const double* vals, double* aw, double* inv_e,
                                  cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_s)) {
-        bcg_defl_rows_kernel<<<blocks, kBlock, 0, stream>>>(n_s, rows, row_ptr, vals, aw);
-    }
+    launch_threads(n_s, bcg_defl_rows_kernel, stream, n_s, rows, row_ptr, vals, aw);
     bcg_defl_energy_kernel<<<1, kDeflCols, 0, stream>>>(n_s, aw, inv_e);
 }
 
 void launch_bcg_defl_affine(int n_s, int n_terms, const double* aw_t, const double* sigma,
                             double* aw, double* inv_e, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_s)) {
-        bcg_defl_affine_kernel<<<blocks, kBlock, 0, stream>>>(n_s, n_terms, aw_t, sigma, aw);
-    }
+    launch_threads(n_s, bcg_defl_affine_kernel, stream, n_s, n_terms, aw_t, sigma, aw);
     bcg_defl_energy_kernel<<<1, kDeflCols, 0, stream>>>(n_s, aw, inv_e);
 }
 
@@ -959,13 +933,9 @@ void launch_bcg_deflate_start(int n, int k, Deflation defl, double* x, float* r,
     const int n_blocks = bcg_partials_blocks(n);
     launch_partials<Fold::kSum, float>(n, k, r, nullptr, partials, n_blocks, stream);
     bcg_reduce_kernel<<<k, kBlock, 0, stream>>>(partials, n_blocks, rsum);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(defl.n_rows)) {
-            bcg_deflate_rows_kernel<K><<<blocks, kBlock, 0, stream>>>(defl.n_rows, defl.rows,
-                                                                      rsum, defl.inv_e, defl.aw,
-                                                                      r);
-        }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        launch_threads(defl.n_rows, bcg_deflate_rows_kernel<K>, stream, defl.n_rows, defl.rows,
+                       rsum, defl.inv_e, defl.aw, r);
         bcg_deflate_start_kernel<K><<<n_blocks, kBlock, 0, stream>>>(n, rsum, defl.inv_e, x, r,
                                                                      partials, n_blocks);
     });
@@ -985,8 +955,7 @@ void launch_bcg_mark_converged(int k, const double* norm_sq, const double* ref_s
 void launch_bcg_update_r_norm(int n, int k, const double* neg_alpha, const float* ap, float* r,
                               double* partials, double* norms_sums, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
         bcg_update_r_kernel<K>
             <<<n_blocks, kBlock, 0, stream>>>(n, neg_alpha, ap, r, partials, n_blocks);
     });
@@ -1027,20 +996,15 @@ void launch_bcg_restart(int n, int k, const float* zf, const float* r, Deflation
 void launch_bcg_update_p(int n, int k, const double* alpha, const double* beta,
                          const double* shift, const float* zf, float* p, double* x,
                          cudaStream_t stream) {
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
-        if (const unsigned blocks = grid_for(n)) {
-            bcg_update_p_kernel<K>
-                <<<blocks, kBlock, 0, stream>>>(n, alpha, beta, shift, zf, p, x);
-        }
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
+        launch_threads(n, bcg_update_p_kernel<K>, stream, n, alpha, beta, shift, zf, p, x);
     });
 }
 
 void launch_bcg_residual(int n, int k, const double* b, const double* ap, const double* write,
                          float* r, double* partials, double* norms, cudaStream_t stream) {
     const int n_blocks = bcg_partials_blocks(n);
-    dispatch_k<1, 2, 4, 8>(k, kBadK, [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
+    dispatch<kBlockWidths>(k, kBadK, [&]<int K>() {
         bcg_residual_kernel<K>
             <<<n_blocks, kBlock, 0, stream>>>(n, b, ap, write, r, partials, n_blocks);
     });

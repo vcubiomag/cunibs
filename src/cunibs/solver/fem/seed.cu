@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cuda/cmath>
@@ -118,23 +119,19 @@ void launch_sweep_seed(const float* q, const double* b, int n, int m, int k, dou
                        double* x0, cudaStream_t stream) {
     if (n <= 0) return;
     if (m <= 0) {
-        check_cuda(cudaMemsetAsync(x0, 0, static_cast<std::size_t>(n) * k * sizeof(double), stream),
-                   "seed", "zero x0");
+        zero_async(x0, static_cast<std::size_t>(n) * k, stream, "seed", "zero x0");
         return;
     }
     const int n_tiles = seed_tiles(n);
     float* const y = reinterpret_cast<float*>(work + static_cast<std::int64_t>(n_tiles) * m * k);
     float* const b32 = y + static_cast<std::int64_t>(m) * k;
     const std::int64_t total = static_cast<std::int64_t>(n) * k;
-    if (const unsigned blocks = grid_for(total)) {
-        seed_narrow_kernel<<<blocks, kBlock, 0, stream>>>(b, total, b32);
-    }
-    dispatch_k<1, 2, 4, 8>(k, "sweep_seed: k must be in {1, 2, 4, 8}", [&](auto kc) {
-        constexpr int K = decltype(kc)::value;
+    launch_threads(total, seed_narrow_kernel, stream, b, total, b32);
+    dispatch<kBlockWidths>(k, "sweep_seed: k must be in {1, 2, 4, 8}", [&]<int K>() {
         const int threads = std::min(cuda::round_up(m, kWarp), kBlock);
         const dim3 grid(n_tiles, cuda::ceil_div(m, threads));
         seed_project_kernel<K><<<grid, threads, 0, stream>>>(q, b32, n, m, work);
-        seed_reduce_kernel<K><<<grid_for(m * K), kBlock, 0, stream>>>(work, n_tiles, m, y);
-        seed_expand_kernel<K><<<grid_for(n), kBlock, 0, stream>>>(q, y, n, m, x0);
+        launch_threads(std::int64_t{m} * K, seed_reduce_kernel<K>, stream, work, n_tiles, m, y);
+        launch_threads(n, seed_expand_kernel<K>, stream, q, y, n, m, x0);
     });
 }

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -12,16 +13,23 @@
 
 namespace {
 
-void check_cuda(cudaError_t rc, const char* what) { ::check_cuda(rc, "solver", what); }
-
 template <typename T>
 DeviceBuffer<T> alloc(std::size_t count, const char* what) {
     return device_alloc<T>(count, "solver", what);
 }
 
 template <typename T>
-DeviceBuffer<T> clone(const T* src, std::size_t count, cudaStream_t stream, const char* what) {
-    return device_clone<T>(src, count, stream, "solver", what);
+void copy(T* dst, const T* src, std::size_t count, cudaStream_t stream, const char* what) {
+    copy_async(dst, src, count, stream, "solver", what);
+}
+
+template <typename T>
+void zero(T* dst, std::size_t count, cudaStream_t stream, const char* what) {
+    zero_async(dst, count, stream, "solver", what);
+}
+
+void sync(cudaStream_t stream, const char* what) {
+    sync_stream(stream, "solver", what);
 }
 
 // A row whose sum is more than this fraction of its l1 norm is a deflation support row, and keeps
@@ -54,7 +62,7 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
     if (n_ <= 0) throw std::invalid_argument("PcgAmgSolver: n must be positive");
     if (nnz_ < 0) throw std::invalid_argument("PcgAmgSolver: nnz must not be negative");
 
-    row_ptr_ = clone(row_ptr, static_cast<size_t>(n_) + 1, stream, "row_ptr");
+    row_ptr_ = device_clone(row_ptr, static_cast<size_t>(n_) + 1, stream, "solver", "row_ptr");
     slots_ = build_slot_csr(n_, row_ptr, col_idx, stream, "solver");
     values_ = alloc<double>(static_cast<size_t>(slots_.n_slots), "values");
     launch_slot_scatter(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values,
@@ -64,11 +72,12 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
                        values32_.get(), stream);
 
     cudaStream_t solve_stream = nullptr;
-    check_cuda(cudaStreamCreateWithFlags(&solve_stream, cudaStreamNonBlocking),
+    check_cuda(cudaStreamCreateWithFlags(&solve_stream, cudaStreamNonBlocking), "solver",
                "create(solve_stream)");
     solve_stream_.reset(solve_stream);
     cudaEvent_t event = nullptr;
-    check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "create(join_event)");
+    check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "solver",
+               "create(join_event)");
     join_event_.reset(event);
 
     // The deflation support: rows whose sum is more than a rounding residue of their l1 norm. On a
@@ -81,21 +90,18 @@ PcgAmgSolver::PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_id
         defl_n_ = select_deflation_rows(n_, slots_.ptr.get(), values_.get(), kSupportTol,
                                         rows.get(), stream);
         defl_rows_ = alloc<int>(std::max(defl_n_, 1), "deflation rows");
-        check_cuda(cudaMemcpyAsync(defl_rows_.get(), rows.get(), defl_n_ * sizeof(int),
-                                   cudaMemcpyDeviceToDevice, stream),
-                   "copy(deflation rows)");
+        copy(defl_rows_.get(), rows.get(), defl_n_, stream, "copy(deflation rows)");
     }
     defl_aw_ = alloc<double>(std::max<size_t>(defl_n_, 1) * kMaxStageBlock, "deflation aw");
     defl_inv_e_ = alloc<double>(kMaxStageBlock, "deflation inv_e");
     deflation_from_values(stream);
-    check_cuda(cudaStreamSynchronize(stream), "sync(deflation setup)");
+    sync(stream, "sync(deflation setup)");
 }
 
 void PcgAmgSolver::deflation_from_values(cudaStream_t stream) {
     // A low-half slot's value is zero, so a row sum over slots is the row sum over entries.
     launch_bcg_defl_from_values(defl_n_, defl_rows_.get(), slots_.ptr.get(), values_.get(),
                                 defl_aw_.get(), defl_inv_e_.get(), stream);
-    check_cuda(cudaGetLastError(), "deflation");
     defl_affine_ = false;
 }
 
@@ -117,8 +123,7 @@ AffineTerms::AffineTerms(const PcgAmgSolver& solver, int n_terms, const double* 
                          term_values, solver.nnz_, n_terms, aw_t_.get(), stream);
     sigma_ = alloc<double>(static_cast<size_t>(kMaxStageBlock) * n_terms, "affine sigma");
     sigma32_ = alloc<float>(static_cast<size_t>(kMaxStageBlock) * n_terms, "affine sigma32");
-    check_cuda(cudaGetLastError(), "affine terms");
-    check_cuda(cudaStreamSynchronize(stream), "sync(affine terms)");
+    sync(stream, "sync(affine terms)");
 }
 
 int AffineTerms::nnz() const { return solver_->nnz(); }
@@ -129,13 +134,10 @@ void AffineTerms::values(const double* sigma, double* out, cudaStream_t stream) 
     // need not outlive the call.
     const ScratchBuffer<double> d_sigma =
         scratch_alloc<double>(static_cast<size_t>(t), stream, "affine terms", "sigma");
-    check_cuda(cudaMemcpyAsync(d_sigma.get(), sigma, t * sizeof(double), cudaMemcpyHostToDevice,
-                               stream),
-               "copy(values sigma)");
+    copy(d_sigma.get(), sigma, t, stream, "copy(values sigma)");
     const PcgAmgSolver& s = *solver_;
     launch_affine_values(s.n_, s.row_ptr_.get(), s.slots_.ptr.get(), s.slots_.cols.get(), slots_,
                          d_sigma.get(), out, stream);
-    check_cuda(cudaGetLastError(), "affine values");
 }
 
 void AffineTerms::matmul(int term, const double* x, double* y, int m, cudaStream_t stream) const {
@@ -143,20 +145,15 @@ void AffineTerms::matmul(int term, const double* x, double* y, int m, cudaStream
         throw std::invalid_argument("AffineTerms::matmul: no such term");
     }
     launch_affine_term_matmul(n_, slots_, term, x, y, m, stream);
-    check_cuda(cudaGetLastError(), "affine term matmul");
 }
 
 void PcgAmgSolver::export_csr(int* row_ptr, int* col_idx, double* values, cudaStream_t stream) {
     const std::lock_guard lock(mutex_);
-    check_cuda(cudaMemcpyAsync(row_ptr, row_ptr_.get(),
-                               (static_cast<size_t>(n_) + 1) * sizeof(int),
-                               cudaMemcpyDeviceToDevice, stream),
-               "copy(export row_ptr)");
+    copy(row_ptr, row_ptr_.get(), static_cast<size_t>(n_) + 1, stream, "copy(export row_ptr)");
     if (col_idx != nullptr || values != nullptr) {
         launch_slot_gather(n_, row_ptr_.get(), slots_.ptr.get(), slots_.cols.get(), values_.get(),
                            col_idx, values, stream);
     }
-    check_cuda(cudaGetLastError(), "export csr");
 }
 
 void PcgAmgSolver::apply_operator(int k, const AffineTerms* terms, const double* x, double* y,
@@ -227,17 +224,12 @@ PcgBlockResult PcgAmgSolver::solve_affine_block(NativeVCycle& preconditioner, Af
         const int from = std::min(c, k - 1);
         for (int j = 0; j < t; ++j) padded[c * t + j] = sigma[from * t + j];
     }
-    check_cuda(cudaMemcpyAsync(terms.sigma_.get(), padded.data(), padded.size() * sizeof(double),
-                               cudaMemcpyHostToDevice, stream),
-               "copy(sigma)");
+    copy(terms.sigma_.get(), padded.data(), padded.size(), stream, "copy(sigma)");
     // Pageable, so the copy has read the host array by the time it returns.
     const std::vector<float> padded32(padded.begin(), padded.end());
-    check_cuda(cudaMemcpyAsync(terms.sigma32_.get(), padded32.data(),
-                               padded32.size() * sizeof(float), cudaMemcpyHostToDevice, stream),
-               "copy(sigma32)");
+    copy(terms.sigma32_.get(), padded32.data(), padded32.size(), stream, "copy(sigma32)");
     launch_bcg_defl_affine(defl_n_, t, terms.aw_t_.get(), terms.sigma_.get(), defl_aw_.get(),
                            defl_inv_e_.get(), stream);
-    check_cuda(cudaGetLastError(), "affine deflation");
     defl_affine_ = true;
     return solve_block(preconditioner, B, X, k, tolerance, max_iters, stream, X0, false, &terms);
 }
@@ -253,8 +245,8 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     ensure_block_buffers(k);
     if (terms == nullptr && defl_affine_) deflation_from_values(stream);
     cudaStream_t s = solve_stream_.get();
-    check_cuda(cudaEventRecord(join_event_.get(), stream), "block:record_in");
-    check_cuda(cudaStreamWaitEvent(s, join_event_.get(), 0), "block:wait_in");
+    check_cuda(cudaEventRecord(join_event_.get(), stream), "solver", "block:record_in");
+    check_cuda(cudaStreamWaitEvent(s, join_event_.get(), 0), "solver", "block:wait_in");
 
     const size_t nk = static_cast<size_t>(n_) * k;
     double* const scalars = scalars_blk_.get();
@@ -289,14 +281,10 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     launch_bcg_norm2(n_, k, B, partials, d_ref_sq, s);
     // The freeze reads the tolerance from the device: a captured body replays whatever it was
     // launched with, and the graph is shared by every solve at this width whatever its tolerance.
-    check_cuda(cudaMemcpyAsync(d_tolerance, &tolerance, sizeof(double), cudaMemcpyHostToDevice, s),
-               "block:copy(tolerance)");
-    check_cuda(cudaMemsetAsync(d_write, 0, static_cast<size_t>(k) * sizeof(double), s),
-               "block:memset(write)");
-    check_cuda(cudaMemcpyAsync(h_ref, d_ref_sq, static_cast<size_t>(k) * sizeof(double),
-                               cudaMemcpyDeviceToHost, s),
-               "block:copy(ref_norms)");
-    check_cuda(cudaStreamSynchronize(s), "block:sync(ref_norms)");
+    copy(d_tolerance, &tolerance, 1, s, "block:copy(tolerance)");
+    zero(d_write, k, s, "block:memset(write)");
+    copy(h_ref, d_ref_sq, k, s, "block:copy(ref_norms)");
+    sync(s, "block:sync(ref_norms)");
     // A zero column's solution is exactly zero. It starts frozen at x = 0 with an infinite
     // reference, so the freeze test keeps it there, and the other columns run as they would alone.
     std::vector<double> norm_ref(k);
@@ -310,40 +298,29 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
         ++n_zero;
     }
     if (n_zero == k) {
-        check_cuda(cudaMemsetAsync(X, 0, nk * sizeof(double), s), "memset(x_out)");
-        check_cuda(cudaStreamSynchronize(s), "sync(x_out0)");
+        zero(X, nk, s, "memset(x_out)");
+        sync(s, "sync(x_out0)");
         return {0, std::vector<double>(k, 0.0), std::vector<int>(k, 0)};
     }
-    check_cuda(cudaMemcpyAsync(d_converged, frozen.data(), static_cast<size_t>(k) * sizeof(double),
-                               cudaMemcpyHostToDevice, s),
-               "block:copy(converged)");
-    if (n_zero) {
-        check_cuda(cudaMemcpyAsync(d_ref_sq, h_ref, static_cast<size_t>(k) * sizeof(double),
-                                   cudaMemcpyHostToDevice, s),
-                   "block:copy(ref_norms)");
-    }
+    copy(d_converged, frozen.data(), k, s, "block:copy(converged)");
+    if (n_zero) copy(d_ref_sq, h_ref, k, s, "block:copy(ref_norms)");
 
     if (X0 != nullptr) {
-        check_cuda(cudaMemcpyAsync(X_int, X0, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
-                   "block:copy(X0)");
+        copy(X_int, X0, nk, s, "block:copy(X0)");
         for (int c = 0; c < k; ++c) {
             if (!frozen[c]) continue;
             check_cuda(cudaMemset2DAsync(X_int + c, k * sizeof(double), 0, sizeof(double), n_, s),
-                       "block:zero(X0 column)");
+                       "solver", "block:zero(X0 column)");
         }
         apply_operator(k, terms, X_int, AP64, s);
         launch_bcg_residual(n_, k, B, AP64, nullptr, R, partials, d_true_sq, s);
-        check_cuda(cudaMemcpyAsync(h_true, d_true_sq, static_cast<size_t>(k) * sizeof(double),
-                                   cudaMemcpyDeviceToHost, s),
-                   "copy(norm r0)");
-        check_cuda(cudaStreamSynchronize(s), "sync(norm r0)");
+        copy(h_true, d_true_sq, k, s, "copy(norm r0)");
+        sync(s, "sync(norm r0)");
         if (single) {
             const double rel0 = std::sqrt(*h_true) / norm_ref[0];
             if (rel0 <= tolerance) {
-                check_cuda(cudaMemcpyAsync(X, X_int, nk * sizeof(double),
-                                           cudaMemcpyDeviceToDevice, s),
-                           "copy(x_int,x)");
-                check_cuda(cudaStreamSynchronize(s), "sync(x_out)");
+                copy(X, X_int, nk, s, "copy(x_int,x)");
+                sync(s, "sync(x_out)");
                 return {0, {rel0}, {0}};
             }
         }
@@ -354,14 +331,9 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
             frozen[c] = 1.0;
             exact = true;
         }
-        if (exact) {
-            check_cuda(cudaMemcpyAsync(d_converged, frozen.data(),
-                                       static_cast<size_t>(k) * sizeof(double),
-                                       cudaMemcpyHostToDevice, s),
-                       "block:copy(converged)");
-        }
+        if (exact) copy(d_converged, frozen.data(), k, s, "block:copy(converged)");
     } else {
-        check_cuda(cudaMemsetAsync(X_int, 0, nk * sizeof(double), s), "block:memset(X)");
+        zero(X_int, nk, s, "block:memset(X)");
         launch_bcg_residual(n_, k, B, nullptr, nullptr, R, partials, d_true_sq, s);
     }
 
@@ -375,9 +347,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
         launch_bcg_alpha(k, d_rz, d_pap, d_converged, d_alpha, d_neg_alpha, s);
         launch_bcg_update_r_norm(n_, k, d_neg_alpha, AP, R, partials, d_norm, s);
         launch_bcg_mark_converged(k, d_norm, d_ref_sq, d_tolerance, d_converged, s);
-        check_cuda(cudaMemcpyAsync(h_norm, d_norm, static_cast<size_t>(k) * sizeof(double),
-                                   cudaMemcpyDeviceToHost, s),
-                   "block:copy(norms)");
+        copy(h_norm, d_norm, k, s, "block:copy(norms)");
         preconditioner.apply_block(n_, k, R, ZF, s);
         launch_bcg_dot_beta(n_, k, ZF, R, defl, d_converged, d_rsum, partials, d_rz, d_beta,
                             d_shift, s);
@@ -409,7 +379,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
     int result_iters = max_iters;
     for (int it = 1; it <= max_iters; ++it) {
         graph.run(s, key, it, run_body);
-        check_cuda(cudaStreamSynchronize(s), "block:sync(iter)");
+        sync(s, "block:sync(iter)");
         // A column whose recurrence met tolerance is frozen on the device, so its x cannot move
         // and its check can wait for the block's other columns: a block then pays one fp64 SpMV
         // for columns that converge a few iterations apart. A column at an intermediate
@@ -435,10 +405,8 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
             // residual, and its next stage is measured from there.
             apply_operator(k, terms, X_int, AP64, s);
             launch_bcg_residual(n_, k, B, AP64, d_write, R, partials, d_true_sq, s);
-            check_cuda(cudaMemcpyAsync(h_true, d_true_sq, static_cast<size_t>(k) * sizeof(double),
-                                       cudaMemcpyDeviceToHost, s),
-                       "block:copy(true norms)");
-            check_cuda(cudaStreamSynchronize(s), "block:sync(true norms)");
+            copy(h_true, d_true_sq, k, s, "block:copy(true norms)");
+            sync(s, "block:sync(true norms)");
             bool restart = false;
             for (int c = 0; c < k; ++c) {
                 write[c] = 0.0;
@@ -453,12 +421,8 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                     // the block's other columns. An infinite reference holds it as it does a zero
                     // column.
                     if (!waiting[c]) {
-                        check_cuda(cudaMemcpyAsync(d_ref_sq + c, &kInfiniteRef, sizeof(double),
-                                                   cudaMemcpyHostToDevice, s),
-                                   "block:copy(settled ref)");
-                        check_cuda(cudaMemcpyAsync(d_converged + c, &kFrozen, sizeof(double),
-                                                   cudaMemcpyHostToDevice, s),
-                                   "block:copy(settled)");
+                        copy(d_ref_sq + c, &kInfiniteRef, 1, s, "block:copy(settled ref)");
+                        copy(d_converged + c, &kFrozen, 1, s, "block:copy(settled)");
                     }
                     continue;
                 }
@@ -469,10 +433,7 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                 restart = true;
             }
             if (restart) {
-                check_cuda(cudaMemcpyAsync(d_write, write.data(),
-                                           static_cast<size_t>(k) * sizeof(double),
-                                           cudaMemcpyHostToDevice, s),
-                           "block:copy(write)");
+                copy(d_write, write.data(), k, s, "block:copy(write)");
                 launch_bcg_residual(n_, k, B, AP64, d_write, R, partials, d_true_sq, s);
                 // zf is dead between iterations, so every column's may be overwritten here.
                 preconditioner.apply_block(n_, k, R, ZF, s);
@@ -480,42 +441,32 @@ PcgBlockResult PcgAmgSolver::solve_block(NativeVCycle& preconditioner, const dou
                                    P, s);
                 for (int c = 0; c < k; ++c) {
                     if (write[c] == 0.0) continue;
-                    check_cuda(cudaMemcpyAsync(d_converged + c, &kUnfrozen, sizeof(double),
-                                               cudaMemcpyHostToDevice, s),
-                               "block:copy(unfreeze)");
+                    copy(d_converged + c, &kUnfrozen, 1, s, "block:copy(unfreeze)");
                 }
-                check_cuda(cudaMemsetAsync(d_write, 0, static_cast<size_t>(k) * sizeof(double), s),
-                           "block:memset(write)");
+                zero(d_write, k, s, "block:memset(write)");
             }
         }
-        if (std::all_of(done.begin(), done.end(), [](bool d) { return d; })) {
+        if (std::ranges::all_of(done, std::identity{})) {
             result_iters = it;
             break;
         }
     }
-    if (!std::all_of(done.begin(), done.end(), [](bool d) { return d; })) {
+    if (!std::ranges::all_of(done, std::identity{})) {
         // A column out of iterations reports its fp64 residual, never the fp32 recurrence, which
         // can drift arbitrarily far below it.
         apply_operator(k, terms, X_int, AP64, s);
         launch_bcg_residual(n_, k, B, AP64, d_write, R, partials, d_true_sq, s);
-        check_cuda(cudaMemcpyAsync(h_true, d_true_sq, static_cast<size_t>(k) * sizeof(double),
-                                   cudaMemcpyDeviceToHost, s),
-                   "block:copy(final norms)");
-        check_cuda(cudaStreamSynchronize(s), "block:sync(final norms)");
+        copy(h_true, d_true_sq, k, s, "block:copy(final norms)");
+        sync(s, "block:sync(final norms)");
         for (int c = 0; c < k; ++c) {
             if (done[c]) continue;
             rel[c] = std::sqrt(h_true[c]) / norm_ref[c];
             if (rel[c] <= tolerance) col_iters[c] = ran[c];
         }
     }
-    check_cuda(cudaMemcpyAsync(X, X_int, nk * sizeof(double), cudaMemcpyDeviceToDevice, s),
-               "block:copy(X_out)");
-    check_cuda(cudaStreamSynchronize(s), "block:sync(X_out)");
-    PcgBlockResult result;
-    result.iterations = result_iters;
-    result.relative_residual = std::move(rel);
-    result.column_iterations = std::move(col_iters);
-    return result;
+    copy(X, X_int, nk, s, "block:copy(X_out)");
+    sync(s, "block:sync(X_out)");
+    return {result_iters, std::move(rel), std::move(col_iters)};
 }
 
 PcgResult PcgAmgSolver::solve_mixed(NativeVCycle& preconditioner, const double* b,

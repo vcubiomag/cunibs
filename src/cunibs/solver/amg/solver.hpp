@@ -40,11 +40,6 @@ public:
         bool operator==(const Key&) const = default;
     };
 
-    GraphCache() = default;
-    ~GraphCache() { clear(); }
-    GraphCache(const GraphCache&) = delete;
-    GraphCache& operator=(const GraphCache&) = delete;
-
     // Runs `body` once on `stream`, replaying the cached graph when there is one.
     //
     // `iteration` is the caller's 1-based loop counter. Capture is attempted on the second, so a
@@ -54,18 +49,13 @@ public:
     template <typename Body>
     void run(cudaStream_t stream, const Key& key, int iteration, Body&& body);
 
-    void clear() noexcept {
-        if (exec_) cudaGraphExecDestroy(exec_);
-        exec_ = nullptr;
-    }
-
 private:
     // Records `body` into a fresh executable graph. Returns false, with the stream out of capture
     // mode and no error left pending, if anything along the way failed.
     template <typename Body>
     bool capture(cudaStream_t stream, Body& body);
 
-    cudaGraphExec_t exec_ = nullptr;
+    CudaGraphExec exec_;
     Key key_{};
     bool capture_failed_ = false;
 };
@@ -84,15 +74,16 @@ bool GraphCache::capture(cudaStream_t stream, Body& body) {
         // capture still has to be ended, or the stream stays in capture mode for good.
         recorded = false;
     }
-    cudaGraph_t graph = nullptr;
-    const bool ended = cudaStreamEndCapture(stream, &graph) == cudaSuccess && graph != nullptr;
-    const bool ok = recorded && ended && cudaGraphInstantiate(&exec_, graph, 0) == cudaSuccess;
-    if (graph) cudaGraphDestroy(graph);
-    if (!ok) {
-        exec_ = nullptr;
-        (void)cudaGetLastError();
+    cudaGraph_t raw = nullptr;
+    const bool ended = cudaStreamEndCapture(stream, &raw) == cudaSuccess;
+    const CudaGraph graph(raw);
+    cudaGraphExec_t exec = nullptr;
+    if (recorded && ended && graph && cudaGraphInstantiate(&exec, graph.get(), 0) == cudaSuccess) {
+        exec_.reset(exec);
+        return true;
     }
-    return ok;
+    (void)cudaGetLastError();
+    return false;
 }
 
 template <typename Body>
@@ -100,11 +91,11 @@ void GraphCache::run(cudaStream_t stream, const Key& key, int iteration, Body&& 
     // A failed capture is given up on for the rest of that solve but retried by the next one,
     // since whatever invalidated it is usually not a property of this body.
     if (iteration == 1) capture_failed_ = false;
-    if (exec_ != nullptr && key_ == key) {
-        check_cuda(cudaGraphLaunch(exec_, stream), "solver", "graph_launch");
+    if (exec_ && key_ == key) {
+        check_cuda(cudaGraphLaunch(exec_.get(), stream), "solver", "graph_launch");
         return;
     }
-    clear();
+    exec_.reset();
     if (iteration == 1 || capture_failed_) {
         body();
         return;
@@ -116,7 +107,7 @@ void GraphCache::run(cudaStream_t stream, const Key& key, int iteration, Body&& 
         return;
     }
     key_ = key;
-    check_cuda(cudaGraphLaunch(exec_, stream), "solver", "graph_launch_first");
+    check_cuda(cudaGraphLaunch(exec_.get(), stream), "solver", "graph_launch_first");
 }
 
 class PcgAmgSolver;
@@ -131,9 +122,6 @@ public:
     // synchronises it, so the caller may drop term_values on return.
     AffineTerms(const PcgAmgSolver& solver, int n_terms, const double* term_values,
                 cudaStream_t stream);
-
-    AffineTerms(const AffineTerms&) = delete;
-    AffineTerms& operator=(const AffineTerms&) = delete;
 
     int n_terms() const { return slots_.n_terms; }
     // Rows of the solver's matrix.
@@ -166,9 +154,6 @@ public:
     // Setup runs on `stream` and synchronises it, so the caller may drop its arrays on return.
     PcgAmgSolver(int n, int nnz, const int* row_ptr, const int* col_idx, const double* values,
                  cudaStream_t stream);
-
-    PcgAmgSolver(const PcgAmgSolver&) = delete;
-    PcgAmgSolver& operator=(const PcgAmgSolver&) = delete;
 
     // Dimensions of the matrix this was built on, so callers can validate their arrays.
     int n() const { return n_; }

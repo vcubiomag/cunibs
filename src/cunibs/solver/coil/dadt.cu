@@ -1,4 +1,5 @@
 #include "coil/coil.hpp"
+#include "core/launch.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -243,12 +244,9 @@ void launch_dadt_block(const double* pos_m, const double* mom, const double* tra
     // With no dipoles nothing sets the axis the planar path reads.
     check_cuda(cudaMemsetAsync(planar.get(), n_dip > 0 ? 1 : 0, sizeof(int), stream), "dadt",
                "planar");
-    if (n_dip > 0) {
-        dadt_planar_kernel<<<grid_for(n_dip), kBlock, 0, stream>>>(mom, n_dip, planar.get());
-    }
-    place_dipoles_kernel<<<grid_for(placed), kBlock, 0, stream>>>(
-        pos_m, mom, transforms, n_dip, k, planar.get(), s4.get(), m4.get(), m2.get(),
-        origin.get(), axis.get());
+    launch_threads(n_dip, dadt_planar_kernel, stream, mom, n_dip, planar.get());
+    launch_threads(placed, place_dipoles_kernel, stream, pos_m, mom, transforms, n_dip, k,
+                   planar.get(), s4.get(), m4.get(), m2.get(), origin.get(), axis.get());
     const std::int64_t threads = grid_for(n_nodes, kNodesPerThread);
     const dim3 grid(grid_for(threads, kDadtBlock), k);
     dadt_block_kernel<<<grid, kDadtBlock, 0, stream>>>(

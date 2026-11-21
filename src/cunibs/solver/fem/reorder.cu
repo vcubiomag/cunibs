@@ -1,4 +1,5 @@
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 #include "fem/fem.hpp"
 
 #include <cuda/std/algorithm>
@@ -25,8 +26,6 @@ __global__ void tet_lowest_node_kernel(const int* __restrict__ inverse,
 
 void launch_tet_lowest_node(const int* inverse, const int* tet_nodes, int* lowest, int n_tet,
                             cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_tet)) {
-        tet_lowest_node_kernel<<<blocks, kBlock, 0, stream>>>(
-            inverse, Tet4View<const int>(tet_nodes, n_tet), lowest, n_tet);
-    }
+    launch_threads(n_tet, tet_lowest_node_kernel, stream, inverse,
+                   Tet4View<const int>(tet_nodes, n_tet), lowest, n_tet);
 }

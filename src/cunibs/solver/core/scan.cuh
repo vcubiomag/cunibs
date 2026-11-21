@@ -8,12 +8,8 @@
 // length the caller allocates the next array at. counts holds n + 1 entries, the last of which
 // this zeroes. Synchronises the stream to read the total.
 inline int scan_counts(int n, int* counts, int* ptr, cudaStream_t stream, const char* origin) {
-    check_cuda(cudaMemsetAsync(counts + n, 0, sizeof(int), stream), origin, "scan tail");
+    zero_async(counts + n, 1, stream, origin, "scan tail");
     check_cuda(cub::DeviceScan::ExclusiveSum(counts, ptr, n + 1, cuda::stream_ref{stream}), origin,
                "scan");
-    int total = 0;
-    check_cuda(cudaMemcpyAsync(&total, ptr + n, sizeof(int), cudaMemcpyDeviceToHost, stream),
-               origin, "scan total");
-    check_cuda(cudaStreamSynchronize(stream), origin, "scan total");
-    return total;
+    return read_back(ptr + n, stream, origin, "scan total");
 }

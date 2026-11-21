@@ -1,5 +1,6 @@
 #include "coil/coil.hpp"
 #include "core/device_math.cuh"
+#include "core/launch.cuh"
 
 namespace {
 
@@ -23,8 +24,6 @@ __global__ void dadt_element_average_kernel(const float* __restrict__ dadt_nodes
 
 void launch_dadt_element_average(const float* dadt_nodes, const int* tet_nodes, float* dadt_elm,
                                  int n_tet, cudaStream_t stream) {
-    if (const unsigned blocks = grid_for(n_tet)) {
-        dadt_element_average_kernel<<<blocks, kBlock, 0, stream>>>(dadt_nodes, tet_nodes,
-                                                                    dadt_elm, n_tet);
-    }
+    launch_threads(n_tet, dadt_element_average_kernel, stream, dadt_nodes, tet_nodes, dadt_elm,
+                   n_tet);
 }
