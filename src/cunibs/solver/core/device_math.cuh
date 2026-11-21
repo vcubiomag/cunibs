@@ -90,6 +90,9 @@ using PtrPack = cuda::std::array<float*, kMaxStageBlock>;
 // rest null, since a kernel only ever reads the columns it was given a k for.
 template <typename T>
 cuda::std::array<T*, kMaxStageBlock> ptr_pack(T* const* src, int k) {
+    if (k < 0 || k > kMaxStageBlock) {
+        throw std::invalid_argument("a block stage takes at most kMaxStageBlock arrays");
+    }
     cuda::std::array<T*, kMaxStageBlock> out{};
     for (int c = 0; c < k; ++c) out[c] = src[c];
     return out;

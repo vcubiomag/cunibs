@@ -6,7 +6,9 @@
 #include <cuda/cmath>
 #include <cuda/std/array>
 
+#include <climits>
 #include <cstdint>
+#include <stdexcept>
 
 // A slot is the unit a patch is fitted around: a node for the global mode, a (node, tissue) pair
 // for the tissue-restricted ones. Either way the patch is a segment of a CSR, so one kernel
@@ -752,6 +754,7 @@ __global__ void recover_elements_kernel(ConstPtrPack e_slots,
 void launch_mark_outer_boundary(const int* tet_nodes, const int* ptr, const int* idx,
                                 int* is_boundary, int n_tet, cudaStream_t stream) {
     const std::int64_t n_face = static_cast<std::int64_t>(n_tet) * 4;
+    if (n_face > INT_MAX) throw std::invalid_argument("mark_outer_boundary: too many faces");
     launch_threads(n_face, mark_outer_boundary_kernel, stream, tet_nodes, ptr, idx, is_boundary,
                    static_cast<int>(n_face));
 }
