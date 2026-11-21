@@ -378,15 +378,12 @@ __device__ bool fit_gradient_weights(Vec3View<const double> nodes_m,
     constexpr int kPerLane = cuda::ceil_div(kEntries, kWarp);
     if (end - begin < Basis::kMinPatch) return false;
 
-    cuda::std::array<int, kPerLane> row, col;
-    cuda::std::array<double, kPerLane> acc;
+    cuda::std::array<int, kPerLane> row{}, col{};
+    cuda::std::array<double, kPerLane> acc{};
     int mine = 0;
 #pragma unroll
     for (int e = 0; e < kPerLane; ++e) {
         const int k = lane + kWarp * e;
-        acc[e] = 0.0;
-        row[e] = 0;
-        col[e] = 0;
         if (k < kEntries) {
             // Invert k = i(i+1)/2 + j.
             const int i = (cuda::isqrt(8 * k + 1) - 1) / 2;
@@ -611,12 +608,7 @@ __global__ void hpr_grad_kernel(const float* __restrict__ v_hi, const float* __r
     const auto wv = unsized<Vec3View<const float>>(w);
     const auto hi = unsized<WidthView<const float, K>>(v_hi);
     const auto lo = unsized<WidthView<const float, K>>(v_lo);
-    float acc[K][3], comp[K][3];
-#pragma unroll
-    for (int c = 0; c < K; ++c) {
-        acc[c][0] = acc[c][1] = acc[c][2] = 0.f;
-        comp[c][0] = comp[c][1] = comp[c][2] = 0.f;
-    }
+    float acc[K][3] = {}, comp[K][3] = {};
 
     int node = 0;
     if (live) {
@@ -690,9 +682,7 @@ __global__ void recover_nodes_kernel(ConstPtrPack e_in, const float* __restrict_
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_slots) return;
 
-    float acc[K][3];
-#pragma unroll
-    for (int c = 0; c < K; ++c) acc[c][0] = acc[c][1] = acc[c][2] = 0.f;
+    float acc[K][3] = {};
 
     const int begin = ptr[s], end = ptr[s + 1];
     for (int p = begin; p < end; ++p) {

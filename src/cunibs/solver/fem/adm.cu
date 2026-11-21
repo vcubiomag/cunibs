@@ -227,9 +227,7 @@ __global__ void __launch_bounds__(kBlock)
                         int* __restrict__ fault) {
     const int cand = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / kWarp);
     const int lane = static_cast<int>(threadIdx.x % kWarp);
-    cuda::std::array<double, D> e;
-#pragma unroll
-    for (int d = 0; d < D; ++d) e[d] = 0.0;
+    cuda::std::array<double, D> e{};
     if (cand < n_frames) {
         const CandidateMap c = candidate_map(frames + static_cast<std::int64_t>(cand) * 16, g);
         const std::int64_t sy = static_cast<std::int64_t>(g.n[2]) * (3 * D);
@@ -248,9 +246,7 @@ __global__ void __launch_bounds__(kBlock)
                 report_fault(fault, kAdmUnsampled, cand);
                 continue;
             }
-            float qv[D * 3];
-#pragma unroll
-            for (int t = 0; t < D * 3; ++t) qv[t] = 0.0f;
+            float qv[D * 3] = {};
             const int slot = __ldg(cell_slot + cell);
             // A slot's eight corners are contiguous, (x, y, z) bit order.
             const float* base =
@@ -324,9 +320,7 @@ __global__ void __launch_bounds__(kBlock)
     const int iz = static_cast<int>(cell % ncz) + (corner & 1);
     const float px = static_cast<float>(ix), py = static_cast<float>(iy),
                 pz = static_cast<float>(iz);
-    float acc[D * 3];
-#pragma unroll
-    for (int c = 0; c < D * 3; ++c) acc[c] = 0.0f;
+    float acc[D * 3] = {};
     const int end = list_ptr[slot + 1];
     for (int k = list_ptr[slot]; k < end; ++k) {
         float entry[entry_floats<D>()];
@@ -513,16 +507,8 @@ __global__ void __launch_bounds__(kSampleBlock)
     }
     __syncthreads();
 
-    float aw[kSamplePoints][D * 3], am[kSamplePoints][D * 3];
-    double sum[kSamplePoints][D * 3];
-#pragma unroll
-    for (int k = 0; k < kSamplePoints; ++k) {
-#pragma unroll
-        for (int c = 0; c < D * 3; ++c) {
-            aw[k][c] = am[k][c] = 0.0f;
-            sum[k][c] = 0.0;
-        }
-    }
+    float aw[kSamplePoints][D * 3] = {}, am[kSamplePoints][D * 3] = {};
+    double sum[kSamplePoints][D * 3] = {};
 
     int tiles = 0;
     for (int base = 0; base < n_src; base += kSampleBlock) {
@@ -608,13 +594,8 @@ __global__ void __launch_bounds__(kSampleBlock)
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int p = min(i, n_points - 1);
     const float px = points[3 * p], py = points[3 * p + 1], pz = points[3 * p + 2];
-    float acc[D * 3];
-    double sum[D * 3];
-#pragma unroll
-    for (int c = 0; c < D * 3; ++c) {
-        acc[c] = 0.0f;
-        sum[c] = 0.0;
-    }
+    float acc[D * 3] = {};
+    double sum[D * 3] = {};
 
     int tiles = 0;
     for (int base = 0; base < n_src; base += kSampleBlock) {

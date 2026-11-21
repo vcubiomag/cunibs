@@ -77,8 +77,7 @@ __device__ __forceinline__ void row_spmv(int n, const int* __restrict__ row_ptr,
                                          const __half* __restrict__ vals,
                                          const float* __restrict__ x, int row, int lane,
                                          cuda::std::array<float, K>& sum) {
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    sum = {};
     if (row < n) {
         const WidthView<const float, K> xv_rows(x, n);
         const int row_e = row_ptr[row + 1];
@@ -178,9 +177,7 @@ __global__ void __launch_bounds__(kBlock)
                        const float* __restrict__ r_fine, float* __restrict__ b_coarse) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kRestrictTpr;
     const int lane = static_cast<int>(threadIdx.x) % kRestrictTpr;
-    cuda::std::array<float, K> sum;
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    cuda::std::array<float, K> sum{};
     if (row < n_coarse) {
         const auto fine = unsized<WidthView<const float, K>>(r_fine);
         const int row_e = r_row_ptr[row + 1];
@@ -208,9 +205,7 @@ __global__ void __launch_bounds__(kBlock)
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= n) return;
     const int row_e = p_row_ptr[row + 1];
-    cuda::std::array<float, K> sum;
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    cuda::std::array<float, K> sum{};
     const auto coarse = unsized<WidthView<const float, K>>(x_coarse);
     const WidthView<float, K> fine(x_fine, n);
     for (int j = p_row_ptr[row]; j < row_e; ++j) {
@@ -313,9 +308,7 @@ __global__ void __launch_bounds__(kBlock)
         s = row_scale[row];
     };
     if (kHoistEpilogue<K> && owner) load_operands();
-    cuda::std::array<float, K> sum;
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    cuda::std::array<float, K> sum{};
     if (row < n) {
         const int row_e = row_ptr[row + 1];
         for (int j = row_ptr[row] + lane; j < row_e; j += TPR) {
@@ -361,9 +354,7 @@ __global__ void __launch_bounds__(kBlock)
                           float* __restrict__ x) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kWarp;
     const int lane = static_cast<int>(threadIdx.x) % kWarp;
-    cuda::std::array<float, K> sum;
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.0f;
+    cuda::std::array<float, K> sum{};
     if (row < n) {
         const Mat2View<const float> a_inv(ainv, n, n);
         const WidthView<const float, K> brows(b, n);

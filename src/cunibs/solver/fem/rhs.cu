@@ -91,9 +91,7 @@ __global__ void __launch_bounds__(kBlock)
                         const float* __restrict__ a, float* __restrict__ b) {
     const int row = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x) / kRhsOpTpr;
     const int lane = static_cast<int>(threadIdx.x) % kRhsOpTpr;
-    cuda::std::array<float, K> acc;
-#pragma unroll
-    for (int c = 0; c < K; ++c) acc[c] = 0.f;
+    cuda::std::array<float, K> acc{};
     if (row < n) {
         const int row_e = indptr[row + 1];
         for (int p = indptr[row] + lane; p < row_e; p += kRhsOpTpr) {

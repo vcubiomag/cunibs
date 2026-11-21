@@ -39,9 +39,7 @@ __global__ void seed_project_kernel(const float* __restrict__ q, const float* __
     if (j >= m) return;
     const int r0 = blockIdx.x * kSeedTileRows;
     const int r1 = min(n, r0 + kSeedTileRows);
-    float acc[K];
-#pragma unroll
-    for (int c = 0; c < K; ++c) acc[c] = 0.0f;
+    float acc[K] = {};
     for (int r = r0; r < r1; ++r) {
         const float qv = q[static_cast<std::int64_t>(r) * m + j];
         cuda::std::array<float, K> bv;
@@ -78,9 +76,7 @@ __global__ void __launch_bounds__(kBlock)
                        double* __restrict__ x0) {
     __shared__ float tile[kBlock][kExpandCols + 1];
     const int r0 = blockIdx.x * kBlock;
-    cuda::std::array<float, K> acc;
-#pragma unroll
-    for (int c = 0; c < K; ++c) acc[c] = 0.0f;
+    cuda::std::array<float, K> acc{};
     for (int j0 = 0; j0 < m; j0 += kExpandCols) {
         const int w = min(kExpandCols, m - j0);
         for (int e = threadIdx.x; e < kBlock * kExpandCols; e += kBlock) {

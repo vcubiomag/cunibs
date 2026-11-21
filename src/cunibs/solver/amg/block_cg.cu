@@ -36,9 +36,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
                       const double* __restrict__ x, double* __restrict__ y) {
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = threadIdx.x % kTpr;
-    cuda::std::array<double, K> sum;
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.0;
+    cuda::std::array<double, K> sum{};
     if (row < n) {
         const WidthView<const double, K> xv(x, n);
         const int row_e = row_ptr[row + 1];
@@ -81,9 +79,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
     const int row = static_cast<int>(tid / K);
     if (row >= n) return;
     const int c = static_cast<int>(tid % K);
-    double part[kTpr];
-#pragma unroll
-    for (int l = 0; l < kTpr; ++l) part[l] = 0.0;
+    double part[kTpr] = {};
 
     // Walk the row in groups of kTpr so the accumulator index stays a compile-time constant;
     // a running index would spill `part` to local memory. Group g slot l is nonzero
@@ -142,9 +138,7 @@ __global__ void __launch_bounds__(kBlock, kSpmvMinBlocks)
                        const float* __restrict__ x, float* __restrict__ y) {
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / kTpr;
     const int lane = threadIdx.x % kTpr;
-    cuda::std::array<float, K> sum;
-#pragma unroll
-    for (int c = 0; c < K; ++c) sum[c] = 0.f;
+    cuda::std::array<float, K> sum{};
     if (row < n) {
         const WidthView<const float, K> xv(x, n);
         cuda::std::array<float, K> xr;
@@ -178,14 +172,10 @@ __global__ void __launch_bounds__(kBlock, K >= 8 ? 4 : kSpmvMinBlocks)
     if (slot >= n) return;
     const int row = order[slot];
     const WidthView<const float, K> xv(x, n);
-    cuda::std::array<float, K> xr, acc;
+    cuda::std::array<float, K> xr, acc{};
     load_row<K>(&xv(row, 0), xr);
-#pragma unroll
-    for (int c = 0; c < K; ++c) acc[c] = 0.f;
     for (int g = seg_ptr[row]; g < seg_ptr[row + 1]; ++g) {
-        cuda::std::array<float, K> part;
-#pragma unroll
-        for (int c = 0; c < K; ++c) part[c] = 0.f;
+        cuda::std::array<float, K> part{};
         for (int j = seg_start[g]; j < seg_start[g + 1]; ++j) {
             const float v = vals[j];
             cuda::std::array<float, K> xc;
@@ -368,9 +358,7 @@ __global__ void bcg_partials_kernel(int n, const T* __restrict__ x, const T* __r
                                     double* __restrict__ partials, int n_blocks) {
     const WidthView<const T, K> xv(x, n);
     const WidthView<const T, K> yv(y, n);
-    cuda::std::array<T, K> local;
-#pragma unroll
-    for (int c = 0; c < K; ++c) local[c] = T(0);
+    cuda::std::array<T, K> local{};
     constexpr int kBatch = 4;
     cuda::std::array<T, K> xb[kBatch];
     cuda::std::array<T, K> yb[kBatch];
@@ -618,9 +606,7 @@ __global__ void bcg_update_r_kernel(int n, const double* __restrict__ neg_alpha,
 #pragma unroll
     for (int c = 0; c < K; ++c) na[c] = static_cast<float>(__ldg(neg_alpha + c));
     // [0, K) is |r|^2 and [K, 2K) is sum(r), which the deflation's Q r term needs.
-    cuda::std::array<float, 2 * K> rloc;
-#pragma unroll
-    for (int c = 0; c < 2 * K; ++c) rloc[c] = 0.f;
+    cuda::std::array<float, 2 * K> rloc{};
     const int stride = gridDim.x * blockDim.x;
     const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
     // Rows go in batches whose loads are all issued before any is consumed. A plain loop with an
