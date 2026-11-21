@@ -6,8 +6,7 @@ import threading
 
 import cupy as cp
 import numpy as np
-
-from cunibs.solver import host_copy_async
+from cuda.core import HOST_COPY_FN, Stream, host_launch, pack_host_copy_args
 
 # Two slots, so one drains into its host array while the other fills.
 _SLOT_BYTES = 64 << 20
@@ -36,6 +35,8 @@ class AsyncCopier:
             for _ in range(_SLOTS)
         ]
         self._streams = [cp.cuda.Stream(non_blocking=True) for _ in range(_SLOTS)]
+        # Views of the same streams for cuda.core, which the copier keeps alive by holding them.
+        self._drains = [Stream.from_handle(s.ptr) for s in self._streams]
         self._turn = 0
         self._lock = threading.Lock()
 
@@ -64,7 +65,11 @@ class AsyncCopier:
                     cp.cuda.runtime.memcpyDeviceToHost,
                     stream.ptr,
                 )
-                host_copy_async(slot, dst.ctypes.data + offset, n, stream.ptr)
+                host_launch(
+                    self._drains[i],
+                    HOST_COPY_FN,
+                    user_data=pack_host_copy_args(dst.ctypes.data + offset, slot, n),
+                )
                 offset += n
         return dst
 

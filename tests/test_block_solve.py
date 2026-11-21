@@ -410,7 +410,9 @@ def test_a_native_allocation_failure_is_a_memory_error(
     cp, fresh_subject, cube_mesh, synthetic_coil
 ):
     """Out of memory is a MemoryError a caller can recover from, and leaves nothing behind."""
-    from cunibs.solver import CudaOutOfMemory, PcgAmgSolver
+    from cuda.core import CUDAOutOfMemoryError
+
+    from cunibs.solver import PcgAmgSolver
 
     subject = fresh_subject(cube_mesh)
     a = subject.context.solver.matrix()
@@ -426,7 +428,7 @@ def test_a_native_allocation_failure_is_a_memory_error(
     try:
         with pytest.raises(MemoryError) as raised:
             PcgAmgSolver(a.indptr, a.indices, a.data, cp.cuda.get_current_stream().ptr)
-        assert isinstance(raised.value, CudaOutOfMemory)
+        assert isinstance(raised.value, CUDAOutOfMemoryError)
         with pytest.raises(MemoryError):
             cp.empty(1 << 30, dtype=cp.uint8)
     finally:

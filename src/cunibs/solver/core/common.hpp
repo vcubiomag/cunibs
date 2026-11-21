@@ -46,8 +46,8 @@ inline bool is_block_width(int k) {
 static_assert(kBlockWidths[std::size(kBlockWidths) - 1] <= kMaxStageBlock,
               "a solve width wider than a staging chunk could never be fed");
 
-// An allocation the device could not satisfy. Kept distinct so Python sees a MemoryError, which a
-// caller can recover from by asking for less.
+// An allocation the device could not satisfy. Kept distinct so Python sees cuda.core's
+// CUDAOutOfMemoryError, a MemoryError, which a caller can recover from by asking for less.
 class CudaOutOfMemory : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;

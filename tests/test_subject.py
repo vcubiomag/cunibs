@@ -25,6 +25,7 @@ from cunibs import (
     resolve_target,
 )
 from cunibs._memory import build_arena, release_scratch, scratch_pool, unpooled
+from cunibs._transfer import _SLOT_BYTES, AsyncCopier
 from cunibs.fem.solve import SolverConvergenceError
 from cunibs.mesh import load_mesh
 
@@ -349,6 +350,26 @@ def test_out_of_memory_is_a_memory_error_from_every_allocator(cp):
         unpooled(huge)
     with pytest.raises(MemoryError), cp.cuda.using_allocator(scratch_pool().malloc):
         cp.empty(huge, dtype=cp.uint8)
+
+
+def test_a_copy_spanning_several_slots_arrives_whole(cp):
+    """The slots drain on the driver's thread, and the device pool keeps its release threshold.
+
+    The extension's scratch relies on that pool returning freed memory at each synchronisation.
+    """
+    runtime = cp.cuda.runtime
+    pool = runtime.deviceGetMemPool(runtime.getDevice())
+    attr = runtime.cudaMemPoolAttrReleaseThreshold
+    threshold = runtime.memPoolGetAttribute(pool, attr)
+    src = cp.arange(5 * _SLOT_BYTES // 8 + 3, dtype=cp.int32)
+    produced = cp.cuda.Event(disable_timing=True)
+    produced.record()
+    copier = AsyncCopier()
+    held: list[object] = []
+    got = copier.copy(src, produced, held)
+    copier.drain()
+    np.testing.assert_array_equal(got, cp.asnumpy(src))
+    assert runtime.memPoolGetAttribute(pool, attr) == threshold
 
 
 def test_another_allocator_failure_is_raised_as_it_is(cp, monkeypatch):

@@ -33,7 +33,6 @@ from cunibs._common import (
     write_provenance,
 )
 from cunibs._memory import library_memory_errors, release_scratch, scratch_pool, unpooled
-from cunibs._transfer import AsyncCopier
 from cunibs.adm.target import check_elements
 from cunibs.fem import (
     MAX_BLOCK,
@@ -55,6 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
     from typing import Self
 
+    from cunibs._transfer import AsyncCopier
     from cunibs.adm.target import ResolvedTarget
     from cunibs.coil import Coil
     from cunibs.uq import (
@@ -288,6 +288,9 @@ class Subject:
 
     def _async_copier(self) -> AsyncCopier:
         """The pinned ring a multi-chunk call copies retained arrays through, kept until free()."""
+        # Imported here because it brings in cuda.core, which a single-chunk call never needs.
+        from cunibs._transfer import AsyncCopier
+
         with self._lock:
             if self._copier is None:
                 self._copier = AsyncCopier()
