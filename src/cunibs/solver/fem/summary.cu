@@ -12,6 +12,7 @@
 #include <cuda/cmath>
 #include <math_constants.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,9 +29,7 @@ constexpr int kWarps = kBlock / kWarp;
 constexpr int kSums = 5;
 
 template <typename T>
-struct Fields {
-    const T* p[kMaxStageBlock];
-};
+using Fields = cuda::std::array<const T*, kMaxStageBlock>;
 
 struct Peak {
     double value;
@@ -64,7 +63,7 @@ __global__ void __launch_bounds__(kBlock)
                            const double* __restrict__ bary, int n_blocks,
                            double* __restrict__ sums, Peak* __restrict__ peaks) {
     const int c = blockIdx.y;
-    const T* __restrict__ m = fields.p[c];
+    const T* __restrict__ m = fields[c];
     cuda::std::array<double, kSums> s{};
     Peak best{-CUDART_INF, n};
     const int stride = gridDim.x * blockDim.x;
@@ -152,7 +151,7 @@ __global__ void __launch_bounds__(kBlock)
                           const double* __restrict__ scratch, double* __restrict__ part,
                           int n_blocks) {
     const int c = blockIdx.y;
-    const T* __restrict__ m = fields.p[c];
+    const T* __restrict__ m = fields[c];
     const double mean = scratch[2 * c];
     cuda::std::array<double, 1> s{0.0};
     const int stride = gridDim.x * blockDim.x;
@@ -329,8 +328,6 @@ __global__ void summary_quantiles_kernel(const T* __restrict__ keys, const doubl
     }
 }
 
-std::size_t aligned(std::size_t bytes) { return cuda::round_up(bytes, std::size_t{256}); }
-
 template <typename T>
 std::size_t sort_bytes(int n) {
     std::size_t bytes = 0;
@@ -343,61 +340,82 @@ std::size_t sort_bytes(int n) {
 }
 
 template <typename T>
-std::size_t work_size(int n, int k) {
-    const std::size_t nb = moment_blocks(n);
+struct Workspace {
+    T* keys;
+    T* keys_sorted;
+    double* w_sorted;
+    double* within;
+    double* tile_total;
+    double* tile_offset;
+    double* sums;
+    Peak* peaks;
+    double* spread;
+    double* scratch;
+    std::size_t sort_bytes;
+    std::byte* sort_temp;
+};
+
+template <typename T>
+Workspace<T> lay_out(Bump& bump, int n, int k) {
     const std::size_t nt = tiles(n);
-    return 2 * aligned(n * sizeof(T)) + 2 * aligned(n * sizeof(double)) +
-           2 * aligned(nt * sizeof(double)) + aligned(k * kSums * nb * sizeof(double)) +
-           aligned(k * nb * sizeof(Peak)) + aligned(k * nb * sizeof(double)) +
-           aligned(2 * k * sizeof(double)) + aligned(sort_bytes<T>(n));
+    const std::size_t kb = static_cast<std::size_t>(k) * moment_blocks(n);
+    const std::size_t sort = sort_bytes<T>(n);
+    return {
+        .keys = bump.take<T>(n),
+        .keys_sorted = bump.take<T>(n),
+        .w_sorted = bump.take<double>(n),
+        .within = bump.take<double>(n),
+        .tile_total = bump.take<double>(nt),
+        .tile_offset = bump.take<double>(nt),
+        .sums = bump.take<double>(kb * kSums),
+        .peaks = bump.take<Peak>(kb),
+        .spread = bump.take<double>(kb),
+        .scratch = bump.take<double>(2 * static_cast<std::size_t>(k)),
+        .sort_bytes = sort,
+        .sort_temp = bump.take<std::byte>(sort),
+    };
+}
+
+template <typename T>
+std::size_t work_size(int n, int k) {
+    Bump sizing(nullptr);
+    lay_out<T>(sizing, n, k);
+    return sizing.bytes();
 }
 
 template <typename T>
 void summarize(const void* const* fields, int k, int n, const int* index, const double* w,
                const double* bary, const Probes& probes, void* work, std::size_t work_bytes,
                double* out, int n_out, cudaStream_t stream) {
-    if (work_bytes < work_size<T>(n, k)) {
+    Bump bump(static_cast<std::byte*>(work));
+    Workspace<T> ws = lay_out<T>(bump, n, k);
+    if (work_bytes < bump.bytes())
         throw std::invalid_argument("region_summary: workspace too small");
-    }
     Fields<T> f{};
-    for (int c = 0; c < k; ++c) f.p[c] = static_cast<const T*>(fields[c]);
+    for (int c = 0; c < k; ++c) f[c] = static_cast<const T*>(fields[c]);
     const int nb = moment_blocks(n);
     const int nt = tiles(n);
-    auto* cursor = static_cast<unsigned char*>(work);
-    const auto take = [&](std::size_t bytes) {
-        void* p = cursor;
-        cursor += aligned(bytes);
-        return p;
-    };
-    T* keys = static_cast<T*>(take(n * sizeof(T)));
-    T* keys_sorted = static_cast<T*>(take(n * sizeof(T)));
-    double* w_sorted = static_cast<double*>(take(n * sizeof(double)));
-    double* within = static_cast<double*>(take(n * sizeof(double)));
-    double* tile_total = static_cast<double*>(take(nt * sizeof(double)));
-    double* tile_offset = static_cast<double*>(take(nt * sizeof(double)));
-    double* sums = static_cast<double*>(take(static_cast<std::size_t>(k) * kSums * nb * 8));
-    Peak* peaks = static_cast<Peak*>(take(static_cast<std::size_t>(k) * nb * sizeof(Peak)));
-    double* spread = static_cast<double*>(take(static_cast<std::size_t>(k) * nb * 8));
-    double* scratch = static_cast<double*>(take(2 * static_cast<std::size_t>(k) * 8));
-    std::size_t sort_temp_bytes = sort_bytes<T>(n);
-    void* sort_temp = take(sort_temp_bytes);
 
     const dim3 grid(nb, k);
-    summary_moments_kernel<T><<<grid, kBlock, 0, stream>>>(f, n, index, w, bary, nb, sums, peaks);
-    summary_moments_finish_kernel<<<k, kBlock, 0, stream>>>(sums, peaks, nb, bary, n_out, out,
-                                                            scratch);
-    summary_spread_kernel<T><<<grid, kBlock, 0, stream>>>(f, n, index, w, scratch, spread, nb);
-    summary_spread_finish_kernel<<<k, kBlock, 0, stream>>>(spread, nb, scratch, n_out, out);
+    summary_moments_kernel<T>
+        <<<grid, kBlock, 0, stream>>>(f, n, index, w, bary, nb, ws.sums, ws.peaks);
+    summary_moments_finish_kernel<<<k, kBlock, 0, stream>>>(ws.sums, ws.peaks, nb, bary, n_out, out,
+                                                            ws.scratch);
+    summary_spread_kernel<T>
+        <<<grid, kBlock, 0, stream>>>(f, n, index, w, ws.scratch, ws.spread, nb);
+    summary_spread_finish_kernel<<<k, kBlock, 0, stream>>>(ws.spread, nb, ws.scratch, n_out, out);
     for (int c = 0; c < k; ++c) {
-        launch_threads(n, summary_gather_kernel<T>, stream, f.p[c], index, n, keys);
-        check_cuda(cub::DeviceRadixSort::SortPairs(sort_temp, sort_temp_bytes, keys, keys_sorted,
-                                                   w, w_sorted, n, 0, sizeof(T) * 8, stream),
-                   "summary", "sort");
-        summary_tile_scan_kernel<<<nt, kBlock, 0, stream>>>(w_sorted, n, within, tile_total);
-        summary_tile_offsets_kernel<<<1, kBlock, 0, stream>>>(tile_total, nt, tile_offset);
+        launch_threads(n, summary_gather_kernel<T>, stream, f[c], index, n, ws.keys);
+        check_cuda(
+            cub::DeviceRadixSort::SortPairs(ws.sort_temp, ws.sort_bytes, ws.keys, ws.keys_sorted, w,
+                                            ws.w_sorted, n, 0, sizeof(T) * 8, stream),
+            "summary", "sort");
+        summary_tile_scan_kernel<<<nt, kBlock, 0, stream>>>(ws.w_sorted, n, ws.within,
+                                                            ws.tile_total);
+        summary_tile_offsets_kernel<<<1, kBlock, 0, stream>>>(ws.tile_total, nt, ws.tile_offset);
         const int warps = probes.n_q > probes.n_f ? probes.n_q : probes.n_f;
         summary_quantiles_kernel<T><<<1, warps * kWarp, 0, stream>>>(
-            keys_sorted, w_sorted, within, tile_offset, n, probes,
+            ws.keys_sorted, ws.w_sorted, ws.within, ws.tile_offset, n, probes,
             out + static_cast<std::int64_t>(c) * n_out);
     }
 }
@@ -423,12 +441,9 @@ void launch_region_summary(const void* const* fields, bool f64, int k, int n, co
     if (n_q < 1 || anchor < 0 || anchor >= n_q) {
         throw std::invalid_argument("region_summary: anchor must name one of the quantiles");
     }
-    Probes probes{};
-    for (int i = 0; i < n_q; ++i) probes.q[i] = qs[i];
-    for (int i = 0; i < n_f; ++i) probes.frac[i] = fracs[i];
-    probes.n_q = n_q;
-    probes.n_f = n_f;
-    probes.anchor = anchor;
+    Probes probes{.n_q = n_q, .n_f = n_f, .anchor = anchor};
+    std::copy_n(qs, n_q, probes.q);
+    std::copy_n(fracs, n_f, probes.frac);
     const int n_out = kSummaryQuantiles + n_q + n_f;
     if (f64) {
         summarize<double>(fields, k, n, index, w, bary, probes, work, work_bytes, out, n_out,

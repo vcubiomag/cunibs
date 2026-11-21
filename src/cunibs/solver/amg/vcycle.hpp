@@ -5,7 +5,6 @@
 #include <cuda_fp16.h>
 
 #include <mutex>
-#include <utility>
 #include <vector>
 
 // One zero-initial-guess aggregation-AMG V-cycle: Chebyshev smoothing over the l1-Jacobi
@@ -57,8 +56,8 @@ public:
         DeviceBuffer<int> r_col_idx;
         DeviceBuffer<float> r_values;
         // (n, k) row-major work buffers, sized for block_k_.
-        DeviceBuffer<float> b;  // level RHS (restricted residual); null at level 0, which reads
-                          // the caller's b directly
+        // The level's RHS, the restricted residual. Null at level 0, which reads the caller's b.
+        DeviceBuffer<float> b;
         // The smoother's two ping-pong buffers, also holding the residual between sweeps.
         // Every Chebyshev step gathers x_cur across the whole vector, so it cannot write the
         // buffer it reads and a sweep alternates between these two; two suffice because the

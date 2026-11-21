@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <iterator>
 #include <memory>
@@ -190,6 +191,27 @@ T read_back(const T* src, cudaStream_t stream, const char* origin, const char* w
     sync_stream(stream, origin, what);
     return host;
 }
+
+// Bump allocator over one device block. Sizing runs it against a null base first, so the
+// sizing pass and the pointer pass cannot drift apart. Every piece starts 256-byte aligned, as
+// CUB's temporary storage and the vector loads expect.
+class Bump {
+public:
+    explicit Bump(std::byte* base) : base_(base) {}
+
+    template <typename T>
+    T* take(std::size_t count) {
+        std::byte* p = base_ != nullptr ? base_ + used_ : nullptr;
+        used_ += (count * sizeof(T) + 255) / 256 * 256;
+        return reinterpret_cast<T*>(p);
+    }
+
+    std::size_t bytes() const { return used_; }
+
+private:
+    std::byte* base_;
+    std::size_t used_ = 0;
+};
 
 template <typename T>
 DeviceBuffer<T> device_alloc(std::size_t count, const char* origin, const char* what) {

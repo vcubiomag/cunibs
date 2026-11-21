@@ -161,7 +161,9 @@ struct GridGeom {
     double spacing[3];
     int n[3];
 
-    std::int64_t points() const { return static_cast<std::int64_t>(n[0]) * n[1] * n[2]; }
+    __host__ __device__ std::int64_t points() const {
+        return static_cast<std::int64_t>(n[0]) * n[1] * n[2];
+    }
 };
 
 // Candidate evaluation against a sampled reciprocity field. q is (nx, ny, nz, n_dir, 3) and cell_ok

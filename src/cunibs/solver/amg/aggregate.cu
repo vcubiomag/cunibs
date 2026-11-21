@@ -2,7 +2,6 @@
 #include "core/scan.cuh"
 
 #include <cuda/atomic>
-#include <cuda/cmath>
 
 #include <cstddef>
 #include <stdexcept>
@@ -271,26 +270,6 @@ __global__ __launch_bounds__(kBlock) void agg_relabel_kernel(int n, int* __restr
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n) agg[tid] = excl[agg[tid]];
 }
-
-// Bump allocator over one device block. Sizing runs it against a null base first, so the
-// sizing pass and the pointer pass cannot drift apart.
-class Bump {
-  public:
-    explicit Bump(std::byte* base) : base_(base) {}
-
-    template <typename T>
-    T* take(size_t count) {
-        std::byte* p = base_ != nullptr ? base_ + used_ : nullptr;
-        used_ += cuda::round_up(count * sizeof(T), size_t{256});
-        return reinterpret_cast<T*>(p);
-    }
-
-    size_t bytes() const { return used_; }
-
-  private:
-    std::byte* base_;
-    size_t used_ = 0;
-};
 
 struct Scratch {
     float* diag;

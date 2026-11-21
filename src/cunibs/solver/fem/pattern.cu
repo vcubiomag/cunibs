@@ -7,6 +7,7 @@
 #include <cub/warp/warp_scan.cuh>
 #include <cuda/std/bit>
 #include <cuda/std/limits>
+#include <cuda/std/utility>
 
 #include <array>
 #include <bit>
@@ -325,17 +326,10 @@ __device__ __forceinline__ void segment_unique_one(Gather g, const int* __restri
     // well short of the widest one, and the padding is what the network would otherwise sort.
     const int m = static_cast<int>(cuda::std::bit_ceil(static_cast<unsigned>(n)));
     if (m <= kRegisterSortPerLane * kWarp) {
-        if (m <= kWarp) {
-            warp_bitonic_sort<1>(b, n, lane);
-        } else if (m <= 2 * kWarp) {
-            warp_bitonic_sort<2>(b, n, lane);
-        } else if (m <= 4 * kWarp) {
-            warp_bitonic_sort<4>(b, n, lane);
-        } else if (m <= 8 * kWarp) {
-            warp_bitonic_sort<8>(b, n, lane);
-        } else {
-            warp_bitonic_sort<16>(b, n, lane);
-        }
+        // The narrowest network that holds m; the fold stops at the first that does.
+        [&]<int... E>(cuda::std::integer_sequence<int, E...>) {
+            (void)((m <= E * kWarp && (warp_bitonic_sort<E>(b, n, lane), true)) || ...);
+        }(cuda::std::integer_sequence<int, 1, 2, 4, 8, kRegisterSortPerLane>{});
     } else {
         // Node ids are non-negative, so the maximum pads to the tail and never displaces a
         // candidate.

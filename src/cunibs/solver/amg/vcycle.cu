@@ -6,6 +6,8 @@
 #include "core/launch.cuh"
 #include "core/slot_csr.cuh"
 
+#include <cuda/cmath>
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -104,7 +106,7 @@ constexpr bool kHoistEpilogue = (K == 1);
 // GPU models.
 inline int choose_tpr(int n_rows, int nnz) {
     if (n_rows <= 0) return kTprChoices[0];
-    const std::int64_t nnz_per_row = (static_cast<std::int64_t>(nnz) + n_rows - 1) / n_rows;
+    const int nnz_per_row = cuda::ceil_div(nnz, n_rows);
     const std::int64_t to_fill = static_cast<std::int64_t>(kFillSms) * kTargetBlocksPerSm * kBlock;
     int tpr = kTprChoices[0];
     for (std::size_t i = 1; i < std::size(kTprChoices); ++i) {

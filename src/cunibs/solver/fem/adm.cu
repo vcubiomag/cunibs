@@ -132,7 +132,6 @@ __device__ __forceinline__ CandidateMap candidate_map(const double* __restrict__
 // so every dipole faulted here is also one the host's fp64 check can name.
 constexpr float kIndexTol = 1e-3f;
 
-
 // Slots of the fault array: the lowest candidate with a dipole off the grid, and the lowest with
 // one in an unsampled cell.
 enum AdmFault : int { kAdmOffGrid = 0, kAdmUnsampled = 1 };
@@ -373,8 +372,7 @@ __global__ void __launch_bounds__(kBlock)
                      const unsigned char* __restrict__ profile, int n_rho, int n_h, double h0,
                      double cell, unsigned char* __restrict__ mask) {
     const std::int64_t p = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::int64_t n_pts = static_cast<std::int64_t>(g.n[0]) * g.n[1] * g.n[2];
-    if (p >= n_pts) return;
+    if (p >= g.points()) return;
     int ip[3];
     decode_point(p, g, ip);
     const double x = g.origin[0] + ip[0] * g.spacing[0];
@@ -434,15 +432,8 @@ __device__ __forceinline__ void sample_tile(int tile, const float4* s_pos, const
         const float4 sp = s_pos[j];
         float4 sc;
         if constexpr (CHECK) sc = s_cell[j];
-        float wm[4 * wm_vectors<D>()];
-#pragma unroll
-        for (int v = 0; v < wm_vectors<D>(); ++v) {
-            const float4 x = s_wm[j][v];
-            wm[4 * v] = x.x;
-            wm[4 * v + 1] = x.y;
-            wm[4 * v + 2] = x.z;
-            wm[4 * v + 3] = x.w;
-        }
+        cuda::std::array<float, 4 * wm_vectors<D>()> wm;
+        load_row<4 * wm_vectors<D>()>(&s_wm[j][0].x, wm);
 #pragma unroll
         for (int k = 0; k < kSamplePoints; ++k) {
             const float dx = px[k] - sp.x, dy = py[k] - sp.y, dz = pz[k] - sp.z;
@@ -520,7 +511,7 @@ __global__ void __launch_bounds__(kSampleBlock)
             s_pos[i] = make_float4(rx, ry, rz, 0.0f);
             s_cell[i] = make_float4(floorf(sx) - o[0] + 0.5f, floorf(sy) - o[1] + 0.5f,
                                     floorf(sz) - o[2] + 0.5f, 0.0f);
-            float wm[4 * wm_vectors<D>()] = {};
+            cuda::std::array<float, 4 * wm_vectors<D>()> wm{};
 #pragma unroll
             for (int d = 0; d < D; ++d) {
                 const float* wd = w + (static_cast<std::int64_t>(d) * n_src + j) * 3;
@@ -532,10 +523,7 @@ __global__ void __launch_bounds__(kSampleBlock)
                 wm[3 * D + 3 * d + 1] = wz * rx - wx * rz;
                 wm[3 * D + 3 * d + 2] = wx * ry - wy * rx;
             }
-#pragma unroll
-            for (int v = 0; v < wm_vectors<D>(); ++v) {
-                s_wm[i][v] = make_float4(wm[4 * v], wm[4 * v + 1], wm[4 * v + 2], wm[4 * v + 3]);
-            }
+            store_row<4 * wm_vectors<D>()>(&s_wm[i][0].x, wm);
         }
         __syncthreads();
 
