@@ -17,7 +17,6 @@ import platform
 import re
 import subprocess
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import import_module
@@ -100,52 +99,35 @@ def cpu_tag(name: str | None = None) -> str:
 # A desktop idles at a few percent. A game never appears among compute processes, so this is the
 # only trace of one.
 BUSY_PERCENT = 20
-SLOWDOWNS = tuple(
-    f"clocks_throttle_reasons.{r}"
-    for r in (
-        "sw_power_cap",
-        "hw_slowdown",
-        "sw_thermal_slowdown",
-        "hw_thermal_slowdown",
-        "hw_power_brake_slowdown",
-    )
+SLOWDOWNS = (
+    "sw_power_cap",
+    "hw_slowdown",
+    "sw_thermal_slowdown",
+    "hw_thermal_slowdown",
+    "hw_power_brake_slowdown",
 )
 
 
-def _nvidia_smi(device: int, query: str, what: str = "gpu") -> list[list[str]]:
-    import cupy as cp
-
-    # nvidia-smi's indices ignore CUDA_VISIBLE_DEVICES and CUDA's fastest-first order.
-    card = uuid.UUID(bytes=cp.cuda.runtime.getDeviceProperties(device)["uuid"])
-    try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--query-{what}={query}",
-                "--format=csv,noheader,nounits",
-                "-i",
-                f"GPU-{card}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return [[c.strip() for c in line.split(",")] for line in out.strip().splitlines()]
-
-
 def gpu_state(device: int) -> dict:
-    fields = ("driver_version", "clocks.sm", "utilization.gpu", *SLOWDOWNS)
-    rows = _nvidia_smi(device, ",".join(fields))
-    state = dict(zip(fields, rows[0], strict=True)) if rows else {}
-    others = [
-        float(mib)
-        for pid, mib in _nvidia_smi(device, "pid,used_memory", "compute-apps")
-        if int(pid) != os.getpid()
-    ]
-    return state | {"others_mib": others}
+    """The driver, clock, load and slowdowns of ``device``, or nothing when NVML is unavailable."""
+    from cuda.core import Device, system
+    from cuda.core.system.exceptions import NvmlError
+
+    try:
+        nvml = Device(device).to_system_device()
+        return {
+            "driver": ".".join(f"{v:02d}" for v in system.get_kernel_mode_driver_version()),
+            "sm_mhz": nvml.get_clock("sm").get_current_mhz(),
+            "busy_percent": nvml.utilization.gpu,
+            "slowed": [r.value for r in nvml.current_clock_event_reasons if r in SLOWDOWNS],
+            "others_mib": [
+                p.used_gpu_memory / 2**20
+                for p in nvml.compute_running_processes
+                if p.pid != os.getpid()
+            ],
+        }
+    except (NvmlError, RuntimeError):
+        return {}
 
 
 def gpu_tag(device: int) -> str:
@@ -178,8 +160,8 @@ def cunibs_version() -> str:
 
 def _warnings(before: dict, after: dict) -> list[str]:
     out = []
-    busy = before.get("utilization.gpu", "")
-    if busy.isdigit() and int(busy) >= BUSY_PERCENT:
+    busy = before.get("busy_percent", 0)
+    if busy >= BUSY_PERCENT:
         out.append(f"the GPU was {busy}% busy before the run started")
     for when, state in (("start", before), ("end", after)):
         if state.get("others_mib"):
@@ -187,9 +169,8 @@ def _warnings(before: dict, after: dict) -> list[str]:
                 f"{len(state['others_mib'])} other processes held "
                 f"{sum(state['others_mib']):.0f} MiB of the GPU at the {when}"
             )
-        active = [r.split(".")[1] for r in SLOWDOWNS if state.get(r) == "Active"]
-        if active:
-            out.append(f"clocks were slowed at the {when}: {', '.join(active)}")
+        if state.get("slowed"):
+            out.append(f"clocks were slowed at the {when}: {', '.join(state['slowed'])}")
     return out
 
 
@@ -227,8 +208,8 @@ def run(name: str, ctx: Context) -> Path | str:
         "elapsed_s": round(elapsed, 1),
         "system": {
             "gpu": cp.cuda.runtime.getDeviceProperties(ctx.device)["name"].decode(),
-            "gpu_clock_mhz": int(before["clocks.sm"]) if "clocks.sm" in before else None,
-            "driver": before.get("driver_version"),
+            "gpu_clock_mhz": before.get("sm_mhz"),
+            "driver": before.get("driver"),
             "cpu": cpu_name(),
             "cunibs": cunibs_version(),
         },
