@@ -5,17 +5,29 @@ description: cuNIBS installation and system requirements.
 
 ## Install with pip
 
+cuNIBS needs CuPy and the CUDA libraries for one CUDA major version. Choose the extra that matches your system:
+
+| Extra | CUDA libraries |
+| --- | --- |
+| `cu13` | Installed from pip, for a driver that supports CUDA 13 |
+| `cu12` | Installed from pip, for a driver that supports CUDA 12 |
+| `cu13-local` | Taken from a CUDA 13 toolkit already on the machine |
+| `cu12-local` | Taken from a CUDA 12 toolkit already on the machine |
+
 ```bash
-python -m pip install cunibs
+python -m pip install "cunibs[cu13]"
 ```
+
+Install exactly one extra. `pip install cunibs` without an extra installs no CuPy, and `import cunibs` then fails with a message that names the extras. With a `-local` extra, CuPy loads the toolkit's libraries itself. If it cannot find them, see the [CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
 
 ## System requirements
 
 - Linux or Windows on x86-64.
 - CPython 3.12, 3.13, or 3.14, including free-threaded 3.14.
-- An NVIDIA GPU that supports CUDA 13, with an R580 series driver or newer. Run `nvidia-smi` to check the GPU and driver.
+- An NVIDIA GPU with compute capability 6.0 (Pascal) or newer. CUDA 13 does not support GPUs older than 7.5 (Turing), so Pascal and Volta GPUs need `cu12` or `cu12-local`.
+- An NVIDIA driver that supports the chosen CUDA version: R580 or newer for CUDA 13, R525 or newer for CUDA 12. Run `nvidia-smi` to check the GPU and driver.
 
-The package dependencies provide the CUDA runtime libraries. [PyPI release files](https://pypi.org/project/cunibs/#files) · [NVIDIA driver compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html)
+The same wheel serves both CUDA versions. [PyPI release files](https://pypi.org/project/cunibs/#files) · [NVIDIA driver compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html)
 
 ## Verify the installation
 

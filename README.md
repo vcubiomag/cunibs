@@ -31,13 +31,16 @@ milliseconds. Use it to:
 ## Installation
 
 ```bash
-python -m pip install cunibs
+python -m pip install "cunibs[cu13]"
 ```
 
+Choose one extra. `cu13` and `cu12` install the CUDA libraries from pip.
+`cu13-local` and `cu12-local` use a CUDA toolkit that is already installed.
+
 cuNIBS needs Python 3.12 or later, an NVIDIA GPU, and a driver that supports
-CUDA 13 (r580 or later). Wheels are available for x86-64 Linux and Windows, for
-CPython 3.12 through 3.14, including free-threaded Python 3.14. The package
-installs its own CUDA libraries, so a separate CUDA toolkit is not needed.
+CUDA 13 (r580 or later) or CUDA 12 (r525 or later). Wheels are available for
+x86-64 Linux and Windows, for CPython 3.12 through 3.14, including free-threaded
+Python 3.14. The same wheel works with CUDA 12 and CUDA 13.
 
 ## Quick start
 
