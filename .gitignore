@@ -1,12 +1,10 @@
 # Python-generated files
 __pycache__/
-*.py[oc]
+*.py[oci]
 build/
 dist/
 wheels/
 *.egg-info
-
-src/cunibs/solver/_solver_ext.pyi
 
 # Virtual environments
 .venv
@@ -21,3 +19,4 @@ compile_commands.json
 benchmarks/results
 reference_data
 manuscripts
+docs

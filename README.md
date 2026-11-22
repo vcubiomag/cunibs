@@ -5,8 +5,9 @@
 [![image](https://img.shields.io/pypi/pyversions/cunibs.svg)](https://pypi.python.org/pypi/cunibs)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/hero-dark.png">
-  <img alt="cuNIBS. (a) Gray-matter electric field of a MagVenture C-B70 coil at C3. (b) Wall time per task for cuNIBS and SimNIBS 4.6. (c) ROI-mean field from cuNIBS against SimNIBS 4.6 for 400 head-target pairs." src="docs/hero-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/vcubiomag/cunibs/wiki/assets/hero/hero-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://github.com/vcubiomag/cunibs/wiki/assets/hero/hero-light.png">
+  <img alt="cuNIBS. (a) Gray-matter electric field of a MagVenture C-B70 coil at C3. (b) Wall time per task for cuNIBS and SimNIBS 4.6. (c) ROI-mean field from cuNIBS against SimNIBS 4.6 for 400 head-target pairs." src="https://github.com/vcubiomag/cunibs/wiki/assets/hero/hero-light.png">
 </picture>
 
 cuNIBS computes the electric field that transcranial magnetic stimulation (TMS)
@@ -24,9 +25,6 @@ milliseconds. Use it to:
 - run the same analysis across a cohort of subjects,
 - estimate how uncertain tissue conductivities affect the field,
 - find the coil position and orientation that best stimulates a target.
-
-The accompanying manuscript describes the numerical method and its validation
-against analytic solutions and SimNIBS.
 
 ## Installation
 
