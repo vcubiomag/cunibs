@@ -1,0 +1,79 @@
+---
+title: Head models
+description: Tetrahedral head meshes for electric field simulation in cuNIBS.
+---
+
+import { FileTree } from '@astrojs/starlight/components';
+
+A head model represents the anatomy of the head as a three-dimensional mesh. The mesh divides the head into small volumes called tetrahedra. Each tetrahedron has a tissue label, which cuNIBS uses to assign an electrical conductivity. The scalp surface provides the geometry for placing the coil.
+
+## Loading a mesh
+
+To try a simulation before processing your own MRI data, start with the prebuilt Ernie model in [First simulation](../../start/first-simulation/). For your own model, pass the mesh file to `Subject.from_mesh`. This example uses the path that CHARM creates for a subject named `subject01`.
+
+```python
+from cunibs import Subject
+
+subject = Subject.from_mesh("m2m_subject01/subject01.msh")
+```
+
+cuNIBS reads binary Gmsh 2.2 meshes and HDF5 meshes written by `HeadMesh.save`. Coordinates must be in millimetres. For coil placement, the mesh needs a scalp surface with tag `1005`. See the [mesh reference](../../reference/inputs-and-head/#head-meshes) for supported tissue and surface tags.
+
+<details>
+<summary>Generate a head model from MRI with CHARM</summary>
+
+CHARM is the SimNIBS tool that segments MRI images into tissues and builds a tetrahedral head mesh. Follow the [SimNIBS installation guide](https://simnibs.github.io/simnibs/build/html/installation/simnibs_installer.html) to install it.
+
+From a terminal where the `charm` command is available, pass a subject identifier and the structural MRI files:
+
+```bash
+charm subject01 T1w.nii.gz T2w.nii.gz
+```
+
+A T1-weighted scan is sufficient. Add a T2-weighted scan if available to improve the segmentation of the skull. Open `results.html` and inspect the tissue boundaries overlaid on the MRI before using the mesh. [CHARM command reference](https://simnibs.github.io/simnibs/build/html/documentation/command_line/charm.html)
+
+<FileTree>
+- m2m_subject01/
+  - subject01.msh
+  - results.html
+  - eeg_positions/
+    - EEG10-10_UI_Jurak_2007.csv
+</FileTree>
+
+Use `subject01.msh` for simulation and the files in `eeg_positions/` if you want to specify placements using [EEG landmarks](../coordinates/).
+
+</details>
+
+## Mesh validation
+
+`validate_mesh` checks file structure and element geometry before you allocate GPU memory for a solve. It reports errors and warnings separately. A missing scalp surface is a warning because the mesh can be read, but you need that surface to position the coil. Use the segmentation report to assess the anatomical boundaries.
+
+```python
+from cunibs import validate_mesh
+
+report = validate_mesh("m2m_subject01/subject01.msh")
+for warning in report.warnings:
+    print(warning)
+if not report.ok:
+    raise ValueError("\n".join(report.errors))
+```
+
+## HDF5 meshes and landmarks
+
+An HDF5 copy can keep the mesh and cap coordinates together. Pass the CHARM `eeg_positions` directory when saving, then use the same HDF5 file to load the model and read the landmarks.
+
+```python
+from pathlib import Path
+
+from cunibs import Subject, load_mesh
+from cunibs.head import read_subject_cap
+
+model_dir = Path("m2m_subject01")
+output = Path("subject01.h5")
+
+mesh = load_mesh(model_dir / "subject01.msh")
+mesh.save(output, eeg_positions=model_dir / "eeg_positions")
+
+subject = Subject.from_mesh(output)
+cap = read_subject_cap(output)
+```

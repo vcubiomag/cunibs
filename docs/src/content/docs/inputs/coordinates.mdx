@@ -1,0 +1,41 @@
+---
+title: Coordinates and landmarks
+description: Mesh coordinates, coil placement, and anatomical landmarks.
+---
+
+import StudyFigure from '../../../components/StudyFigure.astro';
+
+The position of a coil or cortical target is meaningful only in relation to a particular head model. cuNIBS takes XYZ points in millimetres in that model's coordinate system. Map points from MRI voxel indices, an atlas, or another subject into the current mesh before using them.
+
+## EEG landmarks
+
+The cap files that CHARM writes use the coordinates of the mesh in the same subject directory. Use two landmarks to reproduce a placement relative to the same sites on different heads.
+
+```python
+from cunibs import Placement
+from cunibs.head import find_cap, read_fiducials, read_subject_cap
+
+cap = read_subject_cap("m2m_ernie")
+fiducials = read_fiducials(find_cap("m2m_ernie"))
+placement = Placement(cap["C3"], cap["Cz"], distance_mm=4.0)
+```
+
+The default cap is `EEG10-10_UI_Jurak_2007`. Supply `cap=` to read a different montage. Electrode positions include the reference electrode, usually Cz. Fiducials such as Nz, Iz, LPA, and RPA are returned separately.
+
+## Coil placement
+
+| Parameter | Meaning |
+| --- | --- |
+| `center_mm` | The point cuNIBS projects to the nearest location on the scalp surface. |
+| `handle_mm` | A second point in the same coordinate system. Its direction from the projected centre is projected into the scalp tangent plane. |
+| `distance_mm` | How far to offset the coil origin outward from the scalp along the surface normal. The default is 4 mm. |
+
+<StudyFigure kind="placement" alt="Side view of a coil above a curved scalp, with the gap perpendicular to the scalp and an arrow showing the handle direction.">
+  The coil gap is measured along the outward normal at the projected scalp point.
+</StudyFigure>
+
+If cuNIBS reports a degenerate placement, move the handle point sideways relative to the scalp normal. The projected centre and a point directly on its normal cannot define a direction in the tangent plane.
+
+## Cortical depth
+
+`head.project_to_scalp` gives you the projected point and inward unit normal. `head.depth_to_surface_mm` measures from that point along that normal until it intersects the requested tissue surface. The default surface is gray matter. Use [the regional and depth guide](../../guides/region-and-depth/) to turn these measurements into field probes.

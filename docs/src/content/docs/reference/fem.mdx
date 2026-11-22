@@ -1,0 +1,33 @@
+---
+title: Finite-element solver
+description: The low-level finite-element interface in cunibs.fem.
+---
+
+Use `cunibs.fem` when you need direct CuPy arrays or control over the finite-element solve. The [Subject API](../simulation/) handles context caching, memory management, compact summaries, and conversion to NumPy.
+
+## Solver context and placement solves
+
+| API | Purpose |
+| --- | --- |
+| `build_context(mesh)` | Build a `SolverContext` with reordered mesh arrays, scalp geometry, the finite-element operators, and the GPU solver. |
+| `solve_placement(ctx, dip_pos_m, dip_moment, center_mm, handle_mm, distance_mm, didt, ...)` | Solve one placement. Returns a `PlacementResult` with device arrays and a host coil transform. |
+| `solve_placements_block(ctx, dip_pos_m, dip_moment, sites, didt, ...)` | Solve up to `MAX_BLOCK` placements. Each site is a centre, handle, and gap tuple. Returns a list in site order. |
+| `solve_grounded(solver, b, *, tolerance=None, max_iters=None)` | Solve one right-hand side with one entry per mesh node. Returns the potential and `ColumnTelemetry`. |
+| `ensure_sweep_basis(ctx, coil, size=128)` | Build or return the context's basis for estimating initial guesses on later forward solves. |
+
+The placement solvers return the raw field unless you provide a prebuilt recovery operator. They compute field magnitude and, by default, also return field vectors and potential. They accept `vectors=False` or `potential=False` to omit those arrays. The block solver also accepts precomputed transforms and a recovery tissue restriction. When restricting recovery, only read field values in the requested tissues.
+
+`ColumnTelemetry` describes the iteration count and relative residual for an individual right-hand side. If a solve still misses tolerance after retrying, the solver raises `SolverConvergenceError`.
+
+## Coil transforms and source field
+
+- `compute_coil_transform(ctx, center_mm, handle_mm, distance_mm)` returns one NumPy coil-to-head affine. `compute_coil_transforms(ctx, centers_mm, handles_mm, distances_mm)` returns a CuPy array of affines with translations in mm. For the batched version, send paired arrays of shape `(P, 3)` and one gap or one per placement. With `handles_mm=None`, the in-plane axes use a deterministic default.
+- `coil_dadt_at_nodes` and `coil_dadt_block` evaluate the rate of change of the coil vector potential at mesh nodes, in V/m. The dipole positions are in metres and the affine translations are in mm.
+
+## Recovery operators
+
+`RECOVERY_MODES` lists the accepted `Recovery` values. `validate_recovery(recovery)` checks the mode. `TISSUE_SLOT_MODES` contains the modes with one value per node and tissue pair. `TISSUE_CONDUCTIVITY` maps volume tags to nominal conductivity in S/m.
+
+`ensure_recovery(ctx, mode, tissues=None)` builds or retrieves a `RecoveryOperator` for a recovered mode. For a raw solve, pass `recovery=None` to the low-level placement solver. `apply_recovery(op, n_tet, ...)` applies an existing operator and allocates its outputs. Pass element fields for the SPR modes, or nodal potential and coil vector-potential derivative for harmonic recovery. `outer_boundary_nodes` and `tissue_boundary_nodes` mark mesh nodes used by boundary-aware recovery.
+
+See [Methods and reproducibility](../methods-and-reproducibility/) for how the recovery modes differ.

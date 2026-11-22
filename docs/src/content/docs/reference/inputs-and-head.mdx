@@ -1,0 +1,60 @@
+---
+title: Meshes, coils, and head geometry
+description: File readers, tissue tags, coil data, cap positions, and measurements on the head surface.
+---
+
+## Head meshes
+
+| API | Purpose |
+| --- | --- |
+| `load_mesh(mesh_file)` | Read binary Gmsh 2.2 or a cuNIBS HDF5 mesh into a `HeadMesh`. |
+| `validate_mesh(mesh_file)` | Return a `MeshReport` with `ok`, errors, warnings, counts, a bounding box in mm, and element quality statistics. |
+| `HeadMesh(nodes_mm, tet_nodes, tet_tags, surf_tris, surf_tags, *, validate=True)` | Construct a mesh from arrays with zero-based node indices. |
+| `mesh.surface(tag, *, host=True)` | Return node indices for triangles with a given surface tag. With `host=False`, the result stays on the mesh's storage backend. |
+| `mesh.save(path, *, eeg_positions=None)` | Write `.msh`, `.h5`, or `.hdf5`. To embed cap CSV files, use HDF5 and pass one CSV or the CHARM cap directory. |
+
+The coordinate array `nodes_mm` has shape `(n_nodes, 3)`. Connectivity arrays `tet_nodes` and `surf_tris` have four and three indices per row. Tag arrays `tet_tags` and `surf_tags` have one entry per row. `tet_barycenters_mm` gives the centre of each tetrahedron. `skin_tris` selects the scalp triangles. `n_nodes`, `n_tets`, and `surface_tags` describe mesh contents. `content_hash` identifies the mesh arrays.
+
+### Tissue labels and tags
+
+Use the label strings for tissue selections. `"all"` is supported by volume metrics and ROIs. Geometry functions that need one tissue surface take an individual label.
+
+| Label | Volume tag | Surface tag | Nominal conductivity (S/m) |
+| --- | ---: | ---: | ---: |
+| `white_matter` | 1 | 1001 | 0.126 |
+| `gray_matter` | 2 | 1002 | 0.275 |
+| `csf` | 3 | 1003 | 1.654 |
+| `average_bone` | 4 | 1004 | 0.010 |
+| `scalp` | 5 | 1005 | 0.465 |
+| `eye_balls` | 6 | 1006 | 0.500 |
+| `cortical_bone` | 7 | 1007 | 0.008 |
+| `cancellous_bone` | 8 | 1008 | 0.025 |
+| `blood` | 9 | 1009 | 0.600 |
+| `muscle` | 10 | 1010 | 0.160 |
+
+Surface tag 1099 denotes internal air. Volume tags outside the table are rejected by the mesh reader.
+
+## Coils
+
+- `Coil.load(source)` loads a bundled model name, a SimNIBS `.ccd` file, or a cuNIBS HDF5 dipole file.
+- `bundled_coils()` returns a mapping from exact model names to packaged paths.
+- `Coil(positions_m, moments, name="", didt_max=None, metadata=None)` takes finite arrays of shape `(n_dipoles, 3)`. Positions are in metres and magnetic moments are in A·m². `didt_max` is metadata in A/s.
+- `cunibs.coil.encode_ccd(ccd_file, output_h5)` writes a `dipoles` dataset with six columns, three positions followed by three moments. The loader reads metadata from dataset attributes. For the `dIdtmax` attribute in a coil file, use A/µs.
+
+## `cunibs.head`
+
+These functions are in `cunibs.head`. Functions that operate on geometry accept a `Subject` or a `SolverContext`.
+
+| Function | Returns |
+| --- | --- |
+| `find_cap(m2m_dir, cap=DEFAULT_CAP)` | Path to a cap CSV under the CHARM directory. |
+| `read_cap(path, cap=DEFAULT_CAP)` | Electrode label to XYZ in mm from a cap CSV or HDF5 mesh with embedded cap data. |
+| `read_fiducials(path, cap=DEFAULT_CAP)` | Fiducial label to XYZ in mm from the same sources. |
+| `read_subject_cap(subject, cap=DEFAULT_CAP)` | Electrode coordinates from a CHARM directory or an HDF5 mesh with embedded cap data. |
+| `project_to_scalp(subject, points_mm)` | Projected points in mm and inward unit normals. Both arrays have shape `(n_points, 3)`. |
+| `depth_to_surface_mm(subject, points_mm, region="gray_matter")` | Distances to the first intersection with the named surface along the inward normal. |
+| `tissue_depths_mm(subject, points_mm, regions)` | A dictionary of surface distances from the same projections and normals. |
+| `tissue_thickness_mm(subject, points_mm, outer, inner)` | Difference between the inward distances to two surfaces. Give the surface reached first as `outer`. |
+| `scalp_grid(subject, center_mm, radius_mm=20.0, spacing_mm=2.0)` | A `ScalpGrid` with candidate centres, the projected centre, and requested and achieved spacing. |
+
+`DEFAULT_CAP` is `"EEG10-10_UI_Jurak_2007"`. Depth measurements return `NaN` when the inward ray misses a surface. A surface tag missing from the mesh raises `KeyError`. The achieved candidate spacing is the median nearest-neighbour distance. Use the grid directly as the candidate input to `adm.optimize`.

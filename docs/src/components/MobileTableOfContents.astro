@@ -1,0 +1,230 @@
+---
+import TocList from './TocList.astro';
+
+const { toc, entry } = Astro.locals.starlightRoute;
+const label = Astro.locals.t('tableOfContents.onThisPage');
+---
+
+{
+	toc && (
+		<page-bar>
+			<div class="bar" inert>
+				<a class="page-link" href="#_top">
+					{entry.data.title}
+				</a>
+				<span class="separator" aria-hidden="true">
+					/
+				</span>
+				<details class="sections">
+					<summary aria-label={label}>
+						<span class="current" data-current>
+							{toc.items[0]?.text}
+						</span>
+					</summary>
+					<nav class="dropdown" aria-label={label}>
+						<TocList items={toc.items} />
+					</nav>
+				</details>
+			</div>
+		</page-bar>
+	)
+}
+
+<script>
+	import { observeActiveHeading } from '../lib/active-heading';
+
+	const targetId = (link: HTMLAnchorElement) => decodeURIComponent(link.hash.slice(1));
+
+	class PageBar extends HTMLElement {
+		#bar = this.querySelector<HTMLElement>('.bar')!;
+		#details = this.querySelector('details')!;
+		#summary = this.querySelector('summary')!;
+		#current = this.querySelector<HTMLElement>('[data-current]')!;
+		#links = [...this.querySelectorAll<HTMLAnchorElement>('.dropdown a')];
+		#frame = 0;
+		#stopObserving?: () => void;
+
+		#scheduleVisibility = () => {
+			this.#frame ||= requestAnimationFrame(() => {
+				this.#frame = 0;
+				this.#updateVisibility();
+			});
+		};
+
+		#closeOnOutsideClick = (event: MouseEvent) => {
+			if (!this.#details.contains(event.target as Node)) this.#details.open = false;
+		};
+
+		#closeOnEscape = (event: KeyboardEvent) => {
+			if (event.key !== 'Escape' || !this.#details.open) return;
+			const hadFocus = this.#details.contains(document.activeElement);
+			this.#details.open = false;
+			if (hadFocus) this.#summary.focus();
+		};
+
+		connectedCallback() {
+			addEventListener('scroll', this.#scheduleVisibility, { passive: true });
+			addEventListener('resize', this.#scheduleVisibility, { passive: true });
+			addEventListener('click', this.#closeOnOutsideClick);
+			addEventListener('keydown', this.#closeOnEscape);
+			for (const link of this.#links) {
+				link.addEventListener('click', () => (this.#details.open = false));
+			}
+			this.#stopObserving = observeActiveHeading(this.#links.map(targetId), (id) => this.#activate(id));
+			this.#updateVisibility();
+		}
+
+		disconnectedCallback() {
+			removeEventListener('scroll', this.#scheduleVisibility);
+			removeEventListener('resize', this.#scheduleVisibility);
+			removeEventListener('click', this.#closeOnOutsideClick);
+			removeEventListener('keydown', this.#closeOnEscape);
+			cancelAnimationFrame(this.#frame);
+			this.#stopObserving?.();
+		}
+
+		#activate(id: string | null) {
+			const active = this.#links.find((link) => targetId(link) === id);
+			for (const link of this.#links) {
+				if (link === active) link.setAttribute('aria-current', 'location');
+				else link.removeAttribute('aria-current');
+			}
+			this.#current.textContent = active?.textContent ?? '';
+		}
+
+		#updateVisibility() {
+			const title = document.getElementById('_top');
+			const visible =
+				!title || title.getBoundingClientRect().bottom <= this.#bar.getBoundingClientRect().bottom;
+			this.toggleAttribute('data-visible', visible);
+			this.#bar.inert = !visible;
+			if (!visible) this.#details.open = false;
+		}
+	}
+
+	customElements.define('page-bar', PageBar);
+</script>
+
+<style>
+	@layer cunibs {
+		.bar {
+			position: fixed;
+			z-index: var(--sl-z-index-toc);
+			top: var(--sl-nav-height);
+			inset-inline: 0;
+			display: flex;
+			align-items: center;
+			gap: 0.5rem;
+			height: var(--sl-mobile-toc-height);
+			padding-inline: var(--sl-nav-pad-x);
+			border-bottom: 1px solid var(--sl-color-hairline);
+			background-color: var(--sl-color-bg-nav);
+			font-size: var(--sl-text-sm);
+			color: var(--sl-color-gray-3);
+			opacity: 0;
+			pointer-events: none;
+			transition: opacity var(--cunibs-duration-base) ease-out;
+		}
+		@media (min-width: 50rem) {
+			.bar {
+				inset-inline-start: var(--sl-content-inline-start, 0);
+			}
+		}
+		page-bar[data-visible] .bar {
+			opacity: 1;
+			pointer-events: auto;
+		}
+		@media (prefers-reduced-motion: reduce) {
+			.bar {
+				transition: none;
+			}
+		}
+
+		.page-link {
+			/* Truncate the page title before the current section. */
+			flex-shrink: 9999;
+			min-width: 2.5rem;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			color: inherit;
+			text-decoration: none;
+		}
+		.page-link:hover {
+			color: var(--sl-color-white);
+		}
+
+		.separator {
+			flex-shrink: 0;
+			color: var(--sl-color-gray-4);
+		}
+
+		.sections {
+			min-width: 0;
+		}
+
+		summary {
+			display: flex;
+			align-items: center;
+			gap: 0.25rem;
+			height: var(--cunibs-control-height);
+			padding: 0 0.375rem;
+			border-radius: var(--cunibs-radius);
+			color: var(--sl-color-white);
+			cursor: pointer;
+			list-style: none;
+		}
+		summary::-webkit-details-marker {
+			display: none;
+		}
+		summary:hover {
+			background-color: var(--cunibs-fill-hover);
+		}
+		summary::after {
+			content: '';
+			flex-shrink: 0;
+			width: 1rem;
+			height: 1rem;
+			background-color: var(--sl-color-gray-3);
+			mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1 1 0 0 0 1.42 0L17 10.59a1 1 0 0 0 0-1.42Z'/%3E%3C/svg%3E")
+				center / contain no-repeat;
+			transition: rotate var(--cunibs-duration-base) ease-out;
+		}
+		details[open] summary::after {
+			rotate: 180deg;
+		}
+
+		.current {
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+
+		.dropdown {
+			position: absolute;
+			top: calc(100% + 0.25rem);
+			inset-inline: var(--sl-nav-pad-x);
+			max-height: calc(85vh - var(--sl-nav-height) - var(--sl-mobile-toc-height));
+			overflow-y: auto;
+			overscroll-behavior: contain;
+			padding: 0.25rem;
+			border: 1px solid var(--sl-color-hairline-light);
+			border-radius: var(--cunibs-radius-card);
+			background-color: var(--cunibs-surface-raised);
+			box-shadow: var(--sl-shadow-md);
+		}
+		.dropdown :global(a) {
+			padding-block: 0.5rem;
+			padding-inline: calc(0.75rem + var(--depth) * 0.75rem) 0.75rem;
+			border-radius: var(--cunibs-radius);
+			color: var(--sl-color-gray-2);
+		}
+		.dropdown :global(a:hover) {
+			background-color: var(--cunibs-fill-hover);
+		}
+		.dropdown :global(a[aria-current]) {
+			background-color: var(--cunibs-fill-selected);
+			color: var(--sl-color-white);
+		}
+	}
+</style>

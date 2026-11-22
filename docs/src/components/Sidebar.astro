@@ -1,0 +1,153 @@
+---
+import { Badge } from '@astrojs/starlight/components';
+import MobileMenuFooter from '@astrojs/starlight/components/MobileMenuFooter.astro';
+import SidebarPersister from '@astrojs/starlight/components/SidebarPersister.astro';
+import SidebarSublist from '@astrojs/starlight/components/SidebarSublist.astro';
+import type { SidebarEntry, SidebarGroup } from '../lib/sidebar';
+import SearchField from './SearchField.astro';
+
+type Section = { group: SidebarGroup } | { links: SidebarEntry[] };
+
+// Only top-level groups are custom (static headings); Starlight renders everything below them.
+const sections = Astro.locals.starlightRoute.sidebar.reduce<Section[]>((sections, entry) => {
+	const last = sections.at(-1);
+	if (entry.type === 'group') sections.push({ group: entry });
+	else if (last && 'links' in last) last.links.push(entry);
+	else sections.push({ links: [entry] });
+	return sections;
+}, []);
+---
+
+<div class="search"><SearchField /></div>
+
+<SidebarPersister>
+	<div class="nav">
+		{
+			sections.map((section) =>
+				'group' in section ? (
+					<div class="section">
+						<p class="section-label">
+							{section.group.label}
+							{section.group.badge && <Badge {...section.group.badge} />}
+						</p>
+						<SidebarSublist sublist={section.group.entries} nested />
+					</div>
+				) : (
+					<SidebarSublist sublist={section.links} nested />
+				)
+			)
+		}
+	</div>
+</SidebarPersister>
+
+<div class="footer md:sl-hidden"><MobileMenuFooter /></div>
+
+<style>
+	@layer cunibs {
+		.search,
+		.footer {
+			position: sticky;
+			z-index: 1;
+			margin-inline: calc(-1 * var(--sl-sidebar-pad-x));
+			padding-inline: var(--sl-sidebar-pad-x);
+			background-color: var(--sl-color-bg-sidebar);
+		}
+		.search {
+			top: 0;
+			margin-top: -1rem;
+			padding-block: 0.75rem;
+			border-bottom: 1px solid var(--sl-color-hairline);
+		}
+		.footer {
+			bottom: 0;
+			margin-top: auto;
+		}
+		.footer :global(.mobile-preferences) {
+			align-items: center;
+			padding: 0.75rem 0.5rem;
+			border-top-color: var(--sl-color-hairline);
+		}
+		.footer :global(.social-icons) {
+			gap: 0.25rem;
+			padding-block: 0;
+		}
+
+		.nav {
+			display: flex;
+			flex-direction: column;
+			gap: 1rem;
+		}
+
+		.section-label {
+			display: flex;
+			align-items: center;
+			gap: 0.5rem;
+			min-height: var(--cunibs-control-height);
+			margin: 0;
+			padding: 0.375rem 0.5rem;
+			font-size: var(--sl-text-sm);
+			font-weight: 500;
+			line-height: 1.25rem;
+			color: var(--sl-color-white);
+		}
+
+		.nav :global(ul) {
+			display: flex;
+			flex-direction: column;
+			gap: 0.125rem;
+		}
+		.nav :global(ul ul) {
+			margin-top: 0.125rem;
+		}
+		.nav :global(ul ul li) {
+			margin-inline-start: 0.75rem;
+			border-inline-start: 0;
+			padding-inline-start: 0;
+		}
+
+		.nav :global(a),
+		.nav :global(summary) {
+			display: flex;
+			align-items: center;
+			gap: 0.5rem;
+			min-height: var(--cunibs-control-height);
+			padding: 0.375rem 0.5rem;
+			border-radius: var(--cunibs-radius);
+			font-size: var(--sl-text-sm);
+			line-height: 1.25rem;
+			color: var(--sl-color-gray-2);
+			transition: background-color var(--cunibs-duration-fast) ease-out;
+		}
+		.nav :global(a:hover),
+		.nav :global(summary:hover) {
+			background-color: var(--cunibs-fill-hover);
+		}
+		.nav :global(a[aria-current='page']),
+		.nav :global(a[aria-current='page']:hover) {
+			font-weight: 400;
+			color: var(--sl-color-white);
+			background-color: var(--cunibs-fill-selected);
+		}
+		.nav :global(summary .large) {
+			font-size: inherit;
+			font-weight: inherit;
+			color: inherit;
+		}
+		.nav :global(.caret) {
+			color: var(--sl-color-gray-3);
+		}
+
+		@media (prefers-reduced-motion: no-preference) {
+			.nav :global(details::details-content) {
+				block-size: 0;
+				overflow: clip;
+				transition:
+					block-size var(--cunibs-duration-base) ease-out,
+					content-visibility var(--cunibs-duration-base) allow-discrete;
+			}
+			.nav :global(details[open]::details-content) {
+				block-size: auto;
+			}
+		}
+	}
+</style>

@@ -1,0 +1,78 @@
+---
+title: Process a cohort
+description: Coil placement analysis across subject-specific head models.
+---
+
+import { FileTree } from '@astrojs/starlight/components';
+
+When comparing TMS fields across a cohort, use the same placement rule on each subject's anatomy. This example places the coil over C3 and C4 using each subject's own EEG landmarks. The coil, gap, current slope, and field recovery are fixed across runs.
+
+<FileTree>
+- subjects/
+  - m2m_subject01/
+    - subject01.msh
+    - eeg_positions/
+      - EEG10-10_UI_Jurak_2007.csv
+  - m2m_subject02/
+    - subject02.msh
+    - eeg_positions/
+      - EEG10-10_UI_Jurak_2007.csv
+</FileTree>
+
+## Cohort simulation
+
+Inspect the CHARM segmentations first. The script checks each mesh and reads its cap landmarks, then uses one GPU solver context per subject. It reports subjects it skips and writes one row per simulated placement.
+
+```python
+import csv
+from pathlib import Path
+
+from cunibs import Coil, Placement, Subject, validate_mesh
+from cunibs.head import read_subject_cap
+
+model_dirs = sorted(Path("subjects").glob("m2m_*"))
+if not model_dirs:
+    raise FileNotFoundError("Expected CHARM folders under subjects/")
+
+coil = Coil.load("MagStim_D70")
+labels = ("C3", "C4")
+
+with Path("cohort_fields.csv").open("w", newline="") as file:
+    writer = csv.writer(file)
+    writer.writerow(["subject", "site", "peak_V_per_m", "focality_50_cm3"])
+
+    for model_dir in model_dirs:
+        subject_id = model_dir.name.removeprefix("m2m_")
+        mesh_path = model_dir / f"{subject_id}.msh"
+        report = validate_mesh(mesh_path)
+        for warning in report.warnings:
+            print(f"{subject_id}: {warning}")
+        if not report.ok or report.n_skin_tris == 0:
+            reason = " | ".join(report.errors) or "missing scalp surface"
+            print(f"Skipping {subject_id}: {reason}")
+            continue
+        if 2 not in report.tag_counts:
+            print(f"Skipping {subject_id}: missing gray matter")
+            continue
+
+        try:
+            cap = read_subject_cap(model_dir)
+            placements = [Placement(cap[label], cap["Cz"]) for label in labels]
+        except (KeyError, ValueError, OSError) as error:
+            print(f"Skipping {subject_id}: {error}")
+            continue
+
+        with Subject.from_mesh(mesh_path) as subject:
+            results = subject.iter_simulate(coil, placements, didt=1.0e6)
+            for label, result in zip(labels, results, strict=True):
+                writer.writerow([
+                    subject_id,
+                    label,
+                    result.peak_magnE(),
+                    result.focality(0.5) * 1e6,
+                ])
+```
+
+The context manager releases the subject's cached GPU state after its placements finish. The output has columns `subject`, `site`, `peak_V_per_m`, and `focality_50_cm3`. Each included subject contributes a row for each site.
+
+Keep a record of any skipped subjects and the reasons for exclusion alongside the CSV. If your analysis uses anatomical regions, resolve each region on its own subject's mesh. See [Save and reuse results](../../results/save-and-reuse/) to retain per-placement HDF5 files and [Methods and reproducibility](../../reference/methods-and-reproducibility/) for study settings to record.

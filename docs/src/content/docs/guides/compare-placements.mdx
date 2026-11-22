@@ -1,0 +1,68 @@
+---
+title: Compare coil placements
+description: Electric field comparisons across coil orientations on the same head model.
+---
+
+How does the field change when the coil rotates about the same scalp point? To isolate orientation, hold the coil model, position, gap, and current slope fixed. This example compares the gray matter peak and 99th percentile across six orientations on the Ernie head model from [First simulation](../../start/first-simulation/).
+
+## Orientation sweep
+
+Use the direction from C3 toward Cz as the zero angle. Project that direction into the tangent plane at C3, then rotate it about the local scalp normal. Pass the resulting placements to `iter_simulate`, which reuses the solver setup and yields one result per angle.
+
+```python
+import csv
+
+import numpy as np
+from cunibs import Coil, Placement, Subject
+from cunibs.head import project_to_scalp, read_subject_cap
+
+model_dir = "m2m_ernie"
+cap = read_subject_cap(model_dir)
+coil = Coil.load("MagStim_D70")
+angles_deg = [0, 30, 60, 90, 120, 150]
+
+with Subject.from_mesh(f"{model_dir}/ernie.msh") as subject:
+    points, inward_normals = project_to_scalp(subject, cap["C3"])
+    center, inward = points[0], inward_normals[0]
+    toward_cz = cap["Cz"] - center
+    axis = toward_cz - np.dot(toward_cz, inward) * inward
+    axis /= np.linalg.norm(axis)
+    cross_axis = np.cross(inward, axis)
+
+    placements = []
+    for angle in np.deg2rad(angles_deg):
+        direction = np.cos(angle) * axis + np.sin(angle) * cross_axis
+        placements.append(Placement(center, center + 50 * direction, distance_mm=4.0))
+
+    with open("angle_sweep.csv", "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["angle_deg", "peak_V_per_m", "p99_V_per_m"])
+        results = subject.iter_simulate(coil, placements, didt=1.0e6)
+        for angle, result in zip(angles_deg, results, strict=True):
+            writer.writerow([
+                angle,
+                result.peak_magnE(),
+                result.summary["distribution"]["p99"],
+            ])
+```
+
+Results arrive in the order the placements were given. For a position sweep, construct one `Placement` for each scalp point and choose a handle direction at each location.
+
+## Field strength by orientation
+
+Open the CSV in a spreadsheet or plot it with Matplotlib. Install Matplotlib with `python -m pip install matplotlib` to run this plot and the plots in later guides.
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+data = np.genfromtxt("angle_sweep.csv", delimiter=",", names=True)
+fig, ax = plt.subplots(layout="constrained")
+ax.plot(data["angle_deg"], data["peak_V_per_m"], marker="o", label="Peak")
+ax.plot(data["angle_deg"], data["p99_V_per_m"], marker="s", label="99th percentile")
+ax.set(xlabel="Handle angle from Cz direction (degrees)", ylabel="Gray matter field (V/m)")
+ax.legend()
+fig.savefig("angle_sweep.png", dpi=180)
+```
+
+For dense sweeps, consume results as they arrive and retain only what you need. If you plan several hundred placements on one head, see [sweep setup and reproducibility](../../reference/methods-and-reproducibility/#placement-sweeps). If your study compares a particular cortical region, record the same region across all placements using [regional measurements](../region-and-depth/).

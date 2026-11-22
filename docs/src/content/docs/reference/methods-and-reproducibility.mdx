@@ -1,0 +1,60 @@
+---
+title: Methods and reproducibility
+description: Finite-element formulation, field recovery, and reproducibility in cuNIBS.
+---
+
+## Finite-element formulation
+
+cuNIBS reads a tetrahedral volume mesh with tissue labels. It assigns one nominal isotropic conductivity per tissue. The coil is represented by magnetic dipoles. A finite-element solve estimates the scalar potential in the head. The electric field combines the potential gradient with the rate of change of the vector potential from the coil. [Nominal tissue conductivities](../inputs-and-head/#tissue-labels-and-tags)
+
+<details>
+<summary>Solver details</summary>
+
+The solver uses piecewise linear basis functions on tetrahedra. It fixes a potential reference to solve the grounded system and uses preconditioned conjugate gradients with an algebraic multigrid hierarchy on the GPU. The default stopping criterion is a relative residual of `1e-5`. For placement sweeps, multiple right-hand sides can share the same operator while each placement converges independently.
+
+</details>
+
+## Field recovery
+
+Recovery determines the reported field from the finite-element solution. Use the same mode when comparing results.
+
+| Mode | Field used for the output |
+| --- | --- |
+| `"harmonic"` | Default. Fits a harmonic potential within each tissue and uses its gradient to recover the field. It keeps distinct values on the two sides of a tissue interface. |
+| `"raw"` | One constant field vector per tetrahedron from the solve. Use it for direct comparisons with the ADM objective. |
+| `"spr_tissue"` | Fits the element field within each tissue using superconvergent patch recovery (SPR). Use it for comparisons with the corresponding tissue-specific SimNIBS interpolated outputs. |
+| `"spr_global"` | Fits the element field across tissue boundaries. Useful for comparisons with continuous interpolation in SimNIBS. |
+
+<details>
+<summary>Why tissue interfaces matter</summary>
+
+When conductivity changes between tissues, the normal component of the electric field can change abruptly. A fit across the interface smooths that change. Harmonic recovery and tissue-specific SPR fit the two tissues independently. Harmonic recovery uses the fact that the potential is harmonic within a constant-conductivity tissue under the TMS formulation.
+
+</details>
+
+## Placement sweeps
+
+Reuse one `Subject` for a sweep. The solver context and recovery operators are built as needed. Processing placements in a different order or grouping them into different batches leaves an individual placement's calculation unchanged on the same hardware and software.
+
+`subject.prepare_sweep(coil, size=128)` is optional. It builds an initial-guess basis from additional solves and retains one device vector per basis entry. It can help for several hundred placements and has an upfront time and memory cost. Set it before the first solve if you will compare results from the same sweep. A prepared basis can shift results within tolerance. Call `subject.free()` before preparing a different basis.
+
+## Reproducibility
+
+| Record | Examples |
+| --- | --- |
+| Inputs | Original mesh, coil file or exact bundled model name, coordinate mapping, centre, handle, gap, and `didt` in A/s. |
+| Field calculation | Recovery mode, solver tolerance, and sweep basis settings if used. |
+| Analysis | Tissue label, ROI centre and radius, threshold definition, and which arrays were retained. |
+| Uncertainty | Distribution, tissue selection, CoVs, sample count, and seed. |
+| Optimization | Target and direction, candidate centres, coil gap, interpolation spacing and margin, and angular settings. |
+| Environment | cuNIBS version, dependency versions, CUDA driver and runtime, and GPU model. |
+
+HDF5 results store many of these fields in their metadata. Record analysis-specific choices separately, particularly how you generated regions, candidate sets, and study inputs. Results can differ across GPU models, CUDA versions, or changes to the library.
+
+## Validation
+
+The repository contains benchmarks for analytic models, tissue interfaces, accuracy and timing comparisons with SimNIBS, repeated solves, and ADM comparisons against forward solves. The overview figure summarizes selected runs. When reporting performance, include the hardware, mesh, requested outputs, and whether solver setup is included. [Benchmark source](https://github.com/vcubiomag/cunibs/tree/main/benchmarks)
+
+- For coil models and their validation, see the [Drakaki et al. coil database paper](https://doi.org/10.1016/j.brs.2022.04.017).
+- For the reciprocity-based search, see the [Gomez et al. ADM paper](https://doi.org/10.1016/j.neuroimage.2020.117696).
+- For subject-specific head modeling, see the [SimNIBS CHARM documentation](https://simnibs.github.io/simnibs/build/html/documentation/command_line/charm.html).

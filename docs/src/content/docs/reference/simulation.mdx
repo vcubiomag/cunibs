@@ -1,0 +1,67 @@
+---
+title: Simulation
+description: Parameters and return values for loading a subject, simulating placements, and recording regions.
+---
+
+Import `Subject`, `Placement`, and `Coil` from `cunibs`. See [First simulation](../../start/first-simulation/) for a complete example.
+
+## `Placement`
+
+```python
+Placement(center_mm, handle_mm, distance_mm=4.0)
+```
+
+The centre and handle are finite XYZ points in mesh coordinates. The centre is projected onto the scalp. The handle point defines a tangent direction from that projection. An identical centre and handle is rejected at creation. A handle on the projected centre's normal is rejected when cuNIBS computes the placement. See [Coordinates and landmarks](../../inputs/coordinates/).
+
+## `Subject`
+
+| API | Purpose |
+| --- | --- |
+| `Subject(mesh)` | Create a subject from a `HeadMesh`. |
+| `Subject.from_mesh(mesh_file)` | Load a supported file and create a subject. |
+| `subject.mesh` | Get the mesh in result order. Creates the GPU context on first access. |
+| `subject.element_order`, `subject.node_order` | Map result-order indices to indices in the loaded mesh. |
+| `subject.context` | Access the lazily created GPU solver context for advanced use. |
+| `subject.free()` | Release cached GPU state. A later call rebuilds the state as needed. |
+| `with Subject.from_mesh(path) as subject:` | Call `free()` at the end of the block. |
+
+A reference to a device array or context can keep that allocation alive after `free()`. Reuse one subject for repeated solves on the same head.
+
+## `Subject.simulate` and `Subject.iter_simulate`
+
+```python
+def simulate(
+    self, coil, placement, didt=1e6, *,
+    magnitude=False, vectors=False, potential=False, nodal=False,
+    recovery="harmonic", record_rois={},
+) -> FieldResult: ...
+
+def iter_simulate(
+    self, coil, placements, didt=1e6, *,
+    magnitude=False, vectors=False, potential=False, nodal=False,
+    recovery="harmonic", record_rois={},
+) -> Iterator[FieldResult]: ...
+```
+
+### Parameters
+
+| Parameter | Description |
+| --- | --- |
+| `coil` | Coil model used for all placements. |
+| `placement`, `placements` | One `Placement` for `simulate`, or a sequence of placements for `iter_simulate`. |
+| `didt` | Finite rate of change of coil current in A/s. |
+| `magnitude`, `vectors`, `potential`, `nodal` | Flags that select which field arrays to retain. |
+| `recovery` | [Field recovery mode](../methods-and-reproducibility/#field-recovery) used for the summary and retained fields. |
+| `record_rois` | Mapping from names to resolved regions of interest on this subject. |
+
+### Returns
+
+`simulate` returns a [`FieldResult`](../results-and-metrics/). `iter_simulate` yields one `FieldResult` per placement in input order. For long sweeps, `subject.prepare_sweep(coil, size=128)` can precompute an initial-guess basis. See [placement sweeps](../methods-and-reproducibility/#placement-sweeps) for the time and memory trade-offs.
+
+## Regional measurements
+
+- `subject.roi(position_mm, radius_mm=0.0, region="gray_matter")` resolves a volume-weighted region on the subject's mesh.
+- `subject.depth_probes(cortical_point_mm, inward_dir, depths_mm, radius_mm=0.0, region="all")` resolves one ROI per depth in the order supplied. The direction is normalized.
+- `record_rois` maps output names to resolved regions. The default returns `result.roi_means=None`. With named regions, the result contains one mean field magnitude in V/m for each name.
+
+Resolve ROIs on the same subject you simulate. See [optimization](../optimization/) for `Target` and `ResolvedTarget`. See [uncertainty](../uncertainty/) for the Monte Carlo versions of the simulation methods.

@@ -1,0 +1,18 @@
+---
+title: cuNIBS
+description: A GPU library for electric field simulation in transcranial magnetic stimulation.
+---
+
+import { CardGrid, LinkCard } from '@astrojs/starlight/components';
+import ResearchFigure from '../../components/ResearchFigure.astro';
+
+cuNIBS computes the electric field induced by transcranial magnetic stimulation (TMS) in an individual head model. It solves the finite-element problem on an NVIDIA GPU and reuses the solver setup across coil placements. This supports placement comparisons, cohort studies, conductivity uncertainty analysis, and searches for placements that maximize the field at a cortical target.
+
+<CardGrid>
+  <LinkCard title="Installation" href="./start/installation/" />
+  <LinkCard title="First simulation" href="./start/first-simulation/" />
+  <LinkCard title="Compare coil placements" href="./guides/compare-placements/" />
+  <LinkCard title="Python API" href="./reference/simulation/" />
+</CardGrid>
+
+<ResearchFigure />

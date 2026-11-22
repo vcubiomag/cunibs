@@ -1,0 +1,29 @@
+---
+import Default from '@astrojs/starlight/components/SocialIcons.astro';
+---
+
+<span class="social-links"><Default /></span>
+
+<style>
+	@layer cunibs {
+		.social-links {
+			display: contents;
+		}
+		.social-links :global(a) {
+			align-items: center;
+			justify-content: center;
+			width: var(--cunibs-control-height);
+			height: var(--cunibs-control-height);
+			margin: 0;
+			padding: 0;
+			border-radius: var(--cunibs-radius);
+			font-size: 1.25rem;
+			color: var(--sl-color-gray-2);
+			transition: background-color var(--cunibs-duration-fast) ease-out;
+		}
+		.social-links :global(a:hover) {
+			background-color: var(--cunibs-fill-hover);
+			color: var(--sl-color-white);
+		}
+	}
+</style>

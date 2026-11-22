@@ -1,0 +1,75 @@
+---
+title: Conductivity uncertainty API
+description: Configuration and results for Monte Carlo conductivity uncertainty analysis.
+---
+
+## `ConductivityUQConfig`
+
+```python
+def __init__(
+    self, n_samples=500, seed=0, tissue_cov=None,
+    perturbed_tags=None, distribution="lognormal",
+): ...
+```
+
+### Parameters
+
+| Parameter | Description |
+| --- | --- |
+| `n_samples` | Positive integer number of conductivity draws per placement. |
+| `seed` | Nonnegative integer random seed. |
+| `tissue_cov` | Mapping of [tissue labels or volume tags](../inputs-and-head/#tissue-labels-and-tags) to finite, nonnegative coefficients of variation. |
+| `perturbed_tags` | Optional sequence of tissue labels or volume tags to vary. |
+| `distribution` | `"lognormal"` or `"normal"`. Lognormal draws are positive with a mean equal to the nominal conductivity. Normal draws are clipped at one millionth of the nominal conductivity. |
+
+If supplied, `perturbed_tags` determines which tissues vary. Otherwise a nonempty `tissue_cov` selects its named tissues. If neither selects a tissue, all tissues present vary. cuNIBS skips a selected tissue absent from the mesh with a warning and raises an error if every selected tissue is absent.
+
+### Default coefficients of variation
+
+Selected tissues without a CoV override use `uq.DEFAULT_TISSUE_COV`.
+
+| Tissue | Default CoV |
+| --- | ---: |
+| White matter, gray matter, blood | 0.15 |
+| CSF | 0.05 |
+| Average bone, cortical bone, cancellous bone | 0.35 |
+| Scalp, eyes, muscle | 0.20 |
+
+## Conductivity simulations
+
+```python
+def simulate_conductivity_uq(
+    self, coil, placement, config, didt=1e6, *,
+    moments=False, record_rois={}, recovery="harmonic",
+) -> ConductivityUQResult: ...
+
+def iter_simulate_conductivity_uq(
+    self, coil, placements, config, didt=1e6, *,
+    moments=False, record_rois={}, recovery="harmonic",
+) -> Iterator[ConductivityUQResult]: ...
+```
+
+### Returns
+
+`simulate_conductivity_uq` returns one `ConductivityUQResult`. The iterator yields one result per placement in input order. With a shared config, placements on the same mesh use the same conductivity draws. Per-draw summaries and ROI samples describe the field after applying the requested recovery.
+
+## `ConductivityUQResult`
+
+| Attribute or method | Meaning |
+| --- | --- |
+| `sigma_samples` | Conductivity draws in S/m with shape `(n_samples, n_perturbed)`. Columns follow `perturbed_tags`. |
+| `peak_samples`, `focality_samples`, `peak_location_samples` | Gray matter peak (V/m), focality at 50% (m³), and peak location (mm), for each draw. These are `None` on meshes without gray matter. |
+| `roi_samples[name]` | One mean ROI field magnitude in V/m per draw. |
+| `mean_magnE`, `std_magnE`, `cov_magnE` | Retained together with `moments=True`, one value per tetrahedron in subject mesh order. Mean and standard deviation are in V/m. CoV is dimensionless. |
+| `summary` | `ConductivityUQSummary` with metrics of the mean field magnitude map and its region's largest local CoV. The high-level API summarizes gray matter when it is present. |
+| `compute_summary(region="gray_matter")` | Summarize retained moment arrays for a named tissue or `"all"`. |
+| `peak_mean_magnE(region="gray_matter")` | Peak of the mean magnitude map. For an uncached region, retain the moments. |
+| `max_local_cov(region="gray_matter")` | Largest per-tetrahedron CoV in the region. For an uncached region, retain the moments. |
+| `tissue_sensitivity(output="peak")` | Estimated variance share by tissue under a log-linear model. Also accepts `"focality"` or a recorded ROI name. |
+| `save(path)`, `ConductivityUQResult.load(path)` | Write or read the result in cuNIBS HDF5 format. |
+
+The sensitivity fit uses the log of the output. Interpret it for positive, varying values. It estimates individual effects from the fitted model and omits interactions.
+
+## `cunibs.uq`
+
+`uq.sample_conductivities(config, perturbed_tags)` returns a CuPy sample matrix. `uq.build_conductivity_uq_precompute(ctx, perturbed_tags)` builds a reusable `ConductivityUQPrecompute` for the selected tissue tags. `uq.run_conductivity_uq(ctx, pre, coil, placement, config, ...)` runs the ensemble with device-backed moment arrays and leaves the regional summary for the caller. Use `compute_summary()` to calculate it, and `to_numpy()` when you need the arrays on the host.

@@ -1,0 +1,48 @@
+---
+title: Auxiliary dipole method (ADM)
+description: Target definitions, reciprocity fields, and coil placement optimization APIs.
+---
+
+## `Target` and `ResolvedTarget`
+
+```python
+def __init__(self, position_mm, direction=None, *, region="gray_matter", radius_mm=0.0): ...
+```
+
+`position_mm` is a point in mesh coordinates. `radius_mm` selects tetrahedron centres inside a sphere. A radius of zero uses the nearest tetrahedron in the specified tissue. If a positive-radius sphere contains no matching centres, the selection falls back to the nearest. An empty tissue region raises `ValueError`.
+
+Call `resolve_target(subject, target)` to get a `ResolvedTarget`. It contains `elem_idx` in subject element order, volume-normalized `weights`, `directions`, `magnitude`, and the weighted `barycenter_mm`. The index, weight, direction, and centre arrays are CuPy arrays. `offset_mm` estimates how far the requested point lies outside the region using element bounding spheres. A value above 5 mm triggers a warning. Recreate the target for each subject.
+
+With `direction=None`, the score is the norm of the volume-weighted mean raw field vector. For a directional target the supplied vector is normalized, and the score is the signed component of the mean along that direction.
+
+## `adm.optimize`
+
+```python
+def optimize(
+    subject, coil, target, centers_mm, *,
+    n_samples=9, resolution=512, distance_mm=4.0, didt=1e6,
+    spacing_mm=3.0, margin_mm=8.0,
+) -> OptimizeResult: ...
+```
+
+### Parameters
+
+- `centers_mm` takes an `(n_centres, 3)` array or a `head.ScalpGrid`.
+- `distance_mm` is the nonnegative coil gap. `didt` is the current slope in A/s.
+- `n_samples` is the positive odd number of handle angles sampled at each centre. A Fourier interpolant uses those samples to estimate the field on an angle grid. `resolution` is the size of that grid and must be at least 2 and at least `n_samples`.
+- `spacing_mm` controls the reciprocity interpolation grid. It is independent of the distance between scalp candidates. `margin_mm` pads the grid that covers the coil dipoles.
+
+### Returns
+
+`OptimizeResult` contains `best_placement`, `best_center_mm`, `best_handle_mm`, `best_angle_rad`, `best_E`, and `best_objective`. Use `centers_mm`, `center_objective`, and `center_handle_mm` to inspect the optimum at each candidate centre. The angle reference is local to each scalp point. Use the handle coordinates to compare placements across centres.
+
+## `ReciprocityField`
+
+| Function | Purpose |
+| --- | --- |
+| `adm.build_reciprocity(subject, coil, target, centers_mm, *, distance_mm=4.0, spacing_mm=3.0, margin_mm=8.0, tolerance=1e-5)` | Run the adjoint solve and build a reusable `ReciprocityField` covering the candidate coil positions. |
+| `adm.optimize_placement(recip, coil, centers_mm=None, *, n_samples=9, resolution=512, distance_mm=None, didt=1e6)` | Search using a built field. Centres and gap default to those recorded on the field. |
+| `adm.evaluate(recip, coil, placements, didt=1e6)` | Estimate the target field for one `Placement` or a sequence. Returns `(D,)` or `(P, D)` with one column per adjoint direction. |
+| `adm.evaluate_frames(recip, coil, transforms, didt=1e6)` | Evaluate a batch of `(P, 4, 4)` coil-to-head affines directly. Translations use mm. |
+
+Build the field for the subject, target, coil, and candidate coverage you intend to evaluate. If a pose places dipoles outside the grid, rebuild with suitable coverage. See [Optimize coil placement](../../guides/optimize-placement/) for a complete example and how to check the estimate with a forward solve.

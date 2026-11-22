@@ -1,0 +1,35 @@
+---
+title: Developing cuNIBS
+description: Contributions, local builds, and tests for cuNIBS.
+sidebar:
+  order: 1
+---
+
+## Bug reports
+
+Report bugs as [GitHub issues](https://github.com/vcubiomag/cunibs/issues). Include the cuNIBS version, operating system, Python version, GPU model, and NVIDIA driver version. Add a short example that reproduces the problem and the full error message. If the bug depends on a head model, use a public example mesh when possible.
+
+## Pull requests
+
+Pull requests are welcome. Open a GitHub issue before writing a pull request so contributors can discuss the proposal and agree on the design. Link the pull request to that issue.
+
+## Local development
+
+To build and test the library, use an x86-64 Linux or Windows machine with an NVIDIA GPU, a CUDA 13 compatible driver, and a C++20 compiler supported by CUDA. Install `uv` before running these commands. On Windows, use an x64 Visual Studio Developer shell so Ninja can find the compiler.
+
+```bash
+git clone https://github.com/vcubiomag/cunibs.git
+cd cunibs
+uv sync
+uv run pytest
+```
+
+The documentation lives in `docs/`. To preview and build the site, use Node.js 22.23.4 or later and pnpm.
+
+```bash
+cd docs
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+Run `pnpm build` from `docs/` to check the production build.

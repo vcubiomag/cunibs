@@ -1,0 +1,74 @@
+---
+title: Optimize coil placement
+description: Coil placement optimization with the auxiliary dipole method.
+---
+
+To place a coil for a particular cortical target, decide which field measure to maximize and where the coil can sit. The auxiliary dipole method (ADM) estimates that measure across candidate scalp positions and handle orientations. Once you select a placement, use a forward simulation to compute its field throughout the head.
+
+## Cortical target and scalp candidates
+
+Use the Ernie data from [First simulation](../../start/first-simulation/). This example finds the gray matter surface beneath C3 and uses a 5 mm ROI around that point. The scalp candidate region has its own radius and spacing.
+
+```python
+import numpy as np
+from cunibs import Coil, Subject, Target, adm, head, resolve_target
+
+cap = head.read_subject_cap("m2m_ernie")
+coil = Coil.load("MagStim_D70")
+didt = 1.0e6
+
+with Subject.from_mesh("m2m_ernie/ernie.msh") as subject:
+    scalp, inward = head.project_to_scalp(subject, cap["C3"])
+    depth = head.depth_to_surface_mm(subject, cap["C3"])[0]
+    if not np.isfinite(depth):
+        raise ValueError("The inward ray did not intersect gray matter at C3.")
+    cortical_point = scalp[0] + depth * inward[0]
+
+    target = resolve_target(subject, Target(cortical_point, radius_mm=5.0))
+    candidates = head.scalp_grid(subject, cap["C3"], radius_mm=20.0, spacing_mm=2.0)
+    search = adm.optimize(
+        subject, coil, target, candidates, distance_mm=4.0, didt=didt
+    )
+    print(f"{len(candidates)} candidates, median spacing {candidates.achieved_spacing_mm:.2f} mm")
+    print(f"Estimated target score: {search.best_objective:.3f} V/m")
+    print("Best scalp centre (mm):", search.best_center_mm)
+    print("Best handle point (mm):", search.best_handle_mm)
+
+    result = subject.simulate(coil, search.best_placement, didt=didt)
+    result.save("ernie_optimized.h5")
+
+    raw = subject.simulate(
+        coil, search.best_placement, didt=didt, recovery="raw", vectors=True
+    )
+    vectors = raw.E[target.elem_idx.get()]
+    mean_vector = target.weights.get() @ vectors
+    print(f"Forward estimate of the same objective: {np.linalg.norm(mean_vector):.3f} V/m")
+```
+
+:::note[How the score is calculated]
+For a magnitude target, ADM averages the raw electric field vectors over the ROI and then measures the length of the mean vector. Opposing directions can cancel in that average. A directional target uses the signed component of the mean vector along `Target(direction=...)`. Forward simulation with `record_rois` reports the mean of local field magnitudes.
+:::
+
+## Spatial distribution of candidate scores
+
+Add this code after the subject block to plot the scalp candidates and winning handle on the main plane of the search patch. The colour at each centre shows its highest score across the searched rotations. This step uses Matplotlib.
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+origin = search.best_center_mm
+offsets = search.centers_mm - origin
+_, _, axes = np.linalg.svd(offsets, full_matrices=False)
+xy = offsets @ axes[:2].T
+handle_xy = (search.best_handle_mm - origin) @ axes[:2].T
+
+fig, ax = plt.subplots(layout="constrained")
+points = ax.scatter(xy[:, 0], xy[:, 1], c=search.center_objective)
+ax.quiver(0, 0, *(0.1 * handle_xy), angles="xy", scale_units="xy", scale=1, color="black")
+ax.set(xlabel="Patch axis 1 (mm)", ylabel="Patch axis 2 (mm)", aspect="equal")
+fig.colorbar(points, label="Target score (V/m)")
+fig.savefig("placement_search.png", dpi=180)
+```
+
+The two patch axes are local to this plot. Record `best_center_mm` and `best_handle_mm` for comparisons across searches. See the [optimization API](../../reference/optimization/) for grid resolution and how to reuse a reciprocity field.

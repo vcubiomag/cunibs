@@ -1,0 +1,47 @@
+---
+title: Field results and metrics
+description: FieldResult attributes, retention flags, and reusable volume-weighted metrics.
+---
+
+## `FieldResult`
+
+The high-level forward methods return CPU NumPy arrays. Full-volume attributes are `None` unless you request their retention. Here, `N` is the number of mesh nodes and `M` is the number of tetrahedra.
+
+| Attribute | Shape or type | Meaning |
+| --- | --- | --- |
+| `summary` | `FieldMetrics` or `None` | Default gray matter metrics. Empty when the mesh has no gray matter. |
+| `magnE` | `(M,)` | Field magnitude in V/m, with `magnitude=True`. |
+| `E` | `(M, 3)` | Field vectors in V/m, with `vectors=True`. |
+| `v` | `(N,)` | Electric potential in V, with `potential=True`. |
+| `vols`, `tet_tags`, `barycenters_mm` | `(M,)`, `(M,)`, `(M, 3)` | Element volumes in m³, tissue tags, and centres in mm. Retained with `magnitude=True` or `nodal=True`. |
+| `E_slots`, `slot_node`, `slot_tag` | Slot arrays | Recovered field and node indices, plus tissue tags for tissue-specific recovery. Present with `nodal=True`, with `slot_tag=None` for global recovery. Usually read through `nodal_field`. |
+| `n_nodes`, `tet_nodes` | Node count and connectivity | With `nodal=True`, the result records the node count. It also keeps connectivity when the recovery uses global node slots. |
+| `roi_means` | Dictionary or `None` | Volume-weighted mean magnitude in V/m for each requested ROI. |
+| `transform` | `(4, 4)` | Coil-to-head affine with translation in millimetres. |
+| `placement`, `coil_name`, `didt`, `recovery` | Run settings | Input placement, model name, current slope in A/s, and field recovery. |
+| `iterations`, `relative_residual`, `provenance` | Run metadata | Linear solver diagnostics and information about the inputs and run environment. Older files can omit these. |
+
+Use `nodal_field(region="gray_matter")` with a result saved using `nodal=True`. It returns an `(N, 3)` array with `NaN` outside the named region. Global recovery also accepts `"all"`.
+
+### Summary statistics
+
+`summary_for(region)` returns the metric dictionary for a tissue or `"all"`. A different region from the cached summary requires `magnitude=True`. A request for a region with no elements raises `ValueError`.
+
+`peak_magnE(region)`, `peak_location_mm(region)`, `center_of_gravity_mm(region)`, and `focality(frac=0.5, region="gray_matter")` read the relevant metrics. The region defaults to gray matter for all four methods. Fractions other than the cached 0.5 and 0.75 need the retained magnitude.
+
+`save(path)` writes HDF5, and `FieldResult.load(path)` restores the saved output. See [Save and reuse results](../../results/save-and-reuse/).
+
+## `cunibs.metrics`
+
+| Function | Returns |
+| --- | --- |
+| `region_tag(region)` | The numeric tag for a single tissue label. |
+| `region_mask(tet_tags, region)` | A Boolean element mask for a tissue label or `"all"`. |
+| `weighted_quantiles(values, weights, qs)` | Weighted quantiles for probabilities on the 0 to 1 scale. |
+| `percentile_magnitude(magnE, vols, mask, percentile)` | A volume-weighted percentile on the 0 to 100 scale. |
+| `stimulated_volume(magnE, vols, mask, threshold)` | Volume in m³ at or above a field threshold in V/m. |
+| `focality(magnE, vols, mask, frac=0.5)` | Volume in m³ at or above a fraction of the volume-weighted 99.9th percentile. |
+| `compute_metrics(magnE, vols, barycenters_mm, tet_tags, *, region="gray_matter", focality_fracs=(0.5, 0.75), percentiles=(50, 95, 99, 99.9))` | A `FieldMetrics` dictionary. |
+| `region_slice(vols, barycenters_mm, tet_tags, region="gray_matter")` | A reusable `RegionSlice`. Call its `summarize(magnE)` method for multiple fields on the same mesh. |
+
+`FieldMetrics` includes `region`, `peak_magnE`, `peak_location_mm`, `center_of_gravity_mm`, `region_volume_m3`, `focality_m3`, and `distribution`. The distribution uses keys such as `mean`, `std`, and `p99.9`. The focality dictionary uses string keys such as `"0.5"`.

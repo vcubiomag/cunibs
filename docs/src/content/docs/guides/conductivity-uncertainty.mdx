@@ -1,0 +1,60 @@
+---
+title: Conductivity uncertainty
+description: Monte Carlo analysis of tissue conductivity uncertainty at a fixed coil placement.
+---
+
+Tissue conductivities are uncertain, and different conductivity values can change the predicted electric field. To estimate that effect at a fixed coil placement, specify a distribution for each tissue you want to vary. cuNIBS draws conductivity values from those distributions and solves the field for each draw. The example summarizes the resulting variation in a cortical region.
+
+## Conductivity distributions
+
+```python
+from cunibs import ConductivityUQConfig
+
+config = ConductivityUQConfig(
+    n_samples=500,
+    tissue_cov={"gray_matter": 0.15, "csf": 0.05, "cortical_bone": 0.35},
+    seed=1,
+)
+```
+
+The coefficient of variation (CoV) is the standard deviation divided by the mean. A value of 0.15 specifies a standard deviation equal to 15% of the nominal conductivity for the default lognormal model. Choose values appropriate to your study.
+
+This configuration varies the tissues named in `tissue_cov` independently. If you omit both `tissue_cov` and `perturbed_tags`, cuNIBS varies every tissue in the mesh. See [the uncertainty API](../../reference/uncertainty/) for the defaults and how to select tissues explicitly.
+
+## Regional field variability
+
+Use the ROI from [Measure a region or depth profile](../region-and-depth/). Define `config` before that guide's subject block, then add these lines inside the block after it defines `roi`.
+
+```python
+    uq = subject.simulate_conductivity_uq(
+        coil, placement, config, didt=1.0e6, record_rois={"cortex": roi}
+    )
+    uq.save("ernie_c3_conductivity.h5")
+```
+
+Add the following after the subject block to make a histogram. This step uses Matplotlib.
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+samples = uq.roi_samples["cortex"]
+low, median, high = np.quantile(samples, [0.025, 0.5, 0.975])
+print(f"Median: {median:.3f} V/m, central 95% of draws: {low:.3f} to {high:.3f} V/m")
+
+fig, ax = plt.subplots(layout="constrained")
+ax.hist(samples, bins="auto")
+ax.set(xlabel="Mean cortical field magnitude (V/m)", ylabel="Conductivity draws")
+fig.savefig("conductivity_histogram.png", dpi=180)
+```
+
+The interval describes the spread under the chosen conductivity model. Report the tissues, distribution, CoVs, seed, and sample count with the interval.
+
+| Question | Output |
+| --- | --- |
+| Where is the field most variable relative to its mean? | Retain `moments=True` and examine `cov_magnE`, or use `max_local_cov()` for its gray matter maximum. |
+| What is the highest field magnitude after averaging the maps? | `peak_mean_magnE()` finds the peak of the mean field magnitude map. |
+| How does the peak vary between draws? | `peak_samples` holds one gray matter peak per conductivity draw. |
+| How does the field vary in my ROI? | `roi_samples[name]` holds one volume-weighted ROI mean per draw. |
+
+Use `iter_simulate_conductivity_uq` to run the same analysis for several placements. Consume each result in turn to avoid accumulating full moment arrays in memory.

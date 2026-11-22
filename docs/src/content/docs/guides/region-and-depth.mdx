@@ -1,0 +1,62 @@
+---
+title: Regional fields and depth profiles
+description: Volume-weighted electric field measurements in regions and along a depth profile.
+---
+
+The gray matter peak can occur far from a region you intend to study. To measure the field near a cortical target, define a region of interest (ROI) and average the field magnitude over its elements, weighted by volume.
+
+## Cortical region of interest
+
+This example centres a 5 mm ROI on the gray matter surface beneath C3. cuNIBS selects gray matter tetrahedra whose centres fall within that radius. When the radius is zero or no centres fall inside it, cuNIBS uses the nearest matching element. If you already have a cortical target in mesh coordinates, you can use it as the ROI centre.
+
+```python
+import numpy as np
+from cunibs import Coil, Placement, Subject
+from cunibs.head import depth_to_surface_mm, project_to_scalp, read_subject_cap
+
+cap = read_subject_cap("m2m_ernie")
+coil = Coil.load("MagStim_D70")
+placement = Placement(cap["C3"], cap["Cz"])
+
+with Subject.from_mesh("m2m_ernie/ernie.msh") as subject:
+    scalp, inward = project_to_scalp(subject, placement.center_mm)
+    depth = depth_to_surface_mm(subject, placement.center_mm)[0]
+    if not np.isfinite(depth):
+        raise ValueError("The inward ray did not intersect gray matter at C3.")
+    cortical_point = scalp[0] + depth * inward[0]
+
+    roi = subject.roi(cortical_point, radius_mm=5.0, region="gray_matter")
+    result = subject.simulate(coil, placement, record_rois={"cortex": roi})
+    print(f"Cortical mean: {result.roi_means['cortex']:.3f} V/m")
+```
+
+`roi_means["cortex"]` is the mean of local field magnitudes. It is available with the default compact output. Inspect the ROI count with `roi.elem_idx.size` and its displacement with `roi.offset_mm` if the result seems unexpected.
+
+## Field as a function of depth
+
+Add this code inside the same subject block. The depths start at the cortical intersection. With `region="all"`, a probe can include the tissues it encounters along the line.
+
+```python
+    depths_mm = [0, 2, 4, 6, 8, 10]
+    probes = subject.depth_probes(
+        cortical_point, inward[0], depths_mm, radius_mm=2.0, region="all"
+    )
+    names = [f"depth_{depth_mm}" for depth_mm in depths_mm]
+    profile = subject.simulate(
+        coil, placement, record_rois=dict(zip(names, probes, strict=True))
+    )
+    values = [profile.roi_means[name] for name in names]
+```
+
+Add this code after the subject block to plot the profile with Matplotlib.
+
+```python
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(layout="constrained")
+ax.plot(depths_mm, values, marker="o")
+ax.set(xlabel="Depth from cortical intersection (mm)", ylabel="Mean field magnitude (V/m)")
+fig.savefig("depth_profile.png", dpi=180)
+```
+
+Report the tissue selection, probe radius, and the point from which depth is measured. A missing surface intersection gives `NaN`. See [Coordinates and landmarks](../../inputs/coordinates/) for the geometry conventions.

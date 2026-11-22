@@ -1,0 +1,42 @@
+---
+title: Interpret results
+description: Electric field metrics, focality, and retained field arrays.
+---
+
+import StudyFigure from '../../../components/StudyFigure.astro';
+
+`Subject.simulate` returns a `FieldResult`. Its default gray matter summary describes the strength, location, and spread of the field. Which measure you use depends on your question. The peak describes the strongest field anywhere in that tissue, while focality describes how much tissue lies above a defined field level.
+
+## Gray matter summary
+
+| Measure | What it reports |
+| --- | --- |
+| `peak_magnE()` | Largest field magnitude among the gray matter tetrahedra, in V/m. |
+| `peak_location_mm()` | Centre of the tetrahedron with the peak, in mesh coordinates. |
+| `center_of_gravity_mm()` | Average position weighted by both field magnitude and tetrahedron volume, in mm. |
+| `summary["distribution"]` | Volume-weighted mean, standard deviation, and percentiles 50, 95, 99, and 99.9, in V/m. |
+| `focality(0.5)` | Tissue volume with a field magnitude at or above half the volume-weighted 99.9th percentile, in m³. Multiply by one million for cm³. |
+
+The default summary includes focality at 50% and 75%. Focality is a volume defined by a relative field threshold. To compare volumes above a fixed level in V/m, use `metrics.stimulated_volume` with the retained field, volumes, and a region mask.
+
+<StudyFigure kind="focality" alt="Illustrative distribution of electric field magnitude. The shaded region starts at half the 99.9th percentile and extends to the highest field value.">
+  The shaded area represents tissue at or above half the 99.9th-percentile field.
+</StudyFigure>
+
+## Field arrays
+
+Pass one or more of these keyword arguments to `simulate` or `iter_simulate`.
+
+| Argument | Result | Use |
+| --- | --- | --- |
+| `magnitude=True` | `magnE`, V/m per tetrahedron, plus volume, tissue tag, and centre arrays | Make a field map, compute a custom focality fraction, or summarize a different tissue. |
+| `vectors=True` | `E`, three components per tetrahedron in V/m | Analyze orientation or a signed field component. |
+| `potential=True` | `v`, volts per node | Inspect the finite-element potential. |
+| `nodal=True` | `nodal_field(region)`, three components per node in V/m | Retrieve recovered nodal values for use in tissue or surface interpolation. |
+| `record_rois={"name": roi}` | `roi_means`, one scalar per named region in V/m | Record volume-weighted mean field magnitudes without keeping the full field. |
+
+For example, pass `magnitude=True` to the [first simulation](../../start/first-simulation/) and use `result.summary_for("white_matter")` or `result.focality(0.6)`. Meshes without gray matter have `summary=None`. Use available tissues such as `summary_for("all")` with a retained magnitude on a phantom.
+
+`nodal_field` requires a recovery mode such as the default `"harmonic"`. Tissue-specific modes can give one field value per tissue at a boundary node. Specify the tissue you want. Nodes outside that tissue return `NaN`.
+
+See [save and reuse results](../save-and-reuse/) before combining field arrays with an atlas or another mesh representation.

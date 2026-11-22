@@ -1,0 +1,156 @@
+---
+import TocList from './TocList.astro';
+
+const { toc } = Astro.locals.starlightRoute;
+---
+
+{
+	toc && (
+		<toc-rail>
+			<nav aria-labelledby="cunibs-toc-heading">
+				<h2 id="cunibs-toc-heading" class="sr-only">
+					{Astro.locals.t('tableOfContents.onThisPage')}
+				</h2>
+				<div class="rail">
+					<div class="indicator" aria-hidden="true" />
+					<TocList items={toc.items} />
+				</div>
+			</nav>
+		</toc-rail>
+	)
+}
+
+<script>
+	import { observeActiveHeading } from '../lib/active-heading';
+
+	const SCROLL_MARGIN_PX = 32;
+
+	const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+	const targetId = (link: HTMLAnchorElement) => decodeURIComponent(link.hash.slice(1));
+
+	function scrollParent(element: HTMLElement): HTMLElement | null {
+		for (let node = element.parentElement; node; node = node.parentElement) {
+			if (/auto|scroll/.test(getComputedStyle(node).overflowY)) return node;
+		}
+		return null;
+	}
+
+	// The indicator spans the whole list and is clipped to the active link so a single clip-path animates.
+	class TocRail extends HTMLElement {
+		#rail = this.querySelector<HTMLElement>('.rail')!;
+		#indicator = this.querySelector<HTMLElement>('.indicator')!;
+		#links = [...this.querySelectorAll<HTMLAnchorElement>('.rail a')];
+		#active: HTMLAnchorElement | undefined;
+		#scroller: HTMLElement | null = null;
+		#resizes = new ResizeObserver(() => this.#place());
+		#stopObserving?: () => void;
+
+		connectedCallback() {
+			this.#scroller = scrollParent(this);
+			this.#resizes.observe(this.#rail);
+			this.#stopObserving = observeActiveHeading(this.#links.map(targetId), (id) => this.#activate(id));
+		}
+
+		disconnectedCallback() {
+			this.#stopObserving?.();
+			this.#resizes.disconnect();
+		}
+
+		#activate(id: string | null) {
+			this.#active = this.#links.find((link) => targetId(link) === id);
+			for (const link of this.#links) {
+				if (link === this.#active) link.setAttribute('aria-current', 'location');
+				else link.removeAttribute('aria-current');
+			}
+			this.#place();
+			if (this.#active) this.#reveal(this.#active);
+		}
+
+		#place() {
+			if (!this.#active) return;
+			const rail = this.#rail.getBoundingClientRect();
+			const box = this.#active.getBoundingClientRect();
+			const top = box.top - rail.top;
+			const bottom = rail.bottom - box.bottom;
+			this.#indicator.style.clipPath = `inset(${top}px 0 ${bottom}px round 1px)`;
+
+			if (!this.hasAttribute('data-active')) {
+				this.toggleAttribute('data-active', true);
+				// Paint the first placement before enabling the transition.
+				requestAnimationFrame(() => this.toggleAttribute('data-animate', true));
+			}
+		}
+
+		#reveal(link: HTMLElement) {
+			const scroller = this.#scroller;
+			if (!scroller) return;
+			const view = scroller.getBoundingClientRect();
+			const box = link.getBoundingClientRect();
+			const above = box.top < view.top + SCROLL_MARGIN_PX;
+			const below = box.bottom > view.bottom - SCROLL_MARGIN_PX;
+			if (!above && !below) return;
+			scroller.scrollTo({
+				top: scroller.scrollTop + box.top - view.top - view.height / 2 + box.height / 2,
+				behavior: reducedMotion.matches ? 'instant' : 'smooth',
+			});
+		}
+	}
+
+	customElements.define('toc-rail', TocRail);
+</script>
+
+<style>
+	@layer cunibs {
+		toc-rail {
+			display: block;
+		}
+
+		.rail {
+			position: relative;
+		}
+
+		.indicator {
+			position: absolute;
+			inset-block: 0;
+			inset-inline-start: 0;
+			width: 2px;
+			background-color: var(--sl-color-white);
+			clip-path: inset(0 0 100% 0);
+			opacity: 0;
+		}
+		toc-rail[data-active] .indicator {
+			opacity: 1;
+		}
+		toc-rail[data-animate] .indicator {
+			transition: clip-path 400ms var(--cunibs-ease-spring);
+		}
+		@media (prefers-reduced-motion: reduce) {
+			toc-rail[data-animate] .indicator {
+				transition: none;
+			}
+		}
+
+		.rail :global(ul) {
+			gap: 0.25rem;
+		}
+		.rail :global(li > ul) {
+			margin-top: 0.25rem;
+		}
+		.rail :global(a) {
+			padding-block: 0.25rem;
+			padding-inline: calc(0.75rem + var(--depth) * 0.75rem) 0;
+			font-size: var(--sl-text-sm);
+			line-height: 1.25rem;
+			color: var(--sl-color-gray-3);
+			transition: color var(--cunibs-duration-base) ease-out;
+		}
+		.rail :global(a:hover),
+		.rail :global(a[aria-current]) {
+			color: var(--sl-color-white);
+		}
+		.rail :global(a[aria-current]) {
+			font-weight: 500;
+		}
+	}
+</style>

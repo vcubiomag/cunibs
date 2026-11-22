@@ -1,0 +1,78 @@
+---
+import Search from '@astrojs/starlight/components/Search.astro';
+
+interface Props {
+	compact?: boolean;
+}
+
+const { compact = false } = Astro.props;
+---
+
+<div class:list={['search-field', { compact }]}><Search /></div>
+
+<style>
+	@layer cunibs {
+		.search-field {
+			display: flex;
+		}
+
+		.search-field :global(button[data-open-modal]) {
+			display: flex;
+			align-items: center;
+			gap: 0.5rem;
+			width: 100%;
+			max-width: none;
+			height: var(--cunibs-control-height);
+			padding-inline: 0.625rem 0.375rem;
+			border: 1px solid var(--sl-color-hairline-light);
+			border-radius: var(--cunibs-radius);
+			background-color: var(--cunibs-fill-subtle);
+			color: var(--sl-color-gray-3);
+			font-size: var(--sl-text-sm);
+			transition:
+				border-color var(--cunibs-duration-base) ease-out,
+				color var(--cunibs-duration-base) ease-out;
+		}
+		.search-field :global(button[data-open-modal]:hover) {
+			border-color: var(--sl-color-gray-5);
+			color: var(--sl-color-gray-2);
+		}
+		.search-field:not(.compact) :global(button[data-open-modal] > span) {
+			display: block;
+		}
+		.search-field :global(button[data-open-modal] > kbd) {
+			gap: 0.125rem;
+			margin-inline-start: auto;
+			padding: 0;
+			background-color: transparent;
+		}
+		.search-field :global(button[data-open-modal] > kbd > kbd) {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			min-width: 1.25rem;
+			height: 1.25rem;
+			padding-inline: 0.25rem;
+			border: 1px solid var(--sl-color-hairline-light);
+			border-radius: 0.25rem;
+			font-size: 0.6875rem;
+			color: var(--sl-color-gray-3);
+		}
+
+		@media (width < 50rem) {
+			.compact :global(button[data-open-modal]) {
+				width: var(--cunibs-control-height);
+				padding: 0;
+				justify-content: center;
+				border: 0;
+				background-color: transparent;
+				color: var(--sl-color-gray-2);
+			}
+		}
+		@media (min-width: 50rem) {
+			.compact {
+				width: 15rem;
+			}
+		}
+	}
+</style>

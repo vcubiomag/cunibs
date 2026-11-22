@@ -1,0 +1,50 @@
+---
+import focalityLight from '../assets/docs-focality.png';
+import focalityDark from '../assets/docs-focality-dark.png';
+import placementLight from '../assets/docs-placement.png';
+import placementDark from '../assets/docs-placement-dark.png';
+
+interface Props {
+  kind: 'placement' | 'focality';
+  alt: string;
+}
+
+const { kind, alt } = Astro.props;
+const [light, dark] = kind === 'placement'
+  ? [placementLight, placementDark]
+  : [focalityLight, focalityDark];
+---
+
+<figure>
+  <img class="light" src={light.src} width={light.width} height={light.height} alt={alt} loading="lazy" />
+  <img class="dark" src={dark.src} width={dark.width} height={dark.height} alt={alt} loading="lazy" />
+  <figcaption><slot /></figcaption>
+</figure>
+
+<style>
+  figure {
+    max-inline-size: 38rem;
+    margin-inline: auto;
+  }
+
+  img {
+    display: block;
+    inline-size: 100%;
+    block-size: auto;
+    margin: 0;
+  }
+
+  figcaption {
+    color: var(--sl-color-gray-2);
+    font-size: var(--sl-text-sm);
+  }
+
+  .dark,
+  :global([data-theme='dark']) .light {
+    display: none;
+  }
+
+  :global([data-theme='dark']) .dark {
+    display: block;
+  }
+</style>

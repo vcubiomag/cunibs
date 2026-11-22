@@ -1,0 +1,41 @@
+---
+title: Save and reuse results
+description: HDF5 result files and the mapping between mesh and field array order.
+---
+
+Save a result if you need to inspect it again or use it in another analysis. cuNIBS writes the computed summaries and the arrays you choose to retain to HDF5.
+
+## HDF5 result files
+
+Choose which arrays to retain before solving. For example, add `magnitude=True` to the call to `Subject.simulate` in [First simulation](../../start/first-simulation/) to include the per-element field magnitude in the saved result.
+
+```python
+from cunibs import FieldResult
+
+result = FieldResult.load("ernie_c3.h5")
+print(result.peak_magnE())
+print(result.provenance)
+if result.magnE is not None:
+    print(f"Retained field values: {result.magnE.size}")
+```
+
+Call `ConductivityUQResult.load("ernie_c3_conductivity.h5")` to reopen an uncertainty result. That file includes the per-draw values the run recorded. Use `moments=True` in the simulation to include per-tetrahedron mean, standard deviation, and CoV arrays in the saved result.
+
+The two result classes use distinct cuNIBS HDF5 layouts. Keep the original mesh and coil files with the study data. For example, the metadata may identify a mesh by a hash, but the saved result only contains mesh arrays needed by the outputs you retained.
+
+## Mesh and field array order
+
+cuNIBS reorders nodes and tetrahedra to solve more efficiently. The field arrays, `result.tet_tags`, and `result.barycenters_mm` follow `subject.mesh`. Outputs from `load_mesh` follow the input file's order for the nodes and tetrahedra it reads. Convert between these orders before combining the field with data prepared in another tool.
+
+```python
+import numpy as np
+
+# Atlas values are per tetrahedron in load_mesh order.
+atlas_in_result_order = atlas_in_mesh_order[subject.element_order]
+
+# Convert result.magnE back to load_mesh order after a magnitude=True run.
+magnitude_in_mesh_order = np.empty_like(result.magnE)
+magnitude_in_mesh_order[subject.element_order] = result.magnE
+```
+
+Use `subject.node_order` the same way for node data such as `result.v`. Compute the permutations on the same subject mesh used to generate the result. When working with a Gmsh tool, also check whether its arrays include surface triangles or use element IDs. The permutations index loaded array rows.

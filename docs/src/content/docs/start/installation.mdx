@@ -1,0 +1,26 @@
+---
+title: Installation
+description: cuNIBS installation and system requirements.
+---
+
+## Install with pip
+
+```bash
+python -m pip install cunibs
+```
+
+## System requirements
+
+- Linux or Windows on x86-64.
+- CPython 3.12, 3.13, or 3.14, including free-threaded 3.14.
+- An NVIDIA GPU that supports CUDA 13, with an R580 series driver or newer. Run `nvidia-smi` to check the GPU and driver.
+
+The package dependencies provide the CUDA runtime libraries. [PyPI release files](https://pypi.org/project/cunibs/#files) · [NVIDIA driver compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html)
+
+## Verify the installation
+
+```bash
+python -c "import cunibs; print(cunibs.__version__)"
+```
+
+To verify that a simulation can run on your GPU, follow [First simulation](../first-simulation/). For source builds, see [Developing cuNIBS](../../project/developing/).

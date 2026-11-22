@@ -1,0 +1,33 @@
+---
+title: Coil models
+description: Bundled TMS coil models, dipole file formats, and current slope.
+---
+
+cuNIBS represents a TMS coil as a collection of magnetic dipoles. The dipoles describe the coil's geometry and determine the spatial pattern of its induced field. Select the model that corresponds to the coil used in your study.
+
+## Bundled models
+
+cuNIBS distributes 25 dipole models from the Drakaki et al. coil database. Use the exact model name because some coils have more than one version. [Coil model database](https://doi.org/10.1016/j.brs.2022.04.017)
+
+```python
+from cunibs import Coil, bundled_coils
+
+print(*bundled_coils(), sep="\n")
+coil = Coil.load("MagStim_D70")
+print(coil.name, coil.n_dipoles, coil.didt_max)
+print(coil.metadata)
+```
+
+## Coil files
+
+| Source | How to load it |
+| --- | --- |
+| SimNIBS dipole coil | `Coil.load("my_coil.ccd")` |
+| cuNIBS HDF5 dipole coil | `Coil.load("my_coil.h5")` |
+| Dipole arrays | `Coil(positions_m, moments, name="my_coil")`, with one row per dipole |
+
+`cunibs.coil.encode_ccd` converts a `.ccd` file to the HDF5 dipole format. See the [coil API](../../reference/inputs-and-head/#coils) for the dataset and units. Other SimNIBS coil representations, such as `.tcd`, have no direct loader in cuNIBS.
+
+## Coil current slope
+
+The simulation uses the `didt` you pass in A/s. For example, 1 A/µs is 1,000,000 A/s. The signed field vector scales with `didt`, and field magnitude scales with its absolute value. `coil.didt_max` is model metadata when available. It does not set the simulation value or enforce a limit. To compare coils at a common current slope, pass the same explicit `didt` to every run.

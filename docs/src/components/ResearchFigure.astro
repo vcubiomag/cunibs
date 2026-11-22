@@ -1,0 +1,35 @@
+---
+const assetBase = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<figure>
+  <img
+    class="light"
+    src={`${assetBase}/hero-light.png`}
+    width="3840"
+    height="2100"
+    alt="Three panels showing a gray matter electric field map, simulation timings, and a comparison of regional mean fields against SimNIBS."
+    decoding="async"
+  />
+  <img
+    class="dark"
+    src={`${assetBase}/hero-dark.png`}
+    width="3840"
+    height="2100"
+    alt="Three panels showing a gray matter electric field map, simulation timings, and a comparison of regional mean fields against SimNIBS."
+    loading="lazy"
+    decoding="async"
+  />
+  <figcaption>A simulated gray matter field at C3, task timings, and a comparison of regional mean fields with SimNIBS 4.6.</figcaption>
+</figure>
+
+<style>
+  .dark,
+  :global([data-theme='dark']) .light {
+    display: none;
+  }
+
+  :global([data-theme='dark']) .dark {
+    display: block;
+  }
+</style>

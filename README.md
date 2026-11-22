@@ -5,9 +5,9 @@
 [![image](https://img.shields.io/pypi/pyversions/cunibs.svg)](https://pypi.python.org/pypi/cunibs)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/vcubiomag/cunibs/wiki/assets/hero/hero-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="https://github.com/vcubiomag/cunibs/wiki/assets/hero/hero-light.png">
-  <img alt="cuNIBS. (a) Gray-matter electric field of a MagVenture C-B70 coil at C3. (b) Wall time per task for cuNIBS and SimNIBS 4.6. (c) ROI-mean field from cuNIBS against SimNIBS 4.6 for 400 head-target pairs." src="https://github.com/vcubiomag/cunibs/wiki/assets/hero/hero-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="https://vcubiomag.github.com/cunibs/hero-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="https://vcubiomag.github.com/cunibs/hero-light.png">
+  <img alt="cuNIBS. (a) Gray-matter electric field of a MagVenture C-B70 coil at C3. (b) Wall time per task for cuNIBS and SimNIBS 4.6. (c) ROI-mean field from cuNIBS against SimNIBS 4.6 for 400 head-target pairs." src="https://vcubiomag.github.com/cunibs/hero-light.png">
 </picture>
 
 cuNIBS computes the electric field that transcranial magnetic stimulation (TMS)

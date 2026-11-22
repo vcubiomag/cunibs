@@ -1,0 +1,59 @@
+---
+title: First simulation
+description: A first cuNIBS simulation using the SimNIBS Ernie head model.
+---
+
+import { FileTree, Steps } from '@astrojs/starlight/components';
+import StudyFigure from '../../../components/StudyFigure.astro';
+
+In this example, you will estimate the electric field in gray matter when a TMS coil is placed over C3. You will use the public Ernie head model and its EEG landmarks to specify the placement. The coil will sit 4 mm above the scalp with its handle pointing toward Cz. Complete [Installation](../installation/) first.
+
+<StudyFigure kind="placement" alt="Side view of a coil above a curved scalp. The gap follows the outward scalp normal, and an arrow shows the handle direction.">
+  In this example, C3 defines the scalp position and Cz defines the handle direction.
+</StudyFigure>
+
+<Steps>
+
+1. **Locate the head model.** Download and extract the SimNIBS 4 example dataset. Run the following example from the directory containing `m2m_ernie`. [SimNIBS example dataset](https://simnibs.github.io/simnibs/build/html/dataset.html)
+
+   <FileTree>
+   - ernie/
+     - m2m_ernie/
+       - ernie.msh
+       - eeg_positions/
+         - EEG10-10_UI_Jurak_2007.csv
+   </FileTree>
+
+2. **Run the simulation.** Save the following as `first_simulation.py`.
+
+   ```python
+   from pathlib import Path
+
+   from cunibs import Coil, Placement, Subject
+   from cunibs.head import read_subject_cap
+
+   model_dir = Path("m2m_ernie")
+   cap = read_subject_cap(model_dir)
+   coil = Coil.load("MagStim_D70")
+   placement = Placement(center_mm=cap["C3"], handle_mm=cap["Cz"], distance_mm=4.0)
+
+   with Subject.from_mesh(model_dir / "ernie.msh") as subject:
+       result = subject.simulate(coil, placement, didt=1.0e6)
+
+   print(f"Peak gray matter field: {result.peak_magnE():.3f} V/m")
+   print(f"Peak location (mm): {result.peak_location_mm()}")
+   print(f"Focality at 50%: {result.focality(0.5) * 1e6:.3f} cm³")
+   result.save("ernie_c3.h5")
+   ```
+
+   ```bash
+   python first_simulation.py
+   ```
+
+3. **Read the result.** The script prints a peak field, its location in the mesh coordinate system, and a tissue volume in cubic centimetres. It also writes `ernie_c3.h5`. You can reopen it with `FieldResult.load("ernie_c3.h5")`.
+
+</Steps>
+
+`didt` is the rate of change of coil current in A/s. The example sets it to 1,000,000 A/s. The resulting field scales with the current slope. See [coil models](../../inputs/coils/#coil-current-slope) for how to specify it and [Interpret results](../../results/interpret-results/) for the definition of focality.
+
+The guides use the variables defined in this example. Run their simulation code within a `with Subject.from_mesh(model_dir / "ernie.msh") as subject:` block, or add it inside the block above.

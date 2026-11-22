@@ -1,0 +1,42 @@
+---
+import type { StarlightRouteData } from '@astrojs/starlight/route-data';
+
+type TocItem = NonNullable<StarlightRouteData['toc']>['items'][number];
+
+interface Props {
+	items: TocItem[];
+	depth?: number;
+}
+
+const { items, depth = 0 } = Astro.props;
+---
+
+<ul>
+	{
+		items.map((item) => (
+			<li>
+				<a href={`#${item.slug}`} style={`--depth: ${depth}`}>
+					{item.text}
+				</a>
+				{item.children.length > 0 && <Astro.self items={item.children} depth={depth + 1} />}
+			</li>
+		))
+	}
+</ul>
+
+<style>
+	@layer cunibs {
+		ul {
+			display: flex;
+			flex-direction: column;
+			margin: 0;
+			padding: 0;
+			list-style: none;
+		}
+		a {
+			display: block;
+			overflow-wrap: anywhere;
+			text-decoration: none;
+		}
+	}
+</style>

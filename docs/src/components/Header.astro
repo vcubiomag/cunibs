@@ -1,0 +1,51 @@
+---
+import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
+import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
+import SearchField from './SearchField.astro';
+import SocialIcons from './SocialIcons.astro';
+import ThemeSelect from './ThemeSelect.astro';
+
+const { hasSidebar } = Astro.locals.starlightRoute;
+---
+
+{/* Starlight's header always renders <Search>; a second instance would bind Ctrl+K twice. */}
+<div class="header">
+	<div class="title"><SiteTitle /></div>
+	<div class="actions print:hidden">
+		{!hasSidebar && <SearchField compact />}
+		<div class:list={['preferences', hasSidebar ? 'sl-hidden md:sl-flex' : 'sl-flex']}>
+			<SocialIcons />
+			<ThemeSelect />
+			<LanguageSelect />
+		</div>
+	</div>
+</div>
+
+<style>
+	@layer cunibs {
+		.header {
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+			gap: var(--sl-nav-gap);
+			height: 100%;
+		}
+
+		.title {
+			display: flex;
+			min-width: 0;
+			overflow: clip;
+		}
+
+		.actions {
+			display: flex;
+			align-items: center;
+			gap: 0.75rem;
+		}
+
+		.preferences {
+			align-items: center;
+			gap: 0.25rem;
+		}
+	}
+</style>

@@ -1,0 +1,427 @@
+/* Declared before Starlight's layers so every `cunibs` rule wins regardless of specificity. */
+@layer starlight, cunibs;
+
+@layer cunibs {
+	:root {
+		/* Lets sidebar <details> animate to `block-size: auto`. */
+		interpolate-size: allow-keywords;
+
+		--sl-color-white: #f4f4f5;
+		--sl-color-gray-1: #e2e3e5;
+		--sl-color-gray-2: #bbbdc1;
+		--sl-color-gray-3: #8b8d92;
+		--sl-color-gray-4: #5a5c61;
+		--sl-color-gray-5: #2e2f33;
+		--sl-color-gray-6: #1d1e21;
+		--sl-color-black: #131416;
+
+		--sl-color-accent-low: #3b241b;
+		--sl-color-accent: #d97757;
+		--sl-color-accent-high: #eda98e;
+
+		--sl-color-text: var(--sl-color-gray-2);
+		--sl-color-text-accent: var(--sl-color-accent-high);
+		--sl-color-text-invert: var(--sl-color-black);
+		--sl-color-bg: var(--sl-color-black);
+		--sl-color-bg-nav: var(--sl-color-black);
+		--sl-color-bg-sidebar: var(--sl-color-black);
+		--sl-color-bg-inline-code: var(--cunibs-fill-subtle);
+		--sl-color-hairline-light: #2a2b2f;
+		--sl-color-hairline: #232427;
+		--sl-color-hairline-shade: #232427;
+		--sl-color-backdrop-overlay: rgb(8 8 9 / 0.6);
+
+		--cunibs-surface: #18191b;
+		--cunibs-surface-raised: #1e1f22;
+
+		--sl-font-system-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono',
+			monospace;
+
+		--sl-text-h1: 1.75rem;
+		--sl-text-h2: 1.375rem;
+		--sl-text-h3: 1.125rem;
+		--sl-text-h4: 1rem;
+		--sl-text-h5: 0.875rem;
+		--sl-text-code: 0.8125rem;
+		--sl-text-code-sm: 0.875em;
+		--sl-line-height: 1.65;
+		--sl-line-height-headings: 1.25;
+
+		/* Starlight grows this to 4rem at its md breakpoint. */
+		--sl-nav-height: 3.5rem;
+		--sl-sidebar-width: 16.5rem;
+		--sl-sidebar-pad-x: 0.5rem;
+		--sl-content-width: 48rem;
+		--sl-content-pad-x: 1.5rem;
+
+		--cunibs-fill-subtle: color-mix(in srgb, var(--sl-color-white) 5%, transparent);
+		--cunibs-fill-hover: color-mix(in srgb, var(--sl-color-white) 6%, transparent);
+		--cunibs-fill-selected: color-mix(in srgb, var(--sl-color-white) 10%, transparent);
+		--cunibs-control-height: 2rem;
+		--cunibs-radius: 0.5rem;
+		--cunibs-radius-card: 0.75rem;
+		--cunibs-duration-fast: 60ms;
+		--cunibs-duration-base: 200ms;
+		--cunibs-ease-spring: linear(
+			0,
+			0.079,
+			0.248,
+			0.439,
+			0.613,
+			0.754,
+			0.859,
+			0.931,
+			0.977,
+			1.002,
+			1.015,
+			1.019,
+			1.018,
+			1.015,
+			1.012,
+			1.008,
+			1.005,
+			1.003,
+			1.002,
+			1.001,
+			1
+		);
+	}
+
+	@media (width < 72rem) {
+		:root {
+			--sl-mobile-toc-height: 2.5rem;
+		}
+	}
+
+	:root[data-theme='light'] {
+		--sl-color-white: #0b0b0b;
+		--sl-color-gray-1: #262626;
+		--sl-color-gray-2: #4f4f4f;
+		--sl-color-gray-3: #6b6b6b;
+		--sl-color-gray-4: #8f8f8f;
+		--sl-color-gray-5: #d6d6d6;
+		--sl-color-gray-6: #ededed;
+		--sl-color-gray-7: #f6f6f6;
+		--sl-color-black: #fcfcfc;
+
+		--sl-color-accent-low: #f9ece7;
+		--sl-color-accent: #d97757;
+		--sl-color-accent-high: #a6482a;
+
+		--sl-color-text-invert: var(--sl-color-black);
+		--sl-color-hairline-light: #e6e6e6;
+		--sl-color-hairline: #ebebeb;
+		--sl-color-hairline-shade: #ebebeb;
+		--sl-color-backdrop-overlay: rgb(11 11 11 / 0.3);
+
+		--cunibs-surface: #f6f6f6;
+		--cunibs-surface-raised: #ffffff;
+	}
+
+	/* The mobile page bar overlays content, so it reserves no space. */
+	.main-frame {
+		padding-top: var(--sl-nav-height);
+	}
+
+	.content-panel {
+		padding-block: 2rem 0;
+	}
+	.content-panel + .content-panel {
+		border-top: 0;
+		padding-top: 1.5rem;
+	}
+	@media (min-width: 50rem) {
+		.content-panel {
+			padding-inline: 2rem;
+		}
+	}
+
+	.right-sidebar {
+		border-inline-start: 0;
+	}
+	.right-sidebar-panel {
+		padding-block: 2rem;
+	}
+
+	.site-title {
+		gap: 0.5rem;
+		font-size: 1.0625rem;
+		font-weight: 600;
+		letter-spacing: -0.01em;
+		color: var(--sl-color-white);
+	}
+	.site-title img {
+		height: 1.5rem;
+	}
+
+	.sl-menu-button {
+		border-radius: var(--cunibs-radius);
+		background-color: transparent;
+		color: var(--sl-color-white);
+		box-shadow: none;
+	}
+	.sl-menu-button:hover,
+	.sl-menu-button:has(~ :popover-open) {
+		background-color: var(--cunibs-fill-hover);
+	}
+
+	.sl-markdown-content :is(h1, h2, h3, h4, h5, h6):not(:where(.not-content *)) {
+		font-weight: 600;
+		letter-spacing: -0.01em;
+	}
+	.sl-markdown-content :is(h2, h3):not(:where(.not-content *)) {
+		margin-top: 2.5rem;
+	}
+
+	.sl-markdown-content a:not(:where(.not-content *)) {
+		color: var(--sl-color-white);
+		text-decoration-line: underline;
+		text-decoration-color: color-mix(in srgb, var(--sl-color-white) 30%, transparent);
+		text-decoration-thickness: 1px;
+		text-underline-offset: 0.2em;
+		transition: text-decoration-color var(--cunibs-duration-base) ease-out;
+	}
+	.sl-markdown-content a:hover:not(:where(.not-content *)) {
+		color: var(--sl-color-white);
+		text-decoration-color: currentColor;
+	}
+
+	.sl-markdown-content :not(pre) > code:not(:where(.not-content *)) {
+		border: 1px solid var(--sl-color-hairline-light);
+		border-radius: 0.3125rem;
+		padding: 0.1em 0.35em;
+		color: var(--sl-color-white);
+	}
+
+	.sl-markdown-content table:not(:where(.not-content *)) {
+		border-collapse: collapse;
+		font-size: var(--sl-text-sm);
+	}
+	.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+		border: 0;
+		border-bottom: 1px solid var(--sl-color-hairline);
+		padding: 0.625rem 1rem;
+	}
+	.sl-markdown-content th:not(:where(.not-content *)) {
+		color: var(--sl-color-white);
+		font-weight: 500;
+		background-color: transparent;
+	}
+	.sl-markdown-content tr:nth-child(2n):not(:where(.not-content *)) {
+		background-color: transparent;
+	}
+
+	.sl-markdown-content blockquote:not(:where(.not-content *)) {
+		border-inline-start: 2px solid var(--sl-color-gray-5);
+		color: var(--sl-color-gray-3);
+	}
+
+	.sl-markdown-content hr:not(:where(.not-content *)) {
+		border-color: var(--sl-color-hairline);
+	}
+
+	.starlight-aside {
+		border: 1px solid color-mix(in srgb, var(--sl-color-asides-border) 28%, transparent);
+		border-radius: var(--cunibs-radius-card);
+		padding: 0.875rem 1.25rem;
+		background-color: color-mix(in srgb, var(--sl-color-asides-border) 8%, transparent);
+		color: var(--sl-color-gray-1);
+		font-size: var(--sl-text-sm);
+	}
+	.starlight-aside--note {
+		--sl-color-asides-text-accent: var(--sl-color-white);
+		--sl-color-asides-border: var(--sl-color-gray-3);
+	}
+	.starlight-aside--tip {
+		--sl-color-asides-border: var(--sl-color-accent);
+		--sl-color-asides-text-accent: var(--sl-color-accent-high);
+	}
+	.starlight-aside__title {
+		font-size: var(--sl-text-sm);
+		font-weight: 500;
+	}
+	.starlight-aside__icon {
+		font-size: 1.25em;
+	}
+
+	.pagination-links {
+		margin-top: 2rem;
+	}
+	.pagination-links a {
+		border-color: var(--sl-color-hairline-light);
+		border-radius: var(--cunibs-radius-card);
+		padding: 0.875rem 1rem;
+		font-size: var(--sl-text-sm);
+		color: var(--sl-color-gray-3);
+		box-shadow: none;
+		transition: background-color var(--cunibs-duration-base) ease-out;
+	}
+	.pagination-links a:hover {
+		border-color: var(--sl-color-hairline-light);
+		background-color: var(--cunibs-fill-subtle);
+	}
+	.pagination-links .link-title {
+		font-size: var(--sl-text-base);
+		font-weight: 500;
+	}
+
+	.hero .tagline {
+		color: var(--sl-color-gray-3);
+	}
+
+	.sl-link-button {
+		border-radius: var(--cunibs-radius);
+		font-weight: 500;
+	}
+	.sl-link-button.primary,
+	.sl-link-button.primary:hover {
+		border-color: var(--sl-color-white);
+		background: var(--sl-color-white);
+		color: var(--sl-color-black);
+	}
+	.sl-link-button.primary:hover {
+		opacity: 0.88;
+	}
+
+	.card-grid {
+		gap: 1rem;
+	}
+
+	.card,
+	.sl-link-card {
+		gap: 0.75rem;
+		border: 1px solid var(--sl-color-hairline-light);
+		border-radius: var(--cunibs-radius-card);
+		padding: 1.25rem;
+		background-color: transparent;
+		box-shadow: none;
+		font-size: var(--sl-text-sm);
+		line-height: 1.5;
+		color: var(--sl-color-gray-2);
+	}
+	.card .title,
+	.sl-link-card .title {
+		gap: 0.5rem;
+		font-size: var(--sl-text-sm);
+		font-weight: 500;
+		color: var(--sl-color-white);
+	}
+	.card .body {
+		font-size: inherit;
+	}
+	.card .icon {
+		box-sizing: content-box;
+		padding: 0.25rem;
+		border-color: var(--sl-color-hairline-light);
+		border-radius: 0.375rem;
+		background-color: var(--cunibs-fill-subtle);
+		color: var(--sl-color-gray-1);
+	}
+
+	.sl-link-card {
+		align-items: center;
+		transition: background-color var(--cunibs-duration-base) ease-out;
+	}
+	.sl-link-card .stack {
+		gap: 0.25rem;
+	}
+	.sl-link-card a {
+		text-decoration: none;
+	}
+	.sl-link-card .description {
+		color: var(--sl-color-gray-3);
+	}
+	.sl-link-card:hover {
+		border-color: var(--sl-color-hairline-light);
+		background-color: var(--cunibs-fill-subtle);
+	}
+
+	starlight-file-tree {
+		--icon-folder: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'/%3E%3C/svg%3E");
+		--icon-folder-open: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2'/%3E%3C/svg%3E");
+		--icon-file: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/%3E%3Cpath d='M14 2v4a2 2 0 0 0 2 2h4'/%3E%3C/svg%3E");
+		--y-space: 0;
+
+		border: 1px solid var(--sl-color-hairline-light);
+		border-radius: var(--cunibs-radius-card);
+		padding: 1rem;
+		background-color: var(--cunibs-surface-raised);
+		font-size: var(--sl-text-code);
+		line-height: 1.6;
+	}
+	starlight-file-tree ul {
+		margin-inline-start: calc(0.5em - 0.5px);
+		border-inline-start-color: var(--sl-color-hairline-light);
+		padding-inline-start: 0.75rem;
+	}
+	starlight-file-tree > ul {
+		margin: 0;
+		border: 0;
+		padding: 0;
+	}
+	starlight-file-tree .file {
+		margin-inline-start: 0;
+		color: var(--sl-color-gray-1);
+		--tree-icon: var(--icon-file);
+	}
+	starlight-file-tree .directory > details {
+		padding-inline-start: 0;
+	}
+	starlight-file-tree .directory > details > summary {
+		margin-inline-start: 0;
+		padding-inline: 0;
+		list-style: none;
+		--tree-icon: var(--icon-folder);
+	}
+	starlight-file-tree .directory > details[open] > summary {
+		--tree-icon: var(--icon-folder-open);
+	}
+	starlight-file-tree .directory > details > summary::-webkit-details-marker {
+		display: none;
+	}
+	starlight-file-tree .directory > details > summary:hover {
+		color: var(--sl-color-white);
+	}
+	starlight-file-tree .directory > details > summary:hover ~ ul {
+		border-color: var(--sl-color-gray-5);
+	}
+	starlight-file-tree .tree-icon {
+		display: none;
+	}
+	/* Starlight renders per-filetype Seti icons; these outline icons replace them. */
+	starlight-file-tree .tree-entry > span > span:has(> .tree-icon)::before {
+		content: '';
+		display: inline-block;
+		width: 1em;
+		height: 1em;
+		margin-inline-end: 0.5rem;
+		vertical-align: -0.15em;
+		background-color: var(--sl-color-gray-3);
+		mask: var(--tree-icon) center / contain no-repeat;
+	}
+	starlight-file-tree .highlight {
+		padding-inline: 0.25rem 0.5rem;
+		margin-inline-start: -0.25rem;
+		background-color: var(--cunibs-fill-selected);
+		color: var(--sl-color-white);
+	}
+	starlight-file-tree .highlight span::before {
+		background-color: currentColor;
+	}
+	starlight-file-tree .comment {
+		padding-inline-start: 1rem;
+	}
+
+	@media (hover: hover) {
+		.expressive-code .frame:not(.has-title) {
+			--button-spacing: calc(1rem + (var(--sl-text-code) * 1.6 - 2rem) / 2);
+		}
+		.expressive-code .frame.has-title {
+			--button-spacing: 0.1875rem;
+		}
+	}
+
+	::selection {
+		background-color: color-mix(in srgb, var(--sl-color-accent) 28%, transparent);
+	}
+}
