@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 env:
-  CUDA_ARCHS: "75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+  CUDA_VERSION: "12.9.1"
+  CUDA_ARCHS: "60-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
 
 jobs:
   build-wheels:
@@ -33,25 +34,28 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: ilammy/msvc-dev-cmd@v1.13.0
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install CUDA ${{ env.CUDA_VERSION }}
+        run: python .github/scripts/fetch_cuda.py ${{ env.CUDA_VERSION }} ${{ runner.temp }}/cuda
+
+      - uses: step-security/msvc-dev-cmd@v1.13.1
         if: runner.os == 'Windows'
         with:
           arch: x64
 
-      - uses: pypa/cibuildwheel@v4.1.0
+      - uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_BUILD: ${{ matrix.python }}-${{ matrix.platform.tag }}
-          CIBW_ENVIRONMENT: CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCHS }}"
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
-            auditwheel repair -w {dest_dir}
-            --exclude 'libcu*.so.*'
-            --exclude 'libnv*.so.*'
-            {wheel}
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
-            delvewheel repair -w {dest_dir} {wheel}
-            --no-mangle-all
-            --exclude "cu*.dll;nv*.dll"
-          CIBW_TEST_COMMAND: python -c "import cunibs.solver"
+          CIBW_CONFIG_SETTINGS: cmake.define.CMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCHS }}
+          CIBW_ENVIRONMENT_LINUX: CUDACXX=/host${{ runner.temp }}/cuda/bin/nvcc
+          CIBW_ENVIRONMENT_WINDOWS: >-
+            CMAKE_GENERATOR=Ninja
+            CUDACXX='${{ runner.temp }}/cuda/bin/nvcc.exe'
+          CIBW_TEST_SOURCES: .github/scripts/import_extension.py
+          CIBW_TEST_COMMAND: python .github/scripts/import_extension.py
 
       - uses: actions/upload-artifact@v7.0.1
         with:
