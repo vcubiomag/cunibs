@@ -1,19 +1,8 @@
-cmake_minimum_required(VERSION 3.21)
-
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
+cmake_minimum_required(VERSION 3.24)
 
 project(${SKBUILD_PROJECT_NAME} LANGUAGES CXX)
 
 find_package(Python 3.12 COMPONENTS Interpreter Development.Module REQUIRED)
-
-option(CUNIBS_USE_SYSTEM_CUDA "Use the system CUDA toolkit instead of the CUDA wheels" OFF)
-
-if(NOT CUNIBS_USE_SYSTEM_CUDA)
-  include(CunibsCudaPathfinder)
-  cunibs_probe_cuda()
-
-  set(CMAKE_CUDA_COMPILER "${CUNIBS_CUDA_NVCC}")
-endif()
 
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
@@ -21,28 +10,23 @@ endif()
 
 message(STATUS "cunibs: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
-if(WIN32 AND NOT CUNIBS_USE_SYSTEM_CUDA)
-  set(CMAKE_CUDA_RUNTIME_LIBRARY None)
-endif()
-
 enable_language(CUDA)
 
-if(CUNIBS_USE_SYSTEM_CUDA)
-  find_package(CUDAToolkit 12.9 REQUIRED)
-else()
-  # FindCUDAToolkit cannot locate the wheels' cudart, which has only a versioned SONAME on Linux and
-  # a bare DLL on Windows. Windows links against an import library synthesized from that DLL.
-  set(_cudart "${CUNIBS_CUDA_LIB_cudart}")
-  if(WIN32)
-    include(CunibsWindowsImplib)
-    cunibs_generate_cuda_implibs(LIBS cudart)
-    set(_cudart "${CUNIBS_CUDA_IMPLIB_cudart}")
-  endif()
-  add_library(CUDA::cudart UNKNOWN IMPORTED)
-  set_target_properties(CUDA::cudart PROPERTIES
-    IMPORTED_LOCATION "${_cudart}"
-    INTERFACE_INCLUDE_DIRECTORIES "${CUNIBS_CUDA_INCLUDE_DIR}")
+find_package(CUDAToolkit 12.9 REQUIRED)
+
+# The kernels need CCCL 3. CTK 13 bundles it, and CTK 12 bundles 2.8, so a CTK 12 build
+# downloads the release instead.
+find_package(CCCL 3.2 CONFIG QUIET HINTS "${CUDAToolkit_LIBRARY_ROOT}")
+if(NOT CCCL_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(cccl
+    URL https://github.com/NVIDIA/cccl/releases/download/v3.2.1/cccl-v3.2.1.tar.gz
+    URL_HASH SHA256=db8eeb780df099e3e8bb5d0019a9b37533e5fad7c1f80676c4975f290e2c1e4a
+    DOWNLOAD_EXTRACT_TIMESTAMP ON)
+  FetchContent_MakeAvailable(cccl)
+  find_package(CCCL 3.2 CONFIG REQUIRED PATHS "${cccl_SOURCE_DIR}/lib/cmake" NO_DEFAULT_PATH)
 endif()
+message(STATUS "cunibs: CCCL ${CCCL_VERSION} from ${CCCL_DIR}")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -112,21 +96,10 @@ else()
     "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_warn_flags_nvcc},-fvisibility=hidden>")
 endif()
 
-target_link_libraries(
-  _solver_ext
-  PRIVATE CUDA::cudart
-)
-
-if(NOT WIN32)
-  set(_CUNIBS_INSTALL_RPATH "$ORIGIN")
-  if(NOT CUNIBS_USE_SYSTEM_CUDA)
-    list(APPEND _CUNIBS_INSTALL_RPATH "$ORIGIN/../../nvidia/cu13/lib")
-  endif()
-  set_target_properties(_solver_ext PROPERTIES INSTALL_RPATH "${_CUNIBS_INSTALL_RPATH}")
-
-  target_link_options(_solver_ext PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wl,--disable-new-dtags>)
-endif()
+# A static cudart needs only the driver at run time, so a CTK 12 build loads next to the
+# CUDA 12 and CUDA 13 CuPy alike. CCCL comes first so its headers shadow the toolkit's.
+set_target_properties(_solver_ext PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+target_link_libraries(_solver_ext PRIVATE CCCL::CCCL CUDA::cudart_static)
 
 install(TARGETS _solver_ext
   RUNTIME DESTINATION cunibs/solver
@@ -134,26 +107,11 @@ install(TARGETS _solver_ext
   ARCHIVE DESTINATION ${SKBUILD_NULL_DIR}
 )
 
-# Stub generation imports the freshly built extension, and that import has to go through
-# cunibs.solver.__init__, which preloads the CUDA libraries; importing the bare
-# _solver_ext skips the preload and fails on Windows, where the loader will not find
-# cudart64_13.dll on its own. Hence the staging tree: it is the only layout the dotted
-# import resolves against.
-#
-# The top-level __init__ is empty rather than the real one, which calls
-# importlib.metadata.version("cunibs") and so cannot run before installation.
-set(_stub_root "${CMAKE_CURRENT_BINARY_DIR}/stub_pkg")
-set(_stub_pkg "${_stub_root}/cunibs/solver")
-set_target_properties(_solver_ext PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${_stub_pkg}")
-file(CONFIGURE OUTPUT "${_stub_root}/cunibs/__init__.py" CONTENT "")
-configure_file(src/cunibs/solver/__init__.py "${_stub_pkg}/__init__.py" COPYONLY)
-configure_file(src/cunibs/solver/_cuda_preload.py "${_stub_pkg}/_cuda_preload.py" COPYONLY)
-
 nanobind_add_stub(
   _solver_ext_stub
-  MODULE cunibs.solver._solver_ext
-  OUTPUT solver/_solver_ext.pyi
-  PYTHON_PATH "${_stub_root}"
+  MODULE _solver_ext
+  OUTPUT _solver_ext.pyi
+  PYTHON_PATH $<TARGET_FILE_DIR:_solver_ext>
   DEPENDS _solver_ext
 )
 
@@ -162,9 +120,9 @@ nanobind_add_stub(
 # scikit-build-core leaves ignored files out of the wheel, so the wheel takes the stub from install.
 add_custom_target(_solver_ext_stub_sync ALL
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "${CMAKE_CURRENT_BINARY_DIR}/solver/_solver_ext.pyi"
+          "${CMAKE_CURRENT_BINARY_DIR}/_solver_ext.pyi"
           "${CMAKE_CURRENT_SOURCE_DIR}/src/cunibs/solver/_solver_ext.pyi"
   VERBATIM
 )
 add_dependencies(_solver_ext_stub_sync _solver_ext_stub)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/solver/_solver_ext.pyi" DESTINATION cunibs/solver)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/_solver_ext.pyi" DESTINATION cunibs/solver)
