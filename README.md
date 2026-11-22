@@ -1,6 +1,8 @@
 # cuNIBS
 
-[![pypi](https://img.shields.io/pypi/v/cunibs)](https://pypi.python.org/pypi/cunibs)
+[![image](https://img.shields.io/pypi/v/cunibs.svg)](https://pypi.python.org/pypi/cunibs)
+[![image](https://img.shields.io/pypi/l/cunibs.svg)](https://github.com/astral-sh/cunibs/blob/main/LICENSE)
+[![image](https://img.shields.io/pypi/pyversions/cunibs.svg)](https://pypi.python.org/pypi/cunibs)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/hero-dark.png">
