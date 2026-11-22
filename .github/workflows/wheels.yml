@@ -11,7 +11,7 @@ permissions:
 
 env:
   CUDA_VERSION: "12.9.1"
-  CUDA_ARCHS: "60-real;70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
+  CUDA_ARCHS: "70-real;75-real;80-real;86-real;89-real;90-real;100-real;120-real;120-virtual"
 
 jobs:
   build-wheels:

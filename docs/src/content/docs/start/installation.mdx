@@ -24,7 +24,7 @@ Install exactly one extra. `pip install cunibs` without an extra installs no CuP
 
 - Linux or Windows on x86-64.
 - CPython 3.12, 3.13, or 3.14, including free-threaded 3.14.
-- An NVIDIA GPU with compute capability 6.0 (Pascal) or newer. CUDA 13 does not support GPUs older than 7.5 (Turing), so Pascal and Volta GPUs need `cu12` or `cu12-local`.
+- An NVIDIA GPU with compute capability 7.0 (Volta) or newer. CUDA 13 does not support GPUs older than 7.5 (Turing), so Volta GPUs need `cu12` or `cu12-local`.
 - An NVIDIA driver that supports the chosen CUDA version: R580 or newer for CUDA 13, R525 or newer for CUDA 12. Run `nvidia-smi` to check the GPU and driver.
 
 The same wheel serves both CUDA versions. [PyPI release files](https://pypi.org/project/cunibs/#files) · [NVIDIA driver compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/latest/minor-version-compatibility.html)
