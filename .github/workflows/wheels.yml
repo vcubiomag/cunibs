@@ -41,10 +41,13 @@ jobs:
       - name: Install CUDA ${{ env.CUDA_VERSION }}
         run: python .github/scripts/fetch_cuda.py ${{ env.CUDA_VERSION }} ${{ runner.temp }}/cuda
 
+      # CTK 12.9 rejects MSVC 14.50 and later, so take the VS 2022 toolset that the VS 2026
+      # image also ships.
       - uses: step-security/msvc-dev-cmd@v1.13.1
         if: runner.os == 'Windows'
         with:
           arch: x64
+          toolset: "14.44"
 
       - uses: pypa/cibuildwheel@v4.3.5
         env:
