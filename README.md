@@ -2,6 +2,11 @@
 
 [![pypi](https://img.shields.io/pypi/v/cunibs)](https://pypi.python.org/pypi/cunibs)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/hero-dark.png">
+  <img alt="cuNIBS. (a) Gray-matter electric field of a MagVenture C-B70 coil at C3. (b) Wall time per task for cuNIBS and SimNIBS 4.6. (c) ROI-mean field from cuNIBS against SimNIBS 4.6 for 400 head-target pairs." src="docs/hero-light.png">
+</picture>
+
 cuNIBS computes the electric field that transcranial magnetic stimulation (TMS)
 induces in an individual head model. It solves the full-volume finite-element
 model on an NVIDIA GPU and reads head models built with the SimNIBS
