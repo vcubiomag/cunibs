@@ -83,6 +83,10 @@ if(MSVC)
   target_compile_options(_solver_ext PRIVATE
     "$<$<COMPILE_LANGUAGE:CXX>:${_msvc_flags}>"
     "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=${_msvc_flags_nvcc}>")
+  # CUB instantiates its force-inlined host dispatch once per target architecture, and MSVC 14.44
+  # takes over an hour to inline pattern.cu's. CTK 12 rejects the MSVC releases that do not.
+  set_source_files_properties(src/cunibs/solver/fem/pattern.cu
+    PROPERTIES COMPILE_OPTIONS "-Xcompiler=/Ob0")
 else()
   # -Xcompiler only reaches the host half of a .cu, which is where the unused-parameter and
   # sign-compare classes live. Device-side mistakes and ignored CUDA return codes are not
